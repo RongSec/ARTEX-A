@@ -168,10 +168,32 @@ func (d *DB) TokenDailyAll(days int) ([]DailyTokenBucket, error) {
 	return out, rows.Err()
 }
 
+// GraphChange 是图变更回调（ExplorationStore.OnGraphChange）的一次入参：一次
+// 节点增/改状态/连边完成后，供 server 侧（ProjectIndexer）旁路投影用。
+// db 包不 import server，回调经函数字段注入（架构 §2.1，解耦红线）。
+type GraphChange struct {
+	// ExplorationID 是变更所属探索图 id。store 内没有 task_id（tasks↔explorations
+	// 是 1:1，tasks.exploration_id UNIQUE），故回调只带 exploration_id；server 侧
+	// 注入闭包时 taskFromPG 已持有 task，闭包自行回填 ev.TaskID = task.ID
+	// （见 server/project_indexer.go 的注入点，T10）。
+	ExplorationID int64
+	NodeID        int64
+	Kind          string // begin|goal|intent|fact|finding|hint|digest
+	State         string // 节点最新状态；Link 事件为空串
+	Summary       string // 节点一行摘要（payload.summary / payload.text，缺省空）
+	Severity      string // 仅 finding 非空（payload.severity）
+	AssetIDs      []int64
+}
+
 // ExplorationStore is a handle onto one exploration's reasoning graph + activity.
 type ExplorationStore struct {
 	db    *DB
 	expID int64
+	// OnGraphChange 图变更回调（AddNode/SetNodeState/Link 三个原语成功后各调一次）。
+	// nil=关闭（默认），三方法行为与原版逐字节相同、零开销（一次 nil 比较）。
+	// 注入方（server）必须保证回调非阻塞（只 select-default 入缓冲通道），
+	// 本包在事务提交后同步调用，绝不在持锁/事务内调用。
+	OnGraphChange func(ev GraphChange)
 }
 
 // CreateExploration creates a new exploration root and returns its id.
@@ -213,7 +235,83 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 			return 0, err
 		}
 	}
-	return id, tx.Commit()
+	// 原版是 `return id, tx.Commit()`：提交失败同样把 id 带回（调用方见 err
+	// 非空即弃用），此处保持逐字节一致的失败语义。
+	if err := tx.Commit(); err != nil {
+		return id, err
+	}
+	// 提交成功后才发事件：回调方（投影）读到的一定是已落库节点，不存在
+	// 「事件先于数据可见」的竞态。payload 在手，无需回查——零额外查询。
+	s.emitGraphChange(GraphChange{
+		ExplorationID: s.expID, NodeID: id, Kind: kind, State: state,
+		Summary:  nodeSummaryOf(payload),
+		Severity: nodeSeverityOf(payload, kind),
+		AssetIDs: anchors,
+	})
+	return id, nil
+}
+
+// emitGraphChange 在回调未注入时零开销返回；注入时同步调用一次。
+// 约定：回调实现必须非阻塞（如 select-default 入缓冲通道后立刻返回），
+// 否则会拖慢图写热路径——这是 server 侧（ProjectIndexer.Enqueue）的责任。
+func (s *ExplorationStore) emitGraphChange(ev GraphChange) {
+	if s.OnGraphChange == nil {
+		return
+	}
+	s.OnGraphChange(ev)
+}
+
+// nodeSummaryOf 取节点 payload 里的一行摘要：fact/intent 用 summary，
+// goal/hint 用 text（与 agent/tools.go graphOverviewData 的取值口径一致）。
+func nodeSummaryOf(payload map[string]any) string {
+	if s, _ := payload["summary"].(string); strings.TrimSpace(s) != "" {
+		return s
+	}
+	if t, _ := payload["text"].(string); strings.TrimSpace(t) != "" {
+		return t
+	}
+	return ""
+}
+
+// nodeSeverityOf 仅 finding 节点带 severity（critical|high|medium|low），
+// 其余 kind 恒空，避免投影行出现无意义的级别值。
+func nodeSeverityOf(payload map[string]any, kind string) string {
+	if kind != KindFinding {
+		return ""
+	}
+	s, _ := payload["severity"].(string)
+	return s
+}
+
+// graphNodeSnapshot 回查一个节点的投影要素，供 SetNodeState/Link 这类
+// 「payload 不在手」的原语发事件用。仅当 OnGraphChange 已注入才被调用
+// （一次窄查询）；节点不存在/出错返回 false，事件静默不发（投影最终一致，
+// 漏一条由后续事件或心跳兜底，绝不为发事件阻塞/失败图写主流程）。
+func (s *ExplorationStore) graphNodeSnapshot(nodeID int64, stateOverride string) (GraphChange, bool) {
+	var ev GraphChange
+	var payloadRaw []byte
+	var state string
+	if err := s.db.QueryRow(`SELECT kind, state, payload FROM exploration_nodes WHERE id=$1 AND exploration_id=$2`, nodeID, s.expID).Scan(&ev.Kind, &state, &payloadRaw); err != nil {
+		return ev, false
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(payloadRaw, &payload)
+	ev.ExplorationID = s.expID
+	ev.NodeID = nodeID
+	if stateOverride != "" {
+		ev.State = stateOverride // SetNodeState：事务外回查可能已被并发再改，以本次写入值为准
+	} else {
+		ev.State = state // Link：边变化不改状态，带当前状态
+	}
+	ev.Summary = nodeSummaryOf(payload)
+	ev.Severity = nodeSeverityOf(payload, ev.Kind)
+	// 锚定资产：array_to_json 转文本再反序列化（照 db/assets.go 扫数组列的既有惯例，
+	// database/sql 下不能直接 Scan 进 []int64）。查失败按无锚定继续发事件。
+	var anchorsJSON string
+	if err := s.db.QueryRow(`SELECT COALESCE(array_to_json(array_agg(asset_id))::text,'[]') FROM exploration_anchors WHERE node_id=$1`, nodeID).Scan(&anchorsJSON); err == nil {
+		_ = json.Unmarshal([]byte(anchorsJSON), &ev.AssetIDs)
+	}
+	return ev, true
 }
 
 // AddIntent is a convenience: an open intent.
@@ -257,17 +355,52 @@ func (s *ExplorationStore) Anchor(nodeID, assetID int64) error {
 
 // Link adds a typed exploration edge (idempotent).
 func (s *ExplorationStore) Link(from int64, rel string, to int64) error {
-	_, err := s.db.Exec(`
+	if s.OnGraphChange == nil { // 关闭态：与原版逐字节相同的快路径
+		_, err := s.db.Exec(`
 INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)
 ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, from, rel, to)
-	return err
+		return err
+	}
+	res, err := s.db.Exec(`
+INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)
+ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, from, rel, to)
+	if err != nil {
+		return err
+	}
+	// 仅新边才发事件（重复 Link 不打扰投影）；事件锚定 dst 节点（边的产出端），
+	// summary 前缀 rel 供 observer 识别血缘变化。
+	if n, _ := res.RowsAffected(); n > 0 {
+		if ev, ok := s.graphNodeSnapshot(to, ""); ok {
+			if ev.Summary != "" {
+				ev.Summary = rel + ": " + ev.Summary
+			} else {
+				ev.Summary = rel
+			}
+			s.emitGraphChange(ev)
+		}
+	}
+	return nil
 }
 
 // SetNodeState updates any node's state (never deletes). content_version bumps
 // so a folded member's state flip invalidates its digest's cached body (§5.3).
 func (s *ExplorationStore) SetNodeState(id int64, state string) error {
-	_, err := s.db.Exec(`UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID)
-	return err
+	if s.OnGraphChange == nil { // 关闭态：与原版逐字节相同的快路径
+		_, err := s.db.Exec(`UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID)
+		return err
+	}
+	res, err := s.db.Exec(`UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID)
+	if err != nil {
+		return err
+	}
+	// 仅改到行才发事件（节点不属于本探索图时 UPDATE 命中 0 行，不发）；
+	// state 以本次写入值为准（事务外回查可能读到并发再改后的值）。
+	if n, _ := res.RowsAffected(); n > 0 {
+		if ev, ok := s.graphNodeSnapshot(id, state); ok {
+			s.emitGraphChange(ev)
+		}
+	}
+	return nil
 }
 
 // UpdateGoalPayload rewrites a goal node's payload text (and optional vulnclass);

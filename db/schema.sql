@@ -1436,3 +1436,74 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at DES
 -- 批量调度取「某项目 FIFO 队首」用（partial 只索引在排队的行，命中集小）：
 CREATE INDEX IF NOT EXISTS idx_tasks_project_queued ON tasks(project_id, queued_at ASC)
     WHERE deleted_at IS NULL AND queued = true AND project_id IS NOT NULL;
+
+-- =====================================================================
+-- O. 项目大图 + 观察者/阅读者（artex-hs F2，T09）
+-- =====================================================================
+-- projects.observer_enabled 列已在 §N 建表语句内（T05 起即有），无需 ALTER 补。
+-- 本段四表：节点投影索引 / 图变更事件 / 项目洞察 / 全局洞察。
+
+-- 任务图节点的"项目级摘要投影"。不复制整图，只存可供 observer 总览的摘要行。
+-- planner/worker 每轮读各自 exploration 原图（graphOverviewData 零改动），只旁路写投影。
+-- project_id 刻意不加 FK：回调侧（server 闭包）已按 task_id→project_id 解析并校验
+-- 项目存在+开关，热路径不再回查；投影清理本就异步（见 task_id 注释同理）。
+CREATE TABLE IF NOT EXISTS project_index (
+    id             BIGSERIAL PRIMARY KEY,
+    project_id     BIGINT NOT NULL,                        -- 所属项目（无 FK，见上注）
+    task_id        BIGINT NOT NULL,                        -- 冗余任务 id（不 FK，任务删除后投影清理走异步，别级联卡删除事务）
+    node_id        BIGINT NOT NULL,                        -- exploration_nodes.id
+    kind           TEXT NOT NULL,                          -- begin|goal|intent|fact|finding|hint|digest
+    state          TEXT NOT NULL DEFAULT '',               -- 节点终态快照（intent done/blocked…、goal met…）；事件驱动刷新
+    summary        TEXT NOT NULL DEFAULT '',               -- 一行摘要（供 observer/大图列表）
+    asset_keys     TEXT[] NOT NULL DEFAULT '{}',           -- 关联资产键（域名/IP/URL 归一化），跨任务相似命中主键
+    severity       TEXT NOT NULL DEFAULT '',               -- finding 专用：critical|high|medium|low（非 finding 为空）
+    payload_digest JSONB NOT NULL DEFAULT '{}',            -- 摘要载荷（state/confidence/vulnclass/关键词等，够总览不够再展原图）
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 幂等 upsert 键：同一节点在一个项目里只有一行。用显式唯一索引（而非表内 UNIQUE
+-- 约束）建，索引名与 ON CONFLICT 目标一致，旧库/新库都稳定可寻。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_pidx_proj_node ON project_index(project_id, node_id);
+CREATE INDEX IF NOT EXISTS idx_pidx_proj_kind ON project_index(project_id, kind);
+CREATE INDEX IF NOT EXISTS idx_pidx_proj_sev  ON project_index(project_id, severity) WHERE severity <> '';
+CREATE INDEX IF NOT EXISTS idx_pidx_proj_task ON project_index(project_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_pidx_asset     ON project_index USING GIN(asset_keys);   -- 资产交集命中（insight 匹配/observer 查同类）
+DROP TRIGGER IF EXISTS trg_pidx_upd ON project_index;
+CREATE TRIGGER trg_pidx_upd BEFORE UPDATE ON project_index
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 图变更事件"事实表"，供 scheduler 按水位增量扫，唤醒 observer。与 findings→
+-- notification_events 同构（只追加、消费后靠水位线推进，不删行）。
+-- 列集为任务书（task-lead）与架构 §1.4 的并集：node_id/kind 定位变更节点，
+-- delta_summary 喂 observer 触发上下文（"task#7 新增 finding[high] SQLi@/api/user"）。
+CREATE TABLE IF NOT EXISTS project_graph_events (
+    id            BIGSERIAL PRIMARY KEY,
+    project_id    BIGINT NOT NULL,                         -- 所属项目（同上，无 FK）
+    task_id       BIGINT NOT NULL,                         -- 变更源任务
+    node_id       BIGINT,                                  -- 变更节点（可空：批量/摘要类事件不锚定单节点）
+    kind          TEXT NOT NULL DEFAULT '',                -- 变更节点 kind（intent/fact/finding/goal/hint…）
+    delta_summary TEXT NOT NULL DEFAULT '',                -- 一行变更摘要，喂 observer
+    occurred_at   TIMESTAMPTZ NOT NULL DEFAULT now()       -- 事件发生时间（水位扫描按 id，不用此列）
+);
+CREATE INDEX IF NOT EXISTS idx_pge_scan ON project_graph_events(project_id, id);  -- 水位 WHERE project_id=$1 AND id>$last ORDER BY id
+
+-- observer 产出：项目级洞察。content 供 planner 限量注入，keywords 与任务
+-- open 意图锚定的 asset_keys 求交集命中优先（GIN）。
+CREATE TABLE IF NOT EXISTS project_insights (
+    id              BIGSERIAL PRIMARY KEY,
+    project_id      BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, -- observer 产出随项目存亡，级联删
+    content         TEXT NOT NULL,                         -- 洞察正文（"同 CMS 版本 X 的 Y 组件历史可借 Z 打法"）
+    source_task_id  BIGINT,                                -- 触发写此洞察时 observer 正看的任务
+    keywords        TEXT[] NOT NULL DEFAULT '{}',          -- 与 planner 命中匹配用（组件名/CMS/端口/中间件…）
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_pins_proj ON project_insights(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pins_kw   ON project_insights USING GIN(keywords);
+
+-- reader 产出：跨项目洞察。默认不注入 planner（跨项目噪声/token 成本），仅全局视图/报告展示。
+CREATE TABLE IF NOT EXISTS global_insights (
+    id              BIGSERIAL PRIMARY KEY,
+    content         TEXT NOT NULL,                         -- 洞察正文
+    source_projects BIGINT[] NOT NULL DEFAULT '{}',        -- 串联涉及的 project id 列表
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_gins_time ON global_insights(created_at DESC);
