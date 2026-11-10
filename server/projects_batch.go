@@ -163,6 +163,12 @@ func (s *Server) projectsBatchTasks(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, fmt.Sprintf("全部 %d 行创建失败", len(targets)))
 		return
 	}
+	// 小项 X：批量任务建队列时回调已随 taskFromPG 绑定（创建即挂项目），seed 与
+	// 首波图事件本会实时进投影；这里仍补一次后台异步重建兜底——建队列瞬间若
+	// 投影通道恰满（事件被 drop），本次重建把 seed 产物一次性补齐，用户进大图
+	// tab 永远不用手动点重建。同项目一次即可（pid 恒定），fire-and-forget 不占
+	// 请求时延。
+	s.scheduleProjectRebuild([]int64{pid})
 	out := map[string]any{
 		"created":     created,
 		"skipped":     skipped,

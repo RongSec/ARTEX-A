@@ -15,9 +15,12 @@ package server
 // 断言，无需库。
 
 import (
+	"context"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -122,6 +125,34 @@ func (s *Server) projectGraph(w http.ResponseWriter, r *http.Request) {
 		resp["hint"] = "暂无投影：任务运行中会实时出现；批量下发/挂项目后未更新的，点「重建投影」补齐。"
 	}
 	writeJSON(w, 200, resp)
+}
+
+// scheduleProjectRebuild 后台异步重建受影响项目的投影（小项 X，消除 B3 遗留
+// 风险#1：挂/摘项目后投影不再等任务重启/手动重建）。fire-and-forget：
+//   - ctx=s.ctx 派生 30s 预算——进程关停随之取消；单项目重建是几百行级事务，
+//     30s 足够且防毒循环占死连接；
+//   - recover 兜底——这里 panic 绝不能带崩进程（归属写入已成功，重建只是补账）；
+//   - 失败仅 log：下次任意事件流/手动重建自愈（投影最终一致定位）。
+//
+// 去重由调用方保证（AttachTaskProject 的 changed 集已去重）。
+func (s *Server) scheduleProjectRebuild(pids []int64) {
+	for _, pid := range pids {
+		pid := pid
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[project-indexer] 异步重建 panic project#%d（已恢复）: %v", pid, r)
+				}
+			}()
+			ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
+			defer cancel()
+			if n, err := s.RebuildProjectIndex(ctx, pid); err != nil {
+				log.Printf("[project-indexer] 异步重建失败 project#%d: %v", pid, err)
+			} else {
+				log.Printf("[project-indexer] 挂/摘触发异步重建完成 project#%d（%d 节点）", pid, n)
+			}
+		}()
+	}
 }
 
 // projectGraphRebuild POST /api/projects/{id}/graph/rebuild —— 同步全量重建

@@ -10,6 +10,7 @@ package server
 //     finding 与任务列表页完全同源），不另写一套统计 SQL。
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -23,31 +24,45 @@ import (
 // AttachTaskProject 把已存在的（未启动的）任务挂到项目或摘除归属（T05 挂/摘、
 // T06 建后归位共用）。只动 project_id 一列 + 内存 handle，不做队列/状态迁移。
 // projectID=nil 表示摘除。
-func (m *Manager) AttachTaskProject(id string, projectID *int64) error {
+//
+// 返回值 changed=本次归属变动涉及的项目 id 集（去重，最多两个）：挂载时含新
+// 项目（补该任务存量图投影）、摘除/换挂时含旧项目（清该任务残留行）。调用方
+// （tasksAttachProject handler）据此后台异步 RebuildProjectIndex——见小项 X。
+// 归属写入本身成功即返回，重建异步进行、失败不回传给本函数。
+func (m *Manager) AttachTaskProject(id string, projectID *int64) (changed []int64, err error) {
 	m.taskStateMu.Lock()
 	defer m.taskStateMu.Unlock()
 	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	// 旧归属先读（UPDATE 后拿不到）：摘除/换挂时旧项目也要重建清残留行。
+	var oldPID int64
+	{
+		var op sql.NullInt64
+		if err := m.pg.QueryRow(`SELECT project_id FROM tasks WHERE id=$1 AND deleted_at IS NULL`, n).Scan(&op); err != nil {
+			return nil, err
+		}
+		oldPID = op.Int64
 	}
 	var rows int64
 	if err := m.pg.QueryRow(`SELECT count(*) FROM tasks WHERE id=$1 AND deleted_at IS NULL`, n).Scan(&rows); err != nil {
-		return err
+		return nil, err
 	}
 	if rows == 0 {
-		return errors.New("task not found")
+		return nil, errors.New("task not found")
 	}
 	if projectID != nil {
 		var exists bool
 		if err := m.pg.QueryRow(`SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1)`, *projectID).Scan(&exists); err != nil {
-			return err
+			return nil, err
 		}
 		if !exists {
-			return errors.New("project not found")
+			return nil, errors.New("project not found")
 		}
 	}
 	if _, err := m.pg.Exec(`UPDATE tasks SET project_id=$2 WHERE id=$1`, n, projectID); err != nil {
-		return err
+		return nil, err
 	}
 	m.mu.Lock()
 	var expID int64
@@ -59,14 +74,25 @@ func (m *Manager) AttachTaskProject(id string, projectID *int64) error {
 	// 归属变了，消费侧 exploration→project 缓存必须作废，否则在途事件按旧
 	// project_id 投影。回调绑定只在 taskFromPG（handle 发布前）做一次且永不
 	// 改写（运行期改字段与运行中协程的读构成数据竞争）。[已核实 T12 裁决2]
-	// 运行期挂/摘项目的投影语义：挂载后该任务的回调并未新增（事件暂不产生），
-	// 靠任务重启（LoadExisting 重新绑定）或 RebuildProjectIndex（T13 API）补
-	// 投影——前端在挂/摘操作后 toast 提示这一点；摘除后存量回调的事件因缓存
-	// 失效解析到新 pid=0 被丢弃，旧投影行由下次 Rebuild 清掉。
+	// 运行期挂/摘项目的投影语义：挂载后该任务的回调并未新增（事件暂不产生）；
+	// 小项 X 起由调用方后台异步 RebuildProjectIndex 立即补齐（不再等任务重启）。
+	// 摘除后存量回调的事件因缓存失效解析到新 pid=0 被丢弃，旧投影行由旧项目
+	// 这次重建清掉。
 	if expID > 0 {
 		m.projectIndexer.InvalidateTaskMapping(expID)
 	}
-	return nil
+	// 汇总受影响项目：旧（>0 且与新不同）+ 新（>0）。dedup 防换挂同项目时空转。
+	newPID := int64(0)
+	if projectID != nil {
+		newPID = *projectID
+	}
+	if oldPID > 0 && oldPID != newPID {
+		changed = append(changed, oldPID)
+	}
+	if newPID > 0 {
+		changed = append(changed, newPID)
+	}
+	return changed, nil
 }
 
 // EnqueueTaskProjectBatch 是批量下发专用入队（T06）：持久层写
@@ -330,7 +356,8 @@ func (s *Server) tasksAttachProject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "project_id 无效")
 		return
 	}
-	if err := s.m.AttachTaskProject(id, req.ProjectID); err != nil {
+	changed, err := s.m.AttachTaskProject(id, req.ProjectID)
+	if err != nil {
 		if err.Error() == "task not found" {
 			writeErr(w, 404, "任务不存在")
 			return
@@ -342,6 +369,8 @@ func (s *Server) tasksAttachProject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// 小项 X：归属变动→后台异步重建受影响项目投影（含被摘除的旧项目，清残留行）。
+	s.scheduleProjectRebuild(changed)
 	t, _ := s.m.Task(id)
 	if t == nil {
 		writeJSON(w, 200, map[string]any{"task_id": id, "project_id": req.ProjectID})

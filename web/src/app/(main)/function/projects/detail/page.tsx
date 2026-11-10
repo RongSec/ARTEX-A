@@ -237,7 +237,7 @@ function TasksTab({ tasks, onChanged }: { tasks: Task[]; onChanged: () => void }
     try {
       await api.attachTaskProject(taskId, null);
       toast.success("已移出项目", {
-        description: "大图投影将在任务重启或点「重建投影」后更新。",
+        description: "投影正在后台更新，稍后自动反映最新归属。",
         duration: 6000,
       });
       onChanged();
