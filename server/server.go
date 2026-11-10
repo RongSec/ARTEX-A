@@ -712,6 +712,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/projects/{id}", s.projectsUpdate)
 	mux.HandleFunc("DELETE /api/projects/{id}", s.projectsDelete)
 	mux.HandleFunc("POST /api/projects/{id}/batch-tasks", s.projectsBatchTasks)
+	// T13 大图 tab / 洞察面板（project_graph.go）：投影常开，这里只读+重建。
+	mux.HandleFunc("GET /api/projects/{id}/graph", s.projectGraph)
+	mux.HandleFunc("POST /api/projects/{id}/graph/rebuild", s.projectGraphRebuild)
+	mux.HandleFunc("GET /api/projects/{id}/insights", s.projectInsightsList)
+	mux.HandleFunc("DELETE /api/projects/{id}/insights/{iid}", s.projectInsightDelete)
 	mux.HandleFunc("PATCH /api/tasks/{id}/project", s.tasksAttachProject)
 	mux.HandleFunc("GET /api/task-archives", s.listTaskArchives)
 	mux.HandleFunc("GET /api/task-archives/{id}", s.getTaskArchive)

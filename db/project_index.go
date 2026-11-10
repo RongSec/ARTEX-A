@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // ProjectIndexRow 是 project_index 表的一行（一个任务图节点在项目里的摘要投影）。
@@ -25,6 +26,7 @@ type ProjectIndexRow struct {
 	AssetKeys   []string        `json:"asset_keys"`
 	Severity    string          `json:"severity"`
 	PayloadJSON json.RawMessage `json:"payload_digest"`
+	UpdatedAt   time.Time       `json:"updated_at"` // 行最后刷新时刻（大图节点排序/新鲜度展示）
 }
 
 // marshalInt64Array 把 []int64 编成 PG int[] 字面量（'{}' 表示空数组）。
@@ -199,7 +201,7 @@ func escapeLikePattern(s string) string {
 	return r.Replace(s)
 }
 
-const projectIndexCols = `id, project_id, task_id, node_id, kind, state, summary, array_to_json(asset_keys)::text, severity, payload_digest`
+const projectIndexCols = `id, project_id, task_id, node_id, kind, state, summary, array_to_json(asset_keys)::text, severity, payload_digest, updated_at`
 
 // scanProjectIndexRow 扫一行投影（asset_keys 走 array_to_json 文本再反序列化，
 // 照 db/assets.go 扫数组列的既有惯例：database/sql 不能直接 Scan 进 []string）。
@@ -207,7 +209,7 @@ func scanProjectIndexRow(sc interface{ Scan(...any) error }) (ProjectIndexRow, e
 	var r ProjectIndexRow
 	var keysJSON string
 	var digest []byte
-	if err := sc.Scan(&r.ID, &r.ProjectID, &r.TaskID, &r.NodeID, &r.Kind, &r.State, &r.Summary, &keysJSON, &r.Severity, &digest); err != nil {
+	if err := sc.Scan(&r.ID, &r.ProjectID, &r.TaskID, &r.NodeID, &r.Kind, &r.State, &r.Summary, &keysJSON, &r.Severity, &digest, &r.UpdatedAt); err != nil {
 		return r, err
 	}
 	r.PayloadJSON = json.RawMessage(digest)

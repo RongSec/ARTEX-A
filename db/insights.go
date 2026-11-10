@@ -119,6 +119,21 @@ func (d *DB) DeleteInsight(ctx context.Context, id int64) error {
 	return nil
 }
 
+// DeleteProjectInsight 是项目作用域的删除（API 面专用）：WHERE 带 project_id，
+// 单条 SQL 即防越权删他项目行——不靠"调用方先查行再删"的自觉（那有 TOCTOU 窗，
+// 且每删一条多一次往返）。ErrInsightNotFound 同时覆盖"不存在"与"不属于该项目"
+// 两态（对调用方语义一致：这条你删不了）。
+func (d *DB) DeleteProjectInsight(ctx context.Context, projectID, id int64) error {
+	res, err := d.ExecContext(ctx, `DELETE FROM project_insights WHERE id=$1 AND project_id=$2`, id, projectID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrInsightNotFound
+	}
+	return nil
+}
+
 // WriteGlobalInsight 追加一条跨项目洞察（reader 产出）。content 必填；
 // sourceProjects 记录串联涉及的项目 id 集（不校验存在性：只读旁路，
 // 项目随后被删也不该让洞察写入失败——source 列无 FK 正是此意）。
