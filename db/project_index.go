@@ -145,6 +145,13 @@ func (d *DB) DeleteProjectIndexByNode(projectID, nodeID int64) error {
 	return err
 }
 
+// DeleteProjectIndexByNodeTx 是 DeleteProjectIndexByNode 的事务内版本，供
+// ProjectIndexer 把「删投影 + 插事件」压进一个事务。语义一致、幂等。
+func DeleteProjectIndexByNodeTx(ctx context.Context, tx *sql.Tx, projectID, nodeID int64) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM project_index WHERE project_id=$1 AND node_id=$2`, projectID, nodeID)
+	return err
+}
+
 // ProjectIndexFilter 是 QueryProjectIndex 的可选过滤条件；零值=不过滤。
 type ProjectIndexFilter struct {
 	Kinds      []string // kind IN (...)
@@ -231,6 +238,96 @@ func (d *DB) QueryProjectIndex(ctx context.Context, projectID int64, f ProjectIn
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// UpsertProjectIndexTx 在调用方事务内写入/刷新投影行（语义同
+// UpsertProjectIndex）。RebuildProjectIndex 用它把「清旧行+灌新行」压进一个
+// 事务：重建中途失败不会留下半套投影。tx 由 server 侧提供并负责提交。
+func UpsertProjectIndexTx(ctx context.Context, tx *sql.Tx, row ProjectIndexRow) error {
+	digest := row.PayloadJSON
+	if len(digest) == 0 {
+		digest = []byte("{}")
+	}
+	_, err := tx.ExecContext(ctx, `
+INSERT INTO project_index(project_id, task_id, node_id, kind, state, summary, asset_keys, severity, payload_digest)
+VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8, $9::jsonb)
+ON CONFLICT (project_id, node_id) DO UPDATE SET
+    task_id        = EXCLUDED.task_id,
+    kind           = EXCLUDED.kind,
+    state          = EXCLUDED.state,
+    summary        = EXCLUDED.summary,
+    asset_keys     = EXCLUDED.asset_keys,
+    severity       = EXCLUDED.severity,
+    payload_digest = EXCLUDED.payload_digest`,
+		row.ProjectID, row.TaskID, row.NodeID, utf8Clean(row.Kind), utf8Clean(row.State),
+		utf8Clean(row.Summary), marshalTextArray(row.AssetKeys), utf8Clean(row.Severity),
+		string(jsonbClean(digest)))
+	return err
+}
+
+// ProjectIndexNode 是重建投影要扫的一个探索图节点（含锚定资产）。
+type ProjectIndexNode struct {
+	ID      int64
+	Kind    string
+	State   string
+	Payload json.RawMessage
+	Anchors []int64
+}
+
+// NodesWithAnchors 一次查出一个探索图的全部节点及其锚定资产（重建投影用；
+// 与 Nodes() 分开是避免给图可视化热路径带上 join 成本）。
+func (s *ExplorationStore) NodesWithAnchors(ctx context.Context, limit int) ([]ProjectIndexNode, error) {
+	if limit <= 0 {
+		limit = 20000
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT n.id, n.kind, n.state, n.payload,
+       COALESCE(array_to_json(array_agg(a.asset_id) FILTER (WHERE a.asset_id IS NOT NULL))::text, '[]')
+FROM exploration_nodes n
+LEFT JOIN exploration_anchors a ON a.node_id = n.id
+WHERE n.exploration_id = $1
+GROUP BY n.id, n.kind, n.state, n.payload
+ORDER BY n.id LIMIT $2`, s.expID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProjectIndexNode
+	for rows.Next() {
+		var nd ProjectIndexNode
+		var payload []byte
+		var anchorsJSON string
+		if err := rows.Scan(&nd.ID, &nd.Kind, &nd.State, &payload, &anchorsJSON); err != nil {
+			return nil, err
+		}
+		nd.Payload = json.RawMessage(payload)
+		_ = json.Unmarshal([]byte(anchorsJSON), &nd.Anchors)
+		out = append(out, nd)
+	}
+	return out, rows.Err()
+}
+
+// PayloadSummary 取 payload（jsonb 原文）里的一行摘要，口径同 nodeSummaryOf
+// （summary 优先、text 兜底）。重建/查询侧拿到的是 JSON 文本，非 map。
+func PayloadSummary(payload json.RawMessage) string {
+	var m map[string]any
+	if json.Unmarshal(payload, &m) != nil {
+		return ""
+	}
+	return nodeSummaryOf(m)
+}
+
+// PayloadSeverity 取 finding payload 里的 severity（非 finding 恒空）。
+func PayloadSeverity(payload json.RawMessage, kind string) string {
+	if kind != KindFinding {
+		return ""
+	}
+	var m map[string]any
+	if json.Unmarshal(payload, &m) != nil {
+		return ""
+	}
+	s, _ := m["severity"].(string)
+	return s
 }
 
 // ProjectIndexGroup 是「全项目大图」按任务分组的计数行（task 维度汇总 +

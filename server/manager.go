@@ -247,6 +247,11 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+
+	// projectIndexer 是项目投影异步消费者（artex-hs T10）。nil=链路未启用，
+	// 此时 taskFromPG 不给 store 设 OnGraphChange 回调 = 原版三原语零改动路径。
+	// 由 server.New 创建并 Start，Manager.Close 里 Stop（须在 pg.Close 之前）。
+	projectIndexer *ProjectIndexer
 }
 
 // Settings keys the UI toggles at runtime.
@@ -808,6 +813,11 @@ func (m *Manager) Close() error {
 	if m.traffic != nil {
 		m.traffic.Close()
 	}
+	// 投影消费者须在 pg.Close 之前收尾：Stop 取消消费协程并 flush 在途批次
+	// （flush 用 DB 连接）。放在 traffic 之后、pg 之前。
+	if m.projectIndexer != nil {
+		m.projectIndexer.Stop()
+	}
 	return m.pg.Close()
 }
 
@@ -830,7 +840,14 @@ func unixNanoOrZero(t *time.Time) int64 {
 	return t.UnixNano()
 }
 
-func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
+func taskFromPG(m *Manager, pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
+	// 项目投影回调注入（T10）：仅当任务已挂项目且 indexer 已启用。
+	// 1:1 映射在此闭合：store 按 pt.ExplorationID 构造、与任务同生命周期
+	// （每任务一个 handle，见调用点），闭包直接捕获 pt.ID 作 taskID——消费侧
+	// 零归属查询。运行期挂/摘项目不改这个回调（避免与运行中协程的字段读
+	// 竞争），只做缓存失效；补账走 RebuildProjectIndex。不设回调 = nil =
+	// 三原语逐字节原版路径（原版任务恒此路径，零回归）。
+	m.bindGraphHook(store, pt)
 	return &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
 		ProjectID: cloneInt64Ptr(pt.ProjectID),
@@ -900,7 +917,7 @@ func (m *Manager) CreateTaskWithOptions(description, goal string, opts pgdb.Task
 	if err != nil {
 		return nil, err
 	}
-	t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+	t := taskFromPG(m, pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
 	m.mu.Lock()
 	m.tasks[t.ID] = t
 	m.active = t.ID
@@ -1099,7 +1116,7 @@ func (m *Manager) LoadExisting() []*Task {
 		if _, ok := m.tasks[id]; ok {
 			continue
 		}
-		t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+		t := taskFromPG(m, pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
 		m.tasks[id] = t
 		loaded = append(loaded, t)
 	}

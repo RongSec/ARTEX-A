@@ -50,10 +50,20 @@ func (m *Manager) AttachTaskProject(id string, projectID *int64) error {
 		return err
 	}
 	m.mu.Lock()
+	var expID int64
 	if t := m.tasks[id]; t != nil {
 		t.ProjectID = cloneInt64Ptr(projectID)
+		expID = t.ExpID
 	}
 	m.mu.Unlock()
+	// 归属变了，消费侧 exploration→project 缓存必须作废，否则在途事件按旧
+	// project_id 投影。回调本身（store.OnGraphChange）在 taskFromPG 处一经绑定
+	// 就不再改写（避免与运行中 planner/worker 对该函数字段的读构成数据竞争）：
+	// 挂项目的任务靠 projectOf 缓存失效后下一事件自动解析到新 pid 恢复投影，
+	// 摘项目的任务解析到 pid=0 自动短路，都无需重启。
+	if expID > 0 {
+		m.projectIndexer.InvalidateTaskMapping(expID)
+	}
 	return nil
 }
 
@@ -271,6 +281,11 @@ func (s *Server) projectsUpdate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	// 开关翻转：作废消费侧 projGate 缓存，让下一事件立刻按新开关判定
+	// （命中关=丢弃，命中开=恢复投影）。
+	if patch.ObserverEnabled != nil {
+		s.m.projectIndexer.InvalidateProjectGate(pid)
 	}
 	writeJSON(w, 200, p)
 }
