@@ -2122,6 +2122,12 @@ func (s *Server) getFinding(w http.ResponseWriter, r *http.Request) {
 	}
 	assets := s.resolveAssetIDs(f.AssetIDs)
 	dto := findingFromDB(f, assets)
+	// T14(2/2) view-time 兜底：record-time 异步回填可能还没跑（或失败/流量后
+	// 到），这里对仍缺 exchange_id 的步骤用同一解析器再试一次——只读展示，
+	// 不落库（防 GET 延迟绑上写路径 + 并发查看者竞态）。
+	if dto.Reproduction != nil {
+		dto.Reproduction = s.viewReproExchangeIDs(dto.Reproduction, f.TaskID)
+	}
 	if contextTaskID := strings.TrimSpace(r.URL.Query().Get("context_task")); contextTaskID != "" {
 		contextTask := s.m.ResolveTask(contextTaskID)
 		if contextTask == nil {

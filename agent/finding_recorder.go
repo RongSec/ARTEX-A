@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -21,5 +22,19 @@ func (w *Worker) SetFindingRecorder(r FindingRecorder)    { w.findingRecorder = 
 func (p *Planner) SetFindingRecorder(r FindingRecorder)   { p.findingRecorder = r }
 func (m *MainAgent) SetFindingRecorder(r FindingRecorder) { m.findingRecorder = r }
 
-// (T14(2/2) adds the ReproResolver type + SetReproResolver injectors for the
-// record-time step↔traffic linkage here, mirroring this setter pattern.)
+// ReproEnricher is the host-side callback that back-fills a finding's
+// structured reproduction with real recorded exchange ids AFTER the finding row
+// is durably written. The agent handler invokes it asynchronously (go …) so it
+// is non-blocking: report_finding returns immediately with the finding saved,
+// and enrichment (traffic ResolveSteps → UPDATE findings.reproduction) lands a
+// moment later. It is best-effort by contract — the implementation owns its
+// own panic-recovery and logging and MUST NOT surface errors back into the
+// tool path, so a traffic failure can NEVER fail or corrupt the finding write.
+// The signature takes the persisted finding_id + owning task_id and the raw
+// reproduction the agent submitted; nil = feature not wired = original behavior.
+type ReproEnricher func(findingID, taskID int64, repro json.RawMessage)
+
+func (t *ToolSet) SetReproEnricher(r ReproEnricher)   { t.reproEnricher = r }
+func (w *Worker) SetReproEnricher(r ReproEnricher)    { w.reproEnricher = r }
+func (p *Planner) SetReproEnricher(r ReproEnricher)   { p.reproEnricher = r }
+func (m *MainAgent) SetReproEnricher(r ReproEnricher) { m.reproEnricher = r }

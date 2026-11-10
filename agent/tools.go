@@ -52,6 +52,7 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 // One ToolSet is created per planner/worker run; per-run signals live here.
 type ToolSet struct {
 	findingRecorder FindingRecorder
+	reproEnricher   ReproEnricher // T14(2/2) finding 落库后异步回填复现↔流量关联（nil=零行为）
 	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
 	cs              *db.CompanyStore // company store (optional)
 	ts              *db.ExplorationStore
@@ -1286,8 +1287,8 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			return actool.Errorf(err.Error()), nil
 		}
 		// T14(1/2)：reproduction 原样进双写链路（节点 payload + findings 列）。
-		// 落库时的自动流量关联（steps[].exchange_id 回填）是 T14(2/2) 的
-		// reproResolver 回调职责；未填/空壳 "{}" 时整条链路保持原版行为。
+		// T14(2/2)：落库【后】异步把每步逐字报文回填成真实 exchange_id——见
+		// ReproEnricher 契约（旁路、非阻塞、失败只 log，绝不影响登记）。
 		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), Reproduction: a.Reproduction}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
@@ -1310,6 +1311,16 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			t.notify()
 		}
 		t.writes.Findings++
+		// T14(2/2)：异步回填。finding 已经完整落库（含未关联的 reproduction），
+		// 这里把「逐步报文 → 本任务时间窗内真实 exchange」的收窄匹配甩到后台
+		// 协程——report_finding 立刻返回，登记路径不被 SQLite/PG 查询拖慢，
+		// 更不可能被拖坏（enricher 内部自带 recover+log，永不抛错回本栈）。
+		if t.reproEnricher != nil && db.HasReproSteps(a.Reproduction) && recorded != nil {
+			enricher := t.reproEnricher
+			fid, tid := recorded.FindingID, t.taskID
+			repro := append(json.RawMessage(nil), a.Reproduction...)
+			go enricher(fid, tid, repro)
+		}
 		// Keep the first line's node-ID contract for existing reporter triggers.
 		for i := range recorded.Traffic.Bindings {
 			recorded.Traffic.Bindings[i].Snapshot.ReqHead = ""

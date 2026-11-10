@@ -32,6 +32,11 @@ type DBFinding struct {
 	AssetIDs        []int64
 	Status          string
 	Report          string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
+	// Reproduction 是 T14 结构化复现过程(report.Reproduction 的 JSONB)。
+	// 仅 GetFinding / 导出链读取(列表接口不带,防 payload 膨胀);'{}'(列默认)=
+	// 未填。steps[].exchange_id 由 T14(2/2) 的落库后异步 enricher 回填,
+	// view-time 兜底解析。
+	Reproduction    json.RawMessage
 	CreatedAt       time.Time
 	TaskDescription string // populated via LEFT JOIN on tasks
 }
@@ -106,6 +111,10 @@ const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.n
 	       f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
  (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
+
+// findingDetailCols adds the two big columns only the detail/export path reads
+// (列表/分页接口不带，防 payload 膨胀)：report 全文 + T14 reproduction JSONB。
+const findingDetailCols = findingSelectCols + `, COALESCE(f.report, ''), f.reproduction`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -471,7 +480,7 @@ RETURNING id, created_at`, s.expID, audit.NodeID, utf8Clean(audit.Worker), utf8C
 // 再按时间倒序,与「导出汇总报告」的分组顺序一致。
 func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, error) {
 	const order = `ORDER BY CASE f.severity WHEN 'critical' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC, f.created_at DESC`
-	cols := findingSelectCols + `, COALESCE(f.report, '')`
+	cols := findingDetailCols
 
 	var q string
 	var args []any
@@ -511,7 +520,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report, &f.Reproduction); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -627,19 +636,20 @@ func (d *DB) FindingStats() (*FindingStats, error) {
 	return st, nil
 }
 
-// GetFinding returns a single finding row (with task_description joined and the
-// full Markdown report), or nil when no row has that id. Unlike the list queries
-// it also selects `report` — that column is only needed on the detail page.
+// GetFinding returns a single finding row (with task_description joined, the
+// full Markdown report, and the T14 reproduction JSONB), or nil when no row
+// has that id. Unlike the list queries it also selects `report` and
+// `reproduction` — both only needed on the detail page / export path.
 func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 	f := &DBFinding{}
 	var aidsJSON string
-	err := d.QueryRow(`SELECT `+findingSelectCols+`, COALESCE(f.report, '')
+	err := d.QueryRow(`SELECT `+findingDetailCols+`
 		FROM findings f
 		LEFT JOIN tasks t ON f.task_id = t.id
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report, &f.Reproduction)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -648,6 +658,33 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 	}
 	_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
 	return f, nil
+}
+
+// UpdateFindingReproduction overwrites findings.reproduction for one row. T14
+// (2/2) uses it in the record-time async enricher to back-fill steps[].
+// exchange_id after the finding has already been persisted. The payload MUST
+// be valid JSON — callers are expected to marshal a report.Reproduction — and
+// is cast ::jsonb so the driver never has to guess. Returns the exec error.
+func (d *DB) UpdateFindingReproduction(id int64, repro json.RawMessage) error {
+	_, err := d.Exec(`UPDATE findings SET reproduction=$1::jsonb WHERE id=$2`, []byte(repro), id)
+	return err
+}
+
+// HasReproSteps reports whether a raw reproduction JSON carries a non-empty
+// steps array — the cheap gate both record-time enricher and view-time
+// fallback use to skip findings whose reproduction is empty (never filled by
+// the agent). Exposed to the server layer so the gate stays one definition.
+func HasReproSteps(raw json.RawMessage) bool {
+	if len(raw) < 12 {
+		return false
+	}
+	var probe struct {
+		Steps []json.RawMessage `json:"steps"`
+	}
+	if json.Unmarshal(raw, &probe) != nil {
+		return false
+	}
+	return len(probe.Steps) > 0
 }
 
 // DeleteFinding removes a finding entirely: the standalone findings row and its

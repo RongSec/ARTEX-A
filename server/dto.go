@@ -320,6 +320,10 @@ type FindingDTO struct {
 	Summary   string `json:"summary"`
 	Evidence  string `json:"evidence"`
 	Report    string `json:"report,omitempty"` // 详细报告(Markdown);仅详情接口返回,列表为空
+	// Reproduction 是 T14 结构化复现过程(entry_point/prerequisites/steps[]/
+	// provenance)。steps[].exchange_id 由 report_finding 落库后异步回填 + 详情
+	// 读时兜底解析；'{}'/缺失=agent 未填复现（原版行为）。仅详情接口返回。
+	Reproduction json.RawMessage `json:"reproduction,omitempty"`
 
 	IntentID        string            `json:"intent_id,omitempty"`
 	ParamID         string            `json:"param_id,omitempty"`
@@ -458,6 +462,11 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		Evidence:  f.Evidence,
 		Report:    f.Report,
 		TS:        rfc3339(f.CreatedAt),
+	}
+	// T14：reproduction 只在「真填了」时透出（'{}' 列默认 = 未填，键缺席与
+	// 原版 DTO 逐字节一致，前端按有无该键分叉渲染）。
+	if db.HasReproSteps(f.Reproduction) {
+		d.Reproduction = f.Reproduction
 	}
 	d.Assets = findingAssetDTOs(f.AssetIDs, assets)
 	if f.TaskID != nil {
