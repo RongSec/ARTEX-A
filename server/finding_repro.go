@@ -14,10 +14,15 @@ package server
 //
 // 关联的落点选择：写 findings.reproduction JSONB 内的 steps[].exchange_id，
 // 而不是 finding_traffic_bindings 表——后者语义是「人工核实过的证据绑定」
-// （role=baseline/proof/...、参与 evidence_version 计数、reporter 逐条核对后
-// 写入），自动关联未经人工确认、绑错即污染证据；steps[].exchange_id 是
-// 「步骤→流量」的溯源提示（宁缺毋滥 + view-time 兜底），与 T14(1/2) schema
-// 注释为列内回填预留的消费语义（T16 证据穿插按 step_index 取包）一致。
+// （snapshot_id 引用 traffic_evidence_snapshots 证据快照、role=baseline/proof/
+// ...、参与 evidence_version 计数、reporter 逐条核对后写入），自动关联未经
+// 人工确认、绑错即污染证据清单；steps[].exchange_id 是「步骤→流量」的溯源
+// 提示（宁缺毋滥 + view-time 兜底），与 T14(1/2) schema 注释为列内回填预留的
+// 消费语义（T16 报告穿插按 step_index 取包）一致。
+//
+// 竞态说明：reproduction 列自 INSERT 后只有本 enricher 一个写方（patchFinding/
+// bind_finding_traffic/update_finding_report 各写各列、均不触碰 reproduction），
+// 且派发发生在 finding 事务 commit 之后，UPDATE 必然命中已提交行。
 
 import (
 	"encoding/json"
@@ -48,24 +53,8 @@ func (s *Server) reproEnricherFor() agent.ReproEnricher {
 		if tr == nil || !db.HasReproSteps(repro) {
 			return // 未开流量/无步骤：本回调零行为，finding 保持原样
 		}
-		var rp report.Reproduction
-		if json.Unmarshal(repro, &rp) != nil || len(rp.Steps) == 0 {
-			return
-		}
-		since, until := s.taskTrafficWindow(taskID)
-		ids := resolveReproSteps(tr, since.Unix(), until.Unix(), rp.Steps)
-		changed := false
-		for i, id := range ids {
-			if id != "" && rp.Steps[i].ExchangeID == "" {
-				rp.Steps[i].ExchangeID = id
-				changed = true
-			}
-		}
-		if !changed {
-			return
-		}
-		out, err := json.Marshal(rp)
-		if err != nil {
+		out, ok := s.enrichRepro(tr, taskID, repro)
+		if !ok {
 			return
 		}
 		if err := s.m.PG().UpdateFindingReproduction(findingID, out); err != nil {
@@ -74,21 +63,30 @@ func (s *Server) reproEnricherFor() agent.ReproEnricher {
 	}
 }
 
-// resolveReproSteps is the shared narrowing entry: hand the step texts (plus
-// the task window) to the traffic resolver. Returns per-step exchange ids
-// ("" = abstain).
-func resolveReproSteps(tr *traffic.Traffic, sinceUnix, untilUnix int64, steps []report.ReproStep) []string {
-	refs := make([]traffic.StepRef, len(steps))
-	for i, st := range steps {
+// enrichRepro runs the shared resolver over a reproduction's FULL step list
+// and merges the results. Full list (not just unresolved steps) keeps the
+// ordered-cursor semantics intact: each step's candidate pool starts at-or-
+// after the previous step's exchange, so repeated identical requests resolve
+// step1→earliest, step2→next. MergeExchangeIDs only fills steps whose
+// exchange_id was empty, so already-bound steps are never overwritten.
+func (s *Server) enrichRepro(tr *traffic.Traffic, taskID int64, repro json.RawMessage) (json.RawMessage, bool) {
+	var rp report.Reproduction
+	if json.Unmarshal(repro, &rp) != nil || len(rp.Steps) == 0 {
+		return repro, false
+	}
+	since, until := s.taskTrafficWindow(taskID)
+	refs := make([]traffic.StepRef, len(rp.Steps))
+	for i, st := range rp.Steps {
 		refs[i] = traffic.StepRef{Request: st.Request, Response: st.Response}
 	}
-	return tr.ResolveSteps(sinceUnix, untilUnix, refs)
+	ids := tr.ResolveSteps(since.Unix(), until.Unix(), refs)
+	return report.MergeExchangeIDs(repro, ids)
 }
 
 // taskTrafficWindow returns the [start, now] window to search exchanges in.
 // start = tasks.first_run_at（任务首次真正开跑、流量开始录制的时刻），退到
 // created_at，任务行缺失时兜底滚动 24h。until = now（流量可能在 finding 之后
-// 的微秒级才落盘）。
+// 的微秒级才落盘；晚于 now 的录制本就不可作证据）。
 func (s *Server) taskTrafficWindow(taskID int64) (time.Time, time.Time) {
 	since := time.Now().Add(-24 * time.Hour)
 	if tk, err := s.m.PG().GetTask(taskID); err == nil && tk != nil {
@@ -102,51 +100,37 @@ func (s *Server) taskTrafficWindow(taskID int64) (time.Time, time.Time) {
 }
 
 // viewReproExchangeIDs is the getFinding view-time back-fill: it takes a
-// stored reproduction JSON (from the findings column), runs the SAME resolver
-// over steps still missing exchange_id, and returns the enriched JSON —
-// WITHOUT persisting. The read-only fallback covers findings recorded before
-// the async enricher could land a match (traffic arrived after the report, or
-// a transient failure). Persisting on read is deliberately avoided: it would
-// couple a GET handler's latency to SQLite/PG writes and race concurrent
-// viewers. Empty raw / no traffic / no unresolved steps → input passthrough.
+// stored reproduction JSON (from the findings column), runs the SAME resolver,
+// and returns the enriched JSON — WITHOUT persisting. The read-only fallback
+// covers findings recorded before the async enricher could land a match
+// (traffic arrived after the report, or a transient failure). Persisting on
+// read is deliberately avoided: it would couple a GET handler's latency to
+// SQLite/PG writes and race concurrent viewers. Empty raw / no traffic /
+// nothing resolvable → input passthrough.
 func (s *Server) viewReproExchangeIDs(raw json.RawMessage, taskID *int64) json.RawMessage {
-	if s.m == nil || !db.HasReproSteps(raw) || taskID == nil || *taskID <= 0 {
+	if s.m == nil || taskID == nil || *taskID <= 0 || !db.HasReproSteps(raw) {
 		return raw
 	}
 	tr := s.m.Traffic()
 	if tr == nil {
 		return raw
 	}
-	var rp report.Reproduction
-	if json.Unmarshal(raw, &rp) != nil || len(rp.Steps) == 0 {
-		return raw
-	}
-	// 只对「还缺 exchange_id」的步再解析；整份复现的时序由原始顺序约束。
-	pending := make([]report.ReproStep, 0, len(rp.Steps))
-	indexes := make([]int, 0, len(rp.Steps))
-	for i, st := range rp.Steps {
-		if st.ExchangeID == "" {
-			pending = append(pending, st)
-			indexes = append(indexes, i)
+	// 已全绑齐的复现不再空跑一次解析。
+	var probe report.Reproduction
+	if json.Unmarshal(raw, &probe) == nil {
+		done := true
+		for _, st := range probe.Steps {
+			if st.ExchangeID == "" {
+				done = false
+				break
+			}
+		}
+		if done {
+			return raw
 		}
 	}
-	if len(pending) == 0 {
-		return raw
-	}
-	since, until := s.taskTrafficWindow(*taskID)
-	ids := resolveReproSteps(tr, since.Unix(), until.Unix(), pending)
-	changed := false
-	for j, id := range ids {
-		if id != "" {
-			rp.Steps[indexes[j]].ExchangeID = id
-			changed = true
-		}
-	}
-	if !changed {
-		return raw
-	}
-	out, err := json.Marshal(rp)
-	if err != nil {
+	out, ok := s.enrichRepro(tr, *taskID, raw)
+	if !ok {
 		return raw
 	}
 	return out
