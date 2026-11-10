@@ -20,3 +20,6 @@ func (t *ToolSet) SetFindingRecorder(r FindingRecorder)   { t.findingRecorder = 
 func (w *Worker) SetFindingRecorder(r FindingRecorder)    { w.findingRecorder = r }
 func (p *Planner) SetFindingRecorder(r FindingRecorder)   { p.findingRecorder = r }
 func (m *MainAgent) SetFindingRecorder(r FindingRecorder) { m.findingRecorder = r }
+
+// (T14(2/2) adds the ReproResolver type + SetReproResolver injectors for the
+// record-time step↔traffic linkage here, mirroring this setter pattern.)

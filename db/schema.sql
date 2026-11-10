@@ -1109,6 +1109,11 @@ CREATE TABLE IF NOT EXISTS findings (
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
+-- T14 结构化复现过程（reproduction）：entry_point/prerequisites/steps[request,response,
+-- expected,proves,exchange_id]/provenance。JSONB，exchange_id 由落库时按任务时间窗
+-- 自动关联流量回填（无则为空、view-time 再解析）。默认 '{}' = 未填（与空列语义区分，
+-- 报告渲染据此判有无逐字复现）。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS reproduction JSONB NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);

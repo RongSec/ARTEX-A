@@ -325,10 +325,26 @@ func (d *DB) EditFindingTraffic(ctx context.Context, findingID, bindingID, versi
 	})
 }
 
+// hasReproduction 判断工具入参里的 reproduction 是否"真填了"：非空且不是
+// "{}"/"null" 这类空壳（模型没填时常见发 "{}"）。只有真内容才触发双写，
+// 否则 findings.reproduction 保持列默认 '{}'、节点 payload 不带键——原版
+// report_finding 调用（不传该参数）的落库逐字节不变。
+func hasReproduction(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed != "" && trimmed != "{}" && trimmed != "null"
+}
+
 type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	AssetIDs                                             []int64
+	// Reproduction 是 T14 结构化复现过程（report.Reproduction 的 JSON）。nil/空
+	// ("{}"/"null")=未填：节点 payload 不带该键、findings.reproduction 落默认 '{}'，
+	// 与原版 report_finding 逐字节一致（零回归）。
+	Reproduction json.RawMessage
 }
 
 type RecordedFinding struct {
@@ -361,7 +377,20 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 			return nil, errors.New("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
-	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
+	nodePayload := map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}}
+	// T14 双写：reproduction 非空才进 payload（键缺席=与原版节点 payload 逐字节
+	// 一致，前端/T16 渲染按「有无 reproduction 键」分叉）；解出的对象原样放入
+	// （不 re-encode 字段名，保 exchange_id 等回填键）。解不动的脏输入宁可不带
+	// ——finding 主记录要紧，复现是旁路。
+	reproColumn := []byte("{}")
+	if hasReproduction(in.Reproduction) {
+		var rp map[string]any
+		if json.Unmarshal(in.Reproduction, &rp) == nil && len(rp) > 0 {
+			nodePayload["reproduction"] = rp
+			reproColumn = in.Reproduction
+		}
+	}
+	payload, _ := json.Marshal(nodePayload)
 	out := &RecordedFinding{}
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
 VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(payload), in.Worker).Scan(&out.NodeID); err != nil {
@@ -382,8 +411,10 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
+	// reproduction 列：jsonb 参数显式 ::jsonb 转型（库内数组列同款惯例；防驱动
+	// 把 []byte 当 bytea 绑）。空输入恒 '{}'（列 NOT NULL）。
+	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,reproduction)
+VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), string(reproColumn)).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
 	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」

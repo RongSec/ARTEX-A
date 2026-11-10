@@ -1235,7 +1235,23 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
-		"evidence":         str("证据/PoC 文本"),
+		"evidence": str("证据/PoC 文本"),
+		"reproduction": map[string]any{"type": "object", "description": "**结构化复现过程（确认漏洞务必填，决定报告能否被人工从零复现）**：" +
+			"entry_point=触发漏洞的关键接口(方法+URL)；prerequisites=复现前置(需要的账号/角色/前序步骤，若需测试账号写清【如何注册】：接口+关键请求要点)；" +
+			"steps=有序复现步骤数组，每步 {request, response, expected, proves}——**request/response 必须逐字取自你本次真实发出/收到的原文，严禁改写、编造，严禁用\"…\"/\"(略)\"/placeholder 省略或截断响应**；" +
+			"expected=该步预期/结论一句话，proves=证明了什么；provenance=该漏洞的攻击链来源/依赖。你刚打完最清楚每一步，事后没人能替你还原准确。" +
+			"纯命令类漏洞(无 HTTP 报文)在 request/response 里填真实命令与其输出原文即可。",
+			"properties": map[string]any{
+				"entry_point":   str("入口接口：方法+URL"),
+				"prerequisites": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "复现前置条件(账号/角色/前序步骤；测试账号写清如何注册)"},
+				"provenance":    str("攻击链来源/依赖"),
+				"steps": map[string]any{"type": "array", "description": "有序复现步骤", "items": obj(map[string]any{
+					"request":  str("该步真实请求原文(逐字，别改写/别编造)"),
+					"response": str("该步真实响应原文(状态码+关键 header+能证明问题的 body 片段，逐字取自真实返回)"),
+					"expected": str("该步预期/结论一句话"),
+					"proves":   str("该步证明了什么"),
+				})},
+			}},
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
@@ -1246,6 +1262,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
 			EvidenceHintID                               json.RawMessage   `json:"evidence_hint_id"`
+			Reproduction                                 json.RawMessage   `json:"reproduction"`
 		}
 		if err := json.Unmarshal(in, &a); err != nil {
 			return actool.Errorf(err.Error()), nil
@@ -1268,7 +1285,10 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		// T14(1/2)：reproduction 原样进双写链路（节点 payload + findings 列）。
+		// 落库时的自动流量关联（steps[].exchange_id 回填）是 T14(2/2) 的
+		// reproResolver 回调职责；未填/空壳 "{}" 时整条链路保持原版行为。
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), Reproduction: a.Reproduction}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
