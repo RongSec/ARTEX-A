@@ -15,8 +15,8 @@ type Project struct {
 	Description     string    `json:"description"`
 	Status          string    `json:"status"` // active | archived
 	Owner           string    `json:"owner"`
-	Concurrency     int       `json:"concurrency"`       // 项目内批量任务并发数（1=串行）
-	ObserverEnabled bool      `json:"observer_enabled"`  // B3 观察者总开关（默认关）
+	Concurrency     int       `json:"concurrency"`      // 项目内批量任务并发数（1=串行）
+	ObserverEnabled bool      `json:"observer_enabled"` // B3 观察者总开关（默认关）
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -233,8 +233,10 @@ func derefBool(b *bool) bool { return b != nil && *b }
 
 // DeleteProject 删项目行。tasks.project_id 的 FK 是 ON DELETE SET NULL：任务
 // 保留、归属自动摘除（任务数据比分组贵重）。其 queued 的 project_batch 任务
-// 由此变为 project_id IS NULL，dispatcher 不再认领（见 server/project_dispatcher.go），
-// 等待用户显式继续（继续时按原版 resumeAdmissionMode 推断 bootstrap）。
+// 由此变为 project_id IS NULL，dispatcher 与 reconcile（跳过 project_batch）
+// 都认不到它，停在队列里等待人工处置：重新挂到某 active 项目即可恢复批量
+// 调度（见 server/projects.go tasksAttachProject——注：挂回后需该行仍处于
+// queue_mode='project_batch'，attach 只动 project_id、不改队列态）。
 func (d *DB) DeleteProject(id int64) error {
 	res, err := d.Exec(`DELETE FROM projects WHERE id=$1`, id)
 	if err != nil {
@@ -274,13 +276,28 @@ ORDER BY id DESC`, projectID)
 	return out, nil
 }
 
-// ProjectBatchQueuedIDs 返回某项目批量下发、仍在排队等待项目调度的存活任务
-// PG id（queue_mode='project_batch' ∧ queued ∧ 未暂停 ∧ 非终态）。
-// dispatcher 每 tick 对每个项目跑一次（pending 集），claim 后行自动脱离。
-func (d *DB) ProjectBatchQueuedIDs(projectID int64) ([]int64, error) {
-	rows, err := d.Query(`SELECT id FROM tasks
+// ProjectBatchQueuedCount 返回某项目当前排队等待项目调度的批量任务数
+// （dispatcher 计算本 tick 放行量的分子；条件与 PendingBatchProjectIDs/
+// ProjectBatchHeadID 一致，三者对「什么算批量排队行」的口径必须同步改）。
+func (d *DB) ProjectBatchQueuedCount(projectID int64) (int, error) {
+	var n int
+	err := d.QueryRow(`SELECT count(*) FROM tasks
 WHERE project_id=$1 AND deleted_at IS NULL AND queued=true AND paused=false
-  AND queue_mode='project_batch' AND status NOT IN ('done','failed','timeout')`, projectID)
+  AND queue_mode='project_batch' AND status NOT IN ('done','failed','timeout')`, projectID).Scan(&n)
+	return n, err
+}
+
+// PendingBatchProjectIDs 返回「有排队中的批量任务、且项目 active」的项目 id
+// 集（dispatcher 每 tick 的遍历入口；量小——项目是人工建的分组单位）。
+// 归档项目不出现在这里：其排队任务停在队列等人工处置，dispatcher 不认领。
+func (d *DB) PendingBatchProjectIDs() ([]int64, error) {
+	rows, err := d.Query(`SELECT DISTINCT t.project_id FROM tasks t
+JOIN projects p ON p.id = t.project_id
+WHERE t.deleted_at IS NULL AND t.queued=true AND t.paused=false
+  AND t.queue_mode='project_batch'
+  AND t.status NOT IN ('done','failed','timeout')
+  AND p.status='active'
+ORDER BY t.project_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -299,16 +316,15 @@ WHERE project_id=$1 AND deleted_at IS NULL AND queued=true AND paused=false
 // ProjectBatchHeadID 用一条条件 UPDATE 原子认领该项目批量队列的队首
 // （queued_at ASC，NULLS LAST 兜旧行；同秒并列按 id 稳定）：把 queued 翻成
 // false、queue_mode 改写为 bootstrap、清 queued_at，RETURNING id。
+// 认领条件里带项目 active 谓词：pending 扫描与实际认领之间项目可能被人
+// 归档，条件 UPDATE 把 TOCTOU 窗口压没。
 //
-// 为什么是「认领」而不是「读队首再放行」：原版 reconcileConcurrency 每 5s
-// 会盲补所有 queued 行（不认识 project 闸），批量任务若保持 queued=true 等着
-// 被 dispatcher「放行」，会在下一 tick 被 reconcile 先捞走——二道闸门形同虚设。
-// 唯一能抢先的窗口就是 reconcile 的串行锁 concMu：dispatcher 的 Step 全程
-// 持 concMu（同 tick 顺序执行、互斥），在锁内做这次原子 UPDATE，就把
-// 「检查项目额度 + 认领队首」压进一个不 interleaving 的动作；认领成功后该行
-// queued=false，reconcile 的后续补位循环再也看不到它，只能经标准 resume 通道
-// （LLM 不可用 parking 等），不会绕过项目并发额。
-// 返回 0 表示该项目无可认领任务。
+// 为什么要「认领」而不是「读队首再放行」：等待态若保持 queued=true，原版
+// reconcileConcurrency 的盲补循环会在下个 tick 把它按普通排队行捞走（绕过
+// 项目闸）。两道保险：①reconcile 收集循环显式跳过 queue_mode='project_batch'
+// （server/goals.go）；②Step 在 concMu 内做本条原子 UPDATE——「检查项目额度
+// + 认领队首」压进一个不交错的动作，认领后 queued=false，谁都当它是普通
+// bootstrap 行。返回 0 表示该项目无可认领任务。
 func (d *DB) ProjectBatchHeadID(projectID int64) (int64, error) {
 	var id int64
 	err := d.QueryRow(`UPDATE tasks SET queued=false, queue_mode='bootstrap', queued_at=NULL
@@ -316,6 +332,7 @@ WHERE id = (
 	SELECT id FROM tasks
 	WHERE project_id=$1 AND deleted_at IS NULL AND queued=true AND paused=false
 	  AND queue_mode='project_batch' AND status NOT IN ('done','failed','timeout')
+	  AND EXISTS (SELECT 1 FROM projects p WHERE p.id=$1 AND p.status='active')
 	ORDER BY queued_at ASC NULLS LAST, id ASC
 	LIMIT 1
 )
@@ -324,25 +341,4 @@ RETURNING id`, projectID).Scan(&id)
 		return 0, nil
 	}
 	return id, err
-}
-
-// ProjectRunningCount 统计某项目当前占用运行槽的**批量任务**数（项目并发额度
-// 的分母）。只数经批量通道下发过的任务：queue_mode='resume' ∧ 不在排队 ∧
-// 未暂停 ∧ 非终态 ∧ 未删除 ∧ 首次运行过（first_run_at 非 NULL）。
-//
-// 三条排除各治一种误算：
-//   - queue_mode='project_batch'（还在等队）：未被认领的排队行绝不计数；
-//   - first_run_at IS NULL（认领后从未跑过）：dispatcher 认领→admit 落回排队
-//     的瞬时窗口里该条件是 true，但它从未消耗过槽，若算入会出现
-//     「项目 0 在跑却判满额死锁」，直到下一次用户手工继续才被解套；
-//   - 手工建的在跑任务（queue_mode 空且没跑完过/一直 running）：不属于批量
-//     通道，用户显式建的在跑任务与批量任务的资源竞争交给全局上限兜，不计入
-//     项目额度（否则新建一个手工任务就能把项目批量队列饿死）。
-func (d *DB) ProjectRunningCount(projectID int64) (int, error) {
-	var n int
-	err := d.QueryRow(`SELECT count(*) FROM tasks
-WHERE project_id=$1 AND deleted_at IS NULL AND queued=false AND paused=false
-  AND queue_mode='resume' AND first_run_at IS NOT NULL
-  AND status NOT IN ('done','failed','timeout')`, projectID).Scan(&n)
-	return n, err
 }

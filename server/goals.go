@@ -285,7 +285,11 @@ func (s *Server) reconcileConcurrency() {
 	queued := []queuedTask{}
 	for _, task := range s.m.List() {
 		lifecycle := task.lifecycleSnapshot()
-		if lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
+		// project_batch 行跳过（artex-hs T07）：批量下发的排队任务由
+		// projectDispatcher 在二道闸门（项目额度+active 项目）下认领放行，
+		// 盲补会绕穿项目并发额。该 queue_mode 只可能由批量 handler 写出，
+		// 基线库里恒无此类行 → 本条件对原版路径恒真（零回归）。
+		if lifecycle.Queued && lifecycle.QueueMode != "project_batch" && !isTerminalStatus(lifecycle.Status) {
 			queued = append(queued, queuedTask{task: task, lifecycle: lifecycle})
 		}
 	}

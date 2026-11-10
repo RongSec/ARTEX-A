@@ -50,7 +50,8 @@ func (sc *Scheduler) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			sc.s.reconcileConcurrency() // 并发上限:有空位就把排队任务补位启动
+			sc.s.reconcileConcurrency()      // 并发上限:有空位就把排队任务补位启动
+			sc.s.projectDispatcher.Step(ctx) // artex-hs T07：批量任务的项目二道闸门（同持 concMu，认领先于 reconcile 下一 tick）
 			sc.step()
 		}
 	}
