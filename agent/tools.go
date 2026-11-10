@@ -88,6 +88,10 @@ type ToolSet struct {
 	// carrying (intentID, summary) so the round can spell out which intent found what.
 	// Wired for workers; nil elsewhere → falls back to notify (bare wake).
 	notifyFinding func(intentID int64, summary string)
+	// shellGate, if set, guards prove_goal for shell-class goals (T03 red-line):
+	// non-empty return = reject this prove_goal with the returned instruction text.
+	// nil = gate disabled (zero-regression default for unrouted ToolSet constructions).
+	shellGate func(goal, evidence *db.Node) string
 	// resumeTask, if set, revives the task after a graph change that should make a
 	// stopped task run again (currently: set_goals adds a goal). It flips a terminal/
 	// paused task back to running and (re)starts the engine loops — a plain notify()
@@ -128,6 +132,10 @@ func (t *ToolSet) SetNotify(fn func()) { t.notify = fn }
 
 // SetNotifyFinding wires the finding-wake callback (see ToolSet.notifyFinding).
 func (t *ToolSet) SetNotifyFinding(fn func(int64, string)) { t.notifyFinding = fn }
+
+// SetShellGate wires the prove_goal shell gate (see ToolSet.shellGate / shell_gate.go).
+// Wired by worker/planner/mainagent runners; nil (unwired) = gate off.
+func (t *ToolSet) SetShellGate(fn func(goal, evidence *db.Node) string) { t.shellGate = fn }
 
 // EnrichTrigger is the enrichment engine seen from the tool layer (see package
 // enrich). Kept as an interface here to avoid coupling agent → enrich.
@@ -1179,6 +1187,13 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			evidenceNode, err := t.ts.GetNodeWithSources(ev)
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
+			}
+			// 目标要的是「拿到 shell / 权限」，而证据只是一次命令回显、本任务从头到尾
+			// 没有登记过任何 shell 会话 —— 这不是达成，是把「能执行」记成了「已拿到」。
+			if t.shellGate != nil {
+				if msg := t.shellGate(goalNode, evidenceNode); msg != "" {
+					return actool.Errorf(msg), nil
+				}
 			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
 			_ = t.ts.SetNodeState(goal, "met")

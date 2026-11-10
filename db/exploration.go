@@ -2019,3 +2019,52 @@ func (s *ExplorationStore) ActivityByIDsForTerminalIntents(ids []int64) ([]Activ
 func (s *ExplorationStore) AddStandaloneFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
 	return s.db.AddFinding(taskID, nodeID, vulnclass, name, severity, summary, evidence, worker, assetIDs)
 }
+
+// WebshellToolUsage 统计本探索的活动记录里真正调用 Webshell 工具（登记/执行马）
+// 的次数 —— prove_goal 的 shell 目标校验（agent/shell_gate.go）依赖它。
+// （T03 红线吸收：照摘 artex-full-main/db/exploration.go 同名方法。）
+//
+// 只认「真的调用了 Webshell 工具」的活动，不能全表 ILIKE：攻防任务的目标原文
+// 本身就写着「用 mcp__Webshell__shell_add 登记」，任何 TodoWrite / fact 复述一遍
+// 目标就会命中，等于白检。ExecuteExtraTool 的调用行 detail 里带完整入参
+// （末尾是 "tool_name": "mcp__Webshell__xxx"），结果行不带，这个区分刚好够用。
+func (s *ExplorationStore) WebshellToolUsage() (int, error) {
+	if s == nil || s.db == nil {
+		return 0, nil
+	}
+	var n int
+	err := s.db.QueryRow(`
+SELECT count(*) FROM activity
+WHERE exploration_id=$1
+  AND tool='ExecuteExtraTool'
+  AND (detail ~ 'mcp__Webshell__(shell_add|shell_exec|shell_upload)'
+       OR summary ~ 'mcp__Webshell__(shell_add|shell_exec|shell_upload)')`, s.expID).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// HasLandedShellSession 判断给定的主机名里，是否有任一个属于本探索对应的任务资产。
+//
+// prove_goal 的 shell 校验先看活动记录里有没有 shell_add 调用，但那条路只覆盖
+// 「agent 自己在本次运行里登记的会话」。操作员在 WebShell 页面上手工加、或由别的
+// 进程调 MCP 登记的会话，活动表里查不到——可它落在同一台主机上，就是真拿到了。
+// 这里按「会话 URL 的主机 ∈ 任务资产（domain / ip / url）」兜住这种情况。
+func (s *ExplorationStore) HasLandedShellSession(hosts []string) (bool, error) {
+	if s == nil || s.db == nil || len(hosts) == 0 {
+		return false, nil
+	}
+	var n int
+	err := s.db.QueryRow(`
+SELECT count(*) FROM assets a
+JOIN tasks t ON t.id = ANY(a.task_ids)
+WHERE t.exploration_id = $1
+  AND (a.domain = ANY($2) OR a.ip = ANY($2)
+       OR EXISTS (SELECT 1 FROM unnest($2::text[]) h WHERE a.url ILIKE '%' || h || '%'))`,
+		s.expID, hosts).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
