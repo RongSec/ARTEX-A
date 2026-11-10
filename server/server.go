@@ -691,6 +691,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/tasks/{id}/intercept-rules/{rid}", s.taskInterceptDeleteRule)
 	mux.HandleFunc("POST /api/tasks/{id}/intercept-rules/{rid}/toggle", s.taskInterceptToggleRule)
 	mux.HandleFunc("POST /api/tasks/control/batch", s.controlTasksBatch)
+
+	// ==== artex-hs 二开：项目-任务两级模型（T05）====
+	// 项目是纯分组层（不碰引擎），路由全部在 /api/ 前缀下自动过 JWT+CORS。
+	// 新前缀 /api/projects 与现有路由零重叠；任务挂/摘归属走子资源 PATCH，
+	// 不改动原版 PATCH /api/tasks/{id}。
+	mux.HandleFunc("GET /api/projects", s.projectsList)
+	mux.HandleFunc("POST /api/projects", s.projectsCreate)
+	mux.HandleFunc("GET /api/projects/{id}", s.projectsGet)
+	mux.HandleFunc("PATCH /api/projects/{id}", s.projectsUpdate)
+	mux.HandleFunc("DELETE /api/projects/{id}", s.projectsDelete)
+	mux.HandleFunc("PATCH /api/tasks/{id}/project", s.tasksAttachProject)
 	mux.HandleFunc("GET /api/task-archives", s.listTaskArchives)
 	mux.HandleFunc("GET /api/task-archives/{id}", s.getTaskArchive)
 	mux.HandleFunc("POST /api/tasks/{id}/archive", s.queueTaskArchive)
