@@ -3,19 +3,21 @@ package traffic
 // 步骤↔流量自动关联（artex-hs T14(2/2)，架构 §4.2 / b4-spec §T14）。语义移植
 // antifox（0.1.1 血统）的 ResolveSteps：把 report_finding 结构化复现的每一步
 // （逐字 request/response 原文）映射回【本任务时间窗内】真实录制的 exchange，
-// 供证据回链/截图穿插。0.3.15 的差异适配：
-//   - 表结构同名（exchanges/ts/url 等），时间窗谓词直接进 WHERE（原版 PageQuery
-//     无时间窗字段，这里不扩它——关联走自有窄查询，别污染 UI 分页路径）；
-//   - 全文索引是 contentless 的 ex_fts(rowid)，与 exchanges 经 rowid 关联
-//     （antifox 是独立 bodies 表按 id，谓词形态不同、语义相同）；
-//   - 候选排序取【最早】（antifox resolveStepInWindow 同）：步骤按时间顺序列举，
-//     同名端点的重复请求里 step1=最早、step2=其后第一个（cursor 链式推进），
-//     比 antifox 单步版 pickBest 的「最新优先」更贴「有序步骤」的语义。
-//
-// 铁律=宁缺毋滥：只有候选唯一（或被判别词/状态收窄到唯一）才绑；仅端点命中而
-// 候选仍多=弃权；零命中=弃权——绑错一条流量比不绑更糟（污染报告证据）。
+// 供证据回链/报告穿插。与 antifox 的取舍差异：
+//   - antifox 把全部收窄谓词（method/path/body FTS/响应判别词）写进 SQLite
+//     查询，无法脱离数据库测试；这里把收窄核心抽成纯函数 ResolveReproSteps
+//     （输入=步骤列表+候选摘要，输出=每步 exchange id 或 abstain），DB 侧只
+//     留一个最小的「时间窗候选拉取」WindowCandidates——可无 PG/无 SQLite 单测；
+//   - 原版候选排序取【最早】（步骤按时间顺序列举，cursor 链式推进：step1=最
+//     早、step2=其后第一个），比 antifox 单步版「最新优先」更贴「有序步骤」；
+//   - 宁缺毋滥铁律同 antifox 的「唯一才绑」精神并更严：仅端点命中（软收窄全
+//     部未生效）而候选仍多 = 弃权；多候选只有状态唯一（步骤自述状态命中、或
+//     唯一 2xx）才放行——绑错一条流量比不绑更糟（污染报告证据）。
+//   - Host 头缺失时【不限 host】继续收窄（antifox 语义：path substring 同样
+//     不带 host 谓词）；裸报文 request-line 为绝对 URI 时也从 URI 取 host。
 
 import (
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -28,118 +30,191 @@ type StepRef struct {
 	Response string
 }
 
-// ResolveSteps maps an ORDERED list of reproduction steps to real recorded
-// exchanges, constrained to the task's traffic time window [sinceUnix,
-// untilUnix] (Unix seconds, closed bounds). Steps resolve in order — each
-// step's exchange must come at-or-after the previous step's (agents list
-// steps chronologically), which disambiguates repeated identical requests:
-// of many identical requests to one endpoint, step 1 is the earliest, step 2
-// the next after it, and so on. Per step: narrow method+path to the window,
-// then refine by body/query/response discriminators (each applied only while
-// ≥1 candidate remains — an over-specific or paraphrased field never drops
-// the match to zero), then pick the EARLIEST candidate at-or-after the
-// previous step's timestamp; when several survive narrowing, only a UNIQUE
-// status match (the step's stated status, else the sole 2xx) resolves it,
-// otherwise abstain. Returns one exchange id per step ("" when unresolved).
+// Cand 是一个候选 exchange 的最小摘要（WindowCandidates 从索引库拉出，喂给纯
+// 函数）。ReqSnip/RespSnip 是截断的正文开头（candSnip 字节）——够做特征匹配，
+// 又不会把整库正文搬进内存。
+type Cand struct {
+	ID       string
+	TS       int64
+	Host     string
+	Method   string
+	URL      string
+	Status   int
+	ReqHead  string
+	ReqSnip  string
+	RespHead string
+	RespSnip string
+}
+
+// candSnip caps one body snippet pulled for step resolution. 512B already
+// carries any distinctive payload opening; larger windows only bloat memory.
+const candSnip = 512
+
+// ResolveSteps is the DB-side orchestration: pull the task window's recorded
+// exchanges, then hand them to the pure resolver. Returns one exchange id per
+// step ("" = abstain). On query failure it degrades to all-abstain (logged by
+// the caller chain; this is a best-effort enrichment, never fatal).
 func (t *Traffic) ResolveSteps(sinceUnix, untilUnix int64, steps []StepRef) []string {
+	cands, err := t.WindowCandidates(sinceUnix, untilUnix, 0)
+	if err != nil {
+		ids := make([]string, len(steps))
+		return ids
+	}
+	return ResolveReproSteps(sinceUnix, untilUnix, steps, cands)
+}
+
+// WindowCandidates is the minimal host+time-window retrieval the task spec
+// asks for（现有 Search/Page 均无时间窗谓词，且不该为旁路关联扩 UI 分页面）：
+// [since,until] 闭窗口内的 exchange 元数据 + 截断正文摘要，ts 升序。
+func (t *Traffic) WindowCandidates(sinceUnix, untilUnix int64, limit int) ([]Cand, error) {
+	const maxWindow = 5000
+	if limit <= 0 || limit > maxWindow {
+		limit = maxWindow
+	}
+	rows, err := t.db.Query(`SELECT e.id,e.ts,e.host,e.method,e.url,e.status,
+  COALESCE(b.req_head,''), COALESCE(CAST(substr(b.req_body,1,?) AS TEXT),''),
+  COALESCE(b.resp_head,''), COALESCE(CAST(substr(b.resp_body,1,?) AS TEXT),'')
+FROM exchanges e LEFT JOIN exchange_bodies b ON b.id=e.id
+WHERE e.ts BETWEEN ? AND ? ORDER BY e.ts ASC, e.id ASC LIMIT ?`, candSnip, candSnip, sinceUnix, untilUnix, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Cand
+	for rows.Next() {
+		var c Cand
+		if err := rows.Scan(&c.ID, &c.TS, &c.Host, &c.Method, &c.URL, &c.Status,
+			&c.ReqHead, &c.ReqSnip, &c.RespHead, &c.RespSnip); err == nil {
+			out = append(out, c)
+		}
+	}
+	return out, rows.Err()
+}
+
+// ResolveReproSteps is the PURE narrowing core: no I/O, fully unit-testable.
+// It maps an ORDERED list of reproduction steps to candidate exchanges inside
+// the task's time window [sinceUnix, untilUnix] (Unix seconds, closed bounds).
+//
+// Steps resolve in order — each step's exchange must come at-or-after the
+// previous step's resolved timestamp (agents list steps chronologically),
+// which disambiguates repeated identical requests: of many identical requests
+// to one endpoint, step 1 is the earliest, step 2 the next after it, etc.
+//
+// Per step:
+//  1. hard filters: time window + order cursor; method; Host (only when the
+//     step's request names one — verbatim packets carry `Host:`; a bare
+//     `GET /path HTTP/1.1` line does not, and then host is NOT constrained);
+//     url path (endpoint predicate, substring or token-set containment).
+//     An unparseable request (no method+path) abstains outright — never guess.
+//  2. soft narrowing (content-level), each applied only if ≥1 candidate
+//     survives (an over-specific or paraphrased field must never zero out a
+//     match that should succeed): url query → request-body discriminator →
+//     response discriminators (stop once unique).
+//  3. verdict: 0 candidates → abstain; 1 → bind; >1 → bind only if some soft
+//     narrowing actually fired AND the step's stated status matches exactly
+//     one candidate (else the sole 2xx); otherwise abstain.
+//
+// Returns one exchange id per step ("" = unresolved/abstained).
+func ResolveReproSteps(sinceUnix, untilUnix int64, steps []StepRef, cands []Cand) []string {
 	out := make([]string, len(steps))
-	cursor := int64(0) // previous step's exchange ts (chronological lower bound)
+	cursor := sinceUnix // previous step's exchange ts (chronological lower bound)
 	for i, st := range steps {
 		method, path, query, bodyToken := parseStepRequest(st.Request)
 		if method == "" || path == "" {
 			continue // 请求原文里既无报文明细也无 URL——不猜，abstain
 		}
-		if id, ts, ok := t.resolveStepInWindow(sinceUnix, untilUnix, cursor, method, path, query, bodyToken, st.Response); ok {
-			out[i] = id
-			cursor = ts
+		host := parseStepHost(st.Request)
+
+		// ── 硬过滤（窗口+顺序+method+host+path 端点谓词，同 antifox 的 WHERE）──
+		pool := make([]Cand, 0, len(cands))
+		for _, c := range cands {
+			if c.TS < cursor || c.TS > untilUnix {
+				continue
+			}
+			if !strings.EqualFold(c.Method, method) {
+				continue
+			}
+			if host != "" && !strings.EqualFold(c.Host, host) {
+				continue
+			}
+			if !pathMatch(path, c.URL) {
+				continue
+			}
+			pool = append(pool, c)
 		}
+		if len(pool) == 0 {
+			continue
+		}
+
+		// ── 软收窄（内容级特征）：每级只在「收窄后仍 ≥1 候选」时生效 ──
+		narrowed := false
+		tryNarrow := func(keep func(Cand) bool) {
+			if len(pool) <= 1 {
+				return // 已唯一，不再收窄
+			}
+			var next []Cand
+			for _, c := range pool {
+				if keep(c) {
+					next = append(next, c)
+				}
+			}
+			if len(next) >= 1 {
+				pool, narrowed = next, true
+			}
+		}
+		if query != "" {
+			q := strings.ToLower(query)
+			tryNarrow(func(c Cand) bool { return strings.Contains(strings.ToLower(c.URL), q) })
+		}
+		if bodyToken != "" {
+			b := strings.ToLower(bodyToken)
+			tryNarrow(func(c Cand) bool {
+				return strings.Contains(strings.ToLower(c.ReqSnip), b) || strings.Contains(strings.ToLower(c.ReqHead), b)
+			})
+		}
+		for _, disc := range respDiscriminators(st.Response) {
+			if len(pool) <= 1 {
+				break
+			}
+			d := strings.ToLower(disc)
+			tryNarrow(func(c Cand) bool {
+				return strings.Contains(strings.ToLower(c.RespSnip), d) || strings.Contains(strings.ToLower(c.RespHead), d)
+			})
+		}
+
+		// ── 裁决：唯一才绑，宁缺毋滥 ──
+		if len(pool) == 1 {
+			out[i] = pool[0].ID
+			cursor = pool[0].TS
+			continue
+		}
+		if !narrowed {
+			continue // 仅端点级（method/host/窗口）命中而候选仍多 → 真多义，不猜
+		}
+		uniq := func(pred func(Cand) bool) (Cand, bool) {
+			var hit Cand
+			n := 0
+			for _, c := range pool {
+				if pred(c) {
+					hit, n = c, n+1
+				}
+			}
+			return hit, n == 1
+		}
+		if want := expectedStatus(st.Response); want > 0 {
+			if c, ok := uniq(func(c Cand) bool { return c.Status == want }); ok {
+				out[i] = c.ID
+				cursor = c.TS
+				continue
+			}
+		}
+		if c, ok := uniq(func(c Cand) bool { return c.Status >= 200 && c.Status < 300 }); ok {
+			out[i] = c.ID
+			cursor = c.TS
+		}
+		// 仍无法唯一 → abstain（cursor 不推进，后续步骤从同一时刻起找）
 	}
 	return out
-}
-
-// resolveStepInWindow finds the earliest exchange matching one step, at-or-after
-// cursor, inside the task's time window. Returns (id, ts, ok); ok=false on
-// zero candidates or unresolvable ambiguity (see pickBest semantics folded
-// into the earliest-first pick below).
-func (t *Traffic) resolveStepInWindow(sinceUnix, untilUnix, cursor int64, method, path, query, bodyToken, respText string) (string, int64, bool) {
-	where := `method=? AND url LIKE ? ESCAPE '\' AND ts BETWEEN ? AND ? AND ts >= ?`
-	args := []any{strings.ToUpper(method), likeContains(path), sinceUnix, untilUnix, cursor}
-	// tryNarrow applies a discriminator only if it still leaves ≥1 candidate,
-	// so a paraphrased/over-specific field can't zero out a match that should
-	// succeed. narrowed 记录「至少一次内容级收窄生效」——它是最终消歧的资格证明：
-	// 只有端级匹配（narrowed=false）而候选仍多时绝不猜。
-	narrowed := false
-	tryNarrow := func(cond string, arg any) {
-		w, a := where+" AND "+cond, append(append([]any{}, args...), arg)
-		if len(t.queryIDs(w, a)) >= 1 {
-			where, args, narrowed = w, a, true
-		}
-	}
-	if t.fts && bodyToken != "" {
-		tryNarrow(`rowid IN (SELECT rowid FROM ex_fts WHERE ex_fts MATCH ?)`, ftsQuote(bodyToken))
-	}
-	if query != "" {
-		// URL-encoded payloads are full of %27/%20 — escape LIKE metacharacters.
-		tryNarrow(`url LIKE ? ESCAPE '\'`, likeContains(query))
-	}
-	if t.fts {
-		for _, disc := range respDiscriminators(respText) {
-			if len(t.queryIDs(where, args)) <= 1 {
-				break // 已唯一，不必再收窄
-			}
-			tryNarrow(`rowid IN (SELECT rowid FROM ex_fts WHERE ex_fts MATCH ?)`, ftsQuote(disc))
-		}
-	}
-	// 有序语义：取 cursor 之后最早者。先数候选：
-	//   0 个 → abstain。
-	//   1 个 → 直接绑。
-	//   ≥2 个：若从未发生内容级收窄（只有端点匹配）→ 多义 abstain；
-	//          若收窄后仍多个（同一步请求被重放），用状态再消歧：步骤文本自述
-	//          状态唯一命中 → 绑它；否则唯一 2xx → 绑它；再否则 abstain。
-	//          全过不了关才退化为「最早者」是【不允许】的——宁缺毋滥。
-	type cand struct {
-		id     string
-		ts     int64
-		status int
-	}
-	rows, err := t.db.Query(`SELECT id, ts, status FROM exchanges WHERE `+where+` ORDER BY ts ASC, id ASC LIMIT 50`, args...)
-	if err != nil {
-		return "", 0, false
-	}
-	defer rows.Close()
-	var cands []cand
-	for rows.Next() {
-		var c cand
-		if err := rows.Scan(&c.id, &c.ts, &c.status); err == nil {
-			cands = append(cands, c)
-		}
-	}
-	if len(cands) == 0 {
-		return "", 0, false
-	}
-	if len(cands) == 1 {
-		return cands[0].id, cands[0].ts, true
-	}
-	if !narrowed {
-		return "", 0, false // 仅端点命中、候选仍多 → 真多义，不猜
-	}
-	uniq := func(pred func(int) bool) (string, int64, bool) {
-		var hit string
-		var hts int64
-		n := 0
-		for _, c := range cands {
-			if pred(c.status) {
-				hit, hts, n = c.id, c.ts, n+1
-			}
-		}
-		return hit, hts, n == 1
-	}
-	if want := expectedStatus(respText); want > 0 {
-		if id, ts, ok := uniq(func(s int) bool { return s == want }); ok {
-			return id, ts, true
-		}
-	}
-	return uniq(func(s int) bool { return s >= 200 && s < 300 })
 }
 
 // Reproduction-step request parsing: a step's "request" is either a verbatim
@@ -154,6 +229,7 @@ var (
 	reCurlData    = regexp.MustCompile(`(?:-d|--data(?:-raw|-binary)?)[ =]\s*["']?([^"'\n]+)`)
 	reStatusLine  = regexp.MustCompile(`(?i)HTTP[/0-9.]*\s+([1-5]\d\d)\b`)
 	reLongToken   = regexp.MustCompile(`[A-Za-z0-9]{8,}`)
+	reHostHeader  = regexp.MustCompile(`(?im)^host:\s*([^\s]+)`)
 )
 
 // parseStepRequest extracts method, url PATH (query stripped), the url QUERY,
@@ -166,11 +242,22 @@ func parseStepRequest(text string) (method, path, query, bodyToken string) {
 	// 1) Raw HTTP request packet.
 	if m := reHTTPReqLine.FindStringSubmatch(firstNonEmptyLine(text)); m != nil {
 		method = strings.ToUpper(m[1])
-		path, query = splitQuery(m[2])
+		target := m[2]
+		// An absolute-form request line ("GET http://host/path HTTP/1.1")
+		// leaks the host into the target — reduce it to path?query so the
+		// recorded url (also absolute-or-path forms) still aligns.
+		if strings.Contains(target, "://") {
+			if rest := target[strings.Index(target, "://")+3:]; strings.Contains(rest, "/") {
+				target = rest[strings.Index(rest, "/"):]
+			} else {
+				target = "/"
+			}
+		}
+		path, query = splitQuery(target)
 		if i := strings.Index(text, "\n\n"); i >= 0 {
 			body := text[i+2:]
 			// Prefer the upload filename (strongest discriminator, and avoids
-			// a whole-body FTS miss when the agent paraphrased the multipart
+			// a whole-body miss when the agent paraphrased the multipart
 			// boundary as a placeholder).
 			if m := reUploadName.FindStringSubmatch(body); m != nil {
 				bodyToken = m[1]
@@ -185,7 +272,13 @@ func parseStepRequest(text string) (method, path, query, bodyToken string) {
 	if u == "" {
 		return "", "", "", ""
 	}
-	path, query = splitQuery(u)
+	// url.Parse owns percent-encoding/fragment; splitQuery is the fallback
+	// for values Parse rejects (bare IPv6 without brackets, control chars).
+	if parsed, err := url.Parse(u); err == nil && parsed.Path != "" {
+		path, query = parsed.EscapedPath(), parsed.RawQuery
+	} else {
+		path, query = splitQuery(u)
+	}
 	if m := reCurlMethod.FindStringSubmatch(text); m != nil {
 		method = strings.ToUpper(m[1])
 	} else if reBodyFlag.MatchString(text) {
@@ -193,7 +286,7 @@ func parseStepRequest(text string) (method, path, query, bodyToken string) {
 	} else {
 		method = "GET"
 	}
-	// Body discriminator only for body-bearing methods (GET/HEAD have none indexed).
+	// Body discriminator only for body-bearing methods (GET/HEAD have none).
 	if method != "GET" && method != "HEAD" {
 		if m := reUploadName.FindStringSubmatch(text); m != nil {
 			bodyToken = m[1]
@@ -202,6 +295,86 @@ func parseStepRequest(text string) (method, path, query, bodyToken string) {
 		}
 	}
 	return
+}
+
+// parseStepHost extracts the target host a step's request names, or "" when
+// the step gives none (a bare `GET /path HTTP/1.1` with no Host header, or a
+// relative-URL command). "" means "do not constrain host" — matching antifox,
+// whose step query never had a host predicate at all.
+func parseStepHost(text string) string {
+	if m := reHostHeader.FindStringSubmatch(text); m != nil {
+		return hostOnly(strings.ToLower(m[1]))
+	}
+	if m := reHTTPReqLine.FindStringSubmatch(firstNonEmptyLine(text)); m != nil && strings.Contains(m[2], "://") {
+		if u, err := url.Parse(m[2]); err == nil {
+			return strings.ToLower(u.Hostname())
+		}
+	}
+	if u := reURLInText.FindString(text); u != "" {
+		if pu, err := url.Parse(u); err == nil {
+			return strings.ToLower(pu.Hostname())
+		}
+	}
+	return ""
+}
+
+// pathMatch reports whether a recorded URL matches a step's path: verbatim
+// substring either way (handles agent-side prefix loss or extra suffix), or
+// every non-numeric path token of the step present in the recorded path
+// (tolerates /api/v1/ prefixes and ID-segment drift).
+func pathMatch(stepPath, candURL string) bool {
+	candPath := candURL
+	if i := strings.IndexByte(candPath, '?'); i >= 0 {
+		candPath = candPath[:i]
+	}
+	if i := strings.Index(candPath, "://"); i >= 0 {
+		rest := candPath[i+3:]
+		if j := strings.IndexByte(rest, '/'); j >= 0 {
+			candPath = rest[j:]
+		} else {
+			candPath = "/"
+		}
+	}
+	sp, cp := strings.ToLower(stepPath), strings.ToLower(candPath)
+	if sp == "" || sp == "/" {
+		return true // 步骤没给出有效 path，端点级不收窄
+	}
+	if strings.Contains(cp, sp) || strings.Contains(sp, cp) {
+		return true
+	}
+	toks := pathTokens(sp)
+	if len(toks) == 0 {
+		return false
+	}
+	ctoks := pathTokens(cp)
+	for _, t := range toks {
+		found := false
+		for _, c := range ctoks {
+			if c == t {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// pathTokens splits a url path into its meaningful segments, dropping the
+// template placeholders (db.TemplatePath turns ids into {n}/{s}) so a
+// templated step and a concrete recording still align.
+func pathTokens(p string) []string {
+	var out []string
+	for _, seg := range strings.Split(p, "/") {
+		seg = strings.TrimSpace(seg)
+		if seg == "" || strings.HasPrefix(seg, "{") {
+			continue
+		}
+		out = append(out, seg)
+	}
+	return out
 }
 
 // expectedStatus extracts the HTTP status a step's response states (e.g.
@@ -216,7 +389,8 @@ func expectedStatus(respText string) int {
 
 // respDiscriminators returns candidate strings from a step's response, in
 // priority order, to disambiguate same-request exchanges: distinctive long
-// tokens first (they survive "…" paraphrasing), then the verbatim leading slice.
+// tokens first (they survive "…" paraphrasing), then the verbatim leading
+// slice.
 func respDiscriminators(resp string) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -235,30 +409,7 @@ func respDiscriminators(resp string) []string {
 	return out
 }
 
-// queryIDs returns up to 10 exchange ids matching where (newest first).
-func (t *Traffic) queryIDs(where string, args []any) []string {
-	rows, err := t.db.Query(`SELECT id FROM exchanges WHERE `+where+` ORDER BY ts DESC LIMIT 10`, args...)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err == nil {
-			ids = append(ids, id)
-		}
-	}
-	return ids
-}
-
-// likeContains builds a `%…%` LIKE pattern with the inner value's LIKE
-// metacharacters (\ % _) escaped — use with `ESCAPE '\'` so URL-encoded
-// payloads match literally.
-func likeContains(s string) string {
-	return "%" + strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s) + "%"
-}
-
+// splitQuery separates a target's path from its query string.
 func splitQuery(target string) (path, query string) {
 	if i := strings.IndexByte(target, '?'); i >= 0 {
 		return target[:i], target[i+1:]
@@ -267,16 +418,20 @@ func splitQuery(target string) (path, query string) {
 }
 
 // bodyPhrase returns a matchable leading slice of a body/response text:
-// trimmed, ≥minTrigram runes (shorter cannot hit the trigram index at all),
-// capped so a huge body doesn't turn into a huge MATCH term.
+// trimmed to its FIRST LINE (multi-line phrases never match a substring hunt),
+// ≥minTrigram runes (shorter is too generic to discriminate), capped at 200
+// runes so a huge body doesn't dominate matching.
 func bodyPhrase(body string) string {
 	b := strings.TrimSpace(body)
+	if i := strings.IndexByte(b, '\n'); i >= 0 {
+		b = strings.TrimSpace(b[:i])
+	}
 	r := []rune(b)
 	if len(r) < minTrigram {
 		return ""
 	}
-	if len(r) > 400 {
-		r = r[:400]
+	if len(r) > 200 {
+		r = r[:200]
 	}
 	return string(r)
 }
