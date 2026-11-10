@@ -484,6 +484,55 @@ FROM project_graph_events WHERE project_id=$1 AND id > $2 ORDER BY id LIMIT $3`,
 	return out, rows.Err()
 }
 
+// OpenIntentAnchorAssetIDs 返回某探索图里所有 open 意图锚定的资产 id（去重）。
+// T12 insight 注入的命中原料：这些资产的归一化键与 project_insights.keywords
+// 求交集，命中的洞察排前（ListInsights 的 matchKeywords 排序）。
+func (d *DB) OpenIntentAnchorAssetIDs(ctx context.Context, expID int64) ([]int64, error) {
+	rows, err := d.QueryContext(ctx, `
+SELECT DISTINCT ea.asset_id
+FROM exploration_anchors ea
+JOIN exploration_nodes en ON en.id = ea.node_id
+WHERE en.exploration_id=$1 AND en.kind='intent' AND en.state='open' AND ea.asset_id IS NOT NULL`, expID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// TaskInsightContext 一次查回 insight 注入决策所需的全部字段：任务的
+// exploration 归属 + 项目观察者开关（LEFT JOIN——未挂项目时 enabled=false）。
+// 单行查询、每 planner 轮一次，无缓存=挂/摘与开关翻转即时生效。
+type TaskInsightContext struct {
+	ExplorationID int64
+	ProjectID     int64 // 0=未挂项目
+	ObserverOn    bool  // projects.observer_enabled（项目不存在/未挂=false）
+}
+
+func (d *DB) TaskInsightContext(ctx context.Context, taskID int64) (*TaskInsightContext, error) {
+	var c TaskInsightContext
+	var pid sql.NullInt64
+	var on sql.NullBool
+	err := d.QueryRowContext(ctx, `
+SELECT t.exploration_id, t.project_id, p.observer_enabled
+FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+WHERE t.id=$1 AND t.deleted_at IS NULL`, taskID).Scan(&c.ExplorationID, &pid, &on)
+	if err != nil {
+		return nil, err // ErrNoRows=任务不存在/已删，调用方按空处理
+	}
+	c.ProjectID = pid.Int64
+	c.ObserverOn = on.Bool
+	return &c, nil
+}
+
 // truncateRunes 按 rune 截断（PG 存 UTF-8 没问题，但事件摘要喂 LLM 不必超长；
 // 500 rune 上限防一条异常长文本占满 observer 上下文）。
 func truncateRunes(s string, max int) string {

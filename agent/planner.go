@@ -35,6 +35,7 @@ type Planner struct {
 	webSearch         WebSearchOpts                          // web_search tool backend selection (off by default)
 	workDir           string                                 // shared work dir (surfaced in prompt as artifact-output target)
 	injectConstraints func() bool                            // resolver: inject task operation constraints into system prompt? (nil = yes)
+	projectInsights   func(taskID int64) string              // artex-hs T12: 项目观察者洞察注入段渲染（见 SetProjectInsightResolver；nil/空串=零注入）
 	nonStreamingFn    func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn      func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
@@ -99,6 +100,28 @@ func (p *Planner) SetWebSearch(o WebSearchOpts) { p.webSearch = o }
 // constraints get injected into the planner system prompt. Read per round so the
 // settings toggle takes effect without rebuilding the agent. nil = inject (default).
 func (p *Planner) SetConstraintInject(fn func() bool) { p.injectConstraints = fn }
+
+// SetProjectInsightResolver wires the renderer producing this task's project
+// observer-insight injection block (artex-hs T12). Mirrors the per-round read
+// pattern of SetConstraintInject so the projects.observer_enabled toggle takes
+// effect without rebuilding the planner. The resolver returns the FULL rendered
+// section (heading included) or "" — an empty string appends nothing, keeping
+// the prompt byte-identical to the baseline (nil resolver is the same no-op).
+func (p *Planner) SetProjectInsightResolver(fn func(taskID int64) string) { p.projectInsights = fn }
+
+// projectInsightsRendered 产出注入本轮 user 输入的项目洞察段：resolver 为 nil
+// 或返回空串 → ""（整段不出现，prompt 与原版逐字节一致）；否则 = 固定标题 +
+// 正文（正文本身已由 server 侧 resolver 限量/截断）。纯渲染、无 IO。
+func (p *Planner) projectInsightsRendered(taskID int64) string {
+	if p.projectInsights == nil {
+		return ""
+	}
+	body := strings.TrimSpace(p.projectInsights(taskID))
+	if body == "" {
+		return ""
+	}
+	return "\n\n## 项目经验（观察者）\n" + body
+}
 
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (p *Planner) wantConstraints() bool { return p.injectConstraints == nil || p.injectConstraints() }
@@ -381,6 +404,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 只留静态规划正文。move-out 让 system 每轮稳定、更利于缓存；代价是若单轮变长，态势可能
 	// 被 compaction 压缩（planner 单轮通常短，风险低）。situational 会拼进下方 input。
 	situational := renderTriggers(ts, triggers) + renderGraphOverview(tsx.graphOverviewData())
+	// T12 项目洞察注入（架构 §2.4）：拼在态势尾部（与终局收尾同区，随 input 进
+	// user 消息、不污染 system 缓存）。resolver 空串→整段不出现=原版逐字节。
+	situational += p.projectInsightsRendered(taskID)
 	// 任务级 deadline / 终局模式(经 ctx 注入,见 taskclock.go)。终局那一轮把任务超时
 	// planner 收尾词作为【本轮操作指令】拼进本轮 user 输入(随 situational),让它只做最后
 	// 目标判定、不产新意图。
