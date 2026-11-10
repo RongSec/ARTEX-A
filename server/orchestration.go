@@ -600,7 +600,7 @@ func (s *Server) reseedGoalsPrompt() {
 // 保留在历史里,用户若自定义过可从版本记录找回。settings flag 守卫 → 只做一次。全新库无需处理
 // (SeedPromptIfEmpty 已 seed 最新默认)。与 reseedGoalsPrompt 完全同构。
 func (s *Server) reseedMainAgentPrompt() {
-	const flag = "mainagent_prompt_goalless_intent_v1"
+	const flag = "mainagent_prompt_repro_discipline_v2"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -621,7 +621,7 @@ func (s *Server) reseedMainAgentPrompt() {
 		log.Printf("[prompts] mainagent 提示词重刷为新默认失败: %v", err)
 		return
 	}
-	log.Printf("[prompts] mainagent 提示词已追加新默认版本(加入目标达成后反问建目标,一次性)")
+	log.Printf("[prompts] mainagent 提示词已追加新默认版本(代报 report_finding 务必填 reproduction 逐字纪律,一次性)")
 }
 
 // reseedPlannerPrompt 把 planner 提示词刷成【当前代码默认】——默认正文做了精简重构,并把「克制」降级为
@@ -661,7 +661,7 @@ func (s *Server) reseedPlannerPrompt() {
 // SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理【追加一个新版本】并切过去,旧版本仍保留在历史里可找回。
 // settings flag 守卫 → 只做一次。全新库无需处理。与 reseedGoalsPrompt 完全同构。
 func (s *Server) reseedWorkerPrompt() {
-	const flag = "worker_prompt_compact_v4"
+	const flag = "worker_prompt_repro_discipline_v5"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -682,7 +682,7 @@ func (s *Server) reseedWorkerPrompt() {
 		log.Printf("[prompts] worker 提示词重刷为新默认失败: %v", err)
 		return
 	}
-	log.Printf("[prompts] worker 提示词已追加新默认版本(查上下文段收敛为 list_assets/list_findings,去掉 list_facts/node_detail/asset_neighbors,一次性)")
+	log.Printf("[prompts] worker 提示词已追加新默认版本(report_finding 务必填 reproduction 逐字纪律,一次性)")
 }
 
 // reporterToolCallMessage 必须无条件要求先读一次 get_finding_traffic 再写报告。

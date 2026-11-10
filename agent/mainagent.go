@@ -99,7 +99,7 @@ const mainAgentDefaultTmpl = `你是一个授权渗透测试系统的"主 agent"
 
 当前任务目标：{{.Goal}}
 
-不要编造发现；只根据工具返回的真实数据回答。`
+不要编造发现；只根据工具返回的真实数据回答。如需代人为某个已确认漏洞调用 report_finding，务必填 reproduction（结构化复现过程）：steps 每步 request/response **逐字取自真实发出/收到的原文，严禁"…"/"(略)"/改写/编造**——系统会把它自动关联到真实录制流量并决定报告能否被人工复现；拿不到真实报文就不要硬填步骤，可在 evidence 说明。`
 
 func mainAgentSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("mainagent", mainAgentDefaultTmpl, MainVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
