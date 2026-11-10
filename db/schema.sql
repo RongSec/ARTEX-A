@@ -1406,3 +1406,33 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_events_seq ON audit_events(seq);
+
+-- =====================================================================
+-- N. 项目-任务两级模型（artex-hs F1/F2，T05）
+-- =====================================================================
+-- 项目主表。二开新增，与原版任务体系松耦合：任务通过 tasks.project_id 可选归属。
+CREATE TABLE IF NOT EXISTS projects (
+    id                BIGSERIAL PRIMARY KEY,
+    name              TEXT NOT NULL,                        -- 项目名（报告封面/标题用）
+    description       TEXT NOT NULL DEFAULT '',             -- 项目描述/测试范围说明
+    status            TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active','archived')),
+    owner             TEXT NOT NULL DEFAULT '',             -- 负责人，可留空
+    concurrency       INTEGER NOT NULL DEFAULT 2,           -- 项目内批量任务并发数：1=严格串行，2=同时两任务
+    observer_enabled  BOOLEAN NOT NULL DEFAULT false,       -- 观察者开关：默认关闭。开=建索引+触发 observer+注入 insight；关=三者一体停（拍板2）
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_projects_alive ON projects(created_at DESC) WHERE status='active';
+DROP TRIGGER IF EXISTS trg_projects_upd ON projects;
+CREATE TRIGGER trg_projects_upd BEFORE UPDATE ON projects
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 任务归属项目；NULL=无项目（完全等价原版行为，零回归基线）。
+-- 刻意 ON DELETE SET NULL：删项目不连带删任务（任务数据比项目分组更贵重）。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at DESC)
+    WHERE deleted_at IS NULL AND project_id IS NOT NULL;
+-- 批量调度取「某项目 FIFO 队首」用（partial 只索引在排队的行，命中集小）：
+CREATE INDEX IF NOT EXISTS idx_tasks_project_queued ON tasks(project_id, queued_at ASC)
+    WHERE deleted_at IS NULL AND queued = true AND project_id IS NOT NULL;

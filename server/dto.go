@@ -32,6 +32,7 @@ func rawString(raw json.RawMessage) string {
 type TaskDTO struct {
 	ID                 string             `json:"id"`
 	ExplorationID      int64              `json:"exploration_id"`
+	ProjectID          *int64             `json:"project_id,omitempty"` // artex-hs 项目归属；缺省=无项目（原版客户端零感知）
 	Name               string             `json:"name"` // 可选任务名称;空=未命名
 	CategoryID         *int64             `json:"category_id,omitempty"`
 	CategoryName       string             `json:"category_name,omitempty"`
@@ -112,6 +113,7 @@ func taskDTO(t *Task, status string) TaskDTO {
 	return TaskDTO{
 		ID:                 t.ID,
 		ExplorationID:      t.ExpID,
+		ProjectID:          cloneInt64Ptr(t.ProjectID),
 		Name:               lifecycle.Name,
 		CategoryID:         lifecycle.CategoryID,
 		CategoryName:       lifecycle.CategoryName,
