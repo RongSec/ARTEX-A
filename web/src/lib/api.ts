@@ -72,6 +72,8 @@ import type {
   NotificationMeta,
   Project,
   ProjectDetail,
+  ProjectGraphResp,
+  ProjectInsight,
   ProjectWithStats,
   PromptVar,
   PromptVersion,
@@ -1351,6 +1353,17 @@ export const api = {
       };
     },
   ) => post<BatchTasksResult>(`/projects/${id}/batch-tasks`, input),
+  // ---- 项目大图 / 洞察（artex-hs T13(0)：/projects/{id}/graph*、/insights*）----
+  // 数据源=project_index 投影（常开，与 observer_enabled 无关）；重建=全量清旧灌新。
+  projectGraph: (id: number | string) => get<ProjectGraphResp>(`/projects/${id}/graph`),
+  projectGraphRebuild: (id: number | string) =>
+    post<{ rebuilt: number }>(`/projects/${id}/graph/rebuild`, {}),
+  projectInsights: (id: number | string) =>
+    get<{ insights: ProjectInsight[] }>(`/projects/${id}/insights`).then((r) => ({
+      insights: arr(r.insights),
+    })),
+  deleteProjectInsight: (id: number | string, insightId: number) =>
+    del<{ deleted: number }>(`/projects/${id}/insights/${insightId}`),
   // 任务挂/摘项目：纯标签迁移，不动任务生命周期。projectID=null 摘除。
   attachTaskProject: (taskId: string, projectId?: number | null) =>
     patch<Task>(`/tasks/${encodeURIComponent(taskId)}/project`, { project_id: projectId ?? null }),

@@ -19,6 +19,7 @@ import {
 import { toast } from "sonner";
 
 import { ProjectBatchTasks } from "@/components/project-batch-tasks";
+import { ProjectGraphTab } from "./project-graph-tab";
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -186,13 +187,13 @@ function ProjectDetailInner() {
           <TabsTrigger value="graph">全项目大图</TabsTrigger>
         </TabsList>
         <TabsContent value="tasks" className="mt-4">
-          <TasksTab tasks={tasks} />
+          <TasksTab tasks={tasks} onChanged={load} />
         </TabsContent>
         <TabsContent value="overview" className="mt-4">
           <OverviewTab detail={detail} />
         </TabsContent>
         <TabsContent value="graph" className="mt-4">
-          <GraphPlaceholder />
+          <ProjectGraphTab project={p} onChanged={load} />
         </TabsContent>
       </Tabs>
 
@@ -226,7 +227,27 @@ function ProjectDetailInner() {
 }
 
 // TasksTab 任务列表：读详情聚合 API 的 task 行，口径与任务列表页一致。
-function TasksTab({ tasks }: { tasks: Task[] }) {
+// 每行「移出」= PATCH /tasks/{id}/project 摘归属（T05 挂/摘）；操作后 toast
+// 提示投影更新时机（对齐 T12(0)：摘除后大图靠下次重建清旧行、任务重启重绑）。
+function TasksTab({ tasks, onChanged }: { tasks: Task[]; onChanged: () => void }) {
+  const [detaching, setDetaching] = React.useState<string | null>(null);
+
+  async function detach(taskId: string) {
+    setDetaching(taskId);
+    try {
+      await api.attachTaskProject(taskId, null);
+      toast.success("已移出项目", {
+        description: "大图投影将在任务重启或点「重建投影」后更新。",
+        duration: 6000,
+      });
+      onChanged();
+    } catch (e) {
+      toast.error("移出失败：" + (e as Error).message);
+    } finally {
+      setDetaching(null);
+    }
+  }
+
   if (tasks.length === 0) {
     return (
       <Empty>
@@ -293,6 +314,18 @@ function TasksTab({ tasks }: { tasks: Task[] }) {
                   {fmtToken((t.tokens?.input_tokens ?? 0) + (t.tokens?.output_tokens ?? 0))}
                 </TableCell>
                 <TableCell className="text-muted-foreground text-xs tabular-nums">{fmtDateTime(t.created_unix)}</TableCell>
+                <TableCell className="w-16 text-right">
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    className="text-muted-foreground hover:text-destructive"
+                    onClick={() => detach(t.id)}
+                    disabled={detaching === t.id}
+                    title="移出本项目（任务保留）"
+                  >
+                    {detaching === t.id ? "移出中…" : "移出"}
+                  </Button>
+                </TableCell>
               </TableRow>
             );
           })}
@@ -330,21 +363,6 @@ function OverviewTab({ detail }: { detail: ProjectDetail }) {
         </p>
       </div>
     </div>
-  );
-}
-
-// GraphPlaceholder B3 的全项目大图占位（拍板1：本期不做跨任务边投影）。
-function GraphPlaceholder() {
-  return (
-    <Empty>
-      <EmptyHeader>
-        <EmptyMedia variant="icon">
-          <DatabaseIcon />
-        </EmptyMedia>
-        <EmptyTitle>全项目大图</EmptyTitle>
-        <EmptyDescription>将在观察者版本启用（按任务分组的项目级节点投影）。</EmptyDescription>
-      </EmptyHeader>
-    </Empty>
   );
 }
 

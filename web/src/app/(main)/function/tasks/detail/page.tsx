@@ -209,7 +209,11 @@ function TaskDetailInner() {
   const [task, setTask] = React.useState<Task | null>(null);
   const [paused, setPaused] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
-  const [tab, setTab] = React.useState("sessions");
+  // 初值支持 ?tab=（T13 大图下钻链接直达探索链路）；非法值回退 sessions。
+  const [tab, setTab] = React.useState(() => {
+    const t = searchParams.get("tab");
+    return t && TABS.some((x) => x.value === t) ? t : "sessions";
+  });
   const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [archiving, setArchiving] = React.useState(false);

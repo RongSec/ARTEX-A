@@ -1,6 +1,6 @@
 package server
 
-// 项目大图 / 洞察面板 API（artex-hs T13，架构 §5.1/§5.2）。
+// 项目大图 / 洞察面板 API（artex-hs T13，架构 §2.1 投影 / §2.4 注入 / §6 文件清单）。
 //
 // 数据源是 project_index 投影（[已核实 T12 定稿] 投影常开：observer_enabled
 // 只 gate 触发与 insight 注入，**不 gate 这里**——关着观察者的项目照样能看

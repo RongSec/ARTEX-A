@@ -1644,6 +1644,44 @@ export interface ProjectDetail {
   stats: ProjectStats;
 }
 
+// ---- 项目大图 tab（artex-hs T13：GET /api/projects/{id}/graph）----
+// 节点=project_index 投影行（任务探索图节点摘要，投影常开与 observer_enabled 无关）。
+export interface ProjectGraphNode {
+  node_id: number;
+  kind: "begin" | "goal" | "intent" | "fact" | "finding" | "hint" | "digest" | string; // 未知 kind 容错直显
+  state: string;
+  summary: string;
+  severity: string; // 仅 finding 非空：critical/high/medium/low
+  asset_keys: string[];
+  updated_at: number; // unix 秒
+}
+
+// 按任务分组的一卡（组顺序=各任务最新节点新在前）。
+export interface GraphTaskGroup {
+  task_id: number; // 后端 int64（Go JSON 编为数字）
+  task_name: string;
+  task_desc: string;
+  status: string; // 内存无 handle 时 ""
+  projected: boolean; // false=任务已归档/删除、残留投影行（不可下钻）
+  nodes: ProjectGraphNode[];
+  counts_by_kind: Record<string, number>;
+}
+
+export interface ProjectGraphResp {
+  groups: GraphTaskGroup[];
+  hint?: string; // 空投影时的后端文案（单一出处）
+}
+
+// 项目观察者洞察（project_insights 行，GET /api/projects/{id}/insights）。
+export interface ProjectInsight {
+  id: number;
+  project_id: number;
+  content: string;
+  source_task_id?: number; // 0/缺省=未知来源
+  keywords: string[];
+  created_at: string; // RFC3339
+}
+
 export interface BatchTasksResult {
   created: string[];
   skipped?: string[]; // 去重丢弃的重复行（原样回显）
