@@ -933,6 +933,26 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // 兜底审批累计 token 用量
 
+	// ==== T04 外挂工具链（artex-full 摘取）：Nuclei POC + OOB 回连观测 ====
+	// 直接调 /opt/artex/bin/nuclei 与 /opt/artex/nuclei-templates、只读
+	// /opt/artex/data/oob/oob.db，不经 MCP 子进程（详见 nuclei.go / oob.go）。
+	// 路由全部挂在 /api/ 前缀下 → 自动过 requireAuth(JWT)+CORS（见下方 api:=）。
+	// 新前缀 /api/nuclei/、/api/oob/ 与现有路由零重叠；未装二进制/数据目录时
+	// handler 各自返回结构化错误，不影响任何原流程（装而不默认注册 MCP 即默认关）。
+	mux.HandleFunc("GET /api/nuclei/stats", s.nucleiStats)
+	mux.HandleFunc("GET /api/nuclei/search", s.nucleiSearch)
+	mux.HandleFunc("GET /api/nuclei/template", s.nucleiTemplateDetail)
+	mux.HandleFunc("POST /api/nuclei/run", s.nucleiRun)
+	mux.HandleFunc("POST /api/nuclei/fingerprint", s.nucleiFingerprint)
+	mux.HandleFunc("POST /api/nuclei/match", s.nucleiMatch)
+	mux.HandleFunc("POST /api/nuclei/autorun", s.nucleiAutorun)
+	mux.HandleFunc("GET /api/oob/overview", s.oobOverview)
+	mux.HandleFunc("GET /api/oob/sessions", s.oobSessions)
+	mux.HandleFunc("GET /api/oob/hits", s.oobHits)
+	mux.HandleFunc("GET /api/oob/hits/{id}", s.oobHitDetail)
+	mux.HandleFunc("GET /api/oob/capability", s.oobCapability)
+	mux.HandleFunc("GET /api/oob/payloads", s.oobPayloads)
+
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
