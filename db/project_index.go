@@ -406,11 +406,10 @@ VALUES ($1, $2, $3, $4, $5)`,
 	return err
 }
 
-// GraphEventWaterline 返回某项目事件流的水位（observer 消费进度）与一批新事件。
-// afterID=0 时从表尾开始（首次只推进水位、不回放历史，防重启刷屏——与
-// scheduler 的 last_finding_id 语义一致）。limit<=0 默认 50。
+// GraphEvent 是 project_graph_events 的一行（observer 水位扫描的事件载荷）。
 type GraphEvent struct {
 	ID           int64         `json:"id"`
+	ProjectID    int64         `json:"project_id"` // 跨项目扫描（fireProjectGraph）时带；单项目查询不填
 	TaskID       int64         `json:"task_id"`
 	NodeID       sql.NullInt64 `json:"node_id,omitempty"`
 	Kind         string        `json:"kind"`
@@ -422,6 +421,45 @@ func (d *DB) MaxGraphEventID(ctx context.Context, projectID int64) (int64, error
 	var id int64
 	err := d.QueryRowContext(ctx, `SELECT COALESCE(max(id),0) FROM project_graph_events WHERE project_id=$1`, projectID).Scan(&id)
 	return id, err
+}
+
+// NewGraphEventsSince 跨项目按**全局事件 id 水位**取新事件（scheduler
+// fireProjectGraph 专用，T11）。返回 (matched, watermark, err)：
+//   - matched 只含「归属项目 observer_enabled=true」的行（JOIN projects，含
+//     task_id/kind/摘要，喂 observer 触发清单）；
+//   - watermark 是本次扫描窗口内的**绝对最大 id**（无论 enabled 与否），供
+//     调用方无条件推进水位——关键是关闭项目的行也必须被水位跨过，否则水位
+//     卡在这批 disabled 行上，每 tick 重复扫同一批空结果（活锁式自旋）。
+//
+// observer 事后开启不回放到历史事件（水位已推过去），与 finding 水位"启用
+// 后才计"语义一致。按 id 升序 → 单调不双发。limit<=0 默认 200。
+func (d *DB) NewGraphEventsSince(lastID int64, limit int) (matched []GraphEvent, watermark int64, err error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	watermark = lastID
+	rows, err := d.Query(`SELECT e.id, e.project_id, e.task_id, e.node_id, e.kind, e.delta_summary, p.observer_enabled
+FROM project_graph_events e JOIN projects p ON p.id = e.project_id
+WHERE e.id > $1
+ORDER BY e.id LIMIT $2`, lastID, limit)
+	if err != nil {
+		return nil, lastID, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e GraphEvent
+		var on bool
+		if err := rows.Scan(&e.ID, &e.ProjectID, &e.TaskID, &e.NodeID, &e.Kind, &e.DeltaSummary, &on); err != nil {
+			return nil, lastID, err
+		}
+		if e.ID > watermark {
+			watermark = e.ID // 无条件推进（含 disabled 行，防空转自旋）
+		}
+		if on {
+			matched = append(matched, e)
+		}
+	}
+	return matched, watermark, rows.Err()
 }
 
 // ListGraphEvents 按水位增量取某项目的新事件（id 单调，ORDER BY id）。

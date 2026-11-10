@@ -12,26 +12,28 @@ import (
 // trigger to a non-empty set of tool keys (empty is rejected at the API layer for
 // on_tool_call).
 type AgentTrigger struct {
-	ID                 int64      `json:"id"`
-	AgentKey           string     `json:"agent_key"`
-	Enabled            bool       `json:"enabled"`
-	IntervalSec        int        `json:"interval_sec"`
-	OnFinding          bool       `json:"on_finding"`
-	OnGoalMet          bool       `json:"on_goal_met"`
-	OnTaskTimeout      bool       `json:"on_task_timeout"`
-	OnToolCall         bool       `json:"on_tool_call"`
-	OnTaskCreate       bool       `json:"on_task_create"`
-	IntervalMessage    string     `json:"interval_message"` // 各触发条件的独立用户消息
-	FindingMessage     string     `json:"finding_message"`
-	GoalMessage        string     `json:"goal_message"`
-	TaskTimeoutMessage string     `json:"task_timeout_message"`
-	ToolCallMessage    string     `json:"tool_call_message"`
-	TaskCreateMessage  string     `json:"task_create_message"`
-	ToolNames          []string   `json:"tool_names"` // 选中的工具 key 列表(DB 存 JSON 文本)
-	LastFire           *time.Time `json:"last_fire,omitempty"`
+	ID                  int64      `json:"id"`
+	AgentKey            string     `json:"agent_key"`
+	Enabled             bool       `json:"enabled"`
+	IntervalSec         int        `json:"interval_sec"`
+	OnFinding           bool       `json:"on_finding"`
+	OnGoalMet           bool       `json:"on_goal_met"`
+	OnTaskTimeout       bool       `json:"on_task_timeout"`
+	OnToolCall          bool       `json:"on_tool_call"`
+	OnTaskCreate        bool       `json:"on_task_create"`
+	OnProjectGraph      bool       `json:"on_project_graph"` // artex-hs T11：项目图变更触发（observer）
+	IntervalMessage     string     `json:"interval_message"` // 各触发条件的独立用户消息
+	FindingMessage      string     `json:"finding_message"`
+	GoalMessage         string     `json:"goal_message"`
+	TaskTimeoutMessage  string     `json:"task_timeout_message"`
+	ToolCallMessage     string     `json:"tool_call_message"`
+	TaskCreateMessage   string     `json:"task_create_message"`
+	ProjectGraphMessage string     `json:"project_graph_message"` // on_project_graph 的用户消息模板
+	ToolNames           []string   `json:"tool_names"`            // 选中的工具 key 列表(DB 存 JSON 文本)
+	LastFire            *time.Time `json:"last_fire,omitempty"`
 }
 
-const triggerCols = `id, agent_key, enabled, interval_sec, on_finding, on_goal_met, on_task_timeout, on_tool_call, on_task_create, interval_message, finding_message, goal_message, task_timeout_message, tool_call_message, task_create_message, tool_names, last_fire`
+const triggerCols = `id, agent_key, enabled, interval_sec, on_finding, on_goal_met, on_task_timeout, on_tool_call, on_task_create, on_project_graph, interval_message, finding_message, goal_message, task_timeout_message, tool_call_message, task_create_message, project_graph_message, tool_names, last_fire`
 
 // marshalToolNames encodes the tool-key list as JSON text for the tool_names column.
 // A nil/empty list stores "" (not "null"/"[]") so the column default stays clean.
@@ -50,8 +52,8 @@ func scanTrigger(sc interface{ Scan(...any) error }) (*AgentTrigger, error) {
 	var t AgentTrigger
 	var lf sql.NullTime
 	var toolNames string
-	if err := sc.Scan(&t.ID, &t.AgentKey, &t.Enabled, &t.IntervalSec, &t.OnFinding, &t.OnGoalMet, &t.OnTaskTimeout, &t.OnToolCall, &t.OnTaskCreate,
-		&t.IntervalMessage, &t.FindingMessage, &t.GoalMessage, &t.TaskTimeoutMessage, &t.ToolCallMessage, &t.TaskCreateMessage, &toolNames, &lf); err != nil {
+	if err := sc.Scan(&t.ID, &t.AgentKey, &t.Enabled, &t.IntervalSec, &t.OnFinding, &t.OnGoalMet, &t.OnTaskTimeout, &t.OnToolCall, &t.OnTaskCreate, &t.OnProjectGraph,
+		&t.IntervalMessage, &t.FindingMessage, &t.GoalMessage, &t.TaskTimeoutMessage, &t.ToolCallMessage, &t.TaskCreateMessage, &t.ProjectGraphMessage, &toolNames, &lf); err != nil {
 		return nil, err
 	}
 	t.ToolNames = []string{}
@@ -67,18 +69,18 @@ func scanTrigger(sc interface{ Scan(...any) error }) (*AgentTrigger, error) {
 // CreateTrigger inserts a trigger for agentKey and returns it.
 func (d *DB) CreateTrigger(t *AgentTrigger) (*AgentTrigger, error) {
 	row := d.QueryRow(`
-INSERT INTO agent_triggers(agent_key, enabled, interval_sec, on_finding, on_goal_met, on_task_timeout, on_tool_call, on_task_create, interval_message, finding_message, goal_message, task_timeout_message, tool_call_message, task_create_message, tool_names)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING `+triggerCols,
-		t.AgentKey, t.Enabled, t.IntervalSec, t.OnFinding, t.OnGoalMet, t.OnTaskTimeout, t.OnToolCall, t.OnTaskCreate,
-		t.IntervalMessage, t.FindingMessage, t.GoalMessage, t.TaskTimeoutMessage, t.ToolCallMessage, t.TaskCreateMessage, marshalToolNames(t.ToolNames))
+INSERT INTO agent_triggers(agent_key, enabled, interval_sec, on_finding, on_goal_met, on_task_timeout, on_tool_call, on_task_create, on_project_graph, interval_message, finding_message, goal_message, task_timeout_message, tool_call_message, task_create_message, project_graph_message, tool_names)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING `+triggerCols,
+		t.AgentKey, t.Enabled, t.IntervalSec, t.OnFinding, t.OnGoalMet, t.OnTaskTimeout, t.OnToolCall, t.OnTaskCreate, t.OnProjectGraph,
+		t.IntervalMessage, t.FindingMessage, t.GoalMessage, t.TaskTimeoutMessage, t.ToolCallMessage, t.TaskCreateMessage, t.ProjectGraphMessage, marshalToolNames(t.ToolNames))
 	return scanTrigger(row)
 }
 
 // UpdateTrigger updates a trigger's fields (not last_fire).
 func (d *DB) UpdateTrigger(t *AgentTrigger) error {
-	_, err := d.Exec(`UPDATE agent_triggers SET enabled=$2, interval_sec=$3, on_finding=$4, on_goal_met=$5, on_task_timeout=$6, on_tool_call=$7, on_task_create=$8, interval_message=$9, finding_message=$10, goal_message=$11, task_timeout_message=$12, tool_call_message=$13, task_create_message=$14, tool_names=$15 WHERE id=$1`,
-		t.ID, t.Enabled, t.IntervalSec, t.OnFinding, t.OnGoalMet, t.OnTaskTimeout, t.OnToolCall, t.OnTaskCreate,
-		t.IntervalMessage, t.FindingMessage, t.GoalMessage, t.TaskTimeoutMessage, t.ToolCallMessage, t.TaskCreateMessage, marshalToolNames(t.ToolNames))
+	_, err := d.Exec(`UPDATE agent_triggers SET enabled=$2, interval_sec=$3, on_finding=$4, on_goal_met=$5, on_task_timeout=$6, on_tool_call=$7, on_task_create=$8, on_project_graph=$9, interval_message=$10, finding_message=$11, goal_message=$12, task_timeout_message=$13, tool_call_message=$14, task_create_message=$15, project_graph_message=$16, tool_names=$17 WHERE id=$1`,
+		t.ID, t.Enabled, t.IntervalSec, t.OnFinding, t.OnGoalMet, t.OnTaskTimeout, t.OnToolCall, t.OnTaskCreate, t.OnProjectGraph,
+		t.IntervalMessage, t.FindingMessage, t.GoalMessage, t.TaskTimeoutMessage, t.ToolCallMessage, t.TaskCreateMessage, t.ProjectGraphMessage, marshalToolNames(t.ToolNames))
 	return err
 }
 
@@ -91,6 +93,18 @@ func (d *DB) DeleteTrigger(id int64) error {
 // ListTriggersFor returns an agent's triggers.
 func (d *DB) ListTriggersFor(agentKey string) ([]*AgentTrigger, error) {
 	return d.queryTriggers(`SELECT `+triggerCols+` FROM agent_triggers WHERE agent_key=$1 ORDER BY id`, agentKey)
+}
+
+// GetTriggerByID returns one trigger by id, or (nil, nil) when absent.
+// PATCH-style update handlers use it to preserve columns that the web form
+// doesn't know about yet（如 T11 的 on_project_graph：老前端 PUT 不带该字段，
+// 若无条件写 false 会把 seed 的 observer 触发器静默拆掉）。
+func (d *DB) GetTriggerByID(id int64) (*AgentTrigger, error) {
+	list, err := d.queryTriggers(`SELECT `+triggerCols+` FROM agent_triggers WHERE id=$1`, id)
+	if err != nil || len(list) == 0 {
+		return nil, err
+	}
+	return list[0], nil
 }
 
 // ListEnabledTriggers returns all enabled triggers (for the scheduler).

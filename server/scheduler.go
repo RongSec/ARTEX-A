@@ -31,6 +31,7 @@ const (
 	schedKeyLastTimeout    = "last_timeout_id"    // watermark: max task id fired for task timeout
 	schedKeyLastToolCall   = "last_toolcall_id"   // watermark: max activity id fired for tool call
 	schedKeyLastTaskCreate = "last_taskcreate_id" // watermark: max task id fired for task create
+	schedKeyLastProjGraph  = "last_projgraph_id"  // artex-hs T11: max project_graph_events id fired for
 )
 
 func newScheduler(s *Server) *Scheduler {
@@ -113,6 +114,15 @@ func (sc *Scheduler) init() {
 		}
 		_ = sc.pg.SetSchedState(schedKeyLastTaskCreate, strconv.FormatInt(maxID, 10))
 	}
+	// T11 项目图事件水位：首启取全表 MAX(id)——只统计「调度器首次启动之后」
+	// 产生的事件，存量投影/旧事件不回放（与 finding 水位同源语义；observer
+	// 项目级开关迟开时的历史事件雪崩同样被本水位+下方 disabled 过滤挡住）。
+	if sc.mustState(schedKeyLastProjGraph) == "" {
+		var maxID int64
+		if err := sc.pg.QueryRow(`SELECT COALESCE(max(id),0) FROM project_graph_events`).Scan(&maxID); err == nil {
+			_ = sc.pg.SetSchedState(schedKeyLastProjGraph, strconv.FormatInt(maxID, 10))
+		}
+	}
 }
 
 func (sc *Scheduler) step() {
@@ -129,6 +139,7 @@ func (sc *Scheduler) step() {
 	sc.fireTaskTimeouts(triggers)
 	sc.fireToolCalls(triggers)
 	sc.fireTaskCreates(triggers)
+	sc.fireProjectGraph(triggers)
 }
 
 // fireIntervals fires triggers whose interval has elapsed since last_fire.
@@ -180,6 +191,102 @@ func (sc *Scheduler) fireFindings(triggers []*db.AgentTrigger) {
 		}
 	}
 	_ = sc.pg.SetSchedState(schedKeyLastFinding, strconv.FormatInt(maxID, 10))
+}
+
+// fireProjectGraph fires on_project_graph triggers (observer) for
+// project_graph_events above the persisted global watermark (T11, 架构 §2.2)。
+// 范式 1:1 复制 fireFindings：水位单调 id → 重启不双发；**无激活 trigger 也
+// 推进水位**（否则迟开的 observer 触发器会一次性回放全部历史事件——与
+// finding 的"启用后计"语义一致）。事件按项目分组，每个有变更的项目起一次
+// StartTriggeredRun（触发消息=该项目本批事件摘要清单，≤renderEventLimit 条）。
+// observer_enabled=false 的项目：db.NewGraphEventsSince 只让水位跨过其事件、
+// 不进 matched——投影常开但**不产触发**（拍板2 三停之二）。
+func (sc *Scheduler) fireProjectGraph(triggers []*db.AgentTrigger) {
+	var want []*db.AgentTrigger
+	for _, tr := range triggers {
+		if tr.OnProjectGraph {
+			want = append(want, tr)
+		}
+	}
+	last, _ := strconv.ParseInt(sc.mustState(schedKeyLastProjGraph), 10, 64)
+	events, watermark, err := sc.pg.NewGraphEventsSince(last, 0)
+	if err != nil {
+		return
+	}
+	// 水位无条件推进（哪怕本批全是 disabled 项目、matched 为空，或没有激活的
+	// on_project_graph 触发器）——防同一批事件每 tick 重复扫、也防迟开回放。
+	if watermark > last {
+		_ = sc.pg.SetSchedState(schedKeyLastProjGraph, strconv.FormatInt(watermark, 10))
+	}
+	if len(events) == 0 || len(want) == 0 {
+		return
+	}
+	// 按项目分组本批事件：observer 是"每项目一个观察会话"，同项目多事件合并
+	// 进一条触发消息（清单），不同项目各自一次 run。
+	for _, g := range groupGraphEventsByProject(events) {
+		msg := renderProjectGraphMessage(g.projectID, g.events)
+		for _, tr := range want {
+			// mergeable=false：observer 用 merge=all 整波合并（serial），这里一次
+			// 已按项目聚合，不再逐事件拆分；taskID=0（跨任务的项目级触发）。
+			sc.s.StartTriggeredRun(tr.AgentKey, fmt.Sprintf("项目图变更触发 · project#%d", g.projectID),
+				tr.ProjectGraphMessage+msg, 0, false, "", "")
+		}
+	}
+}
+
+// projectEventGroup 是 fireProjectGraph 的分组结果（纯函数产物，单测断言用）。
+type projectEventGroup struct {
+	projectID int64
+	events    []db.GraphEvent
+}
+
+// groupGraphEventsByProject 纯函数：把一批事件按 project_id 分组，组顺序=
+// 该项目首事件的出现顺序（水位扫出是 id 升序→项目按"最早变更"排序，稳定
+// 且对测试可断言）；组内保持原顺序。
+func groupGraphEventsByProject(events []db.GraphEvent) []projectEventGroup {
+	byProject := map[int64][]db.GraphEvent{}
+	var order []int64
+	for _, e := range events {
+		if _, seen := byProject[e.ProjectID]; !seen {
+			order = append(order, e.ProjectID)
+		}
+		byProject[e.ProjectID] = append(byProject[e.ProjectID], e)
+	}
+	out := make([]projectEventGroup, 0, len(order))
+	for _, pid := range order {
+		out = append(out, projectEventGroup{projectID: pid, events: byProject[pid]})
+	}
+	return out
+}
+
+// renderEventLimit 触发清单最多渲染的事件条数（超出的只报计数，防一批积压
+// 把 observer 上下文撑爆——投影/事件全量仍可读，清单只是"本次有哪些变更"）。
+const renderEventLimit = 30
+
+// renderProjectGraphMessage 纯函数：把某项目的一批图事件渲染成喂 observer 的
+// 触发消息正文（不含 agent 的用户消息模板 tr.ProjectGraphMessage——那由调用方
+// 拼接，与本渲染解耦、便于单测）。清单 ≤renderEventLimit 条，含 kind/摘要/
+// task_id；超出部分折叠成一行计数。无事件返回 ""（调用方已提前拦，这里防御）。
+func renderProjectGraphMessage(projectID int64, events []db.GraphEvent) string {
+	if len(events) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n\n【本次由项目 #%d 的探索图变更触发】", projectID)
+	shown := events
+	omitted := 0
+	if len(shown) > renderEventLimit {
+		omitted = len(shown) - renderEventLimit
+		shown = shown[:renderEventLimit]
+	}
+	fmt.Fprintf(&b, "\n本批 %d 条变更：", len(events))
+	for _, e := range shown {
+		fmt.Fprintf(&b, "\n- %s", e.DeltaSummary)
+	}
+	if omitted > 0 {
+		fmt.Fprintf(&b, "\n- …另有 %d 条未列出（用 query_project_index 查看全量投影）", omitted)
+	}
+	return b.String()
 }
 
 // fireGoals fires on_goal_met triggers for met goals not yet in the fired set.

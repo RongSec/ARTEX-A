@@ -1000,12 +1000,14 @@ CREATE TABLE IF NOT EXISTS agent_triggers (
     on_task_timeout             BOOLEAN NOT NULL DEFAULT false,
     on_tool_call                BOOLEAN NOT NULL DEFAULT false,
     on_task_create              BOOLEAN NOT NULL DEFAULT false,
+    on_project_graph            BOOLEAN NOT NULL DEFAULT false,
     interval_message            TEXT NOT NULL DEFAULT '',
     finding_message             TEXT NOT NULL DEFAULT '',
     goal_message                TEXT NOT NULL DEFAULT '',
     task_timeout_message        TEXT NOT NULL DEFAULT '',
     tool_call_message           TEXT NOT NULL DEFAULT '',
     task_create_message         TEXT NOT NULL DEFAULT '',
+    project_graph_message       TEXT NOT NULL DEFAULT '',
     tool_names                  TEXT NOT NULL DEFAULT '',
     last_fire                   TIMESTAMPTZ,
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1018,6 +1020,11 @@ ALTER TABLE agent_triggers ADD COLUMN IF NOT EXISTS tool_call_message   TEXT    
 ALTER TABLE agent_triggers ADD COLUMN IF NOT EXISTS tool_names          TEXT    NOT NULL DEFAULT '';
 ALTER TABLE agent_triggers ADD COLUMN IF NOT EXISTS on_task_create      BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE agent_triggers ADD COLUMN IF NOT EXISTS task_create_message TEXT    NOT NULL DEFAULT '';
+-- T11 观察者触发：某项目的探索图发生变更（project_graph_events 有新行且
+-- 该项目 observer_enabled=true）时唤起 observer。project_graph_message 是该
+-- 触发器的用户消息模板（与 finding_message 同形态：模板+引擎追加的变更清单）。
+ALTER TABLE agent_triggers ADD COLUMN IF NOT EXISTS on_project_graph      BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE agent_triggers ADD COLUMN IF NOT EXISTS project_graph_message TEXT    NOT NULL DEFAULT '';
 DROP TRIGGER IF EXISTS trg_agent_triggers_upd ON agent_triggers;
 CREATE TRIGGER trg_agent_triggers_upd BEFORE UPDATE ON agent_triggers
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();

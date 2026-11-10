@@ -502,6 +502,14 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.
 		return false, err
 	}
 	n, err := res.RowsAffected()
+	// 意图流转主路径（T11 补挂，team-lead 拍板）：真正 CAS 成功（state 变了，
+	// n==1）才发事件——与 SetNodeState 守卫口径一致。payload 不在手，走一次
+	// 窄回查；回调未注入时零开销（n==1 也只多一次 nil 比较）。
+	if err == nil && n == 1 && s.OnGraphChange != nil {
+		if ev, ok := s.graphNodeSnapshot(id, state); ok {
+			s.emitGraphChange(ev)
+		}
+	}
 	return n == 1, err
 }
 
@@ -555,7 +563,19 @@ func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, er
 			summary = sm
 		}
 	}
-	return summary, tx.Commit()
+	// 原版是 `return summary, tx.Commit()`：提交失败把 summary 带回（调用方见
+	// err 弃用），此处保持失败语义逐字节一致。
+	if err := tx.Commit(); err != nil {
+		return summary, err
+	}
+	// 假删事件（T11 补挂）：提交成功后发，state='deleted' 让消费侧删投影。
+	// 事件载荷手已在（kind 恒 intent、summary 已解出）；删除路径不需要
+	// anchors/severity，零额外查询。回调未注入时只多一次 nil 比较。
+	s.emitGraphChange(GraphChange{
+		ExplorationID: s.expID, NodeID: id, Kind: KindIntent,
+		State: StateIntentDeleted, Summary: summary,
+	})
+	return summary, nil
 }
 
 // CancelIntent 物理删除一个意图,以及"仅由该意图支撑"的全部独占子孙节点——从该意图沿
