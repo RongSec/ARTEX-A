@@ -701,6 +701,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/projects/{id}", s.projectsGet)
 	mux.HandleFunc("PATCH /api/projects/{id}", s.projectsUpdate)
 	mux.HandleFunc("DELETE /api/projects/{id}", s.projectsDelete)
+	mux.HandleFunc("POST /api/projects/{id}/batch-tasks", s.projectsBatchTasks)
 	mux.HandleFunc("PATCH /api/tasks/{id}/project", s.tasksAttachProject)
 	mux.HandleFunc("GET /api/task-archives", s.listTaskArchives)
 	mux.HandleFunc("GET /api/task-archives/{id}", s.getTaskArchive)
