@@ -1,16 +1,18 @@
 package server
 
-// ProjectIndexer（artex-hs T10，架构 §2.1）：把三图原语（AddNode /
-// SetNodeState / Link）经 ExplorationStore.OnGraphChange 发来的图变更异步
-// 投影到 project_index，并追加 project_graph_events 事实行（喂 T11 observer
-// 的水位扫描）。热路径（planner/worker 写图）只付一次 select-default 入
-// 通道 + nil 判断的代价；满则 drop（投影最终一致，漏的行由 RebuildProjectIndex
-// 兜底重建），drop 计数限频告警。
+// ProjectIndexer（artex-hs T10/T12，架构 §2.1）：把图原语（AddNode /
+// SetNodeState / Link / CompareAndSetIntentState / SoftDeleteIntent）经
+// ExplorationStore.OnGraphChange 发来的图变更异步投影到 project_index，并
+// 追加 project_graph_events 事实行（喂 T11 observer 的水位扫描）。热路径
+// （planner/worker 写图）只付一次 select-default 入通道 + nil 判断的代价；
+// 满则 drop（投影最终一致，漏的行由 RebuildProjectIndex 兜底重建），drop
+// 计数限频告警。
 //
-// 开关语义（拍板2 三停之一）：事件按 exploration→task→project 解析归属后，
-// 先查 projects.observer_enabled——关闭的项目直接丢弃（不 upsert、不插事件）。
-// 两个进程内缓存（映射/开关）只是省一次单行查询，失效钩子见
-// AttachTaskProject / projectsUpdate（缓存错了不破坏一致性：下一事件自愈）。
+// [已核实 T12 定稿] 投影常开：消费路径只按 exploration→project 归属过滤
+// （pid<=0 丢弃=原版任务），**不过 observer_enabled**——project_index 是
+// 大图 tab 的数据源，关闭观察者的项目也要能看。observer_enabled 只管
+// fireProjectGraph 触发与 insight 注入两处（各自侧过滤）。绑定侧的对应
+// 红线见 bindGraphHook：原版（未挂项目）任务完全不回调、零额外查询。
 
 import (
 	"context"
@@ -50,8 +52,6 @@ type ProjectIndexer struct {
 	// taskPID 缓存 exploration_id → project_id(int64)。0=无归属（原版任务
 	// 恒此值；也缓存，之后每事件零查询）。
 	taskPID sync.Map
-	// projGate 缓存 project_id → observer_enabled(bool)。命中 false=直接丢。
-	projGate sync.Map
 
 	drops    atomic.Int64 // 通道满被丢弃的事件累计数
 	lastWarn atomic.Int64 // 上次 drop 告警时刻（unix nano，限频用）
@@ -146,49 +146,23 @@ func (ix *ProjectIndexer) InvalidateTaskMapping(expID int64) {
 	ix.taskPID.Delete(expID)
 }
 
-// observerEnabled 查项目观察者开关（进程内缓存，缺则查库）。查询失败按
-// 关闭处理（fail-closed：宁可不投影，不给已关的项目建索引——拍板2）；失败
-// 路径直接返回 false 且不写缓存（cachedResolve 的 loader ok=false 语义），
-// 下条事件自愈重查。
-// 失效方：项目 PATCH observer_enabled（server/projects.go projectsUpdate）。
-func (ix *ProjectIndexer) observerEnabled(projectID int64) bool {
-	v, ok, _ := cachedResolve[bool](&ix.projGate, projectID, func() (bool, bool) {
-		var on bool
-		if err := ix.pg.QueryRow(`SELECT observer_enabled FROM projects WHERE id=$1`, projectID).Scan(&on); err != nil {
-			return false, false // 查询失败=不缓存，本条 fail-closed
-		}
-		return on, true
-	})
-	if !ok {
-		return false
-	}
-	return v
-}
-
-// InvalidateProjectGate 清一个项目的开关缓存（PATCH 翻转后调用）。
-func (ix *ProjectIndexer) InvalidateProjectGate(projectID int64) {
-	if ix == nil {
-		return
-	}
-	ix.projGate.Delete(projectID)
-}
-
-// filterAdmitted 纯函数（可注入解析器，单测直接断言）：一批事件逐条解析
-// 归属与开关，产出「通过投影」的条目与其 project_id（平行数组）。
+// filterAdmitted 纯函数（可注入解析器，单测直接断言）：一批事件逐条解析归属，
+// 产出「通过投影」的条目与其 project_id（平行数组）。
 // resolve 返回 ok=false=查询失败，本条丢弃（下条事件自愈）；pid<=0=无归属
-// 丢弃（原版任务恒此路径）；enabled=false=拍板2 丢弃。
+// 丢弃（原版任务恒此路径）。
+//
+// [已核实 T12 定稿] 这里**不再过 observer_enabled**：project_index 是大图 tab
+// 的数据源，关闭观察者的项目也要能看大图——投影常开。observer_enabled 的语义
+// 收窄为只管 ① fireProjectGraph 产不产触发（scheduler 侧 JOIN projects 过滤）
+// ② T12 的 insight 注入。二者都不在本消费路径。
 func filterAdmitted(batch []indexedEvent,
-	resolve func(expID int64) (int64, bool),
-	enabled func(projectID int64) bool) ([]indexedEvent, []int64) {
+	resolve func(expID int64) (int64, bool)) ([]indexedEvent, []int64) {
 	rows := make([]indexedEvent, 0, len(batch))
 	pids := make([]int64, 0, len(batch))
 	for _, ev := range batch {
 		pid, ok := resolve(ev.ev.ExplorationID)
 		if !ok || pid <= 0 {
-			continue
-		}
-		if !enabled(pid) {
-			continue
+			continue // 查询失败=下条自愈；无归属=原版任务天然短路（零回归）
 		}
 		rows = append(rows, ev)
 		pids = append(pids, pid)
@@ -236,24 +210,29 @@ func graphChangeDigest(taskID int64, ev pgdb.GraphChange) json.RawMessage {
 
 // bindGraphHook 给任务专属的 ExplorationStore 挂上投影回调（T10 注入点，
 // 架构 §2.1）。indexer 未启用（nil，无 PG/构造失败）时不挂——store 字段保持
-// nil，三原语逐字节走原版快路径（原版任务/原版库零回归）。
+// nil，原语逐字节走原版快路径（零回归）。
 //
-// 已启用则**无条件**挂（不看 pt.ProjectID）：原版任务的图写也会入通道，由
-// 消费侧 projectOf 解析归属、pid=0/NULL 直接丢弃（天然短路，任务书 §A）。
-// 这样「运行期才挂项目」的任务无需重启即恢复投影——回调本身永不改（见下），
-// 生效与否完全由消费侧缓存决定，挂/摘项目只需 InvalidateTaskMapping。
+// [已核实 T12 裁决2] **仅当任务已挂项目（pt.ProjectID 非空）才绑定**：原版
+// 高频路径（intent CAS 每轮都走）不得多 graphNodeSnapshot 的 2 条回查 SELECT
+// ——零额外查询是红线。未绑定的任务事件根本不产生，消费侧 projectOf 的
+// pid=0 短路保留为 defense-in-depth（事件可能来自已摘除归属的存量 handle）。
 //
-// 闭包只做两件事：回填 taskID（store 侧只有 exploration_id，1:1 映射在
-// 这里闭合）+ select-default 入通道。不查库、不加锁——图写热路径的全部代价
-// 就是一次函数调用 + 一次非阻塞发送。观察者开关（observer_enabled）在消费
-// 侧判（批内缓存），不在这里查——开关翻转不该让每个图写付一次 SQL。
+// 运行期挂/摘项目的投影语义（低频操作，拍板接受）：
+//   - 挂载后：该任务存量图靠任务重启（LoadExisting 重新 bindGraphHook）或
+//     T13 的 RebuildProjectIndex 按钮补齐；重启前的新节点不产事件。
+//   - 摘除后：回调保持挂着（不运行期改写——与运行中协程的字段读竞争），
+//     事件继续入通道但 AttachTaskProject 的 InvalidateTaskMapping 让消费侧
+//     解析到新 pid=0 → 丢弃；旧投影行由下次 Rebuild 的 DELETE 谓词自然清掉
+//     （大图上短暂残留旧任务行可接受）。
 //
-// 调用点：仅 taskFromPG（新建/LoadExisting，store handle 尚未发布给其他
-// 协程，写 OnGraphChange 无竞争）。回调一经绑定不再改写——运行期改它会与
-// 正在跑 planner/worker 的字段读构成数据竞争；摘除归属由消费侧短路完成。
+// 闭包只做两件事：回填 taskID + select-default 入通道。不查库、不加锁。
+// 调用点：仅 taskFromPG（新建/LoadExisting，handle 发布前，写字段无竞争）。
 func (m *Manager) bindGraphHook(store *pgdb.ExplorationStore, pt *pgdb.Task) {
 	if store == nil || m.projectIndexer == nil || pt == nil {
 		return
+	}
+	if pt.ProjectID == nil || *pt.ProjectID <= 0 {
+		return // 原版任务：不绑定，零回调零开销（红线）
 	}
 	ix := m.projectIndexer
 	taskID := pt.ID
@@ -337,7 +316,7 @@ func (ix *ProjectIndexer) run(ctx context.Context) {
 // 查询），通过的条目攒成一次事务落投影 + 事件行。批内同节点多条事件全保留
 // （事件是事实流）；投影按 (project_id,node_id) 幂等 upsert，后写覆盖前写。
 func (ix *ProjectIndexer) handleBatch(ctx context.Context, batch []indexedEvent) {
-	rows, pids := filterAdmitted(batch, ix.projectOf, ix.observerEnabled)
+	rows, pids := filterAdmitted(batch, ix.projectOf)
 	if len(rows) == 0 {
 		return
 	}
@@ -400,24 +379,19 @@ func nullIfZero(v int64) any {
 }
 
 // RebuildProjectIndex 全量重建一个项目的投影：事务内 DELETE 该项目全部旧行 +
-// 按任务逐图扫节点重新 upsert。供 T13 的 API 兜底（drop 补账/开关开启时
-// 一键投影存量图）。observer_enabled=false 时不做任何事并返回 0——关闭的
-// 项目不该存在投影行（拍板2 三停之一；事件路径同样遵守，重建不必反向）。
-// 返回重建的投影行数。
+// 按任务逐图扫节点重新 upsert。供 T13 的 API 兜底（drop 补账/挂项目后补齐
+// 存量图投影）。投影常开（[已核实 T12 定稿]，大图 tab 的数据源），不看
+// observer_enabled——只要项目存在就重建。返回重建的投影行数。
 //
 // 摘除归属的旧投影行清理也由此天然完成：DELETE 以 project_id 为谓词，
 // 重建后只剩「当前挂在项目上的任务」的节点。
 func (s *Server) RebuildProjectIndex(ctx context.Context, projectID int64) (int, error) {
-	ix := s.m.projectIndexer
-	var on bool
-	if err := s.m.pg.QueryRow(`SELECT observer_enabled FROM projects WHERE id=$1`, projectID).Scan(&on); err != nil {
-		if err == sql.ErrNoRows {
-			return 0, pgdb.ErrProjectNotFound
-		}
+	var exists bool
+	if err := s.m.pg.QueryRow(`SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1)`, projectID).Scan(&exists); err != nil {
 		return 0, err
 	}
-	if !on {
-		return 0, nil
+	if !exists {
+		return 0, pgdb.ErrProjectNotFound
 	}
 	type taskExp struct {
 		id    int64
@@ -490,9 +464,6 @@ WHERE project_id=$1 AND deleted_at IS NULL ORDER BY id`, projectID)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
-	}
-	if ix != nil { // 重建后归属/开关缓存保持有效；只清 gate 以防外部直改库
-		ix.InvalidateProjectGate(projectID)
 	}
 	return len(all), nil
 }

@@ -1426,7 +1426,7 @@ CREATE TABLE IF NOT EXISTS projects (
                         CHECK (status IN ('active','archived')),
     owner             TEXT NOT NULL DEFAULT '',             -- 负责人，可留空
     concurrency       INTEGER NOT NULL DEFAULT 2,           -- 项目内批量任务并发数：1=严格串行，2=同时两任务
-    observer_enabled  BOOLEAN NOT NULL DEFAULT false,       -- 观察者开关：默认关闭。开=建索引+触发 observer+注入 insight；关=三者一体停（拍板2）
+    observer_enabled  BOOLEAN NOT NULL DEFAULT false,       -- 观察者开关：默认关闭。[T12 定稿]只管两件事：触发 observer + 注入 insight；project_index 投影常开（大图 tab 数据源，关着也能看）
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );

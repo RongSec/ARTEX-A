@@ -199,8 +199,10 @@ func (sc *Scheduler) fireFindings(triggers []*db.AgentTrigger) {
 // 推进水位**（否则迟开的 observer 触发器会一次性回放全部历史事件——与
 // finding 的"启用后计"语义一致）。事件按项目分组，每个有变更的项目起一次
 // StartTriggeredRun（触发消息=该项目本批事件摘要清单，≤renderEventLimit 条）。
-// observer_enabled=false 的项目：db.NewGraphEventsSince 只让水位跨过其事件、
-// 不进 matched——投影常开但**不产触发**（拍板2 三停之二）。
+// 事件恒生成（投影常开，见 §2.1），observer_enabled=false 的项目：
+// db.NewGraphEventsSince 只让水位跨过其事件、不进 matched——不产触发。这是
+// observer_enabled 语义收窄后的职责之一（[已核实 T12 定稿]：只管触发 + insight
+// 注入两处，投影不受它控制）。
 func (sc *Scheduler) fireProjectGraph(triggers []*db.AgentTrigger) {
 	var want []*db.AgentTrigger
 	for _, tr := range triggers {

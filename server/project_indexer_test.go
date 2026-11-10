@@ -21,11 +21,14 @@ func evOf(expID, nodeID int64, kind, state string) indexedEvent {
 }
 
 func TestFilterAdmitted(t *testing.T) {
+	// [已核实 T12 定稿] 投影常开：消费侧只按归属过滤（查询失败/无归属丢弃），
+	// 不再过 observer_enabled——关闭观察者的项目也要能看大图（T11 的触发过滤
+	// 在 scheduler JOIN projects 处，不在这里）。
 	batch := []indexedEvent{
 		evOf(1, 10, pgdb.KindFact, "confirmed"),    // 归属查询失败 → 丢（下条自愈）
-		evOf(2, 20, pgdb.KindFact, "confirmed"),    // pid=0（原版任务）→ 丢
-		evOf(3, 30, pgdb.KindGoal, "open"),         // pid=8 但开关关 → 丢（拍板2）
-		evOf(4, 40, pgdb.KindFinding, "confirmed"), // pid=7 开关开 → 过
+		evOf(2, 20, pgdb.KindFact, "confirmed"),    // pid=0（原版任务/已摘除）→ 丢
+		evOf(3, 30, pgdb.KindGoal, "open"),         // pid=8（开关关的项目）→ 过（投影常开）
+		evOf(4, 40, pgdb.KindFinding, "confirmed"), // pid=7 → 过
 		evOf(4, 41, pgdb.KindIntent, "done"),       // 同项目第二条 → 过（平行数组对齐）
 	}
 	resolve := func(expID int64) (int64, bool) {
@@ -40,23 +43,23 @@ func TestFilterAdmitted(t *testing.T) {
 			return 7, true
 		}
 	}
-	enabled := func(pid int64) bool { return pid == 7 }
 
-	rows, pids := filterAdmitted(batch, resolve, enabled)
-	if len(rows) != 2 || len(pids) != 2 {
-		t.Fatalf("admitted len=%d/%d want 2/2", len(rows), len(pids))
+	rows, pids := filterAdmitted(batch, resolve)
+	if len(rows) != 3 || len(pids) != 3 {
+		t.Fatalf("admitted len=%d/%d want 3/3", len(rows), len(pids))
 	}
-	if rows[0].ev.NodeID != 40 || rows[1].ev.NodeID != 41 {
-		t.Errorf("wrong rows survived: %v, %v", rows[0].ev.NodeID, rows[1].ev.NodeID)
+	if rows[0].ev.NodeID != 30 || rows[1].ev.NodeID != 40 || rows[2].ev.NodeID != 41 {
+		t.Errorf("wrong rows survived: %v, %v, %v", rows[0].ev.NodeID, rows[1].ev.NodeID, rows[2].ev.NodeID)
 	}
-	if pids[0] != 7 || pids[1] != 7 || len(pids) != len(rows) {
+	if pids[0] != 8 || pids[1] != 7 || pids[2] != 7 {
 		t.Errorf("pids misaligned: %v", pids)
 	}
 
-	// 开关全关 → 空。
-	rows, pids = filterAdmitted(batch, resolve, func(int64) bool { return false })
+	// 全部无归属 → 空。
+	none := func(int64) (int64, bool) { return 0, true }
+	rows, pids = filterAdmitted(batch, none)
 	if len(rows) != 0 || len(pids) != 0 {
-		t.Errorf("all-disabled must yield empty, got %d/%d", len(rows), len(pids))
+		t.Errorf("all-unowned must yield empty, got %d/%d", len(rows), len(pids))
 	}
 }
 
@@ -178,7 +181,8 @@ func TestCachedResolve(t *testing.T) {
 		t.Fatalf("after invalidate loader must rerun: v=%v ok=%v", v, ok)
 	}
 
-	// bool 值型（projGate 用）：false 也是"有效缓存值"而非 miss。
+	// bool 值型：false 也是"有效缓存值"而非 miss（泛型骨架的通用契约；
+	// T12 投影常开删掉了 projGate 用例，骨架保留给 taskPID 与后续复用）。
 	var gm sync.Map
 	_, _, _ = cachedResolve[bool](&gm, 1, func() (bool, bool) { return false, true })
 	b, ok, fromCache := cachedResolve[bool](&gm, 1, func() (bool, bool) { t.Fatal("loader rerun"); return true, true })

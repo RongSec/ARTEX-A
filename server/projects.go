@@ -57,10 +57,12 @@ func (m *Manager) AttachTaskProject(id string, projectID *int64) error {
 	}
 	m.mu.Unlock()
 	// 归属变了，消费侧 exploration→project 缓存必须作废，否则在途事件按旧
-	// project_id 投影。回调本身（store.OnGraphChange）在 taskFromPG 处一经绑定
-	// 就不再改写（避免与运行中 planner/worker 对该函数字段的读构成数据竞争）：
-	// 挂项目的任务靠 projectOf 缓存失效后下一事件自动解析到新 pid 恢复投影，
-	// 摘项目的任务解析到 pid=0 自动短路，都无需重启。
+	// project_id 投影。回调绑定只在 taskFromPG（handle 发布前）做一次且永不
+	// 改写（运行期改字段与运行中协程的读构成数据竞争）。[已核实 T12 裁决2]
+	// 运行期挂/摘项目的投影语义：挂载后该任务的回调并未新增（事件暂不产生），
+	// 靠任务重启（LoadExisting 重新绑定）或 RebuildProjectIndex（T13 API）补
+	// 投影——前端在挂/摘操作后 toast 提示这一点；摘除后存量回调的事件因缓存
+	// 失效解析到新 pid=0 被丢弃，旧投影行由下次 Rebuild 清掉。
 	if expID > 0 {
 		m.projectIndexer.InvalidateTaskMapping(expID)
 	}
@@ -282,11 +284,10 @@ func (s *Server) projectsUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	// 开关翻转：作废消费侧 projGate 缓存，让下一事件立刻按新开关判定
-	// （命中关=丢弃，命中开=恢复投影）。
-	if patch.ObserverEnabled != nil {
-		s.m.projectIndexer.InvalidateProjectGate(pid)
-	}
+	// 投影常开（T12 定稿）：observer_enabled 翻转不影响 project_index，无需
+	// 失效任何投影侧缓存。该开关只管 fireProjectGraph 触发（scheduler 每 tick
+	// 直查 JOIN projects，无缓存）与 insight 注入（planner resolver 每次直查，
+	// 无缓存），两处都即时生效。
 	writeJSON(w, 200, p)
 }
 
