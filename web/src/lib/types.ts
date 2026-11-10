@@ -39,6 +39,7 @@ export interface Task {
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
+  project_id?: number; // artex-hs 项目归属；缺省=无项目（原版任务零感知）
 }
 
 export interface TaskCategory {
@@ -1609,4 +1610,44 @@ export interface InterceptExecution {
   session: string;
   seq: number;
   items: Activity[];
+}
+
+// ---- artex-hs 二开：项目-任务两级模型（T05/T08）----
+
+// 与后端 db.Project / db.ProjectStats 逐字段对应。
+export interface Project {
+  id: number;
+  name: string;
+  description: string;
+  status: "active" | "archived";
+  owner: string;
+  concurrency: number; // 项目内批量任务并发数：1=严格串行
+  observer_enabled: boolean; // 观察者开关（B3 功能，本期只透传展示）
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProjectStats {
+  task_count: number;
+  queued_tasks: number;
+  findings: Record<string, number>; // severity -> 计数（critical/high/medium/low/其他）
+}
+
+export interface ProjectWithStats extends Project {
+  stats: ProjectStats;
+}
+
+// GET /api/projects/{id} 的详情体：项目 + 任务聚合（taskDTO 口径）+ finding 汇总。
+export interface ProjectDetail {
+  project: Project;
+  tasks: Task[];
+  stats: ProjectStats;
+}
+
+export interface BatchTasksResult {
+  created: string[];
+  skipped?: string[]; // 去重丢弃的重复行（原样回显）
+  failed?: string[]; // 单行创建失败的目标行
+  project_id: number;
+  concurrency: number;
 }

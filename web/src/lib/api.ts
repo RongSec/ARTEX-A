@@ -19,6 +19,7 @@ import type {
   Audit,
   BatchCategoryItem,
   BatchControlItem,
+  BatchTasksResult,
   ChatAttachment,
   CommandRecord,
   Company,
@@ -69,6 +70,9 @@ import type {
   NotificationDelivery,
   NotificationFilter,
   NotificationMeta,
+  Project,
+  ProjectDetail,
+  ProjectWithStats,
   PromptVar,
   PromptVersion,
   SessionTokenUsage,
@@ -1302,6 +1306,54 @@ export const api = {
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
+
+  // ---- 项目（artex-hs 二开 T05-T08：项目-任务两级模型）----
+  // 后端 /api/projects*；列表带统计（任务数/排队数/finding 分档），详情带任务聚合。
+  projects: (status?: "active" | "archived") =>
+    get<{ projects: ProjectWithStats[] }>(`/projects${status ? `?status=${status}` : ""}`).then((r) => ({
+      projects: arr(r.projects),
+    })),
+  project: (id: number | string) => get<ProjectDetail>(`/projects/${id}`),
+  createProject: (input: { name: string; description?: string; owner?: string; concurrency?: number }) =>
+    post<Project>("/projects", {
+      name: input.name,
+      description: input.description ?? "",
+      owner: input.owner ?? "",
+      concurrency: input.concurrency ?? 2,
+    }),
+  updateProject: (
+    id: number | string,
+    patchBody: {
+      name?: string;
+      description?: string;
+      owner?: string;
+      status?: "active" | "archived";
+      concurrency?: number;
+      observer_enabled?: boolean;
+    },
+  ) => patch<Project>(`/projects/${id}`, patchBody),
+  deleteProject: (id: number | string) => del<{ deleted: number }>(`/projects/${id}`),
+  // 批量下发：一行一目标拆 N 任务，全部落 queued 不即跑（项目 dispatcher 按额度放行）。
+  batchProjectTasks: (
+    id: number | string,
+    input: {
+      targets: string;
+      concurrency?: number;
+      common?: {
+        name_prefix?: string;
+        desc_template?: string;
+        category_id?: number | null;
+        llm_profile_ids?: number[];
+        timeout_seconds?: number;
+        plan_heartbeat_seconds?: number;
+        seed_first_intent?: boolean;
+        coverage_enabled?: boolean;
+      };
+    },
+  ) => post<BatchTasksResult>(`/projects/${id}/batch-tasks`, input),
+  // 任务挂/摘项目：纯标签迁移，不动任务生命周期。projectID=null 摘除。
+  attachTaskProject: (taskId: string, projectId?: number | null) =>
+    patch<Task>(`/tasks/${encodeURIComponent(taskId)}/project`, { project_id: projectId ?? null }),
 
   // ---- 一键更新 ----
   // 检查以后端为准：下载是后端做的，浏览器能连 GitHub 而服务器连不上的情况很常见
