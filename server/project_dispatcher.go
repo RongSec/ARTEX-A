@@ -103,12 +103,18 @@ func (pd *ProjectDispatcher) Step(ctx context.Context) {
 	if pd.claimed == nil {
 		pd.claimed = map[int64]int64{}
 	}
-	// 修剪认领集合：handle 消失（删除）、进终态、或已被原版口径计为占槽
+	// 修剪认领集合：handle 消失（删除）、进终态、被用户暂停（暂停=显式让出
+	// 额度，恢复走原版 resume 通道）、或已被原版口径计为占槽
 	// （occupiesConcurrencySlot 与本函数同一把锁下调用，口径严格同源）的
 	// 任务从认领视图退休，改由原版计数，避免重复占额。
 	for id := range pd.claimed {
 		t, ok := s.m.Task(strconv.FormatInt(id, 10))
-		if !ok || isTerminalStatus(t.lifecycleSnapshot().Status) || s.occupiesConcurrencySlot(t) {
+		if !ok {
+			delete(pd.claimed, id)
+			continue
+		}
+		lc := t.lifecycleSnapshot()
+		if isTerminalStatus(lc.Status) || lc.Paused || s.occupiesConcurrencySlot(t) {
 			delete(pd.claimed, id)
 		}
 	}
