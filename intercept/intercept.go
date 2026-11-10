@@ -311,9 +311,13 @@ const (
 )
 
 // Judge default values.
+//
+// FailAction 默认 deny（红线吸收，T02）：判官不可用（超时、报错、输出不可
+// 解析）时若回落 allow，等于「审批形同虚设」—— 只要让判官失效就能绕过全部
+// 规则。管理员仍可在「系统 → 命令拦截」里显式改成 allow / ask，那是有意的放宽。
 const (
 	defaultJudgeTimeoutSecs      = 15
-	defaultJudgeFailAction       = "allow"
+	defaultJudgeFailAction       = "deny"
 	defaultJudgeAskTimeoutSecs   = 300
 	defaultJudgeAskTimeoutAction = "deny"
 )
@@ -330,15 +334,29 @@ type JudgeConfig struct {
 	AskTimeoutAction  string `json:"ask_timeout_action"` // allow|deny
 }
 
+// judgeFailAction 解析 llm_judge_fail_action：缺失或非法值回落到
+// defaultJudgeFailAction。
+//
+// 抽成纯函数是为了能在没有数据库的环境里确定性地测这条安全默认值 —— 它
+// 是「判官不可用时到底放不放行」的唯一开关。
+func judgeFailAction(stored string) string {
+	switch v := strings.TrimSpace(stored); v {
+	case "allow", "ask", "deny":
+		return v
+	}
+	return defaultJudgeFailAction
+}
+
 // judgeConfig reads the judge configuration from settings, applying defaults for
 // missing/invalid keys. Read fresh on each fallback judgement — the LLM call that
 // follows dwarfs a few KV reads, and freshness avoids a cache-invalidation path.
 func (i *Interceptor) judgeConfig() JudgeConfig {
+	failStored, _, _ := i.db.GetSetting(settingJudgeFailAction)
 	c := JudgeConfig{
 		Enabled:           i.db.GetBool(settingJudgeEnabled, false),
 		ProfileID:         int64(i.getSettingInt(settingJudgeProfileID, 0)),
 		TimeoutSeconds:    i.getSettingInt(settingJudgeTimeoutSecs, defaultJudgeTimeoutSecs),
-		FailAction:        i.getSettingChoice(settingJudgeFailAction, defaultJudgeFailAction, "allow", "ask", "deny"),
+		FailAction:        judgeFailAction(failStored),
 		AskTimeoutSeconds: i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs),
 		AskTimeoutAction:  i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
 	}
@@ -502,6 +520,80 @@ func judgeActionLabel(action string) string {
 	}
 }
 
+// 审批防疲劳（可用性参数，故可热改；安全边界不在这里）。T02 红线吸收，照 reArtex。
+const (
+	settingAskBurstThreshold  = "intercept_ask_burst_threshold"
+	settingAskBurstWindowSecs = "intercept_ask_burst_window_seconds"
+)
+
+const (
+	// defaultAskBurstThreshold 是窗口内「允许进入人工审批」的最大次数。
+	// 第 N+1 次起直接拒绝（不再打扰人），治「疲劳点 allow」的无限循环。
+	defaultAskBurstThreshold = 5
+	// defaultAskBurstWindowSecs 是计数窗口（秒）。
+	defaultAskBurstWindowSecs = 600
+)
+
+// AskBurstExceeded 判断该 agent 在时间窗内对某工具的审批请求是否已达阈值。
+//
+// 只对【有 agent 归属】的请求计数：会话侧没有 agent 归属，计了会误伤人。
+// 计数失败时返回 false（不升级）：这个计数是防疲劳措施、不是安全边界，
+// 误拒的代价（正常任务被卡死）高于漏拒的代价（人多点一次 allow）。
+func (i *Interceptor) AskBurstExceeded(ctx context.Context, toolName string) bool {
+	_, agentName := taskInfoFromCtx(ctx)
+	if agentName == "" {
+		return false
+	}
+	threshold := i.getSettingInt(settingAskBurstThreshold, defaultAskBurstThreshold)
+	if threshold <= 0 {
+		return false
+	}
+	window := i.getSettingInt(settingAskBurstWindowSecs, defaultAskBurstWindowSecs)
+	if window <= 0 {
+		window = defaultAskBurstWindowSecs
+	}
+	since := time.Now().Add(-time.Duration(window) * time.Second)
+	n, err := i.db.CountRecentInterceptAsks(agentName, toolName, since)
+	if err != nil {
+		return false
+	}
+	return n >= threshold
+}
+
+// defaultAskTimeoutSecs 是 DB 规则 ask 类的默认审批超时。
+//
+// 种子规则照抄了 timeout_enabled=false，照抄即「审批无限等待」——审批挂着
+// 不回来，人不在的时候这条面就永远卡住。默认给 60s 且超时即拒：超时放行
+// 等于「人不在就通过」。
+const defaultAskTimeoutSecs = 60
+
+// matchRule 把一条命中的 DB 规则变成 Decision。
+//
+// 抽成纯函数是为了能在没有数据库的环境里确定性地测「ask 类规则是否带默认
+// 超时」——那是一条安全默认值，只能靠纯函数测（走 DB 的路径要库就绪）。
+func matchRule(r db.InterceptRule) Decision {
+	msg := r.Message
+	if msg == "" {
+		msg = defaultMessage(r.Action, r.Name)
+	}
+	configJSON, _ := json.Marshal(r)
+	dec := Decision{
+		RuleName: r.Name, ConfigDigest: digestInput(configJSON),
+		Action:         r.Action,
+		Message:        msg,
+		RuleID:         r.ID,
+		TimeoutEnabled: r.TimeoutEnabled,
+		TimeoutSeconds: r.TimeoutSeconds,
+		TimeoutAction:  r.TimeoutAction,
+	}
+	if dec.Action == "ask" && !dec.TimeoutEnabled {
+		dec.TimeoutEnabled = true
+		dec.TimeoutSeconds = defaultAskTimeoutSecs
+		dec.TimeoutAction = "deny"
+	}
+	return dec
+}
+
 // Match evaluates the rule list (priority DESC) against a tool call.
 // Returns (Decision, true) for the first matching enabled rule, or
 // (Decision{}, false) if no rule matches.
@@ -510,41 +602,78 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	if err != nil || len(rules) == 0 {
 		return Decision{}, false
 	}
+	normalized := normalizeToolInput(input)
 	for _, r := range rules {
-		if ruleMatches(r, toolName, input) {
-			msg := r.Message
-			if msg == "" {
-				msg = defaultMessage(r.Action, r.Name)
-			}
-			configJSON, _ := json.Marshal(r.InterceptRule)
-			return Decision{
-				RuleName: r.Name, ConfigDigest: digestInput(configJSON),
-				Action:         r.Action,
-				Message:        msg,
-				RuleID:         r.ID,
-				TimeoutEnabled: r.TimeoutEnabled,
-				TimeoutSeconds: r.TimeoutSeconds,
-				TimeoutAction:  r.TimeoutAction,
-			}, true
+		if ruleMatches(r, toolName, input, normalized) {
+			return matchRule(r.InterceptRule), true
 		}
 	}
 	return Decision{}, false
 }
 
-func ruleMatches(r compiledRule, toolName string, input []byte) bool {
-	var subject string
+func ruleMatches(r compiledRule, toolName string, input []byte, normalized string) bool {
+	var subjects []string
 	switch r.MatchTarget {
 	case "tool_name":
-		subject = toolName
+		subjects = []string{toolName}
 	case "tool_input":
-		subject = string(input)
+		subjects = []string{string(input)}
+		if normalized != "" {
+			subjects = append(subjects, normalized)
+		}
 	default:
 		return false
 	}
 	if r.MatchType == "regex" {
-		return r.re != nil && r.re.MatchString(subject)
+		if r.re == nil {
+			return false
+		}
+		for _, s := range subjects {
+			if r.re.MatchString(s) {
+				return true
+			}
+		}
+		return false
 	}
-	return strings.Contains(subject, r.Pattern)
+	for _, s := range subjects {
+		if strings.Contains(s, r.Pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeToolInput 对入参做 JSON 深解码。norma 流式路径原样透传入参、
+// 不解码不重序列化，故 {"command":"\u0072m -rf /tmp"} 的字节里不存在字符
+// 'r'，词表正则永不命中。返回空串表示非 JSON 对象，调用方应只匹配 raw。
+func normalizeToolInput(input []byte) string {
+	if len(input) == 0 || input[0] != '{' {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(input, &m); err != nil {
+		return ""
+	}
+	fields := []string{"command", "text", "pattern", "file_path", "path", "query", "description", "content", "args"}
+	var b strings.Builder
+	for _, k := range fields {
+		v, ok := m[k]
+		if !ok {
+			continue
+		}
+		switch t := v.(type) {
+		case string:
+			b.WriteString(t)
+			b.WriteByte('\n')
+		default:
+			enc, err := json.Marshal(t)
+			if err == nil {
+				b.Write(enc)
+				b.WriteByte('\n')
+			}
+		}
+	}
+	return b.String()
 }
 
 func defaultMessage(action, name string) string {
@@ -571,6 +700,10 @@ func (i *Interceptor) Log(ctx context.Context, convID int64, dec Decision, toolN
 	if err == nil {
 		i.bindResult(ctx, id, audit)
 	}
+	// 被拦下的判定进审计链：intercept_pending 的行可以直接被改，链能报出断在第几条。
+	if status == "denied" {
+		i.appendAuditEvent(ctx, dec, toolName, input, "denied")
+	}
 }
 
 // HandleAsk creates a pending approval record and blocks until the user decides
@@ -591,6 +724,8 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 	if err != nil {
 		return false
 	}
+	// 人工审批也是判定动作，进审计链（放行/拒绝/超时都在这张 pending 行上）。
+	i.appendAuditEvent(ctx, dec, toolName, input, "ask")
 
 	i.bindResult(ctx, pendingID, audit)
 	ch := i.pending.add(pendingID)

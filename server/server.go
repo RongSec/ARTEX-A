@@ -782,6 +782,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tokens/usage", s.pgUsageStats) // 全局 llm_usage 聚合（仪表盘新版视图）
 
 	mux.HandleFunc("GET /api/audit", s.getAudit)
+	mux.HandleFunc("GET /api/audit/chain", s.auditChainVerify)
 	mux.HandleFunc("POST /api/gc", s.gc)
 	mux.HandleFunc("GET /api/traffic", s.getTraffic)
 	mux.HandleFunc("GET /api/traffic/hosts", s.getTrafficHosts)
@@ -3868,6 +3869,25 @@ func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"entries": t.Guard.Audit(), "attributions": t.Guard.Attributions()})
+}
+
+// auditChainVerify 校验安全判定审计链（T02 红线吸收）。
+//
+// 与 getAudit 的区别：getAudit 返回的是单任务内存态 guard 审计（进程退出即失），
+// 这里验的是全局 audit_events 哈希链的完整性 —— 平台拦截判定（deny/ask）有没有
+// 被人事后改库抹掉。intact=false 时 broken_at_seq 指出断在哪一条。
+// 只读、无副作用；链为空视为完整。
+func (s *Server) auditChainVerify(w http.ResponseWriter, r *http.Request) {
+	if s.m == nil || s.m.pg == nil {
+		writeErr(w, http.StatusServiceUnavailable, "数据库不可用")
+		return
+	}
+	seq, err := s.m.pg.VerifyAuditChain()
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"intact": false, "broken_at_seq": seq, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"intact": true, "broken_at_seq": 0})
 }
 
 // gc is a no-op stub (GC not yet implemented in the new asset store).

@@ -1,0 +1,205 @@
+package guard
+
+import (
+	"log"
+	"os"
+	"regexp"
+	"strings"
+
+	"github.com/Autumn-27/artex/intercept"
+)
+
+// ============================================================================
+// 代码级短路表 —— 红线吸收（artex-hs T02，摘取自 reArtex 限制强化方案 V2 §4
+// 的 G-01① 与 G-02①-a）
+//
+// 设计约束（V2 §6.3「安全类回退键脱离 settings 热改面」）：
+//  1. 必须是【代码常量】，不进 DB 规则行、不受任何 settings 键覆盖。
+//     理由：settings 热改无校验，持 JWT 者一次 PUT /api/settings 即可整体关闭
+//     全部防线（H2-A4）。DB 规则行同理可被 DELETE。
+//  2. 求值位置在 applyIntercept 的【最前面】，先于 IsToolEnabled。
+//     否则不在 intercept_enabled_tools 名单内的工具会直接放行，本表形同虚设。
+//  3. 回滚仅经编译期 feature flag（ShortCircuitEnabled）+ 环境变量 + 重启，
+//     不提供运行时开关。
+// ============================================================================
+
+// ShortCircuitEnabled 是本表的编译期/环境变量双重闸门。默认启用。
+//
+// 设为 false（改代码重编译）或 env ARTEX_DISABLE_SHORT_CIRCUIT=1（重启生效，
+// 无需重新构建镜像）可整体停用本表。仅限应急回滚——停用后平台退化为
+// 「仅 DB 规则」防线，而 DB 规则本身可被持 JWT 者热改（H2-A4）。
+var ShortCircuitEnabled = true
+
+// init 读取环境变量开关。放在 init 而非 shortCircuit 内部：env 读取每次调用
+// 都做没有意义，且便于启动日志里留下"本表是否生效"的可见痕迹。
+func init() {
+	disabled, raw := disableFlagFromEnv()
+	if disabled {
+		log.Printf("[guard] ⚠ 短路表已停用 (ARTEX_DISABLE_SHORT_CIRCUIT=%q)：平台仅剩 DB 规则防线", raw)
+	}
+}
+
+func disableFlagFromEnv() (bool, string) {
+	raw := os.Getenv("ARTEX_DISABLE_SHORT_CIRCUIT")
+	if raw == "" {
+		return false, ""
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		ShortCircuitEnabled = false
+		return true, raw
+	default:
+		log.Printf("[guard] ARTEX_DISABLE_SHORT_CIRCUIT=%q 非真值(1/true/yes/on)，短路表保持启用", raw)
+		return false, raw
+	}
+}
+
+// platformDenyTools 比 ask 更严的一档。MCP 注册是凭据汇：stdio 传输会以容器 root
+// 拉起任意二进制，http/sse 传输则把 env 字段当 HTTP header 回放。所以「新建 MCP」
+// 等价于「让平台对任意地址带任意 header 发请求」，不该由 agent 在测评中途自行开通。
+var platformDenyTools = map[string]bool{
+	"create_mcp": true,
+	"update_mcp": true,
+}
+
+// platformAskTools 是 G-01① 的对象：改平台配置的工具一律 ask，不直接 deny —— 建自定义
+// 工具 / skill 是 auto agent 的合法日常操作，拦死会废掉平台运维能力。MCP 见上。
+//
+// create_skill 不在此表：新建技能文件不覆盖既有行为，其后果由动作层护栏兜住
+// （护栏拦行为不拦内容，故写进 skill 的内容无法绕过工具层策略），日常操作不该
+// 被人工审批打断。它落在 platformAllowTools —— 显式判定放行，不是漏判。
+var platformAskTools = map[string]bool{
+	"create_custom_tool":    true,
+	"update_custom_tool":    true,
+	"update_skill_file":     true,
+	"delete_assets_by_host": true,
+}
+
+// platformAllowTools 是低危面：代码常量【显式判定放行】。
+//
+// 与「不命中短路表」的区别是本表存在的全部意义：不命中 = 漏判，平台工具
+// 就能绕开判官（G-01① 原漏洞）；显式 allow = 平台主动判了「这件事无害」，
+// 判定动作照样落审计链。
+//
+// 收录标准：① 不覆盖既有行为（新建不同于改写）；② 其后果由动作层护栏兜住
+// （护栏拦行为不拦内容，故写进 skill 的内容无法绕过工具层策略）。
+var platformAllowTools = map[string]bool{
+	"create_skill": true,
+}
+
+// platformCredentialRe 是 G-02①-a 的对象：只拦 ARTEX 平台自身的凭据。
+//
+// 收窄依据：agent 的工作目录是 <data>/sessions/<key>，即工作区就落在 data
+// 目录里。所以任何"按目录前缀一刀切"（如 /app/data/**/*.key、裸 /\.env\b）
+// 都会连带拦掉渗透目标上的证据文件，而 .env 恰恰是渗透最常要读的东西之一。
+// 故改为按【具体凭据文件】列举，而不是按目录或扩展名通配。
+//
+// 已覆盖的平台凭据（0.3.15 实测）：
+//
+//	/app/jwt.key                     —— 签发管理员 JWT 的签名密钥（现行位置：可执行文件同目录）
+//	/app/data/jwt.key                —— 旧版遗留位置（auth.go loadOrCreateJWTKey 的迁移源，
+//	                                    未迁移的存量安装里它仍在可浏览工作区）
+//	/app/.env                        —— 若日后挂载平台环境文件
+//	/app/data/traffic/_ca/*.pem|key|crt —— mitmproxy MITM CA 私钥/证书（traffic.go CaRootPath）
+//
+// /proc 族：worker 的 Bash 是 server 子进程、同 UID，可读 server 原始环境块，
+// 其中含 ANTHROPIC_API_KEY / ARTEX_PG_DSN。只能靠谓词拦（H2-A3）。注意只拦
+// environ/cmdline/mem，/proc/net/tcp 等本机侦察手法不受影响。
+//
+// 【本表的固有上限】这是对工具入参的字符串预筛，不是路径解析级强制。
+// `cat $(realpath ../../../jwt.key)` 这类经 shell 展开后才现形的路径绕得过。
+// 真正闭合要等 env 白名单 + 执行前 realpath 校验。
+var platformCredentialRe = regexp.MustCompile(
+	`(?i)(` +
+		// 平台签名密钥（现行 + 旧版遗留两处位置）
+		`/app/(?:data/)?jwt\.key` +
+		`|/app/\.env\b` +
+		// MITM CA 私钥/证书
+		`|/app/data/traffic/_ca/[^\s"']*\.(?:pem|key|crt)` +
+		// 相对路径回溯到平台密钥（cwd 为 /app/data/sessions/<key>：
+		// 两层 .. 到 /app/data/jwt.key（旧版遗留位），三层 .. 到 /app/jwt.key）。
+		// 少于一层的 ../jwt.key 是同级的会话/目标文件，不该拦。
+		`|(?:\.\./){2,}jwt\.key` +
+		// /proc 族：任意 PID 的环境块 / 命令行 / 内存。
+		// environ 用一条覆盖形态的规则收口：pid 段可以是数字、self、*、
+		// [0-9]*、$$ 等任意写法，文件名段也可能是 glob（envi*on）。
+		// 只认字面形态的话，cat /proc/*/environ 就绕过去了。
+		`|/proc/[^\s"']*envi[^\s"']*` +
+		`|/proc/\d+/cmdline` +
+		`|/proc/\d+/mem` +
+		`)`,
+)
+
+// 宽字符类补充规则：覆盖 jwt.key 被插入空白/分隔符的绕过变形
+// （如 "/app/j w t . k e y"）。深解码只处理 JSON 转义，对字面插入的
+// 空格无效，故此条不是冗余。
+//
+// 必须带 /app/ 前缀：裸的 `j[\s._-]*w…` 会连渗透目标上名为 jwt.key 的
+// 文件一起拦掉，而那可能正是要取的证据。
+var platformCredentialLooseRe = regexp.MustCompile(
+	`(?i)/app/(?:data/)?j[\s._-]*w[\s._-]*t[\s._-]*\.?[\s._-]*k[\s._-]*e[\s._-]*y`)
+
+const (
+	msgPlatformAsk = "该工具用于修改平台自身配置（建/改自定义工具、skill、资产库）。" +
+		"已转人工确认，确认后即可执行。"
+	msgMCPDeny = "MCP 注册属于凭据汇：stdio 会以容器 root 拉起任意二进制，" +
+		"http/sse 会把 env 当 HTTP header 对任意地址回放。agent 不得自行开通，" +
+		"需要时请由 owner 在管理界面配置。"
+	msgSensitiveDeny = "该路径指向 ARTEX 平台自身的签名密钥或进程环境" +
+		"（含 LLM API Key / 数据库口令），属于控制面，不是渗透目标资产。已禁止读取。"
+)
+
+// shortCircuit 在 applyIntercept 最前面求值。返回非 nil 的 Decision 表示
+// 本表命中，应当直接执行该动作，不再走 DB 规则与 judge。
+//
+// 动作语义：
+//
+//	deny —— 硬拦，无人工放行路径（平台自身凭据、MCP 注册）
+//	ask  —— 转人工审批（改写既有行为/可执行面、删证据库）
+//	allow —— 代码常量显式判定放行（低危面，如新建技能文件）
+//
+// RuleName 一律带 "[代码常量]" 前缀：db.interceptSource 靠它把记录归为
+// shortcircuit 来源（跨包约定，见 guard/shortcircuit_source_test.go）。
+func shortCircuit(toolName string, input []byte) *intercept.Decision {
+	if !ShortCircuitEnabled {
+		return nil
+	}
+	// 必须独立求值而非并入 platformAskTools：deny 无人工放行路径，ask 有 60s 超时兜底，合并即丢一档语义。
+	if platformDenyTools[toolName] {
+		return &intercept.Decision{
+			Action:   "deny",
+			RuleName: "[代码常量] MCP 注册属凭据汇",
+			Message:  msgMCPDeny,
+		}
+	}
+	// G-01①：平台工具一律 ask
+	if platformAskTools[toolName] {
+		return &intercept.Decision{
+			Action:   "ask",
+			RuleName: "[代码常量] 平台工具需人工确认",
+			Message:  msgPlatformAsk,
+			// ask 类规则默认启用超时（种子规则 timeout_enabled=false
+			// 照抄即无限等待）。60s 超时 → deny。
+			TimeoutEnabled: true,
+			TimeoutSeconds: 60,
+			TimeoutAction:  "deny",
+		}
+	}
+	// 低危面：显式放行（仍是代码常量判定，不是漏判）
+	if platformAllowTools[toolName] {
+		return &intercept.Decision{
+			Action:   "allow",
+			RuleName: "[代码常量] 平台低危工具放行",
+			Message:  "新建技能文件不改变既有行为，按平台策略放行。",
+		}
+	}
+	// G-02①-a：平台凭据/进程环境 deny
+	if platformCredentialRe.Match(input) || platformCredentialLooseRe.Match(input) {
+		return &intercept.Decision{
+			Action:   "deny",
+			RuleName: "[代码常量] 平台凭据/进程环境",
+			Message:  msgSensitiveDeny,
+		}
+	}
+	return nil
+}

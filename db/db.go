@@ -279,6 +279,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV3(); err != nil {
 		return fmt.Errorf("seed intercept rules v3: %w", err)
 	}
+	if err := d.seedDefaultInterceptRulesV4(); err != nil {
+		return fmt.Errorf("seed intercept rules v4: %w", err)
+	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
 	}
@@ -614,4 +617,85 @@ WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 		return fmt.Errorf("rule %q: %w", name, err)
 	}
 	return d.SetSetting("intercept_default_rules_v3", "done")
+}
+
+// seedDefaultInterceptRulesV4 closes several high-risk gaps the v1–v3 seeds miss, all
+// chosen to be *irreversibly destructive operations that recon / exploitation never
+// needs* — so denying them hardens the platform without impeding a pentest:
+//   - cloud object-store wipe (aws s3 rm --recursive / rb / s3api delete-bucket|objects)
+//   - infrastructure teardown (terraform destroy)
+//   - scheduled-task wipe (crontab -r)
+//   - raw block-device overwrite via redirect, broader than v2's sd-only
+//     (> /dev/nvme|vd|xvd|mapper|disk…)
+//   - the whole Windows destructive surface the Unix-oriented v1 set ignores
+//     (format X:, del|rd /s recursive delete, diskpart, Format-Volume, Clear-Disk)
+//   - the PowerShell analogue of rm -rf (Remove-Item -Recurse -Force)
+//
+// （T02 红线吸收：六条规则原文照摘自 ARTEX-God v0.3.15 派生库的
+// seedDefaultInterceptRulesV4；注意 artex-full-main 的同名 V4 是另一件事——
+// 它改写 v1 的「删除系统关键目录」规则，本处不取。）
+//
+// Patterns match the JSON-encoded tool input (same as v1–v3) and use [^|\n"] guards so a
+// match can't span a pipe / newline / JSON string boundary. Own settings flag + per-name
+// WHERE NOT EXISTS guard, so it lands idempotently on DBs that already ran v1/v2/v3 (where
+// editing the earlier seeds would have no effect), and user edits are never overwritten.
+func (d *DB) seedDefaultInterceptRulesV4() error {
+	if v, _, _ := d.GetSetting("intercept_default_rules_v4"); v == "done" {
+		return nil
+	}
+	type rule struct {
+		name     string
+		pattern  string
+		message  string
+		priority int
+	}
+	rules := []rule{
+		{
+			name:     "[内置] 云对象存储批量删除 aws s3 rm --recursive / rb",
+			pattern:  `(?i)\baws\s+s3\s+rm\b[^|\n]{0,200}--recursive\b|\baws\s+s3\s+rb\b|\baws\s+s3api\s+delete-(?:bucket|objects)\b`,
+			message:  "禁止通过 aws s3 批量删除对象或删除存储桶（rm --recursive / rb / s3api delete-bucket|delete-objects），可能不可逆地清空目标数据",
+			priority: 90,
+		},
+		{
+			name:     "[内置] 基础设施销毁 terraform destroy",
+			pattern:  `(?i)\bterraform\s+destroy\b`,
+			message:  "禁止执行 terraform destroy，会销毁已部署的基础设施",
+			priority: 90,
+		},
+		{
+			name:     "[内置] 清空计划任务 crontab -r",
+			pattern:  `(?i)\bcrontab\s+-r\b`,
+			message:  "禁止执行 crontab -r（删除当前用户的全部计划任务）",
+			priority: 100,
+		},
+		{
+			name:     "[内置] 覆写磁盘块设备（重定向到 /dev）",
+			pattern:  `>\s*/dev/(?:sd|hd|vd|xvd|nvme|mapper|disk)`,
+			message:  "禁止将输出重定向覆写到磁盘块设备（> /dev/sdX、/dev/nvmeX 等），会损毁磁盘数据",
+			priority: 100,
+		},
+		{
+			name:     "[内置] Windows 破坏性删除 / 格式化",
+			pattern:  `(?i)\bformat\s+[a-z]:|\b(?:del|erase)\b[^|\n"]{0,80}\s/s\b|\b(?:rd|rmdir)\b[^|\n"]{0,80}\s/s\b|\bFormat-Volume\b|\bClear-Disk\b|\bdiskpart\b`,
+			message:  "禁止 Windows 破坏性磁盘/删除操作（format 盘符、del|rd /s 递归删除、diskpart、Format-Volume、Clear-Disk）",
+			priority: 100,
+		},
+		{
+			name:     "[内置] PowerShell 递归强制删除 Remove-Item -Recurse -Force",
+			pattern:  `(?i)\bRemove-Item\b[^|\n]{0,120}-Recurse\b[^|\n]{0,60}-Force\b|\bRemove-Item\b[^|\n]{0,120}-Force\b[^|\n]{0,60}-Recurse\b`,
+			message:  "禁止 PowerShell 递归强制删除（Remove-Item -Recurse -Force），等同 rm -rf，可能永久损坏系统或靶机环境",
+			priority: 100,
+		},
+	}
+	for _, r := range rules {
+		if _, err := d.Exec(`
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+SELECT $1, true, $2, 'tool_input', 'regex', $3, 'deny', $4, false, 60, 'deny'
+WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
+			r.name, r.priority, r.pattern, r.message,
+		); err != nil {
+			return fmt.Errorf("rule %q: %w", r.name, err)
+		}
+	}
+	return d.SetSetting("intercept_default_rules_v4", "done")
 }
