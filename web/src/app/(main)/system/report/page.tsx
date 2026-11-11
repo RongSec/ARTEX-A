@@ -1,52 +1,73 @@
 "use client";
 
-// 报告中心（artex-hs T16(2/3)）：模板管理 + 编辑 + 调试 + 生成历史。
+// 报告中心（artex-hs T16 起，T21 改版）：模板管理 + 对话调模板 + 实时预览 +
+// 导入/导出 skill + 生成历史。
 //
-// 三栏（lg 起）：
-//   左 = 模板列表（新建/复制/设默认/删）
-//   中 = 模板编辑器（名称/输出语/出具方/人员表/章节骨架勾选+排序/style 关键
-//        字段/prompts 文本域） + 调试区（选任务或项目+locale+format→试渲染
-//        调 render-draft→浏览器下载；「保存后正式生成」→ 建 job→轮询→下载）
-//   右 = 生成历史（状态/警告 tooltip 含伪资产剔除/下载/删）
+// 三列（lg 起，设计 §1.2A）：
+//   左 = 模板列表（新建/复制/设默认/删）+ 生成历史入口（Dialog）
+//   中 = 实时预览（iframe，render-draft format=html；800ms 防抖+AbortController；
+//        数据源=样例/任务/项目；模板走 inline 草稿=未保存也所见即所调）
+//   右 = 对话调模板（template-chat，补丁合并进草稿不落库）+ 设置折叠区
+//        （原 TemplateEditor 收进来，未重写）+ 正式生成
+// 工具条：「导入模板」（docx/md 上传反推 / 从 skill 读预填，均不自动建）与
+// 「转成 Skill」（幂等哨兵覆盖）。
+// URL ?project_id=&template_id=（T19 项目页跳转的接收端）：进页预选模板并把
+// 预览源切到该项目。
 //
 // 风格照 system/notify + function/projects 页（shadcn、既有表格/对话框，不引
 // 新依赖）。章节骨架的 key 枚举与后端 db.ReportSectionKey 同步。
 
 import * as React from "react";
+import { useSearchParams } from "next/navigation";
 
 import {
   CopyIcon,
   DownloadIcon,
+  FileInputIcon,
   FileTextIcon,
   GripVerticalIcon,
+  HistoryIcon,
   PlusIcon,
   RefreshCwIcon,
+  SendIcon,
+  SparklesIcon,
   StarIcon,
   Trash2Icon,
+  WandSparklesIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { TemplateChat } from "./_components/template-chat";
+import { TemplatePreview, type PreviewDebugForm, type PreviewSource } from "./_components/template-preview";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Separator } from "@/components/ui/separator";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import type {
+  ReportImportResult,
   ReportJob,
   ReportPerson,
   ReportSection,
   ReportSectionKey,
   ReportTemplate,
   ReportTemplateInput,
+  SkillItem,
   Task,
 } from "@/lib/types";
 
@@ -65,20 +86,26 @@ const LOCALES = [
   { v: "en-US", label: "English" },
 ];
 
-// emptySkeleton：默认全开六章（与后端 ParseSkeletonJSON(nil) 同构）。
+// defaultSkeleton：默认全开六章（与后端 ParseSkeletonJSON(nil) 同构）。
 function defaultSkeleton(): ReportSection[] {
   return SECTION_META.map((m) => ({ key: m.key, title: m.title, enabled: true }));
 }
 
-interface DraftForm {
-  scope: "task" | "project";
-  task_id: string;
-  project_id: string;
-  locale: string;
-  format: "docx" | "md";
+export default function ReportCenterPage() {
+  // useSearchParams 在静态导出下要求 Suspense 边界（CSR 预渲染填充）。
+  return (
+    <React.Suspense fallback={null}>
+      <ReportCenterInner />
+    </React.Suspense>
+  );
 }
 
-export default function ReportCenterPage() {
+function ReportCenterInner() {
+  const searchParams = useSearchParams();
+  // T19 项目详情页跳转参数（一次性消费，存 ref 防刷新列表时反复覆盖选择）。
+  const urlTemplateId = React.useRef<number | null>(readIntParam(searchParams.get("template_id")));
+  const urlProjectId = React.useRef<string>(searchParams.get("project_id") ?? "");
+
   const [templates, setTemplates] = React.useState<ReportTemplate[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
@@ -88,18 +115,49 @@ export default function ReportCenterPage() {
 
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [projects, setProjects] = React.useState<{ id: number; name: string }[]>([]);
-  const [debugForm, setDebugForm] = React.useState<DraftForm>({
-    scope: "task",
+  const [previewSource, setPreviewSource] = React.useState<PreviewSource>("demo");
+  const [previewForm, setPreviewForm] = React.useState<PreviewDebugForm>({
+    task_id: "",
+    project_id: "",
+    locale: "zh-CN",
+  });
+  const [chatTick, setChatTick] = React.useState(0); // 对话应用补丁 +1 → 预览立即重渲
+
+  // URL 预填（进页一次）：project_id → 预览源切项目并带上；template_id 消费在
+  // loadTemplates 里（要等列表回来才知道该模板存不存在）。
+  React.useEffect(() => {
+    const pid = urlProjectId.current;
+    if (pid) {
+      setPreviewSource("project");
+      setPreviewForm((f) => ({ ...f, project_id: pid }));
+    }
+  }, []);
+
+  // 生成对话框（正式 job）：范围跟随预览源（demo=样例不可正式生成）。
+  const [genOpen, setGenOpen] = React.useState(false);
+  const [genForm, setGenForm] = React.useState<{ scope: "task" | "project"; task_id: string; project_id: string; locale: string; format: "docx" | "md" }>({
+    scope: "project",
     task_id: "",
     project_id: "",
     locale: "zh-CN",
     format: "docx",
   });
-  const [rendering, setRendering] = React.useState(false);
 
   const [jobs, setJobs] = React.useState<ReportJob[]>([]);
   const [jobsLoading, setJobsLoading] = React.useState(false);
+  const [historyOpen, setHistoryOpen] = React.useState(false);
   const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // 导入对话框（docx/md）。
+  const [importDocxOpen, setImportDocxOpen] = React.useState(false);
+  const [importing, setImporting] = React.useState(false);
+  const [importResult, setImportResult] = React.useState<ReportImportResult | null>(null);
+  const [importName, setImportName] = React.useState("");
+  // 导入对话框（skill）。
+  const [importSkillOpen, setImportSkillOpen] = React.useState(false);
+  const [skills, setSkills] = React.useState<SkillItem[]>([]);
+  const [skillsLoading, setSkillsLoading] = React.useState(false);
+  const [skillName, setSkillName] = React.useState("");
 
   const selected = React.useMemo(() => templates.find((t) => t.id === selectedId) ?? null, [templates, selectedId]);
 
@@ -110,6 +168,12 @@ export default function ReportCenterPage() {
       const list = await api.reportTemplates();
       setTemplates(list);
       setSelectedId((cur) => {
+        // URL template_id 只在首次加载时消费一次（ref 清空后不再干扰）。
+        const want = urlTemplateId.current;
+        if (want != null) {
+          urlTemplateId.current = null;
+          if (list.some((t) => t.id === want)) return want;
+        }
         if (keepSelection && cur != null && list.some((t) => t.id === cur)) return cur;
         return list[0]?.id ?? null;
       });
@@ -145,7 +209,7 @@ export default function ReportCenterPage() {
       .catch(() => undefined);
   }, [loadTemplates, loadJobs]);
 
-  // 选中模板变化 → 载入编辑态（复制深避免污染列表）。
+  // 选中模板变化 → 载入编辑态（深拷避免污染列表）。
   React.useEffect(() => {
     if (!selected) {
       setDraft(null);
@@ -246,6 +310,29 @@ export default function ReportCenterPage() {
     setDirty(true);
   };
 
+  // 对话面板应用服务端合并草稿：只取内容字段进编辑态（后端多带的
+  // id/只读键忽略），并触发预览立即重渲。
+  const applyChatTemplate = (t: ReportTemplateInput) => {
+    setDraft((d) => {
+      if (!d) return t;
+      const picked: ReportTemplateInput = {
+        ...d,
+        name: t.name ?? d.name,
+        output_lang: t.output_lang ?? d.output_lang,
+        skeleton: t.skeleton ?? d.skeleton,
+        style: t.style ?? d.style,
+        prompts: t.prompts ?? d.prompts,
+        issuer: t.issuer ?? d.issuer,
+        personnel: t.personnel ?? d.personnel,
+        cvss_enabled: t.cvss_enabled ?? d.cvss_enabled,
+        remark: t.remark ?? d.remark,
+      };
+      return picked;
+    });
+    setDirty(true);
+    setChatTick((x) => x + 1);
+  };
+
   // ---- CRUD ----
   const save = async () => {
     if (!draft) return;
@@ -310,6 +397,89 @@ export default function ReportCenterPage() {
     }
   };
 
+  // 转成 Skill（T20 端点，幂等：同哨兵目录覆盖；非哨兵 409 如实报错）。
+  const [toSkillBusy, setToSkillBusy] = React.useState(false);
+  const toSkill = async () => {
+    if (selectedId == null) return;
+    setToSkillBusy(true);
+    try {
+      const r = await api.reportTemplateToSkill(selectedId);
+      toast.success(`已导出 skill：${r.skill_name}（skills/ 目录，可拷贝复用/再导入）`);
+    } catch (e) {
+      toast.error(`转成 Skill 失败：${(e as Error).message}`);
+    } finally {
+      setToSkillBusy(false);
+    }
+  };
+
+  // 导入：docx/md 上传反推（不自动建，确认后落库）。
+  const pickImportFile = async (file: File | null) => {
+    if (!file) return;
+    setImporting(true);
+    setImportResult(null);
+    try {
+      const r = await api.importTemplateDocx(file);
+      setImportResult(r);
+      setImportName(r.draft.name || file.name.replace(/\.(docx|md|markdown|txt)$/i, ""));
+      if (r.degraded) toast.warning("LLM 归纳不可用，已按标题结构规则映射（可在详情继续调整）", { duration: 8000 });
+    } catch (e) {
+      toast.error(`导入失败：${(e as Error).message}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+  const confirmImportDocx = async () => {
+    if (!importResult) return;
+    const name = importName.trim() || importResult.draft.name;
+    if (!name) {
+      toast.error("请填写模板名");
+      return;
+    }
+    try {
+      const t = await api.createReportTemplate({ ...importResult.draft, name });
+      await loadTemplates(false);
+      setSelectedId(t.id);
+      setImportDocxOpen(false);
+      setImportResult(null);
+      toast.success(`模板已导入：${t.name}`);
+    } catch (e) {
+      toast.error(`建模板失败：${(e as Error).message}`);
+    }
+  };
+
+  // 导入：从 skill 读预填体（列 skills → 选一个 → 建模板）。
+  const openImportSkill = async () => {
+    setImportSkillOpen(true);
+    setSkillName("");
+    setSkillsLoading(true);
+    try {
+      setSkills(await api.skills());
+    } catch (e) {
+      toast.error(`加载 skills 失败：${(e as Error).message}`);
+    } finally {
+      setSkillsLoading(false);
+    }
+  };
+  const confirmImportSkill = async () => {
+    if (!skillName) {
+      toast.error("请选择一个 skill");
+      return;
+    }
+    setImporting(true);
+    try {
+      const r = await api.reportTemplateFromSkill(skillName);
+      const t = await api.createReportTemplate(r.draft);
+      await loadTemplates(false);
+      setSelectedId(t.id);
+      setImportSkillOpen(false);
+      toast.success(`已从 skill 导入模板：${t.name}`);
+    } catch (e) {
+      toast.error(`导入失败：${(e as Error).message}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+
   const [confirmDel, setConfirmDel] = React.useState<ReportTemplate | null>(null);
   const doDelete = async () => {
     if (!confirmDel) return;
@@ -324,34 +494,20 @@ export default function ReportCenterPage() {
     }
   };
 
-  // ---- 调试：试渲染（同步小样，不落库） ----
-  const renderDraft = async () => {
-    if (!debugFormHasTarget(debugForm)) {
-      toast.error("请选择任务或项目");
-      return;
-    }
-    setRendering(true);
-    try {
-      const { filename, warning } = await api.renderReportDraft({
-        scope: debugForm.scope,
-        task_id: debugForm.scope === "task" ? Number(debugForm.task_id) : undefined,
-        project_id: debugForm.scope === "project" ? Number(debugForm.project_id) : undefined,
-        template_id: selectedId ?? undefined,
-        locale: debugForm.locale || undefined,
-        format: debugForm.format,
-      });
-      toast.success(`小样已下载：${filename}`);
-      if (warning) toast.warning(warning, { duration: 8000 });
-    } catch (e) {
-      toast.error(`试渲染失败：${(e as Error).message}`);
-    } finally {
-      setRendering(false);
-    }
+  // ---- 正式生成（建 job→轮询）：对话框确认 ----
+  const openGenerate = () => {
+    // 默认跟随当前预览上下文；demo 样例不可正式生成→回项目/任务首个。
+    setGenForm((g) => ({
+      ...g,
+      scope: previewSource === "project" ? "project" : previewSource === "task" ? "task" : g.scope,
+      project_id: previewSource === "project" ? previewForm.project_id : g.project_id,
+      task_id: previewSource === "task" ? previewForm.task_id : g.task_id,
+      locale: previewForm.locale || g.locale,
+    }));
+    setGenOpen(true);
   };
-
-  // ---- 正式生成（建 job→轮询） ----
   const generate = async () => {
-    if (!debugFormHasTarget(debugForm)) {
+    if (genForm.scope === "task" ? !genForm.task_id : !genForm.project_id) {
       toast.error("请选择任务或项目");
       return;
     }
@@ -361,14 +517,16 @@ export default function ReportCenterPage() {
     }
     try {
       const job = await api.reportGenerate({
-        scope: debugForm.scope,
-        task_id: debugForm.scope === "task" ? Number(debugForm.task_id) : undefined,
-        project_id: debugForm.scope === "project" ? Number(debugForm.project_id) : undefined,
+        scope: genForm.scope,
+        task_id: genForm.scope === "task" ? Number(genForm.task_id) : undefined,
+        project_id: genForm.scope === "project" ? Number(genForm.project_id) : undefined,
         template_id: selectedId ?? undefined,
-        locale: debugForm.locale || undefined,
-        format: debugForm.format,
+        locale: genForm.locale || undefined,
+        format: genForm.format,
       });
       toast.success(`报告任务 #${job.id} 已提交`);
+      setGenOpen(false);
+      setHistoryOpen(true);
       await loadJobs();
     } catch (e) {
       toast.error(`生成失败：${(e as Error).message}`);
@@ -402,19 +560,41 @@ export default function ReportCenterPage() {
             <h1 className="flex items-center gap-2 text-lg font-semibold">
               <FileTextIcon className="size-5" /> 报告中心
             </h1>
-            <p className="text-muted-foreground text-sm">管理交付报告模板、调试渲染并生成/下载 Word 报告。</p>
+            <p className="text-muted-foreground text-sm">对话调整模板、实时预览结构、导入/导出 skill 并生成 Word 报告。</p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button variant="outline" size="sm" onClick={() => void loadTemplates(true)} disabled={loading}>
               <RefreshCwIcon className={loading ? "animate-spin" : ""} /> 刷新
             </Button>
+            <Button variant="outline" size="sm" onClick={() => setHistoryOpen(true)}>
+              <HistoryIcon /> 生成历史
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm">
+                  <FileInputIcon /> 导入模板
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => setImportDocxOpen(true)}>从 Word/Markdown 文档反推…</DropdownMenuItem>
+                <DropdownMenuItem onClick={() => void openImportSkill()}>从 Skill 导入…</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="outline" size="sm" onClick={() => void toSkill()} disabled={selectedId == null || toSkillBusy}>
+                  {toSkillBusy ? <Spinner /> : <SendIcon data-icon="inline-start" className="rotate-[-35deg]" />} 转成 Skill
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>把当前模板导出为 skills/ 目录下的报告模板 skill（幂等覆盖）</TooltipContent>
+            </Tooltip>
             <Button size="sm" onClick={createNew}>
               <PlusIcon /> 新建模板
             </Button>
           </div>
         </div>
 
-        <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)_360px]">
+        <div className="grid gap-4 lg:grid-cols-[230px_minmax(0,1.4fr)_minmax(0,1fr)] lg:items-stretch lg:gap-6">
           {/* 左：模板列表 */}
           <Card className="flex flex-col">
             <CardHeader className="pb-2">
@@ -428,7 +608,7 @@ export default function ReportCenterPage() {
               ) : templates.length === 0 ? (
                 <p className="text-muted-foreground p-4 text-center text-sm">暂无模板，点「新建模板」。</p>
               ) : (
-                <ScrollArea className="max-h-[70vh]">
+                <ScrollArea className="max-h-[72vh]">
                   <div className="flex flex-col gap-1 pr-2">
                     {templates.map((t) => (
                       <button
@@ -482,81 +662,269 @@ export default function ReportCenterPage() {
             </CardContent>
           </Card>
 
-          {/* 中：编辑器 + 调试区 */}
-          <Card className="flex flex-col">
-            <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm">{selectedId == null ? "新建模板" : "编辑模板"}</CardTitle>
-              <div className="flex items-center gap-2">
-                {dirty && <Badge variant="secondary">未保存</Badge>}
-                <Button size="sm" onClick={() => void save()} disabled={saving || !draft}>
-                  {saving ? <Spinner /> : null} 保存
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent className="flex-1 space-y-4">
-              {!draft ? (
-                <p className="text-muted-foreground py-10 text-center text-sm">选择或新建一个模板开始编辑。</p>
-              ) : (
-                <TemplateEditor
-                  draft={draft}
-                  patch={patch}
-                  moveSection={moveSection}
-                  toggleSection={toggleSection}
-                  renameSection={renameSection}
-                  setPerson={setPerson}
-                  addPerson={addPerson}
-                  removePerson={removePerson}
-                  setPrompt={setPrompt}
-                  setStyle={setStyle}
-                />
-              )}
-
-              {draft && (
-                <>
-                  <Separator />
-                  <DebugPanel
-                    form={debugForm}
-                    setForm={setDebugForm}
-                    tasks={tasks}
-                    projects={projects}
-                    rendering={rendering}
-                    onRenderDraft={() => void renderDraft()}
-                    onGenerate={() => void generate()}
-                  />
-                </>
-              )}
+          {/* 中：实时预览 */}
+          <Card className="flex min-h-[60vh] flex-col lg:min-h-0">
+            <CardContent className="flex min-h-0 flex-1 flex-col p-3">
+              <TemplatePreview
+                draft={draft}
+                source={previewSource}
+                setSource={setPreviewSource}
+                form={previewForm}
+                setForm={setPreviewForm}
+                tasks={tasks}
+                projects={projects}
+                chatTick={chatTick}
+              />
             </CardContent>
           </Card>
 
-          {/* 右：生成历史 */}
-          <Card className="flex flex-col">
-            <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm">生成历史</CardTitle>
+          {/* 右：对话 + 设置（折叠） */}
+          <div className="flex min-h-0 flex-col gap-4">
+            <Card className="flex min-h-[40vh] flex-col lg:min-h-0 lg:flex-1">
+              <CardContent className="flex min-h-0 flex-1 flex-col p-3">
+                <TemplateChat
+                  templateId={selectedId}
+                  draft={draft}
+                  onApplyTemplate={applyChatTemplate}
+                  locale={previewForm.locale}
+                />
+              </CardContent>
+            </Card>
+
+            <Collapsible defaultOpen={false} className="shrink-0">
+              <Card>
+                <CollapsibleTrigger asChild>
+                  <CardHeader className="cursor-pointer py-3">
+                    <div className="flex w-full items-center justify-between">
+                      <CardTitle className="flex items-center gap-2 text-sm">
+                        <WandSparklesIcon className="size-4" /> 设置
+                      </CardTitle>
+                      <div className="flex items-center gap-2">
+                        {dirty && <Badge variant="secondary">未保存</Badge>}
+                        <span className="text-muted-foreground text-xs">模板字段编辑</span>
+                      </div>
+                    </div>
+                  </CardHeader>
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <CardContent className="space-y-3">
+                    {!draft ? (
+                      <p className="text-muted-foreground py-6 text-center text-sm">选择或新建一个模板开始编辑。</p>
+                    ) : (
+                      <>
+                        <div className="max-h-[44vh] overflow-y-auto pr-1">
+                          <TemplateEditor
+                            draft={draft}
+                            patch={patch}
+                            moveSection={moveSection}
+                            toggleSection={toggleSection}
+                            renameSection={renameSection}
+                            setPerson={setPerson}
+                            addPerson={addPerson}
+                            removePerson={removePerson}
+                            setPrompt={setPrompt}
+                            setStyle={setStyle}
+                          />
+                        </div>
+                        <div className="flex gap-2">
+                          <Button size="sm" onClick={() => void save()} disabled={saving}>
+                            {saving ? <Spinner /> : null} 保存
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={openGenerate}>
+                            <SparklesIcon /> 正式生成
+                          </Button>
+                        </div>
+                      </>
+                    )}
+                  </CardContent>
+                </CollapsibleContent>
+              </Card>
+            </Collapsible>
+          </div>
+        </div>
+      </div>
+
+      {/* 生成历史 Dialog */}
+      <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center justify-between">
+              生成历史
               <Button variant="ghost" size="icon" onClick={() => void loadJobs()} disabled={jobsLoading}>
                 <RefreshCwIcon className={jobsLoading ? "animate-spin" : ""} />
               </Button>
-            </CardHeader>
-            <CardContent className="p-2">
-              {jobs.length === 0 ? (
-                <p className="text-muted-foreground p-4 text-center text-sm">暂无生成记录。</p>
+            </DialogTitle>
+          </DialogHeader>
+          {jobs.length === 0 ? (
+            <p className="text-muted-foreground py-8 text-center text-sm">暂无生成记录。</p>
+          ) : (
+            <ScrollArea className="max-h-[60vh]">
+              <div className="flex flex-col gap-2 pr-2">
+                {jobs.map((j) => (
+                  <JobRow key={j.id} job={j} onDownload={() => void downloadJob(j)} onDelete={() => void delJob(j)} />
+                ))}
+              </div>
+            </ScrollArea>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* 正式生成确认 Dialog */}
+      <Dialog open={genOpen} onOpenChange={setGenOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>正式生成报告</DialogTitle>
+          </DialogHeader>
+          <div className="grid gap-3 py-2">
+            <Field label="范围">
+              <NativeSelect
+                value={genForm.scope}
+                onChange={(e) => setGenForm((f) => ({ ...f, scope: e.target.value as "task" | "project" }))}
+              >
+                <NativeSelectOption value="task">单任务</NativeSelectOption>
+                <NativeSelectOption value="project">项目汇总</NativeSelectOption>
+              </NativeSelect>
+            </Field>
+            <Field label={genForm.scope === "task" ? "任务" : "项目"}>
+              {genForm.scope === "task" ? (
+                <NativeSelect value={genForm.task_id} onChange={(e) => setGenForm((f) => ({ ...f, task_id: e.target.value }))}>
+                  <NativeSelectOption value="">— 选择任务 —</NativeSelectOption>
+                  {tasks.map((t) => (
+                    <NativeSelectOption key={t.id} value={t.id}>
+                      {t.name || t.description.slice(0, 30)}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
               ) : (
-                <ScrollArea className="max-h-[78vh]">
-                  <div className="flex flex-col gap-2 pr-2">
-                    {jobs.map((j) => (
-                      <JobRow
-                        key={j.id}
-                        job={j}
-                        onDownload={() => void downloadJob(j)}
-                        onDelete={() => void delJob(j)}
-                      />
-                    ))}
-                  </div>
-                </ScrollArea>
+                <NativeSelect value={genForm.project_id} onChange={(e) => setGenForm((f) => ({ ...f, project_id: e.target.value }))}>
+                  <NativeSelectOption value="">— 选择项目 —</NativeSelectOption>
+                  {projects.map((pr) => (
+                    <NativeSelectOption key={pr.id} value={String(pr.id)}>
+                      {pr.name}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
               )}
-            </CardContent>
-          </Card>
-        </div>
-      </div>
+            </Field>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="输出语言">
+                <NativeSelect value={genForm.locale} onChange={(e) => setGenForm((f) => ({ ...f, locale: e.target.value }))}>
+                  {LOCALES.map((l) => (
+                    <NativeSelectOption key={l.v} value={l.v}>
+                      {l.label}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              </Field>
+              <Field label="格式">
+                <NativeSelect
+                  value={genForm.format}
+                  onChange={(e) => setGenForm((f) => ({ ...f, format: e.target.value as "docx" | "md" }))}
+                >
+                  <NativeSelectOption value="docx">Word (.docx)</NativeSelectOption>
+                  <NativeSelectOption value="md">Markdown (.md)</NativeSelectOption>
+                </NativeSelect>
+              </Field>
+            </div>
+            <p className="text-muted-foreground text-xs">
+              正式生成使用**已保存**的模板（当前选择：{selected ? selected.name : "默认模板"}），进队列异步渲染并落历史。
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setGenOpen(false)}>
+              取消
+            </Button>
+            <Button onClick={() => void generate()}>提交生成</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 导入模板（docx/md） */}
+      <Dialog open={importDocxOpen} onOpenChange={(o) => !importing && setImportDocxOpen(o)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>从文档导入模板</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 py-1">
+            <input
+              type="file"
+              accept=".docx,.md,.markdown,.txt"
+              className="text-sm"
+              disabled={importing}
+              onChange={(e) => void pickImportFile(e.target.files?.[0] ?? null)}
+            />
+            {importing && (
+              <div className="text-muted-foreground flex items-center gap-2 text-sm">
+                <Spinner className="size-4" /> 解析并归纳模板中…
+              </div>
+            )}
+            {importResult && (
+              <div className="space-y-2 rounded-md border p-3 text-sm">
+                <div className="flex items-center gap-2">
+                  <span className="text-muted-foreground">识别标题 {importResult.outline.headings?.length ?? 0} 个</span>
+                  {importResult.degraded && (
+                    <Badge variant="outline" className="border-amber-400 text-amber-600">
+                      规则映射（LLM 未参与）
+                    </Badge>
+                  )}
+                </div>
+                {importResult.draft.skeleton?.some((s) => s.enabled) ? null : (
+                  <p className="text-muted-foreground text-xs">未识别出可映射章节，将使用默认骨架。</p>
+                )}
+                <Field label="模板名称">
+                  <Input value={importName} onChange={(e) => setImportName(e.target.value)} />
+                </Field>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setImportDocxOpen(false)} disabled={importing}>
+              取消
+            </Button>
+            <Button onClick={() => void confirmImportDocx()} disabled={!importResult || importing}>
+              创建模板
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 导入模板（skill） */}
+      <Dialog open={importSkillOpen} onOpenChange={(o) => !importing && setImportSkillOpen(o)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>从 Skill 导入模板</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2 py-1">
+            {skillsLoading ? (
+              <div className="flex justify-center py-6">
+                <Spinner />
+              </div>
+            ) : skills.length === 0 ? (
+              <p className="text-muted-foreground py-6 text-center text-sm">没有已安装的 skills。</p>
+            ) : (
+              <>
+                <p className="text-muted-foreground text-xs">选择带 template.json 的报告模板 skill（「转成 Skill」导出的产物）：</p>
+                <NativeSelect className="w-full" value={skillName} onChange={(e) => setSkillName(e.target.value)}>
+                  <NativeSelectOption value="">— 选择 skill —</NativeSelectOption>
+                  {skills.map((sk) => (
+                    <NativeSelectOption key={sk.name} value={sk.name}>
+                      {sk.name}
+                    </NativeSelectOption>
+                  ))}
+                </NativeSelect>
+              </>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setImportSkillOpen(false)} disabled={importing}>
+              取消
+            </Button>
+            <Button onClick={() => void confirmImportSkill()} disabled={!skillName || importing}>
+              {importing ? <Spinner /> : null} 导入为模板
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={confirmDel != null} onOpenChange={(o) => !o && setConfirmDel(null)}>
         <DialogContent>
@@ -576,6 +944,12 @@ export default function ReportCenterPage() {
       </Dialog>
     </TooltipProvider>
   );
+}
+
+function readIntParam(v: string | null): number | null {
+  if (!v) return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 function IconBtn({
@@ -605,7 +979,7 @@ function IconBtn({
   );
 }
 
-// ---- 模板编辑器 ----
+// ---- 模板编辑器（T16 原样保留，T21 收进「设置」折叠区） ----
 interface EditorProps {
   draft: ReportTemplateInput;
   patch: (p: Partial<ReportTemplateInput>) => void;
@@ -776,83 +1150,6 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-// ---- 调试区 ----
-function DebugPanel(props: {
-  form: DraftForm;
-  setForm: React.Dispatch<React.SetStateAction<DraftForm>>;
-  tasks: Task[];
-  projects: { id: number; name: string }[];
-  rendering: boolean;
-  onRenderDraft: () => void;
-  onGenerate: () => void;
-}) {
-  const { form, setForm, tasks, projects } = props;
-  return (
-    <div className="space-y-3">
-      <Label className="text-sm font-medium">调试 / 生成</Label>
-      <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="范围">
-          <NativeSelect
-            value={form.scope}
-            onChange={(e) => setForm((f) => ({ ...f, scope: e.target.value as "task" | "project" }))}
-          >
-            <NativeSelectOption value="task">单任务</NativeSelectOption>
-            <NativeSelectOption value="project">项目汇总</NativeSelectOption>
-          </NativeSelect>
-        </Field>
-        <Field label={form.scope === "task" ? "任务" : "项目"}>
-          {form.scope === "task" ? (
-            <NativeSelect value={form.task_id} onChange={(e) => setForm((f) => ({ ...f, task_id: e.target.value }))}>
-              <NativeSelectOption value="">— 选择任务 —</NativeSelectOption>
-              {tasks.map((t) => (
-                <NativeSelectOption key={t.id} value={t.id}>
-                  {t.name || t.description.slice(0, 30)}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
-          ) : (
-            <NativeSelect
-              value={form.project_id}
-              onChange={(e) => setForm((f) => ({ ...f, project_id: e.target.value }))}
-            >
-              <NativeSelectOption value="">— 选择项目 —</NativeSelectOption>
-              {projects.map((pr) => (
-                <NativeSelectOption key={pr.id} value={String(pr.id)}>
-                  {pr.name}
-                </NativeSelectOption>
-              ))}
-            </NativeSelect>
-          )}
-        </Field>
-        <Field label="输出语言">
-          <NativeSelect value={form.locale} onChange={(e) => setForm((f) => ({ ...f, locale: e.target.value }))}>
-            {LOCALES.map((l) => (
-              <NativeSelectOption key={l.v} value={l.v}>
-                {l.label}
-              </NativeSelectOption>
-            ))}
-          </NativeSelect>
-        </Field>
-        <Field label="格式">
-          <NativeSelect
-            value={form.format}
-            onChange={(e) => setForm((f) => ({ ...f, format: e.target.value as "docx" | "md" }))}
-          >
-            <NativeSelectOption value="docx">Word (.docx)</NativeSelectOption>
-            <NativeSelectOption value="md">Markdown (.md)</NativeSelectOption>
-          </NativeSelect>
-        </Field>
-      </div>
-      <div className="flex gap-2">
-        <Button variant="outline" onClick={props.onRenderDraft} disabled={props.rendering}>
-          {props.rendering ? <Spinner /> : null} 试渲染小样
-        </Button>
-        <Button onClick={props.onGenerate}>保存后正式生成</Button>
-      </div>
-    </div>
-  );
-}
-
 // ---- 历史行 ----
 function JobRow({ job, onDownload, onDelete }: { job: ReportJob; onDownload: () => void; onDelete: () => void }) {
   const isTerminal = job.status === "done" || job.status === "failed";
@@ -924,10 +1221,6 @@ function fmtTime(iso: string): string {
   if (Number.isNaN(d.getTime())) return iso;
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function debugFormHasTarget(f: DraftForm): boolean {
-  return f.scope === "task" ? !!f.task_id : !!f.project_id;
 }
 
 // templateToDraft：把后端模板行拷成编辑态（深拷 skeleton/personnel/prompts/style）。

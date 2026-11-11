@@ -1785,11 +1785,63 @@ export interface ReportGenerateInput {
   finding_ids?: number[];
   template_id?: number;
   locale?: string;
-  format?: "docx" | "md";
+  format?: "docx" | "md" | "html";
 }
 
 // ReportDraftInput 是 POST /api/report/render-draft 的入参（同步小样，不落库）。
-export interface ReportDraftInput extends ReportGenerateInput {}
+// T20 扩展：template=inline 草稿（优先于 template_id，未保存也能预览）；
+// demo=true=内置样例数据旁路（跳过任务/项目取数与伪资产校验）。
+export interface ReportDraftInput extends ReportGenerateInput {
+  template?: ReportTemplateInput;
+  demo?: boolean;
+}
+
+// TemplateChatMessage / TemplateChatRequest / TemplateChatResponse 是
+// POST /api/report-templates/{id}/chat 的会话线格式（T20：对话调模板，
+// 服务端不落库，template=合并补丁后的完整草稿回给前端进 draft）。
+export interface TemplateChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface TemplateChatRequest {
+  messages: TemplateChatMessage[];
+  template?: ReportTemplateInput;
+  llm_profile_id?: number;
+  locale?: string;
+}
+
+export interface TemplateChatResponse {
+  reply: string;
+  patch: Record<string, unknown>;
+  template: ReportTemplateInput;
+  warnings?: string[];
+}
+
+// ReportImportResult 是 POST /api/report-templates/import-docx 的响应
+// （T20：docx/md 反推模板草稿，degraded=true=LLM 失败回退规则映射）。
+export interface ReportImportOutlineHeading {
+  text: string;
+  level: number;
+}
+
+export interface ReportImportResult {
+  draft: ReportTemplateInput & { id?: number };
+  outline: {
+    headings: ReportImportOutlineHeading[];
+    table_heads?: string[][];
+    text_sample?: string;
+    total_bytes?: number;
+  };
+  degraded: boolean;
+  warnings?: string[];
+}
+
+// ReportSkillDraft 是 GET /api/report-templates/from-skill/{name} 的响应。
+export interface ReportSkillDraft {
+  draft: ReportTemplateInput;
+  skill_name: string;
+}
 
 // T14 结构化复现过程（后端 report.Reproduction 的 JSON 形状；仅 finding 详情
 // 接口透出，未填=键缺席）。steps[].exchange_id=自动关联的真实流量 id（可空）。

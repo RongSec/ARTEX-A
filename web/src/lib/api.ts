@@ -77,10 +77,14 @@ import type {
   FindingEvidenceImage,
   ReportDraftInput,
   ReportGenerateInput,
+  ReportImportResult,
   ReportJob,
   ReportSettings,
+  ReportSkillDraft,
   ReportTemplate,
   ReportTemplateInput,
+  TemplateChatRequest,
+  TemplateChatResponse,
   ProjectWithStats,
   PromptVar,
   PromptVersion,
@@ -1545,4 +1549,86 @@ export const api = {
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) },
       true,
     ),
+  // T21 实时预览专用：render-draft(format=html) 拉 blob（**不触发浏览器下载**），
+  // 调用方 URL.createObjectURL → iframe.src。signal 支持 AbortController 取消
+  // in-flight（防抖连发时旧请求作废）。X-Report-Warning 同口径回传。
+  renderReportPreview: async (
+    input: ReportDraftInput,
+    signal?: AbortSignal,
+  ): Promise<{ blob: Blob; warning: string }> => {
+    if (MOCK) {
+      return {
+        blob: new Blob([`<html><body><h1>（demo）预览占位</h1><p>${input.template?.name ?? "模板"}</p></body></html>`], { type: "text/html" }),
+        warning: "",
+      };
+    }
+    const token = getToken();
+    const r = await fetch(`/api/report/render-draft`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ ...input, format: "html" }),
+      signal,
+    });
+    if (!r.ok) {
+      let message = `预览渲染失败: ${r.status}`;
+      try {
+        const p = (await r.json()) as { error?: unknown };
+        if (typeof p.error === "string" && p.error.trim()) message = p.error.trim();
+      } catch {
+        /* 非 JSON 错误体保留状态码文案 */
+      }
+      throw new Error(message);
+    }
+    const warnRaw = r.headers.get("X-Report-Warning") ?? "";
+    let warning = "";
+    try {
+      warning = warnRaw ? decodeURIComponent(warnRaw) : "";
+    } catch {
+      warning = warnRaw;
+    }
+    return { blob: await r.blob(), warning };
+  },
+  // T20 对话调模板（不落库；template=合并补丁后的完整草稿）。400=入参/模板
+  // 非法，502=LLM 失败或输出不可解析。
+  reportTemplateChat: (id: number, req: TemplateChatRequest) =>
+    post<TemplateChatResponse>(`/report-templates/${id}/chat`, req),
+  // T20 模板转 skill（幂等：同哨兵目录覆盖，非哨兵 409）。
+  reportTemplateToSkill: (id: number) => post<{ skill_name: string }>(`/report-templates/${id}/to-skill`, {}),
+  // T20 从 skill 读模板预填体（不建模板；前端填进新建表单）。
+  reportTemplateFromSkill: (name: string) =>
+    get<ReportSkillDraft>(`/report-templates/from-skill/${encodeURIComponent(name)}`),
+  // T20 从 docx/md 导入模板草稿（multipart ≤20MB；degraded=true=LLM 失败
+  // 回退规则映射。不建模板——用户确认后 POST /report-templates）。
+  importTemplateDocx: async (file: File): Promise<ReportImportResult> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (MOCK) {
+      return {
+        draft: { name: file.name.replace(/\.(docx|md|markdown|txt)$/i, ""), output_lang: "zh-CN", skeleton: [], style: {}, prompts: {}, issuer: "", personnel: [], cvss_enabled: false, remark: "" },
+        outline: { headings: [] },
+        degraded: true,
+        warnings: ["mock"],
+      };
+    }
+    const token = getToken();
+    const r = await fetch(`/api/report-templates/import-docx`, {
+      method: "POST",
+      body: fd,
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    });
+    if (!r.ok) {
+      let message = `导入失败: ${r.status}`;
+      try {
+        const p = (await r.json()) as { error?: unknown };
+        if (typeof p.error === "string" && p.error.trim()) message = p.error.trim();
+      } catch {
+        /* 非 JSON 错误体保留状态码 */
+      }
+      throw new Error(message);
+    }
+    return r.json() as Promise<ReportImportResult>;
+  },
 };
