@@ -310,4 +310,57 @@ func TestPacketShotSettingSeed(t *testing.T) {
 	}
 }
 
+// TestPacketShotSettingsRoundTrip 缺口1：packet_shot_enabled 走完整设置 API
+// 往返——PUT 白名单收键并落库、PUT 响应体与 GET /api/settings 均回显该键。
+// （V2 部署实测：键曾只 seed 在 DB、不在 settings 结构体=UI 无法开启。）
+func TestPacketShotSettingsRoundTrip(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer m.Close()
+	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+	h := s.Handler()
+	tok, err := signJWT(s.jwtKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(method, body string) map[string]any {
+		req := httptest.NewRequest(method, "/api/settings", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s want 200, got %d body=%s", method, rec.Code, rec.Body.String())
+		}
+		var out map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// 初始态：seed/默认 false。
+	if v, ok := call(http.MethodGet, "")["packet_shot_enabled"]; !ok || v != false {
+		t.Fatalf("GET must echo packet_shot_enabled=false, got %v ok=%v", v, ok)
+	}
+	// PUT true → 响应体回显 true + DB 落值（照 agent_traffic_binding 断言口径）。
+	if v := call(http.MethodPut, `{"packet_shot_enabled":true}`)["packet_shot_enabled"]; v != true {
+		t.Fatalf("PUT response must echo true, got %v", v)
+	}
+	if !m.pg.GetBool(settingPacketShotEnabled, false) {
+		t.Fatal("switch was not persisted")
+	}
+	// GET 再读回=true（读写两条路径共用 settingsPayload）。
+	if v := call(http.MethodGet, "")["packet_shot_enabled"]; v != true {
+		t.Fatalf("GET after set must be true, got %v", v)
+	}
+	// PUT false 关闸 + 部分 PUT 不重置（只发别的键时该键保持 false）。
+	call(http.MethodPut, `{"packet_shot_enabled":false}`)
+	if v := call(http.MethodPut, `{"llm_record":false}`)["packet_shot_enabled"]; v != false {
+		t.Fatalf("unrelated partial PUT must keep packet_shot=false, got %v", v)
+	}
+}
+
 var _ = time.Now

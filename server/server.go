@@ -3398,8 +3398,11 @@ func (s *Server) settingsPayload() map[string]any {
 		concLimit = defaultConcurrencyLimit // 关闭时也回显一个合理默认值给 UI
 	}
 	return map[string]any{
-		"traffic_capture":          s.m.TrafficEnabled(),
-		"agent_traffic_binding":    s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		"traffic_capture":       s.m.TrafficEnabled(),
+		"agent_traffic_binding": s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		// T22 报文自动截图全局闸（默认关=零回归；开=新报告漏洞 enrich 成功即
+		// 自动为每步报文出图。手动「生成截图」按钮不受此闸约束）。
+		"packet_shot_enabled":      s.m.pg.GetBool(settingPacketShotEnabled, false),
 		"llm_record":               s.m.LLMRecordEnabled(),
 		"web_search_enabled":       on,
 		"web_search_backend":       backend,
@@ -3470,7 +3473,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		TrafficCapture      *bool `json:"traffic_capture"`
 		AgentTrafficBinding *bool `json:"agent_traffic_binding"`
-		LLMRecord           *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
+		PacketShotEnabled   *bool `json:"packet_shot_enabled"` // T22 报文自动截图闸；每 finding 读一次，即时生效无需重建 agent
+		LLMRecord           *bool `json:"llm_record"`          // LLM 录制开关（默认关）；即时生效，无需重建 agent
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
 		WebSearchEnabled *bool   `json:"web_search_enabled"`
@@ -3614,6 +3618,14 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AgentTrafficBinding != nil {
 		if err := s.m.pg.SetBool(settingAgentTrafficBinding, *req.AgentTrafficBinding); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.PacketShotEnabled != nil {
+		// T22 报文自动截图闸：renderPacketShots 每次调用读 GetBool，切换即时
+		// 对下一条登记漏洞生效，无需重建 agent/重启。
+		if err := s.m.pg.SetBool(settingPacketShotEnabled, *req.PacketShotEnabled); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

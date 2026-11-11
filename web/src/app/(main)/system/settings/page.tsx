@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
+import { CameraIcon, CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -20,6 +20,7 @@ import { UpdateCard } from "./_components/update-card";
 export default function SystemSettingsPage() {
   const [trafficCapture, setTrafficCapture] = React.useState(false);
   const [agentTrafficBinding, setAgentTrafficBinding] = React.useState(false);
+  const [packetShot, setPacketShot] = React.useState(false);
   const [webSearch, setWebSearch] = React.useState(false);
   const [backend, setBackend] = React.useState("ddgs");
   const [braveKeySet, setBraveKeySet] = React.useState(false);
@@ -49,6 +50,7 @@ export default function SystemSettingsPage() {
   const apply = React.useCallback((s: Settings) => {
     setTrafficCapture(!!s.traffic_capture);
     setAgentTrafficBinding(!!s.agent_traffic_binding);
+    setPacketShot(!!s.packet_shot_enabled);
     setWebSearch(!!s.web_search_enabled);
     setBackend(s.web_search_backend || "ddgs");
     setBraveKeySet(!!s.brave_key_set);
@@ -139,6 +141,14 @@ export default function SystemSettingsPage() {
         toast.error(`保存失败：${(e as Error).message}`);
       })
       .finally(() => setSaving(false));
+  };
+
+  const togglePacketShot = (v: boolean) => {
+    setPacketShot(v); // optimistic
+    api
+      .setSettings({ packet_shot_enabled: v })
+      .then(apply)
+      .catch(() => setPacketShot(!v)); // revert on failure
   };
 
   const toggleInjectWorker = (v: boolean) => {
@@ -319,6 +329,36 @@ export default function SystemSettingsPage() {
               checked={agentTrafficBinding}
               disabled={!loaded || saving}
               onCheckedChange={toggleAgentTrafficBinding}
+            />
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <CameraIcon className="size-4" />
+              漏洞报文自动截图
+            </CardTitle>
+            <CardDescription id="packet-shot-enabled-description">
+              默认关闭。开启后，新报告漏洞在复现步骤成功关联流量后，自动为每步 HTTP
+              请求/响应生成报文截图（Burp 式 PNG，凭据类头值自动脱敏），进证据条与报告。
+              <br />
+              <b>依赖流量捕获开启</b>：报文↔流量关联（exchange_id
+              回填）只在流量捕获开着、库里有候选报文时产出；关闭捕获时自动通道零行为。
+              漏洞详情页的「生成截图」按钮不受本闸约束（显式点击即显式渲染）。自动截图只覆盖
+              自动生成行，手工粘贴/上传的截图永不被替换。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex items-center justify-between gap-4">
+            <Label htmlFor="packet-shot-enabled" className="text-sm font-normal text-muted-foreground">
+              {packetShot ? "已开启 · 新漏洞自动出图（需流量捕获在开）" : "已关闭 · 可逐漏洞手动生成截图"}
+            </Label>
+            <Switch
+              id="packet-shot-enabled"
+              aria-describedby="packet-shot-enabled-description"
+              checked={packetShot}
+              disabled={!loaded}
+              onCheckedChange={togglePacketShot}
             />
           </CardContent>
         </Card>
