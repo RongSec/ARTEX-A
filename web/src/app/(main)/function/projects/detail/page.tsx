@@ -44,10 +44,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
-import type { ProjectDetail, Task } from "@/lib/types";
+import type { ProjectDetail, ReportTemplate, Task } from "@/lib/types";
 
 function fmtToken(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "—";
@@ -81,6 +82,15 @@ function ProjectDetailInner() {
   const [loading, setLoading] = React.useState(true);
   const [editOpen, setEditOpen] = React.useState(false);
   const [deleteOpen, setDeleteOpen] = React.useState(false);
+  // 报告模板列表（编辑对话框下拉 + 概览展示模板名共用一次拉取）。
+  const [templates, setTemplates] = React.useState<ReportTemplate[]>([]);
+
+  React.useEffect(() => {
+    api
+      .reportTemplates()
+      .then(setTemplates)
+      .catch(() => setTemplates([]));
+  }, []);
 
   const load = React.useCallback(() => {
     if (!id) return;
@@ -156,7 +166,21 @@ function ProjectDetailInner() {
             <Badge variant={p.status === "active" ? "default" : "secondary"}>
               {p.status === "active" ? "进行中" : "已归档"}
             </Badge>
-            {p.observer_enabled && <Badge variant="outline">观察者开</Badge>}
+            {p.observer_enabled && (
+              <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400">
+                观察者开
+              </Badge>
+            )}
+            {p.reader_enabled && (
+              <Badge variant="outline" className="text-blue-600 dark:text-blue-400">
+                阅读者开
+              </Badge>
+            )}
+            {p.auto_report && (
+              <Badge variant="outline" className="text-purple-600 dark:text-purple-400">
+                自动报告开
+              </Badge>
+            )}
           </div>
           {p.description && <p className="text-muted-foreground mt-1 text-sm">{p.description}</p>}
           <p className="text-muted-foreground mt-1 text-xs">
@@ -190,14 +214,14 @@ function ProjectDetailInner() {
           <TasksTab tasks={tasks} onChanged={load} />
         </TabsContent>
         <TabsContent value="overview" className="mt-4">
-          <OverviewTab detail={detail} />
+          <OverviewTab detail={detail} templates={templates} />
         </TabsContent>
         <TabsContent value="graph" className="mt-4">
           <ProjectGraphTab project={p} onChanged={load} />
         </TabsContent>
       </Tabs>
 
-      <EditProjectDialog open={editOpen} onOpenChange={setEditOpen} project={p} onSaved={load} />
+      <EditProjectDialog open={editOpen} onOpenChange={setEditOpen} project={p} templates={templates} onSaved={load} />
 
       <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <AlertDialogContent>
@@ -335,8 +359,8 @@ function TasksTab({ tasks, onChanged }: { tasks: Task[]; onChanged: () => void }
   );
 }
 
-// OverviewTab 项目 finding 汇总 + 基础信息。
-function OverviewTab({ detail }: { detail: ProjectDetail }) {
+// OverviewTab 项目 finding 汇总 + 基础信息 + 报告设置（T19）。
+function OverviewTab({ detail, templates }: { detail: ProjectDetail; templates: ReportTemplate[] }) {
   const f = detail.stats.findings;
   const g = (k: string) => f[k] ?? 0;
   const cards: { key: string; label: string; cls: string }[] = [
@@ -345,6 +369,8 @@ function OverviewTab({ detail }: { detail: ProjectDetail }) {
     { key: "medium", label: "中危", cls: "text-amber-600 dark:text-amber-400" },
     { key: "low", label: "低危", cls: "text-slate-600 dark:text-slate-400" },
   ];
+  const p = detail.project;
+  const bound = p.report_template_id ? templates.find((t) => t.id === p.report_template_id) : null;
   return (
     <div className="grid gap-4">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -361,21 +387,57 @@ function OverviewTab({ detail }: { detail: ProjectDetail }) {
           {new Date(detail.project.updated_at).toLocaleString("zh-CN")} · 并发额度：{detail.project.concurrency} ·
           观察者：{detail.project.observer_enabled ? "开" : "关（将在观察者版本启用）"}
         </p>
+        <p className="text-muted-foreground mt-2">
+          阅读者：{p.reader_enabled ? "开（跨项目 reader 可聚合本项目洞察）" : "关"} · 自动写报告：
+          {p.auto_report ? "开（全部任务收官后按下方模板生成）" : "关"}
+        </p>
+      </div>
+      <div className="flex items-center justify-between gap-4 rounded-xl border p-4 text-sm">
+        <div className="min-w-0">
+          <p className="text-muted-foreground text-xs">项目报告模板</p>
+          <p className="mt-1 truncate">
+            {bound ? (
+              <span title={bound.name}>{bound.name}</span>
+            ) : p.report_template_id ? (
+              <span className="text-muted-foreground">模板 #{p.report_template_id}（未在模板列表，可能已删除→按默认链）</span>
+            ) : (
+              <span className="text-muted-foreground">默认模板链（未绑定专属模板）</span>
+            )}
+          </p>
+        </div>
+        {p.report_template_id && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={() => {
+              // 报告中心 T21 会读取 query 预填；本棒只负责带上跳转参数。
+              window.location.href = `/system/report?project_id=${p.id}&template_id=${p.report_template_id}`;
+            }}
+          >
+            用此模板生成报告
+          </Button>
+        )}
       </div>
     </div>
   );
 }
 
-// EditProjectDialog PATCH 项目名/描述/负责人/并发/observer 开关。
+// EditProjectDialog PATCH 项目名/描述/负责人/并发 + 四设置开关
+//（观察者/阅读者/自动报告 + 报告模板绑定，T19 与建项目对话框同构）。
+// report_template_id 三态：保持原值不动时不传键；选「默认模板」传 null=清绑定；
+// 选具体模板传数字=绑定（后端 *int64+Set 语义）。
 function EditProjectDialog({
   open,
   onOpenChange,
   project,
+  templates,
   onSaved,
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
   project: ProjectDetail["project"];
+  templates: ReportTemplate[];
   onSaved: () => void;
 }) {
   const [name, setName] = React.useState(project.name);
@@ -383,6 +445,9 @@ function EditProjectDialog({
   const [owner, setOwner] = React.useState(project.owner);
   const [concurrency, setConcurrency] = React.useState(String(project.concurrency));
   const [observer, setObserver] = React.useState(project.observer_enabled);
+  const [reader, setReader] = React.useState(project.reader_enabled);
+  const [autoReport, setAutoReport] = React.useState(project.auto_report);
+  const [templateId, setTemplateId] = React.useState<string>(project.report_template_id ? String(project.report_template_id) : "");
   const [saving, setSaving] = React.useState(false);
 
   React.useEffect(() => {
@@ -392,6 +457,9 @@ function EditProjectDialog({
       setOwner(project.owner);
       setConcurrency(String(project.concurrency));
       setObserver(project.observer_enabled);
+      setReader(project.reader_enabled);
+      setAutoReport(project.auto_report);
+      setTemplateId(project.report_template_id ? String(project.report_template_id) : "");
     }
   }, [open, project]);
 
@@ -413,6 +481,10 @@ function EditProjectDialog({
         owner: owner.trim(),
         concurrency: conc,
         observer_enabled: observer,
+        reader_enabled: reader,
+        auto_report: autoReport,
+        // "" = 默认链（显式 null 清除绑定）；数字 = 绑定该模板。
+        report_template_id: templateId ? Number(templateId) : null,
       });
       toast.success("已保存");
       onOpenChange(false);
@@ -449,10 +521,34 @@ function EditProjectDialog({
             <Label htmlFor="ep-desc">描述</Label>
             <Input id="ep-desc" value={description} onChange={(e) => setDescription(e.target.value)} />
           </div>
-          <label className="flex items-center gap-3 text-sm">
-            <Switch checked={observer} onCheckedChange={setObserver} />
-            观察者模式（B3 功能：项目级索引 + 观察 agent 触发 + 洞察注入，默认关）
-          </label>
+          <div className="grid gap-2">
+            <Label htmlFor="ep-template">报告模板</Label>
+            <NativeSelect id="ep-template" value={templateId} onChange={(e) => setTemplateId(e.target.value)}>
+              <NativeSelectOption value="">默认模板（跟随全局默认链）</NativeSelectOption>
+              {templates.map((t) => (
+                <NativeSelectOption key={t.id} value={String(t.id)}>
+                  {t.name}
+                  {t.is_default ? "（默认）" : ""}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+            <p className="text-muted-foreground text-xs">整项目收官自动写报告时用的模板；选「默认模板」= 清除专属绑定。</p>
+          </div>
+          <div className="grid gap-3 rounded-lg border p-3">
+            <label className="flex items-center justify-between gap-3 text-sm">
+              <span>跨任务观察者</span>
+              <Switch checked={observer} onCheckedChange={setObserver} />
+            </label>
+            <label className="flex items-center justify-between gap-3 text-sm">
+              <span>跨项目阅读者</span>
+              <Switch checked={reader} onCheckedChange={setReader} />
+            </label>
+            <label className="flex items-center justify-between gap-3 text-sm">
+              <span>自动写报告</span>
+              <Switch checked={autoReport} onCheckedChange={setAutoReport} />
+            </label>
+            <p className="text-muted-foreground text-xs">观察者=项目级索引+观察 agent 触发+洞察注入；阅读者=允许跨项目 reader 聚合本项目；自动报告=全部任务收官后按上方模板生成项目报告。均默认关。</p>
+          </div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>

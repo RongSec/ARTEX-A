@@ -1626,6 +1626,10 @@ export interface Project {
   owner: string;
   concurrency: number; // 项目内批量任务并发数：1=严格串行
   observer_enabled: boolean; // 观察者开关（B3 功能，本期只透传展示）
+  // T18 项目设置扩展三字段。report_template_id=null → 走默认模板链。
+  report_template_id: number | null;
+  auto_report: boolean; // 整项目收官自动写报告（默认关）
+  reader_enabled: boolean; // 允许跨项目 reader 聚合本项目（默认关）
   created_at: string;
   updated_at: string;
 }

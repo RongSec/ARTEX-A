@@ -21,6 +21,7 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
@@ -123,15 +124,37 @@ export default function ProjectsPage() {
               {projects.map((p) => (
                 <TableRow key={p.id}>
                   <TableCell>
-                    <Link
-                      href={`/function/projects/detail?id=${p.id}`}
-                      className="text-foreground inline-flex items-center gap-1.5 rounded-sm font-medium hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    >
-                      <FolderKanbanIcon className="text-muted-foreground size-4 shrink-0" />
-                      <span className="max-w-64 truncate" title={p.description || p.name}>
-                        {p.name}
-                      </span>
-                    </Link>
+                    <div className="flex min-w-0 flex-col gap-1">
+                      <Link
+                        href={`/function/projects/detail?id=${p.id}`}
+                        className="text-foreground inline-flex items-center gap-1.5 rounded-sm font-medium hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        <FolderKanbanIcon className="text-muted-foreground size-4 shrink-0" />
+                        <span className="max-w-64 truncate" title={p.description || p.name}>
+                          {p.name}
+                        </span>
+                      </Link>
+                      {/* T19 状态徽章：开关开启才显示，配色与详情页/现有一致。 */}
+                      {(p.observer_enabled || p.reader_enabled || p.auto_report) && (
+                        <div className="flex flex-wrap items-center gap-1">
+                          {p.observer_enabled && (
+                            <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400">
+                              观察者
+                            </Badge>
+                          )}
+                          {p.reader_enabled && (
+                            <Badge variant="outline" className="text-blue-600 dark:text-blue-400">
+                              阅读者
+                            </Badge>
+                          )}
+                          {p.auto_report && (
+                            <Badge variant="outline" className="text-purple-600 dark:text-purple-400">
+                              自动报告
+                            </Badge>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </TableCell>
                   <TableCell>
                     <Badge variant={p.status === "active" ? "default" : "secondary"}>
@@ -186,6 +209,9 @@ export default function ProjectsPage() {
 }
 
 // CreateProjectDialog 新建项目：名称必填，描述/负责人/并发数可选。
+// T19 新增四设置控件：观察者 / 阅读者 / 自动写报告（三 Switch，默认关）+
+// 报告模板（下拉，可留空=默认链）。observer_enabled 后端 create 不收（PATCH 收），
+// 故 create 成功后若勾了观察者，紧跟一次 PATCH 补上（见 submit 内注释）。
 function CreateProjectDialog({
   open,
   onOpenChange,
@@ -199,6 +225,11 @@ function CreateProjectDialog({
   const [description, setDescription] = React.useState("");
   const [owner, setOwner] = React.useState("");
   const [concurrency, setConcurrency] = React.useState("2");
+  const [observer, setObserver] = React.useState(false);
+  const [reader, setReader] = React.useState(false);
+  const [autoReport, setAutoReport] = React.useState(false);
+  const [templateId, setTemplateId] = React.useState<string>(""); // "" = 默认链
+  const [templates, setTemplates] = React.useState<{ id: number; name: string; is_default: boolean }[]>([]);
   const [saving, setSaving] = React.useState(false);
 
   React.useEffect(() => {
@@ -207,6 +238,14 @@ function CreateProjectDialog({
       setDescription("");
       setOwner("");
       setConcurrency("2");
+      setObserver(false);
+      setReader(false);
+      setAutoReport(false);
+      setTemplateId("");
+      api
+        .reportTemplates()
+        .then(setTemplates)
+        .catch(() => setTemplates([]));
     }
   }, [open]);
 
@@ -227,7 +266,22 @@ function CreateProjectDialog({
         description: description.trim(),
         owner: owner.trim(),
         concurrency: conc,
+        report_template_id: templateId ? Number(templateId) : null,
+        auto_report: autoReport,
+        reader_enabled: reader,
       });
+      // observer_enabled 后端 POST /api/projects 不接收（T18 只加了 auto/reader/模板三
+      // 字段；PATCH 才收 observer），这里 create 成功后补一次 PATCH，避免用户勾了不生效。
+      // PATCH 失败不回滚已建项目，单独提示——项目主体已创建、仅观察者开关需稍后在详情页开。
+      if (observer) {
+        try {
+          await api.updateProject(p.id, { observer_enabled: true });
+        } catch {
+          toast.warning(`项目已创建，但「观察者」开关补设失败——请到详情页重新打开`);
+          onCreated();
+          return;
+        }
+      }
       toast.success(`项目已创建：${p.name}`);
       onCreated();
     } catch (e) {
@@ -262,6 +316,34 @@ function CreateProjectDialog({
               <Input id="p-conc" type="number" min={1} max={8} value={concurrency} onChange={(e) => setConcurrency(e.target.value)} />
               <p className="text-muted-foreground text-xs">1=严格串行，2=同时两任务（默认）</p>
             </div>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="p-template">报告模板</Label>
+            <NativeSelect id="p-template" value={templateId} onChange={(e) => setTemplateId(e.target.value)}>
+              <NativeSelectOption value="">默认模板（跟随全局默认链）</NativeSelectOption>
+              {templates.map((t) => (
+                <NativeSelectOption key={t.id} value={String(t.id)}>
+                  {t.name}
+                  {t.is_default ? "（默认）" : ""}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
+            <p className="text-muted-foreground text-xs">整项目收官自动写报告时用的模板；留空则用全局默认模板链。</p>
+          </div>
+          <div className="grid gap-3 rounded-lg border p-3">
+            <label className="flex items-center justify-between gap-3 text-sm">
+              <span>跨任务观察者</span>
+              <Switch checked={observer} onCheckedChange={setObserver} />
+            </label>
+            <label className="flex items-center justify-between gap-3 text-sm">
+              <span>跨项目阅读者</span>
+              <Switch checked={reader} onCheckedChange={setReader} />
+            </label>
+            <label className="flex items-center justify-between gap-3 text-sm">
+              <span>自动写报告</span>
+              <Switch checked={autoReport} onCheckedChange={setAutoReport} />
+            </label>
+            <p className="text-muted-foreground text-xs">三项默认关闭；自动写报告在该项目全部任务收官后按所选模板生成一份项目报告。</p>
           </div>
         </div>
         <DialogFooter>

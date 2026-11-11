@@ -1397,12 +1397,25 @@ export const api = {
       projects: arr(r.projects),
     })),
   project: (id: number | string) => get<ProjectDetail>(`/projects/${id}`),
-  createProject: (input: { name: string; description?: string; owner?: string; concurrency?: number }) =>
+  // createProject 建项目。T18 三字段（report_template_id/auto_report/reader_enabled）
+  // 后端 create 已支持；report_template_id 省略/null=走默认模板链。
+  createProject: (input: {
+    name: string;
+    description?: string;
+    owner?: string;
+    concurrency?: number;
+    report_template_id?: number | null;
+    auto_report?: boolean;
+    reader_enabled?: boolean;
+  }) =>
     post<Project>("/projects", {
       name: input.name,
       description: input.description ?? "",
       owner: input.owner ?? "",
       concurrency: input.concurrency ?? 2,
+      report_template_id: input.report_template_id ?? null,
+      auto_report: input.auto_report ?? false,
+      reader_enabled: input.reader_enabled ?? false,
     }),
   updateProject: (
     id: number | string,
@@ -1413,6 +1426,11 @@ export const api = {
       status?: "active" | "archived";
       concurrency?: number;
       observer_enabled?: boolean;
+      // T18 三字段。report_template_id 三态：键缺席=不动、null=清绑定回默认链、
+      // 数字=绑定（后端 *int64+Set 语义）。
+      report_template_id?: number | null;
+      auto_report?: boolean;
+      reader_enabled?: boolean;
     },
   ) => patch<Project>(`/projects/${id}`, patchBody),
   deleteProject: (id: number | string) => del<{ deleted: number }>(`/projects/${id}`),
