@@ -800,6 +800,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/{id}/retests", s.listFindingRetests)
 	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
+	// T17 批量状态：字面段 batch-status 与 /{id} 模式在方法+路径上双隔离
+	//（照 :801 findings/retests/active 先例），注册位置无先后依赖。
+	mux.HandleFunc("POST /api/exploration/findings/batch-status", s.findingsBatchStatus)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)

@@ -7,6 +7,7 @@ import Link from "next/link";
 import {
   ArrowUpRightIcon,
   BugIcon,
+  ChevronDownIcon,
   ChevronRightIcon,
   ClockIcon,
   DownloadIcon,
@@ -30,6 +31,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
@@ -248,6 +255,8 @@ export default function FindingsPage() {
 
   // 勾选导出:按 finding_id(独立表 id)记选中项,跨页保留。
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(() => new Set());
+  // 批量标记进行中标记,防止并发重复提交。
+  const [batchMarking, setBatchMarking] = React.useState(false);
   // 导出弹窗状态:范围(当前筛选/全部/选中) × 格式(md 单文件/md 分文件 zip/csv/json)。
   const [exportOpen, setExportOpen] = React.useState(false);
   const [exportScope, setExportScope] = React.useState<"filtered" | "all" | "selected">("filtered");
@@ -629,6 +638,91 @@ export default function FindingsPage() {
     [refreshAfterMutation, setFindings, status],
   );
 
+  // batchUpdateStatus 是 updateStatus 的批量版:同一套乐观翻转 + 失败整体回滚 +
+  // 统计刷新 + 筛选剔除语义,只是把单条 PATCH 换成一次 batch-status 请求。
+  // 勾选集合跨页/跨组保留,所以只快照本地已加载的勾选行(未加载的行本地无需回滚)。
+  const batchUpdateStatus = React.useCallback(
+    async (next: FindingStatus) => {
+      const ids = [...selectedIds];
+      if (ids.length === 0 || batchMarking) return;
+      setBatchMarking(true);
+      const prev = new Map<string, FindingStatus>();
+      const collect = (items: Finding[]) => {
+        for (const item of items) {
+          if (item.finding_id && selectedIds.has(item.finding_id)) prev.set(item.finding_id, item.status);
+        }
+      };
+      collect(flatStateRef.current.items);
+      for (const state of Object.values(groupFindingsRef.current)) collect(state.items);
+      const apply = (status: FindingStatus) =>
+        setFindings((cur) =>
+          cur.map((x) => (x.finding_id && selectedIds.has(x.finding_id) ? { ...x, status } : x)),
+        );
+      apply(next);
+      try {
+        const result = await api.batchSetFindingStatus(ids, next);
+        const updated = result.updated?.length ?? 0;
+        const skipped = ids.length - updated;
+        if (skipped > 0) {
+          toast.success(
+            `已标记 ${updated} 条为「${statusMeta("finding", next).label}」,${skipped} 条不存在或已变更`,
+          );
+        } else {
+          toast.success(`已标记 ${updated} 条为「${statusMeta("finding", next).label}」`);
+        }
+        api
+          .findingStats()
+          .then(setStats)
+          .catch(() => {
+            // 统计卡刷新失败不影响已生效的批量更新。
+          });
+        // 与当前状态筛选不一致的勾选行要从列表剔除(照单条 updateStatus 的语义)。
+        if (status !== "all" && next !== status) {
+          const removed = new Set<string>();
+          for (const item of flatStateRef.current.items) {
+            if (item.finding_id && selectedIds.has(item.finding_id)) removed.add(findingRowKey(item));
+          }
+          const count = removed.size;
+          if (count > 0) {
+            setFindings((cur) => cur.filter((x) => !removed.has(findingRowKey(x))));
+            setTotal((t) => Math.max(0, t - count));
+            setFlat((cur) => ({ ...cur, total: Math.max(0, cur.total - count) }));
+          }
+        }
+        setSelectedIds(new Set());
+        // 批量影响多行/多组,统一重拉当前视图拿权威结果。
+        if (view === "grouped") {
+          void refreshGroups();
+          for (const [key, state] of Object.entries(groupFindingsRef.current)) {
+            if (state.loaded) void loadGroup(key, state.page, state.pageSize);
+          }
+        }
+        void loadFlat();
+        if (view === "asset") void loadAssetTree();
+      } catch (e) {
+        setFindings((cur) =>
+          cur.map((x) =>
+            x.finding_id && prev.has(x.finding_id) ? { ...x, status: prev.get(x.finding_id) as FindingStatus } : x,
+          ),
+        );
+        toast.error(`批量标记失败：${(e as Error).message}`);
+      } finally {
+        setBatchMarking(false);
+      }
+    },
+    [
+      batchMarking,
+      loadAssetTree,
+      loadFlat,
+      loadGroup,
+      refreshGroups,
+      selectedIds,
+      setFindings,
+      status,
+      view,
+    ],
+  );
+
   // 行内展开的详细报告缓存按全局稳定行键存。report 是大段 Markdown,列表查询不带它,
   // 故展开时才按 finding_id 单独拉取一次;done 且文本为空 = 该漏洞暂无报告。
   const [reports, setReports] = React.useState<Record<string, FindingReport>>({});
@@ -883,6 +977,26 @@ export default function FindingsPage() {
               </ToggleGroupItem>
             ))}
           </ToggleGroup>
+
+          {/* T17 批量标记:勾选后一键改状态,选项与行内单条 Select 完全一致。 */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button size="sm" variant="outline" disabled={selectedIds.size === 0 || batchMarking}>
+                {batchMarking ? <Spinner data-icon="inline-start" /> : <ChevronDownIcon data-icon="inline-start" />}
+                批量标记
+                {selectedIds.size > 0 && (
+                  <span className="ml-1 text-xs text-muted-foreground tabular-nums">{selectedIds.size}</span>
+                )}
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              {FINDING_STATUSES.map((st) => (
+                <DropdownMenuItem key={st} onSelect={() => void batchUpdateStatus(st)}>
+                  {statusMeta("finding", st).label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
 
           <Select value={status} onValueChange={(v) => setStatus(v as "all" | FindingStatus)}>
             <SelectTrigger size="sm" className="w-32">
