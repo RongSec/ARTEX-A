@@ -1002,6 +1002,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/report-templates/{id}", s.reportTemplateUpdate)
 	mux.HandleFunc("DELETE /api/report-templates/{id}", s.reportTemplateDelete)
 	mux.HandleFunc("POST /api/report-templates/{id}/set-default", s.reportTemplateSetDefault)
+	// T20 对话调模板（不自动落库，返回合并态给前端进 draft）。
+	mux.HandleFunc("POST /api/report-templates/{id}/chat", s.reportTemplateChat)
+	// T20 模板↔skill：导出（幂等，哨兵覆盖）/ 从 skill 导入预填（不建模板）。
+	// 路由名以设计 §1.2F 的 GET from-skill 为准；派工书提到的 POST
+	// import-skill/{name} 与既有 POST /{id}/set-default 在 Go ServeMux 下
+	// 字面段/通配段交叉冲突（实测 panic），故不注册别名（偏差已报 team-lead）。
+	mux.HandleFunc("POST /api/report-templates/{id}/to-skill", s.reportTemplateToSkill)
+	mux.HandleFunc("GET /api/report-templates/from-skill/{name}", s.reportTemplateFromSkill)
+	// T20 从文档导入（multipart .docx/.md → LLM 归纳模板草稿，失败回退规则映射）。
+	mux.HandleFunc("POST /api/report-templates/import-docx", s.reportTemplateImportDocx)
 	mux.HandleFunc("GET /api/report-settings", s.reportSettingsGet)
 	mux.HandleFunc("PATCH /api/report-settings", s.reportSettingsPatch)
 	mux.HandleFunc("POST /api/report/generate", s.reportGenerate)

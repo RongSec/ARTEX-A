@@ -73,6 +73,10 @@ type EvidenceImage struct {
 	StepIndex int    `json:"step_index"`
 	Path      string `json:"path"`
 	Caption   string `json:"caption,omitempty"`
+	// APIPath 是同源可访问的 API 相对路径（/api/findings/{fid}/evidence/{eid}，
+	// T20 HTML 预览 <img> 用；server 组装时填）。omitempty=不进旧契约消费方
+	// （pybuilder 读 path 插图，忽略此键零影响）。
+	APIPath string `json:"api_path,omitempty"`
 }
 
 // ReportInput 是一次报告生成的完整输入（任务级/项目级共用）。

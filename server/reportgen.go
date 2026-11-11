@@ -649,28 +649,46 @@ func joinWarnings(a, b string) string {
 // locale?, format:"docx"|"md"}（缺 template_id=默认模板解析链；缺 format=docx）。
 // 与正式生成的差异仅是「临时目录出文件 → 字节流回传 → 即删」，数据组装/伪资产
 // 红线校验走同一条 buildReportInput 逻辑（调试所见=交付所得）。60s 超时保护。
+// reportRenderDraft 同步渲染模板调试小样：不落库、不进队列、不占 job 状态机。
+// 入参 {template_id?|template?|demo?, scope:"task"|"project", task_id?|project_id?,
+// finding_ids?, locale?, format:"docx"|"md"|"html"}（缺 template_id=默认模板解析链；
+// 缺 format=docx）。
+//
+// T20（N1-C/D）扩展：
+//   - format="html"：走 report.HTMLFromInput 纯 Go 结构预览渲染（零子进程，
+//     对话调模板的实时预览通道）；docx/md 分支行为逐字节不变=零回归。
+//   - inline template=<完整模板 JSON>：**优先于 template_id**——未保存的 draft
+//     直接试渲染（对话预览关键路径）。只取内容字段（骨架/样式/提示词/元信息），
+//     id/is_default 等只读键忽略。
+//   - demo=true + task_id=0：数据=内置 fixture（report.DemoInput()），模板 meta
+//     按 inline template（或 template_id 解析链）覆盖；**跳过伪资产校验**
+//     （红线针对真实交付，fixture 的 targets 自洽即可——设计 §1.2D 显式绕开）。
 func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
 	if !s.pgReportDBGuard(w) {
 		return
 	}
 	var body struct {
-		TemplateID int64   `json:"template_id"`
-		Scope      string  `json:"scope"`
-		TaskID     int64   `json:"task_id"`
-		ProjectID  int64   `json:"project_id"`
-		FindingIDs []int64 `json:"finding_ids"`
-		Locale     string  `json:"locale"`
-		Format     string  `json:"format"`
+		TemplateID int64           `json:"template_id"`
+		Template   json.RawMessage `json:"template"`
+		Demo       bool            `json:"demo"`
+		Scope      string          `json:"scope"`
+		TaskID     int64           `json:"task_id"`
+		ProjectID  int64           `json:"project_id"`
+		FindingIDs []int64         `json:"finding_ids"`
+		Locale     string          `json:"locale"`
+		Format     string          `json:"format"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, "请求格式错误")
 		return
 	}
+	// 校验顺序与老行为逐字节一致：scope → format → 模板。demo 通道下 scope
+	// 无意义（fixture 不查任务），跳过 scope 校验。
 	body.Scope = strings.TrimSpace(body.Scope)
 	if body.Scope == "" {
 		body.Scope = db.ReportScopeTask
 	}
-	if body.Scope != db.ReportScopeTask && body.Scope != db.ReportScopeProject {
+	if !body.Demo && body.Scope != db.ReportScopeTask && body.Scope != db.ReportScopeProject {
 		writeErr(w, 400, "scope 必须是 task 或 project")
 		return
 	}
@@ -678,18 +696,35 @@ func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
 	if body.Format == "" {
 		body.Format = "docx"
 	}
-	if body.Format != "docx" && body.Format != "md" {
-		writeErr(w, 400, "format 仅支持 docx|md")
+	if body.Format != "docx" && body.Format != "md" && body.Format != "html" {
+		writeErr(w, 400, "format 仅支持 docx|md|html")
 		return
 	}
-	tmpl, err := s.m.pg.ResolveTemplateIDBySettings(body.TemplateID)
-	if err != nil {
-		writeErr(w, 500, "读取模板失败: "+err.Error())
-		return
+
+	// 模板解析：inline 优先 → template_id/settings/is_default 链（老行为）。
+	var inline *db.ReportTemplate
+	if len(body.Template) > 0 {
+		var err error
+		inline, err = draftTemplateFromRaw(body.Template)
+		if err != nil {
+			writeErr(w, 400, "template 不是合法草稿 JSON: "+err.Error())
+			return
+		}
 	}
-	if body.TemplateID > 0 && tmpl == nil {
-		writeErr(w, 400, "模板不存在")
-		return
+	var tmpl *db.ReportTemplate
+	if inline != nil {
+		tmpl = inline
+	} else {
+		var err error
+		tmpl, err = s.m.pg.ResolveTemplateIDBySettings(body.TemplateID)
+		if err != nil {
+			writeErr(w, 500, "读取模板失败: "+err.Error())
+			return
+		}
+		if body.TemplateID > 0 && tmpl == nil {
+			writeErr(w, 400, "模板不存在")
+			return
+		}
 	}
 	locale := strings.TrimSpace(body.Locale)
 	if locale == "" && tmpl != nil {
@@ -699,30 +734,47 @@ func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
 		locale = "zh-CN"
 	}
 
-	// 组一条「虚拟 job」直接喂 buildReportInput（不插 reports 表）。
-	vjob := &db.Report{
-		Scope:      body.Scope,
-		Format:     body.Format,
-		Locale:     locale,
-		FindingIDs: body.FindingIDs,
-		CreatedAt:  time.Now(),
-	}
-	if body.Scope == db.ReportScopeProject {
-		vjob.ProjectID = &body.ProjectID
-	} else {
-		vjob.TaskID = &body.TaskID
-	}
-	if tmpl != nil {
-		tid := tmpl.ID
-		vjob.TemplateID = &tid
-	}
-
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	in, warning, err := s.buildReportInput(ctx, vjob)
-	if err != nil {
-		writeErr(w, 400, "组装失败: "+err.Error()) // 任务/项目不存在、无 findings 等 → 400（调试语义）
-		return
+
+	var in *report.ReportInput
+	var warning string
+	if body.Demo {
+		// demo 通道：fixture 数据 + 模板 meta 覆盖；不查任务表、跳过伪资产红线
+		//（见函数头注释）。scope/task_id 参数在 demo 下无意义，忽略。
+		in = report.DemoInput()
+		in.Locale = locale
+		report.DemoTouchGeneratedAt(in)
+		applyTemplateMeta(in, tmpl, s.m.dir)
+	} else {
+		// 组一条「虚拟 job」直接喂 buildReportInput（不插 reports 表）。inline
+		// draft 不在 DB，vjob 不带 TemplateID（buildReportInput 会回查库拿错
+		// 的旧行），组装完成后由 applyTemplateMeta 覆盖模板段。
+		vjob := &db.Report{
+			Scope:      body.Scope,
+			Format:     body.Format,
+			Locale:     locale,
+			FindingIDs: body.FindingIDs,
+			CreatedAt:  time.Now(),
+		}
+		if body.Scope == db.ReportScopeProject {
+			vjob.ProjectID = &body.ProjectID
+		} else {
+			vjob.TaskID = &body.TaskID
+		}
+		if tmpl != nil && inline == nil {
+			tid := tmpl.ID
+			vjob.TemplateID = &tid
+		}
+		var err error
+		in, warning, err = s.buildReportInput(ctx, vjob)
+		if err != nil {
+			writeErr(w, 400, "组装失败: "+err.Error()) // 任务/项目不存在、无 findings 等 → 400（调试语义）
+			return
+		}
+		if inline != nil {
+			applyTemplateMeta(in, inline, s.m.dir)
+		}
 	}
 	if warning != "" {
 		w.Header().Set("X-Report-Warning", url.PathEscape(warning)) // 伪资产剔除在调试端同样透传
@@ -730,7 +782,9 @@ func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
 
 	// 文件名 = draft-<模板名>-<YYYYMMDD>.<ext>（调试语义，防与正式交付混淆）。
 	tmplName := "默认模板"
-	if tmpl != nil && strings.TrimSpace(tmpl.Name) != "" {
+	if inline != nil && strings.TrimSpace(inline.Name) != "" {
+		tmplName = inline.Name
+	} else if tmpl != nil && strings.TrimSpace(tmpl.Name) != "" {
 		tmplName = tmpl.Name
 	}
 	base := report.ReportBaseName("draft-"+tmplName, time.Now(), body.Format)
@@ -743,21 +797,106 @@ func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
 	defer os.RemoveAll(tmpDir)
 	outPath := filepath.Join(tmpDir, base)
 
-	if body.Format == "md" {
-		md := report.MarkdownFromInput(in)
-		if err := os.WriteFile(outPath, []byte(md), 0o644); err != nil {
+	if data, pure := renderDraftBytes(body.Format, in, s.requestOrigin(r)); pure {
+		// md/html 纯 Go 分派（renderDraftBytes 可测）；docx 走下方子进程管线。
+		if err := os.WriteFile(outPath, data, 0o644); err != nil {
 			writeErr(w, 500, "渲染失败: "+err.Error())
 			return
 		}
-	} else {
-		if err := report.GenerateDocx(ctx, in, outPath); err != nil {
-			writeErr(w, 502, "docx 渲染失败（无 python/python-docx？）: "+err.Error())
-			return
-		}
+	} else if err := report.GenerateDocx(ctx, in, outPath); err != nil {
+		writeErr(w, 502, "docx 渲染失败（无 python/python-docx？）: "+err.Error())
+		return
 	}
 	w.Header().Set("Content-Type", reportContentType(outPath))
 	w.Header().Set("Content-Disposition", contentDispositionAttachment(base))
 	http.ServeFile(w, r, outPath)
+}
+
+// renderDraftBytes 是 render-draft 的纯 Go 格式分派（T20，可测无副作用）：
+// "md"→MarkdownFromInput、"html"→HTMLPreviewFromInput（证据图 src 拼 origin
+// ——blob 预览下相对路径失效，见 report/html.go），pure=true；其余（docx）
+// pure=false，由调用方走 report.GenerateDocx 子进程管线（本函数不碰磁盘/
+// 子进程，保持纯函数测试面）。
+func renderDraftBytes(format string, in *report.ReportInput, origin string) (data []byte, pure bool) {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "md":
+		return []byte(report.MarkdownFromInput(in)), true
+	case "html":
+		return []byte(report.HTMLPreviewFromInput(in, origin)), true
+	default:
+		return nil, false
+	}
+}
+
+// draftTemplateFromRaw 把 inline 草稿 JSON 解成模板行形态（只取内容字段；
+// id/is_default/时间戳等只读键忽略）。skeleton 缺省=默认全章节；非法骨架
+// 直接报错（与 PATCH 入参同口径的护栏位置——渲染前的最后一次校验）。
+func draftTemplateFromRaw(raw json.RawMessage) (*db.ReportTemplate, error) {
+	var t db.ReportTemplate
+	if err := json.Unmarshal(raw, &t); err != nil {
+		return nil, err
+	}
+	if len(t.Skeleton) == 0 {
+		t.Skeleton = db.ParseSkeletonJSON(nil)
+	} else if err := db.ValidateSkeleton(t.Skeleton); err != nil {
+		return nil, err
+	} else {
+		t.Skeleton = db.NormalizeSkeleton(t.Skeleton)
+	}
+	if len(t.Style) == 0 {
+		t.Style = json.RawMessage("{}")
+	}
+	if len(t.Prompts) == 0 {
+		t.Prompts = json.RawMessage("{}")
+	}
+	if len(t.Personnel) == 0 {
+		t.Personnel = json.RawMessage("[]")
+	}
+	return &t, nil
+}
+
+// applyTemplateMeta 把模板的章节/元信息段覆盖进已组装的 ReportInput——与
+// buildReportInput 第 5 段对 DB 模板做的事一致（logo 相对 dataDir 解析绝对
+// 路径、缺文件留空），供 inline draft 与 demo 通道复用。
+func applyTemplateMeta(in *report.ReportInput, tmpl *db.ReportTemplate, dataDir string) {
+	if tmpl == nil {
+		return
+	}
+	in.Chapters = tmpl.Skeleton
+	in.Personnel = tmpl.Personnel
+	in.Issuer = tmpl.Issuer
+	in.LogoPath = tmpl.LogoPath
+	in.CVSSEnabled = tmpl.CVSSEnabled
+	in.Remark = tmpl.Remark
+	in.Style = tmpl.Style
+	in.Prompts = tmpl.Prompts
+	in.LogoAbs = ""
+	if rel := strings.TrimSpace(tmpl.LogoPath); rel != "" {
+		abs := filepath.Join(dataDir, filepath.FromSlash(rel))
+		if fi, err := os.Stat(abs); err == nil && !fi.IsDir() {
+			in.LogoAbs = abs
+		}
+	}
+}
+
+// requestOrigin 推导本次请求的站点绝对前缀（证据图 src 拼 URL 用）。
+// 优先 notify_public_base_url（部署方声明的对外地址，与 IM 回链同源）；
+// 未配置时回退请求头（X-Forwarded-Proto > URL.Scheme；Host）。都拿不到返回
+// ""（预览退相对路径，srcdoc 场景仍可用）。
+func (s *Server) requestOrigin(r *http.Request) string {
+	if base := strings.TrimRight(notifyPublicBaseURL(s.m.pg), "/"); base != "" {
+		return base
+	}
+	scheme := "http"
+	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
+		scheme = p
+	} else if r.TLS != nil {
+		scheme = "https"
+	}
+	if host := r.Host; host != "" {
+		return scheme + "://" + host
+	}
+	return ""
 }
 
 // ---------- ReportInput 组装（DB 取数 + 纯函数合并/校验） ----------
@@ -929,7 +1068,13 @@ func (s *Server) loadEvidenceImages(fs []*db.DBFinding) map[int64][]report.Evide
 			if fi, err := os.Stat(abs); err != nil || fi.IsDir() {
 				continue // 表行有、盘上无 → 跳过（不留占位）
 			}
-			out[f.ID] = append(out[f.ID], report.EvidenceImage{StepIndex: e.StepIndex, Path: abs, Caption: e.Caption})
+			out[f.ID] = append(out[f.ID], report.EvidenceImage{
+				StepIndex: e.StepIndex, Path: abs, Caption: e.Caption,
+				// T20 HTML 预览的 <img> src：同源相对 API 路径（字节流端点
+				// 支持 cookie/?token=，finding_evidence.go:205）。docx 通道只读
+				// Path，此键 omitempty 不进旧契约。
+				APIPath: fmt.Sprintf("/api/findings/%d/evidence/%d", f.ID, e.ID),
+			})
 		}
 	}
 	return out
@@ -1098,6 +1243,10 @@ func reportContentType(path string) string {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".md":
 		return "text/markdown; charset=utf-8"
+	case ".html":
+		// T20 预览通道：前端 fetch→blob→iframe 直接可嵌（charset 必须给，
+		// 中文标题否则按 latin1 猜）。
+		return "text/html; charset=utf-8"
 	case ".zip":
 		return "application/zip"
 	default:
