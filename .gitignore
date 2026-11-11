@@ -15,6 +15,11 @@ web/.next/
 web/tsconfig.tsbuildinfo
 web/next-env.d.ts
 *.local
+# 陈旧构建产物改名残留（build 前手动 rename .next/out 而来，非源码）
+web/.next_stale_*/
+web/out_stale_*/
+# 本地临时构建/编译暂存目录
+.buildtmp/
 
 # development tools
 .playwright-mcp/
