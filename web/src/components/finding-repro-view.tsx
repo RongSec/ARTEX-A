@@ -160,7 +160,13 @@ export function FindingReproView({
                   images={byStep.get(stepNo) ?? []}
                   onUpload={!readOnly ? (f) => void upload(stepNo, f) : undefined}
                   onRemove={!readOnly ? (img) => void remove(img) : undefined}
-                  onGenerate={!readOnly && (st.request || st.response) ? () => void generateShot(stepNo) : undefined}
+                  // 任务书语义：该步「有报文且无图」才给生成入口（有图=已渲/
+                  // 手工在位，再放按钮属冗余；重渲可由后端 enrich 幂等覆盖）。
+                  onGenerate={
+                    !readOnly && (st.request || st.response) && (byStep.get(stepNo) ?? []).length === 0
+                      ? () => void generateShot(stepNo)
+                      : undefined
+                  }
                   generating={generatingStep === stepNo}
                 />
               </div>
