@@ -1689,3 +1689,97 @@ export interface BatchTasksResult {
   project_id: number;
   concurrency: number;
 }
+
+// =====================================================================
+// 报告中心（artex-hs T15/T16，/api/report-templates|report-settings|report/*）
+// =====================================================================
+
+// ReportSectionKey 是章节骨架的章节标识（与后端 db.ReportSectionKey 枚举同步：
+// cover|statement|targets|summary|vuln_detail|conclusion）。
+export type ReportSectionKey = "cover" | "statement" | "targets" | "summary" | "vuln_detail" | "conclusion";
+
+// ReportSection 是模板 skeleton 数组的一个元素（有序章节定义）。
+export interface ReportSection {
+  key: ReportSectionKey;
+  title: string;
+  enabled: boolean;
+}
+
+// ReportPerson 是模板人员表条目。
+export interface ReportPerson {
+  name: string;
+  role: string;
+  contact?: string;
+}
+
+// ReportTemplate 是 report_templates 行（GET /api/report-templates）。
+export interface ReportTemplate {
+  id: number;
+  name: string;
+  is_default: boolean;
+  output_lang: string;
+  skeleton: ReportSection[];
+  style: Record<string, unknown>;
+  prompts: Record<string, string>;
+  issuer: string;
+  logo_path: string;
+  personnel: ReportPerson[];
+  cvss_enabled: boolean;
+  remark: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// ReportTemplateInput 是 POST 全量 / PATCH 局部门面的编辑态。
+export interface ReportTemplateInput {
+  name: string;
+  output_lang?: string;
+  skeleton?: ReportSection[];
+  style?: Record<string, unknown>;
+  prompts?: Record<string, string>;
+  issuer?: string;
+  logo_path?: string;
+  personnel?: ReportPerson[];
+  cvss_enabled?: boolean;
+  remark?: string;
+}
+
+// ReportSettings 是全局单例设置（GET/PATCH /api/report-settings）。
+export interface ReportSettings {
+  template_id?: number | null; // null=回退 is_default 模板
+  default_locale: string;
+}
+
+// ReportJob 是 reports 行（job+历史一体）。status 状态机
+// pending→running→done|failed；warning 含伪资产剔除提示。
+export interface ReportJob {
+  id: number;
+  scope: "task" | "project";
+  task_id?: number;
+  project_id?: number;
+  template_id?: number;
+  locale: string;
+  format: "docx" | "md";
+  status: "pending" | "running" | "done" | "failed";
+  file_path: string;
+  error: string;
+  warning: string;
+  finding_ids: number[];
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
+// ReportGenerateInput 是 POST /api/report/generate 的入参。
+export interface ReportGenerateInput {
+  scope: "task" | "project";
+  task_id?: number;
+  project_id?: number;
+  finding_ids?: number[];
+  template_id?: number;
+  locale?: string;
+  format?: "docx" | "md";
+}
+
+// ReportDraftInput 是 POST /api/report/render-draft 的入参（同步小样，不落库）。
+export interface ReportDraftInput extends ReportGenerateInput {}

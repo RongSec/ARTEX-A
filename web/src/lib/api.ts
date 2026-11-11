@@ -74,6 +74,12 @@ import type {
   ProjectDetail,
   ProjectGraphResp,
   ProjectInsight,
+  ReportDraftInput,
+  ReportGenerateInput,
+  ReportJob,
+  ReportSettings,
+  ReportTemplate,
+  ReportTemplateInput,
   ProjectWithStats,
   PromptVar,
   PromptVersion,
@@ -151,6 +157,76 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (r.status === 204) return undefined as T;
   return r.json();
+}
+
+// downloadBlob 拉一个需要 JWT 的文件端点并触发浏览器保存。文件名优先解析
+// Content-Disposition（RFC5987 filename*=UTF-8'' 优先、filename= 回退），拿
+// 不到用 fallback。withWarning=true 时返回响应头 X-Report-Warning（解码后），
+// 供报告中心展示伪资产剔除提示。
+export async function downloadBlob(
+  path: string,
+  fallbackName: string,
+  init?: RequestInit,
+  withWarning = false,
+): Promise<{ filename: string; warning: string }> {
+  if (MOCK) {
+    const blob = new Blob([`（demo）${fallbackName} 内容示例`], { type: "application/octet-stream" });
+    saveBlob(blob, fallbackName);
+    return { filename: fallbackName, warning: "" };
+  }
+  const token = getToken();
+  const r = await fetch(`/api${path}`, {
+    ...init,
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers as Record<string, string> | undefined),
+    },
+  });
+  if (!r.ok) {
+    let message = `${init?.method ?? "GET"} ${path}: ${r.status}`;
+    try {
+      const payload = (await r.json()) as { error?: unknown };
+      if (typeof payload.error === "string" && payload.error.trim()) message = payload.error.trim();
+    } catch {
+      /* 空/非 JSON 错误体保留状态码文案 */
+    }
+    throw new Error(message);
+  }
+  const disp = r.headers.get("Content-Disposition") ?? "";
+  let filename = "";
+  const mStar = disp.match(/filename\*=UTF-8''([^;]+)/i);
+  const mPlain = disp.match(/filename="?([^";]+)"?/);
+  if (mStar) {
+    try {
+      filename = decodeURIComponent(mStar[1]);
+    } catch {
+      filename = mStar[1];
+    }
+  } else if (mPlain) {
+    filename = mPlain[1];
+  }
+  if (!filename) filename = fallbackName;
+  const blob = await r.blob();
+  saveBlob(blob, filename);
+  const warnRaw = r.headers.get("X-Report-Warning") ?? "";
+  let warning = "";
+  try {
+    warning = warnRaw ? decodeURIComponent(warnRaw) : "";
+  } catch {
+    warning = warnRaw;
+  }
+  return { filename, warning: withWarning ? warning : "" };
+}
+
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 // sseUrl builds a URL for Server-Sent Events streams.
@@ -1378,4 +1454,38 @@ export const api = {
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
   rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
+
+  // ---- 报告中心（artex-hs T15/T16）----
+  // 模板 CRUD + 默认模板 + 全局设置 + 生成 job + 历史 + 同步调试小样。
+  reportTemplates: () => get<ReportTemplate[] | null>("/report-templates").then((r) => arr(r)),
+  createReportTemplate: (input: ReportTemplateInput) => post<ReportTemplate>("/report-templates", input),
+  updateReportTemplate: (id: number, input: Partial<ReportTemplateInput>) =>
+    patch<ReportTemplate>(`/report-templates/${id}`, input),
+  deleteReportTemplate: (id: number) => del<{ ok: boolean }>(`/report-templates/${id}`),
+  setDefaultReportTemplate: (id: number) => post<{ ok: boolean }>(`/report-templates/${id}/set-default`, {}),
+  reportSettings: () => get<ReportSettings>("/report-settings"),
+  patchReportSettings: (input: { template_id?: number | null; default_locale?: string }) =>
+    patch<ReportSettings>("/report-settings", input),
+  // 建 job 异步生成（202 返回 pending 行，前端轮询 reportJob）。
+  reportGenerate: (input: ReportGenerateInput) => post<ReportJob>("/report/generate", input),
+  reportJob: (id: number) => get<ReportJob>(`/report/jobs/${id}`),
+  // 历史列表（分页；重下不重生成）。
+  reports: (page = 1, pageSize = 20, status?: string) =>
+    get<{ items: ReportJob[]; total: number }>(
+      `/reports?page=${page}&page_size=${pageSize}${status ? `&status=${encodeURIComponent(status)}` : ""}`,
+    ).then((r) => ({ items: arr(r.items), total: r.total })),
+  deleteReport: (id: number) => del<{ ok: boolean }>(`/reports/${id}`),
+  // 浏览器直接触发下载（<a href> 带不了 JWT 头，统一走 fetch blob 范式，同
+  // exportFindings）；文件名优先取 Content-Disposition 的 RFC5987 filename*。
+  reportDownloadURL: (id: number) => `/report/jobs/${id}/download`,
+  downloadReportJob: (id: number) => downloadBlob(`/report/jobs/${id}/download`, `report-${id}.docx`),
+  // 同步渲染模板调试小样（60s 超时；不落库不进队列）。X-Report-Warning 透传
+  // 伪资产剔除提示，调用方解码展示。
+  renderReportDraft: (input: ReportDraftInput) =>
+    downloadBlob(
+      `/report/render-draft`,
+      "draft.docx",
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) },
+      true,
+    ),
 };
