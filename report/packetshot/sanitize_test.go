@@ -14,10 +14,10 @@ func TestSensitiveValue(t *testing.T) {
 		{"", ""},
 		{"short", "*****"},                                 // 5 < 12 全星
 		{"1234567890", "**********"},                       // 10 < 12 全星
-		{"abcdefghijkl", "abcd…jkl"},                      // 12 = 前4…后3
-		{"abcdefghijklmnopqrs", "abcd…qrs"},               // 17 < 20 弱打
-		{"abcdefghijklmnopqrst", "abcdefg…qrst"},          // 20 ≥20 前7…后4
-		{"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.full.body", "eyJhbGc…body"}, // 长 JWT（前7…后4=body）
+		{"abcdefghijkl", "abcd...jkl"},                      // 12 = 前4…后3
+		{"abcdefghijklmnopqrs", "abcd...qrs"},               // 17 < 20 弱打
+		{"abcdefghijklmnopqrst", "abcdefg...qrst"},          // 20 ≥20 前7…后4
+		{"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.full.body", "eyJhbGc...body"}, // 长 JWT（前7…后4=body）
 	}
 	for _, c := range cases {
 		if got := SensitiveValue(c.in); got != c.want {
@@ -28,7 +28,7 @@ func TestSensitiveValue(t *testing.T) {
 	if got := SensitiveValue(strings.Repeat("x", 11)); got != strings.Repeat("*", 11) {
 		t.Errorf("11-char should be all stars, got %q", got)
 	}
-	if got := SensitiveValue(strings.Repeat("y", 12)); !strings.Contains(got, "…") {
+	if got := SensitiveValue(strings.Repeat("y", 12)); !strings.Contains(got, "...") {
 		t.Errorf("12-char should be masked-with-ellipsis, got %q", got)
 	}
 	// 首尾明文残留校验：≥20 的前7后4 必须是原串的前7/后4。

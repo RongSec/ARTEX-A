@@ -24,10 +24,10 @@ func SensitiveValue(v string) string {
 		return strings.Repeat("*", n)
 	case n < 20:
 		r := []rune(v)
-		return string(r[:4]) + "…" + string(r[n-3:])
+		return string(r[:4]) + "..." + string(r[n-3:])
 	default:
 		r := []rune(v)
-		return string(r[:7]) + "…" + string(r[n-4:])
+		return string(r[:7]) + "..." + string(r[n-4:])
 	}
 }
 
