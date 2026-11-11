@@ -210,8 +210,8 @@ export default function ProjectsPage() {
 
 // CreateProjectDialog 新建项目：名称必填，描述/负责人/并发数可选。
 // T19 新增四设置控件：观察者 / 阅读者 / 自动写报告（三 Switch，默认关）+
-// 报告模板（下拉，可留空=默认链）。observer_enabled 后端 create 不收（PATCH 收），
-// 故 create 成功后若勾了观察者，紧跟一次 PATCH 补上（见 submit 内注释）。
+// 报告模板（下拉，可留空=默认链）。后端 create 字段集已与 PATCH 对齐（方案 A），
+// 四控件值直接进 POST body。
 function CreateProjectDialog({
   open,
   onOpenChange,
@@ -266,22 +266,11 @@ function CreateProjectDialog({
         description: description.trim(),
         owner: owner.trim(),
         concurrency: conc,
+        observer_enabled: observer,
         report_template_id: templateId ? Number(templateId) : null,
         auto_report: autoReport,
         reader_enabled: reader,
       });
-      // observer_enabled 后端 POST /api/projects 不接收（T18 只加了 auto/reader/模板三
-      // 字段；PATCH 才收 observer），这里 create 成功后补一次 PATCH，避免用户勾了不生效。
-      // PATCH 失败不回滚已建项目，单独提示——项目主体已创建、仅观察者开关需稍后在详情页开。
-      if (observer) {
-        try {
-          await api.updateProject(p.id, { observer_enabled: true });
-        } catch {
-          toast.warning(`项目已创建，但「观察者」开关补设失败——请到详情页重新打开`);
-          onCreated();
-          return;
-        }
-      }
       toast.success(`项目已创建：${p.name}`);
       onCreated();
     } catch (e) {

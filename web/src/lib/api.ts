@@ -1397,13 +1397,15 @@ export const api = {
       projects: arr(r.projects),
     })),
   project: (id: number | string) => get<ProjectDetail>(`/projects/${id}`),
-  // createProject 建项目。T18 三字段（report_template_id/auto_report/reader_enabled）
-  // 后端 create 已支持；report_template_id 省略/null=走默认模板链。
+  // createProject 建项目。四开关字段（observer_enabled/report_template_id/
+  // auto_report/reader_enabled）后端 create 已收齐（方案 A 对齐 PATCH 字段集）；
+  // report_template_id 省略/null=走默认模板链。
   createProject: (input: {
     name: string;
     description?: string;
     owner?: string;
     concurrency?: number;
+    observer_enabled?: boolean;
     report_template_id?: number | null;
     auto_report?: boolean;
     reader_enabled?: boolean;
@@ -1413,6 +1415,7 @@ export const api = {
       description: input.description ?? "",
       owner: input.owner ?? "",
       concurrency: input.concurrency ?? 2,
+      observer_enabled: input.observer_enabled ?? false,
       report_template_id: input.report_template_id ?? null,
       auto_report: input.auto_report ?? false,
       reader_enabled: input.reader_enabled ?? false,
