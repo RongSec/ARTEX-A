@@ -136,13 +136,15 @@ func (m *Manager) EnqueueTaskProjectBatch(id string) error {
 // --- HTTP handlers ---
 
 // projectsCreate 建项目。body {name, description?, owner?, concurrency?,
-// report_template_id?, auto_report?, reader_enabled?}（后三字段 T18，缺省=关）。
+// observer_enabled?, report_template_id?, auto_report?, reader_enabled?}
+// （后三字段 T18，observer_enabled T19 方案 A 补齐=与 PATCH 字段集对齐；缺省全关）。
 func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name             string `json:"name"`
 		Description      string `json:"description"`
 		Owner            string `json:"owner"`
 		Concurrency      int    `json:"concurrency"`
+		ObserverEnabled  bool   `json:"observer_enabled"`
 		ReportTemplateID *int64 `json:"report_template_id"`
 		AutoReport       bool   `json:"auto_report"`
 		ReaderEnabled    bool   `json:"reader_enabled"`
@@ -173,6 +175,7 @@ func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 		Description:      req.Description,
 		Owner:            req.Owner,
 		Concurrency:      req.Concurrency,
+		ObserverEnabled:  req.ObserverEnabled,
 		ReportTemplateID: req.ReportTemplateID,
 		AutoReport:       req.AutoReport,
 		ReaderEnabled:    req.ReaderEnabled,

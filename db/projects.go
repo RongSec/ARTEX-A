@@ -10,13 +10,13 @@ import (
 // Project 是 projects 表的一行：artex-hs 二开的「项目-任务两级模型」上层。
 // 任务经 tasks.project_id 可选归属；NULL=无项目（完全等价原版行为）。
 type Project struct {
-	ID              int64     `json:"id"`
-	Name            string    `json:"name"`
-	Description     string    `json:"description"`
-	Status          string    `json:"status"` // active | archived
-	Owner           string    `json:"owner"`
-	Concurrency     int       `json:"concurrency"`      // 项目内批量任务并发数（1=串行）
-	ObserverEnabled bool      `json:"observer_enabled"` // B3 观察者总开关（默认关）
+	ID              int64  `json:"id"`
+	Name            string `json:"name"`
+	Description     string `json:"description"`
+	Status          string `json:"status"` // active | archived
+	Owner           string `json:"owner"`
+	Concurrency     int    `json:"concurrency"`      // 项目内批量任务并发数（1=串行）
+	ObserverEnabled bool   `json:"observer_enabled"` // B3 观察者总开关（默认关）
 	// T18 项目设置扩展三列。ReportTemplateID=nil → 走默认模板链；指针区分
 	// 「未设置」与「显式 0」，PATCH 语义与其余两列一致。
 	ReportTemplateID *int64    `json:"report_template_id"`
@@ -65,12 +65,14 @@ func scanProject(sc interface{ Scan(...any) error }) (*Project, error) {
 }
 
 // CreateProjectInput 是建项目的入参集（T18：新增三字段，nil/false = 列默认值，
-// 与三列的「默认关=基线」语义一致）。
+// 与三列的「默认关=基线」语义一致）。ObserverEnabled 后补（T19 方案 A 对齐
+// PATCH 字段集），同默认关=基线。
 type CreateProjectInput struct {
 	Name             string
 	Description      string
 	Owner            string
 	Concurrency      int
+	ObserverEnabled  bool
 	ReportTemplateID *int64 // nil=不绑定，走默认模板链
 	AutoReport       bool
 	ReaderEnabled    bool
@@ -91,10 +93,10 @@ func (d *DB) CreateProject(in CreateProjectInput) (*Project, error) {
 		tmpl = *in.ReportTemplateID
 	}
 	return scanProject(d.QueryRow(`
-INSERT INTO projects(name, description, owner, concurrency, report_template_id, auto_report, reader_enabled)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO projects(name, description, owner, concurrency, observer_enabled, report_template_id, auto_report, reader_enabled)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING `+projectCols, name, strings.TrimSpace(in.Description), strings.TrimSpace(in.Owner),
-		normalizeProjectConcurrency(concurrency), tmpl, in.AutoReport, in.ReaderEnabled))
+		normalizeProjectConcurrency(concurrency), in.ObserverEnabled, tmpl, in.AutoReport, in.ReaderEnabled))
 }
 
 // GetProject 返回单个项目；不存在时返回 ErrProjectNotFound。
