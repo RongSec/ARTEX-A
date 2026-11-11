@@ -15,8 +15,11 @@ package server
 
 import (
 	"context"
+	"log"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
@@ -25,7 +28,37 @@ import (
 const (
 	insightInjectMax      = 3   // 每轮最多注入条数（token 预算：3×200 字有上限）
 	insightInjectMaxRunes = 200 // 单条正文截断
+	// insightWarnEvery 是洞察链路 DB 错误的告警限频（照 project_indexer 的
+	// maybeWarnDrop 30s 范式）。OBS-1：resolver 出错→静默返回 "" 会让「四个
+	// planner 轮无注入」这类故障完全无线索，必须留一条 warn；但每轮一条会
+	// 刷屏，所以 30s 至多一条、带累计计数。
+	insightWarnEvery = 30 * time.Second
 )
+
+// insightErrWarner 限频告器（一次构造、跨 planner 轮共享，CAS 防并发刷屏）。
+// 返回是否真的打了这条日志（测试可直调断言，不劫持全局 log 输出）。
+type insightErrWarner struct {
+	last     atomic.Int64 // 上次告警时刻（unix nano）
+	suppressed atomic.Int64 // 距上次告警后被限频吞掉的错误数
+}
+
+func (w *insightErrWarner) warn(what string, taskID int64, err error) {
+	ts := time.Now().UnixNano()
+	n := w.suppressed.Add(1)
+	last := w.last.Load()
+	if ts-last < int64(insightWarnEvery) {
+		return
+	}
+	if !w.last.CompareAndSwap(last, ts) {
+		return
+	}
+	w.suppressed.Store(0)
+	log.Printf("[project-insight] %s 查询失败（task %d，%.0fs 内另有 %d 次同类错误被限频）：注入静默跳过 =%v", what, taskID, insightWarnEvery.Seconds(), n-1, err)
+}
+
+// insightWarner 是包级单例：全局限频（resolver 每任务一构造，per-task 实例会
+// 让刷屏按任务数翻倍；OBS-1 要的是「出错了看得见」而非「谁出的错」）。
+var insightWarner insightErrWarner
 
 // projectInsightResolverFor 构造 planner 的洞察渲染闭包。只捕获 pg（无状态），
 // taskID 由 planner 每轮 Plan 传入（engine.go:880 的 taskIDInt=DB 任务 id，与
@@ -38,8 +71,14 @@ func (s *Server) projectInsightResolverFor() func(taskID int64) string {
 		}
 		ctx := context.Background()
 		tctx, err := pg.TaskInsightContext(ctx, taskID)
-		if err != nil || !tctx.ObserverOn || tctx.ProjectID <= 0 {
-			return "" // 任务不存在/未挂项目/观察者关——三停之一的"注入停"
+		if err != nil {
+			// OBS-1：区分「查询失败静默」与「三停正常空转」——后者是预期空串
+			// 不该告警，前者必须留限频线索。
+			insightWarner.warn("TaskInsightContext", taskID, err)
+			return ""
+		}
+		if !tctx.ObserverOn || tctx.ProjectID <= 0 {
+			return "" // 未挂项目/观察者关——三停之一的"注入停"
 		}
 		// 命中原料：本任务 open 意图锚定的资产 → 归一化键。任一环节失败退化为
 		// 无关键词（时间序补位）——注入是锦上添花，绝不该因查询抖动报错。
@@ -50,7 +89,11 @@ func (s *Server) projectInsightResolverFor() func(taskID int64) string {
 			}
 		}
 		list, err := pg.ListInsights(ctx, tctx.ProjectID, match, insightInjectMax)
-		if err != nil || len(list) == 0 {
+		if err != nil {
+			insightWarner.warn("ListInsights", taskID, err)
+			return ""
+		}
+		if len(list) == 0 {
 			return ""
 		}
 		return renderProjectInsights(list)
