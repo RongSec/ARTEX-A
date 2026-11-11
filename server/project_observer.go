@@ -19,6 +19,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -154,13 +155,19 @@ func (s *Server) toolPushTaskHint() actool.CoreTool {
 }
 
 // toolReadAllProjectInsights 读跨项目的项目洞察池（reader 的输入面）。
-// project_ids 可选：空=全部项目。limit 默认 100（串联是"读一遍再归纳"，
-// 不该吞全表）。
+// project_ids 可选：空=全部【已开 reader_enabled 的 active 项目】。limit
+// 默认 100（串联是"读一遍再归纳"，不该吞全表）。
+//
+// T18 reader_enabled=项目级 opt-in：未开启的项目不进 reader 视野（读面收窄，
+// 双闸的全局侧由 reader 触发器 enabled，项目侧由此处过滤）。显式传入的
+// project_ids 同样过滤——只保留开了 reader_enabled 的；被剔除的在返回体里
+// 如实标注 skipped_projects，不静默吞掉（agent 需要知道哪些项目不在视野内，
+// 免得对着空结果反复重试）。
 func (s *Server) toolReadAllProjectInsights() actool.CoreTool {
 	return roTool("read_all_project_insights",
-		"读多个项目的【项目洞察】(project_insights，observer 产出)，供跨项目串联。project_ids 空=读全部项目；返回按项目分组的 content/keywords/时间。",
+		"读多个项目的【项目洞察】(project_insights，observer 产出)，供跨项目串联。仅覆盖【开启阅读者开关(reader_enabled)】的 active 项目；project_ids 空=读全部已开启项目；返回按项目分组的 content/keywords/时间。",
 		objSchema(map[string]any{
-			"project_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：限定项目 id；空=全部"},
+			"project_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：限定项目 id；空=全部已开启项目"},
 			"limit":       map[string]any{"type": "integer", "description": "每项目条数上限(可选，默认 50)"},
 		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
@@ -169,15 +176,9 @@ func (s *Server) toolReadAllProjectInsights() actool.CoreTool {
 				Limit      int     `json:"limit"`
 			}
 			_ = json.Unmarshal(in, &a)
-			ids := a.ProjectIDs
-			if len(ids) == 0 {
-				ps, err := s.m.pg.ListProjects("active")
-				if err != nil {
-					return actool.Errorf(err.Error()), nil
-				}
-				for _, p := range ps {
-					ids = append(ids, p.ID)
-				}
+			ids, skipped, err := s.readerVisibleProjects(a.ProjectIDs)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
 			}
 			if a.Limit <= 0 {
 				a.Limit = 50
@@ -194,8 +195,55 @@ func (s *Server) toolReadAllProjectInsights() actool.CoreTool {
 				}
 				out = append(out, map[string]any{"project_id": pid, "insights": items})
 			}
+			if len(skipped) > 0 {
+				// 被 reader_enabled 闸剔除的项目如实回报（照 warn 不拒纪律）。
+				out = append(out, map[string]any{"skipped_projects": skipped, "note": "这些项目未开启 reader_enabled 或不是 active 项目，不在跨项目阅读视野内"})
+			}
 			return jsonResult(out)
 		})
+}
+
+// readerVisibleProjects 计算 reader 可见项目集：projectIDs 空=全部 active 且
+// reader_enabled=true 的项目；非空=逐个过滤（不存在/非 active/未开启的进
+// skipped）。返回的 skipped 是字符串描述数组，供工具返回体如实标注。
+func (s *Server) readerVisibleProjects(projectIDs []int64) (visible []int64, skipped []string, err error) {
+	pg := s.m.pg
+	if len(projectIDs) == 0 {
+		ps, err := pg.ListProjects("active")
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, p := range ps {
+			if p.ReaderEnabled {
+				visible = append(visible, p.ID)
+			}
+		}
+		return visible, nil, nil
+	}
+	seen := map[int64]bool{}
+	for _, pid := range projectIDs {
+		if pid <= 0 || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		p, err := pg.GetProject(pid)
+		if errors.Is(err, db.ErrProjectNotFound) {
+			skipped = append(skipped, fmt.Sprintf("%d(不存在)", pid))
+			continue
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		switch {
+		case p.Status != "active":
+			skipped = append(skipped, fmt.Sprintf("%d(非 active)", pid))
+		case !p.ReaderEnabled:
+			skipped = append(skipped, fmt.Sprintf("%d(未开 reader_enabled)", pid))
+		default:
+			visible = append(visible, pid)
+		}
+	}
+	return visible, skipped, nil
 }
 
 // toolWriteGlobalInsight 写一条跨项目全局洞察（reader 产出）。只进
@@ -217,11 +265,24 @@ func (s *Server) toolWriteGlobalInsight() actool.CoreTool {
 			if len(a.SourceProjects) == 0 {
 				return actool.Errorf("source_projects 至少 1 个"), nil
 			}
-			g, err := s.m.pg.WriteGlobalInsight(ctx, a.Content, a.SourceProjects)
+			// T18：source_projects 剔除未 opt-in（reader_enabled 关/非 active/
+			// 不存在）的项目——warn 不拒，洞察宁少勿滥的纪律不变，但也不因某
+			// 个项目没开开关就把整条合法的全局洞察打回。全被剔除才报错。
+			visible, skipped, err := s.readerVisibleProjects(a.SourceProjects)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return actool.Text(fmt.Sprintf("global insight %d written (projects %v)", g.ID, a.SourceProjects)), nil
+			if len(skipped) > 0 {
+				log.Printf("[reader] write_global_insight 剔除未开启 reader_enabled 的项目: %v", skipped)
+			}
+			if len(visible) == 0 {
+				return actool.Errorf("source_projects 全部未开启 reader_enabled 或不可见，无有效来源项目"), nil
+			}
+			g, err := s.m.pg.WriteGlobalInsight(ctx, a.Content, visible)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return actool.Text(fmt.Sprintf("global insight %d written (projects %v)", g.ID, visible)), nil
 		})
 }
 

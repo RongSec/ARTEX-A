@@ -252,6 +252,21 @@ type Manager struct {
 	// 此时 taskFromPG 不给 store 设 OnGraphChange 回调 = 原版三原语零改动路径。
 	// 由 server.New 创建并 Start，Manager.Close 里 Stop（须在 pg.Close 之前）。
 	projectIndexer *ProjectIndexer
+
+	// OnTaskTerminal 是任务终态钩子（artex-hs T18）：任务状态落库为终态
+	// （done/failed/timeout）成功后异步派发 (taskID, status)，供「整项目收官
+	// 自动写报告」等旁路功能消费。nil=链路未启用，emitTaskTerminal 首行短路
+	// =原版零改动路径（注入范式同 bindGraphHook 的 OnGraphChange）。
+	// 由 server.New 在 PG 就绪后装配。
+	OnTaskTerminal func(taskID int64, status string)
+	// terminalEmitted 记录本进程已派发过终态的任务（防重：同一任务重复落同一
+	// 终态只 emit 一次；SetTaskStatus 是无条件 UPDATE 不像 Guarded 有 DB CAS，
+	// 任务从终态改回运行态时清除标记，允许再次收官派发）。
+	terminalEmitted sync.Map // int64 -> struct{}
+	// autoReportMu 按项目串行化「终态→建报告 job」判定（T18）。并发双终态时
+	// 两个钩子协程会各自查库都见全终态；互斥 + HasOpenProjectReport 在途检查
+	// 把「查收官→入队」压成一个不交错的动作，后到者看到在途 job 直接跳过。
+	autoReportMu sync.Map // int64(projectID) -> *sync.Mutex
 }
 
 // Settings keys the UI toggles at runtime.
@@ -1420,6 +1435,8 @@ func (m *Manager) SetTaskStatusGuarded(id, status string) (won bool, err error) 
 		})
 	}
 	m.mu.Unlock()
+	// 终态 DB 写入成功且本次赢得转换（Guarded CAS 通过）→ 派发终态钩子。
+	m.emitTaskTerminal(n, status)
 	return true, nil
 }
 
@@ -1451,7 +1468,44 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 		})
 	}
 	m.mu.Unlock()
+	// DB 写入成功后的唯一收口点。非终态时 emitTaskTerminal 内部判 IsTerminal
+	// 并清除防重标记（允许重新收官），无额外开销。
+	m.emitTaskTerminal(n, status)
 	return nil
+}
+
+// emitTaskTerminal 是任务终态钩子的唯一派发口（T18）：全仓只有三处写终态
+// （engine.go goalless-done / engine.go planner-done / engine_timeout.go
+// done|timeout），全部经 SetTaskStatus 或 SetTaskStatusGuarded 进来，因此挂
+// 在这两个收口方法上即可「防漏」；用 sync.Map 的 LoadOrStore 做「防重」——
+// 同一任务在本进程内只派发一次终态（重复落同一终态、或 Guarded 失败后再次
+// 尝试都不二次触发）。任务从终态回到非终态（继续/追问复活）时清除标记，
+// 让它再次收官能重新派发。
+//
+// 派发是异步的（goroutine + recover），绝不能在 taskStateMu 内同步跑钩子逻辑：
+// 钩子要查库、要起报告 job，慢查询会把所有任务的状态写入串行卡住。nil 钩子
+// 首行短路 = 原版零行为。
+func (m *Manager) emitTaskTerminal(taskID int64, status string) {
+	hook := m.OnTaskTerminal
+	if !pgdb.IsTerminal(status) {
+		// 非终态：清掉可能存在的标记，使该任务后续真正收官时仍能派发一次。
+		m.terminalEmitted.Delete(taskID)
+		return
+	}
+	if hook == nil {
+		return
+	}
+	if _, loaded := m.terminalEmitted.LoadOrStore(taskID, struct{}{}); loaded {
+		return // 本进程已为该任务派发过终态
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[terminal-hook] task %d (%s) 钩子 panic（已吞）: %v", taskID, status, r)
+			}
+		}()
+		hook(taskID, status)
+	}()
 }
 
 // DeleteTask removes a task and optionally its related global data. Traffic has

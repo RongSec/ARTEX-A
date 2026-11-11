@@ -17,8 +17,13 @@ type Project struct {
 	Owner           string    `json:"owner"`
 	Concurrency     int       `json:"concurrency"`      // 项目内批量任务并发数（1=串行）
 	ObserverEnabled bool      `json:"observer_enabled"` // B3 观察者总开关（默认关）
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	// T18 项目设置扩展三列。ReportTemplateID=nil → 走默认模板链；指针区分
+	// 「未设置」与「显式 0」，PATCH 语义与其余两列一致。
+	ReportTemplateID *int64    `json:"report_template_id"`
+	AutoReport       bool      `json:"auto_report"`    // 整项目收官自动写报告（默认关）
+	ReaderEnabled    bool      `json:"reader_enabled"` // 允许跨项目 reader 聚合本项目（默认关）
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // ProjectStats 是项目列表/详情的聚合统计（任务数/排队数/finding 分档数）。
@@ -49,29 +54,47 @@ func normalizeProjectConcurrency(n int) int {
 	return n
 }
 
-const projectCols = `id, name, description, status, owner, concurrency, observer_enabled, created_at, updated_at`
+const projectCols = `id, name, description, status, owner, concurrency, observer_enabled, report_template_id, auto_report, reader_enabled, created_at, updated_at`
 
 func scanProject(sc interface{ Scan(...any) error }) (*Project, error) {
 	var p Project
-	if err := sc.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Owner, &p.Concurrency, &p.ObserverEnabled, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := sc.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Owner, &p.Concurrency, &p.ObserverEnabled, &p.ReportTemplateID, &p.AutoReport, &p.ReaderEnabled, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &p, nil
 }
 
+// CreateProjectInput 是建项目的入参集（T18：新增三字段，nil/false = 列默认值，
+// 与三列的「默认关=基线」语义一致）。
+type CreateProjectInput struct {
+	Name             string
+	Description      string
+	Owner            string
+	Concurrency      int
+	ReportTemplateID *int64 // nil=不绑定，走默认模板链
+	AutoReport       bool
+	ReaderEnabled    bool
+}
+
 // CreateProject 插入一个项目（status 固定 active 起步；owner 可空）。
-func (d *DB) CreateProject(name, description, owner string, concurrency int) (*Project, error) {
-	name = strings.TrimSpace(name)
+func (d *DB) CreateProject(in CreateProjectInput) (*Project, error) {
+	name := strings.TrimSpace(in.Name)
 	if name == "" {
 		return nil, errors.New("project name is required")
 	}
+	concurrency := in.Concurrency
 	if concurrency <= 0 {
 		concurrency = 2
 	}
+	var tmpl any
+	if in.ReportTemplateID != nil && *in.ReportTemplateID > 0 {
+		tmpl = *in.ReportTemplateID
+	}
 	return scanProject(d.QueryRow(`
-INSERT INTO projects(name, description, owner, concurrency)
-VALUES ($1, $2, $3, $4)
-RETURNING `+projectCols, name, strings.TrimSpace(description), strings.TrimSpace(owner), normalizeProjectConcurrency(concurrency)))
+INSERT INTO projects(name, description, owner, concurrency, report_template_id, auto_report, reader_enabled)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING `+projectCols, name, strings.TrimSpace(in.Description), strings.TrimSpace(in.Owner),
+		normalizeProjectConcurrency(concurrency), tmpl, in.AutoReport, in.ReaderEnabled))
 }
 
 // GetProject 返回单个项目；不存在时返回 ErrProjectNotFound。
@@ -183,6 +206,13 @@ type UpdateProjectPatch struct {
 	Status          *string // active|archived
 	Concurrency     *int
 	ObserverEnabled *bool
+	// T18：三列的 PATCH 指针字段。report_template_id 可空，*int64 的 nil 无法
+	// 区分「键缺席」与「显式 null=清除」，故加 Set 标志（server 判键后置位，
+	// 值指针 nil=清除回默认模板链）。
+	ReportTemplateID    *int64
+	ReportTemplateIDSet bool
+	AutoReport          *bool
+	ReaderEnabled       *bool
 }
 
 // UpdateProject 应用局部更新并返回新行。status 非法值返回错误（DDL 有 CHECK，
@@ -195,13 +225,22 @@ func (d *DB) UpdateProject(id int64, patch UpdateProjectPatch) (*Project, error)
 			return nil, errors.New(`invalid status (want active|archived)`)
 		}
 	}
+	// report_template_id 可空：$15 直接传 any——显式清除时是 nil→SQL NULL，
+	// 绑定时是 int64。CASE 谓词 $14 用 Set 标志判「键是否出现」。
+	var templateAny any
+	if patch.ReportTemplateIDSet && patch.ReportTemplateID != nil && *patch.ReportTemplateID > 0 {
+		templateAny = *patch.ReportTemplateID
+	}
 	p, err := scanProject(d.QueryRow(`UPDATE projects SET
 	name          = CASE WHEN $2::boolean THEN $3 ELSE name END,
 	description   = CASE WHEN $4::boolean THEN $5 ELSE description END,
 	owner         = CASE WHEN $6::boolean THEN $7 ELSE owner END,
 	status        = CASE WHEN $8::boolean THEN $9 ELSE status END,
 	concurrency   = CASE WHEN $10::boolean THEN $11 ELSE concurrency END,
-	observer_enabled = CASE WHEN $12::boolean THEN $13 ELSE observer_enabled END
+	observer_enabled = CASE WHEN $12::boolean THEN $13 ELSE observer_enabled END,
+	report_template_id = CASE WHEN $14::boolean THEN $15::bigint ELSE report_template_id END,
+	auto_report   = CASE WHEN $16::boolean THEN $17 ELSE auto_report END,
+	reader_enabled = CASE WHEN $18::boolean THEN $19 ELSE reader_enabled END
 WHERE id=$1
 RETURNING `+projectCols,
 		id,
@@ -210,7 +249,10 @@ RETURNING `+projectCols,
 		patch.Owner != nil, derefStr(patch.Owner),
 		patch.Status != nil, derefStr(patch.Status),
 		patch.Concurrency != nil, normalizeProjectConcurrency(derefInt(patch.Concurrency)),
-		patch.ObserverEnabled != nil, derefBool(patch.ObserverEnabled)))
+		patch.ObserverEnabled != nil, derefBool(patch.ObserverEnabled),
+		patch.ReportTemplateIDSet, templateAny,
+		patch.AutoReport != nil, derefBool(patch.AutoReport),
+		patch.ReaderEnabled != nil, derefBool(patch.ReaderEnabled)))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrProjectNotFound
 	}

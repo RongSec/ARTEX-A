@@ -560,6 +560,16 @@ func (d *DB) FinishReportFailed(id int64, errorText string) error {
 	return nil
 }
 
+// HasOpenProjectReport 返回某项目是否已有未收尾（pending/running）的 project 级
+// 报告 job（T18 自动报告去抖：并发双终态时后到的钩子看到前一个已入队的 job
+// 就跳过，防重复建报告）。
+func (d *DB) HasOpenProjectReport(projectID int64) (bool, error) {
+	var exists bool
+	err := d.QueryRow(`SELECT EXISTS(SELECT 1 FROM reports
+WHERE project_id=$1 AND scope='project' AND status IN ('pending','running'))`, projectID).Scan(&exists)
+	return exists, err
+}
+
 // GetReport returns one report/job row, or nil when absent.
 func (d *DB) GetReport(id int64) (*Report, error) {
 	r, err := scanReport(d.QueryRow(`SELECT `+reportCols+` FROM reports WHERE id=$1`, id))

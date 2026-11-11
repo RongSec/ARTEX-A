@@ -135,13 +135,17 @@ func (m *Manager) EnqueueTaskProjectBatch(id string) error {
 
 // --- HTTP handlers ---
 
-// projectsCreate 建项目。body {name, description?, owner?, concurrency?}。
+// projectsCreate 建项目。body {name, description?, owner?, concurrency?,
+// report_template_id?, auto_report?, reader_enabled?}（后三字段 T18，缺省=关）。
 func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
-		Owner       string `json:"owner"`
-		Concurrency int    `json:"concurrency"`
+		Name             string `json:"name"`
+		Description      string `json:"description"`
+		Owner            string `json:"owner"`
+		Concurrency      int    `json:"concurrency"`
+		ReportTemplateID *int64 `json:"report_template_id"`
+		AutoReport       bool   `json:"auto_report"`
+		ReaderEnabled    bool   `json:"reader_enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
@@ -151,7 +155,28 @@ func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "项目名不能为空")
 		return
 	}
-	p, err := s.m.PG().CreateProject(req.Name, req.Description, req.Owner, req.Concurrency)
+	// 模板存在性校验（仿 reportgen.go:331-340）：传了 >0 就必须是真的模板行；
+	// 0/null 视为不绑定。
+	if req.ReportTemplateID != nil && *req.ReportTemplateID > 0 {
+		t, err := s.m.PG().GetReportTemplate(*req.ReportTemplateID)
+		if err != nil {
+			writeErr(w, 500, "读取模板失败: "+err.Error())
+			return
+		}
+		if t == nil {
+			writeErr(w, 400, "模板不存在")
+			return
+		}
+	}
+	p, err := s.m.PG().CreateProject(db.CreateProjectInput{
+		Name:             req.Name,
+		Description:      req.Description,
+		Owner:            req.Owner,
+		Concurrency:      req.Concurrency,
+		ReportTemplateID: req.ReportTemplateID,
+		AutoReport:       req.AutoReport,
+		ReaderEnabled:    req.ReaderEnabled,
+	})
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -300,6 +325,46 @@ func (s *Server) projectsUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		patch.ObserverEnabled = &b
+	}
+	// T18 三字段。report_template_id 显式 null=清除绑定（回退默认模板链），
+	// 数字>0=绑定（校验存在性，仿 reportgen.go:331-340）；0 同 null。
+	if v, has := raw["report_template_id"]; has {
+		patch.ReportTemplateIDSet = true
+		if string(v) != "null" {
+			var n int64
+			if err := json.Unmarshal(v, &n); err != nil {
+				writeErr(w, 400, "report_template_id 须为整数或 null")
+				return
+			}
+			if n > 0 {
+				t, err := s.m.PG().GetReportTemplate(n)
+				if err != nil {
+					writeErr(w, 500, "读取模板失败: "+err.Error())
+					return
+				}
+				if t == nil {
+					writeErr(w, 400, "模板不存在")
+					return
+				}
+				patch.ReportTemplateID = &n
+			}
+		}
+	}
+	if v, has := raw["auto_report"]; has {
+		var b bool
+		if err := json.Unmarshal(v, &b); err != nil {
+			writeErr(w, 400, "auto_report 须为布尔")
+			return
+		}
+		patch.AutoReport = &b
+	}
+	if v, has := raw["reader_enabled"]; has {
+		var b bool
+		if err := json.Unmarshal(v, &b); err != nil {
+			writeErr(w, 400, "reader_enabled 须为布尔")
+			return
+		}
+		patch.ReaderEnabled = &b
 	}
 	p, err := s.m.PG().UpdateProject(pid, patch)
 	if errors.Is(err, db.ErrProjectNotFound) {

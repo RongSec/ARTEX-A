@@ -1432,6 +1432,9 @@ CREATE TABLE IF NOT EXISTS projects (
     owner             TEXT NOT NULL DEFAULT '',             -- 负责人，可留空
     concurrency       INTEGER NOT NULL DEFAULT 2,           -- 项目内批量任务并发数：1=严格串行，2=同时两任务
     observer_enabled  BOOLEAN NOT NULL DEFAULT false,       -- 观察者开关：默认关闭。[T12 定稿]只管两件事：触发 observer + 注入 insight；project_index 投影常开（大图 tab 数据源，关着也能看）
+    report_template_id BIGINT,                             -- 项目默认报告模板（report_templates.id）；NULL=走默认模板链。无 FK：模板行允许被删（view-time/建 job 时判缺回退默认，照 tasks.template_id 同款策略）
+    auto_report       BOOLEAN NOT NULL DEFAULT false,      -- 整项目收官自动写报告：默认关闭。任务终态钩子查此开关决定是否建 project 级报告 job（T18）
+    reader_enabled    BOOLEAN NOT NULL DEFAULT false,      -- 允许跨项目 reader 聚合本项目洞察：默认关闭=行为等于基线（T18）
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -1443,6 +1446,11 @@ CREATE TRIGGER trg_projects_upd BEFORE UPDATE ON projects
 -- 任务归属项目；NULL=无项目（完全等价原版行为，零回归基线）。
 -- 刻意 ON DELETE SET NULL：删项目不连带删任务（任务数据比项目分组更贵重）。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects(id) ON DELETE SET NULL;
+-- T18 项目设置扩展三列（CREATE 内+ALTER 双写，schema.go:171 exec 整份、
+-- 幂等约束照 :249-255 写法；新库走 CREATE、存量库走 ALTER，语义一致）。
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS report_template_id BIGINT;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS auto_report BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS reader_enabled BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at DESC)
     WHERE deleted_at IS NULL AND project_id IS NOT NULL;
 -- 批量调度取「某项目 FIFO 队首」用（partial 只索引在排队的行，命中集小）：

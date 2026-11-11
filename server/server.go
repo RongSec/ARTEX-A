@@ -245,6 +245,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// OnGraphChange 回调。无 PG 时恒 nil=整条链路惰性（原版零回归）。
 		m.projectIndexer = newProjectIndexer(m.pg)
 		m.projectIndexer.Start(s.ctx)
+		// 任务终态→整项目自动报告钩子（artex-hs T18）。nil 守卫在装配内部，
+		// 钩子本体在 Manager.emitTaskTerminal 判空短路=原版零行为。
+		s.installAutoReportHook()
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
