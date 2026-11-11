@@ -58,11 +58,16 @@ func (s *Server) evidenceImageAccess(w http.ResponseWriter, r *http.Request) (in
 }
 
 func evidenceImageDTO(e db.FindingEvidenceImage) map[string]any {
+	src := e.Source
+	if src == "" {
+		src = db.EvidenceSourceUpload // 历史行/缺省归 upload
+	}
 	return map[string]any{
 		"id":         e.ID,
 		"step_index": e.StepIndex,
 		"caption":    e.Caption,
 		"sort_order": e.SortOrder,
+		"source":     src, // T22：auto/paste/upload（前端角标与覆盖判定用）
 		"url":        fmt.Sprintf("/api/findings/%d/evidence/%d", e.FindingID, e.ID),
 		"created_at": e.CreatedAt,
 	}

@@ -1866,6 +1866,8 @@ export interface FindingEvidenceImage {
   step_index: number; // 复现步骤下标(从1计)；0=漏洞级
   caption: string;
   sort_order: number;
+  // T22 来源：auto=报文自动截图（幂等覆盖、可删）；paste/upload=手工。
+  source: "auto" | "paste" | "upload";
   url: string;
   created_at: string;
 }

@@ -1618,6 +1618,9 @@ CREATE TABLE IF NOT EXISTS finding_evidence_images (
     filename    TEXT NOT NULL,                         -- 相对 dataDir 的存储路径
     caption     TEXT NOT NULL DEFAULT '',             -- 图注（可空）
     sort_order  INTEGER NOT NULL DEFAULT 0,           -- 同步骤内展示序
+    source      TEXT NOT NULL DEFAULT 'upload',       -- T22：auto=报文自动截图 / paste / upload（存量行默认 upload 兼容）
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_fei_finding ON finding_evidence_images(finding_id, step_index, sort_order, id);
+-- T22 报文自动截图：旧库补 source 列（CREATE 段已含，双写法同 projects 三列先例）。
+ALTER TABLE finding_evidence_images ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'upload';

@@ -11,7 +11,7 @@
 
 import * as React from "react";
 
-import { EyeIcon, ImagePlusIcon, Trash2Icon } from "lucide-react";
+import { CameraIcon, EyeIcon, ImagePlusIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
 
 import { CapturedTrafficViewer } from "@/components/traffic-evidence-viewer";
@@ -19,6 +19,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 import { api } from "@/lib/api";
 import type { FindingEvidenceImage, Reproduction } from "@/lib/types";
 
@@ -91,6 +92,23 @@ export function FindingReproView({
     }
   };
 
+  // T22 存量报文一键补渲：后端幂等只覆盖 auto 行，手工截图不动。
+  const [generatingStep, setGeneratingStep] = React.useState<number | null>(null);
+  const generateShot = async (stepIndex: number) => {
+    if (generatingStep != null) return;
+    setGeneratingStep(stepIndex);
+    try {
+      const r = await api.autoGenerateEvidence(findingId, stepIndex);
+      if (r.rendered > 0) toast.success(`已生成 ${r.rendered} 步报文截图`);
+      else toast.warning("该步没有可渲染的请求/响应报文");
+      reload();
+    } catch (e) {
+      toast.error(`生成截图失败：${(e as Error).message}`);
+    } finally {
+      setGeneratingStep(null);
+    }
+  };
+
   const steps = repro.steps ?? [];
 
   return (
@@ -138,7 +156,13 @@ export function FindingReproView({
                 {st.proves && <p className="text-sm">证明：{st.proves}</p>}
                 {st.request && <Packet title="请求" text={st.request} />}
                 {st.response && <Packet title="响应" text={st.response} />}
-                <EvidenceStrip images={byStep.get(stepNo) ?? []} onUpload={!readOnly ? (f) => void upload(stepNo, f) : undefined} onRemove={!readOnly ? (img) => void remove(img) : undefined} />
+                <EvidenceStrip
+                  images={byStep.get(stepNo) ?? []}
+                  onUpload={!readOnly ? (f) => void upload(stepNo, f) : undefined}
+                  onRemove={!readOnly ? (img) => void remove(img) : undefined}
+                  onGenerate={!readOnly && (st.request || st.response) ? () => void generateShot(stepNo) : undefined}
+                  generating={generatingStep === stepNo}
+                />
               </div>
             </div>
           );
@@ -171,10 +195,15 @@ function EvidenceStrip({
   images,
   onUpload,
   onRemove,
+  onGenerate,
+  generating,
 }: {
   images: FindingEvidenceImage[];
   onUpload?: (file: File | null | undefined) => void;
   onRemove?: (img: FindingEvidenceImage) => void;
+  // T22：该步有报文但无图（或用户想重渲）时显示「生成截图」按钮。
+  onGenerate?: () => void;
+  generating?: boolean;
 }) {
   // 粘贴截图：证据条聚焦（或内部控件获得焦点）时 Ctrl+V 取剪贴板图片直传。
   const handlePaste = (e: React.ClipboardEvent) => {
@@ -196,6 +225,11 @@ function EvidenceStrip({
           {/* 同源 artex_token cookie 自动随行过 requireAuth（auth.go 支持
               cookie 取值），无需拼 ?token=。 */}
           <img src={img.url} alt={img.caption || "证据截图"} className="border-primary/30 hover:border-primary h-20 w-28 rounded-md border object-cover" title={img.caption} />
+          {img.source === "auto" && (
+            <span className="bg-sky-500/90 text-white absolute bottom-0.5 left-0.5 rounded px-1 py-px text-[10px] leading-none">
+              自动生成
+            </span>
+          )}
           {onRemove && (
             <button
               type="button"
@@ -216,7 +250,12 @@ function EvidenceStrip({
           </Button>
         </>
       )}
-      {images.length === 0 && !onUpload && <Badge variant="outline">无截图</Badge>}
+      {onGenerate && (
+        <Button variant="outline" size="xs" onClick={onGenerate} disabled={generating}>
+          {generating ? <Spinner className="size-3" /> : <CameraIcon />} 生成截图
+        </Button>
+      )}
+      {images.length === 0 && !onUpload && !onGenerate && <Badge variant="outline">无截图</Badge>}
     </div>
   );
 }

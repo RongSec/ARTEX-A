@@ -59,7 +59,11 @@ func (s *Server) reproEnricherFor() agent.ReproEnricher {
 		}
 		if err := s.m.PG().UpdateFindingReproduction(findingID, out); err != nil {
 			log.Printf("[repro] finding %d 回填 exchange_id 失败: %v", findingID, err)
+			return
 		}
+		// T22：回填成功后同协程续渲报文截图（全局闸 packet_shot_enabled
+		// 默认 false=零行为；内部 panic/失败全吞，绝不影响 finding 主链路）。
+		s.renderPacketShots(findingID, out, false, nil)
 	}
 }
 

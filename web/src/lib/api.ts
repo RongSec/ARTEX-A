@@ -1496,7 +1496,7 @@ export const api = {
     if (caption) fd.append("caption", caption);
     // FormData 必须让浏览器自设 multipart 边界，不能走 http()（其会给 body
     // 强设 application/json）。范式同 workspaceUpload。
-    if (MOCK) return { id: Date.now(), step_index: stepIndex, caption, sort_order: 0, url: "", created_at: new Date().toISOString() };
+    if (MOCK) return { id: Date.now(), step_index: stepIndex, caption, sort_order: 0, source: "upload", url: "", created_at: new Date().toISOString() };
     const token = getToken();
     const r = await fetch(`/api/findings/${findingId}/evidence`, {
       method: "POST",
@@ -1515,6 +1515,15 @@ export const api = {
   },
   deleteFindingEvidence: (findingId: string | number, evidenceId: number) =>
     del<{ ok: boolean }>(`/findings/${findingId}/evidence/${evidenceId}`),
+  // T22 存量报文一键补渲（后端幂等：只覆盖 source=auto 行，手工行不动）。
+  // stepIndex 省略=全部步骤；返回 {steps,rendered}。mock 模式不真渲，回占位。
+  autoGenerateEvidence: (findingId: string | number, stepIndex?: number) =>
+    MOCK
+      ? Promise.resolve({ steps: stepIndex ? 1 : 2, rendered: stepIndex ? 1 : 2 })
+      : post<{ steps: number; rendered: number }>(
+          `/findings/${findingId}/evidence/auto-generate${stepIndex && stepIndex > 0 ? `?step_index=${stepIndex}` : ""}`,
+          {},
+        ),
 
   // ---- 报告中心（artex-hs T15/T16）----
   // 模板 CRUD + 默认模板 + 全局设置 + 生成 job + 历史 + 同步调试小样。

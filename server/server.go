@@ -248,6 +248,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 任务终态→整项目自动报告钩子（artex-hs T18）。nil 守卫在装配内部，
 		// 钩子本体在 Manager.emitTaskTerminal 判空短路=原版零行为。
 		s.installAutoReportHook()
+		// T22 报文自动截图：一次性 seed 全局闸 packet_shot_enabled（默认关
+		// =零回归；渲染入口在 reproEnricher 续渲 + 手动端点，闸判定在使用侧）。
+		s.installPacketShot()
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
@@ -1025,6 +1028,9 @@ func (s *Server) Handler() http.Handler {
 	// 原版路由零重叠）：上传/列表/删除/原图服务。{id}=findings 表 id。====
 	mux.HandleFunc("POST /api/findings/{id}/evidence", s.findingEvidenceUpload)
 	mux.HandleFunc("GET /api/findings/{id}/evidence", s.findingEvidenceList)
+	// T22 存量报文一键补渲（字面段 auto-generate 与 /{eid} 双隔离：方法同
+	// 为 GET/POST 时路径段互不含，照 retests/active 先例）。
+	mux.HandleFunc("POST /api/findings/{id}/evidence/auto-generate", s.findingEvidenceAutoGenerate)
 	mux.HandleFunc("DELETE /api/findings/{id}/evidence/{eid}", s.findingEvidenceDelete)
 	mux.HandleFunc("GET /api/findings/{id}/evidence/{eid}", s.findingEvidenceServe)
 
