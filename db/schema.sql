@@ -1519,3 +1519,75 @@ CREATE TABLE IF NOT EXISTS global_insights (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_gins_time ON global_insights(created_at DESC);
+
+-- =====================================================================
+-- P. 报告中心（artex-hs F4，T15）：报告模板 / 生成 job+历史 / 全局设置
+-- =====================================================================
+-- 三表分工：report_templates=可复用的封面/章节骨架/样式/AI prompt 预设；
+-- reports=「job+历史」一体（生成任务的状态机行，成功后 file_path 即交付物）；
+-- report_settings=全局单例（默认模板引用 + 默认输出语言）。
+-- 渲染实现本棒为 Markdown 桩（server/reportgen.go 的 ReportRenderer 挂点），
+-- T16 换 pybuilder docx 实装，表结构不变。
+
+-- 报告模板。skeleton 是章节骨架：有序数组 [{"key","title","enabled"}]，
+-- key 枚举起步 cover|statement|targets|summary|vuln_detail|conclusion，
+-- 校验/归一化纯函数见 db.ValidateSkeleton / db.NormalizeSkeleton
+-- （列默认 '{}' = 旧行未初始化，读取时归一化为默认全章节骨架）。
+-- style=字体/字号等渲染样式参数（T16 pybuilder 消费）；prompts=按章节 key
+-- 组织的 AI 叙述模板；personnel=[{name,role,contact}]。
+CREATE TABLE IF NOT EXISTS report_templates (
+    id           BIGSERIAL PRIMARY KEY,
+    name         TEXT NOT NULL,                              -- 模板名（报告中心列表展示）
+    is_default   BOOLEAN NOT NULL DEFAULT false,             -- 全局默认模板（至多一行 true，SetDefaultTemplate 单事务维护）
+    output_lang  TEXT NOT NULL DEFAULT 'zh-CN',              -- 默认输出语言（locale；生成入参可覆盖）
+    skeleton     JSONB NOT NULL DEFAULT '{}',                -- 章节骨架数组 [{key,title,enabled}]；'{}'=未初始化→读取时归一化为默认
+    style        JSONB NOT NULL DEFAULT '{}',                -- 字体/字号等样式（T16 pybuilder 消费）
+    prompts      JSONB NOT NULL DEFAULT '{}',                -- AI 叙述 prompt（按章节 key 组织）
+    issuer       TEXT NOT NULL DEFAULT '',                   -- 出具方（封面）
+    logo_path    TEXT NOT NULL DEFAULT '',                   -- logo 相对 dataDir 路径（封面）
+    personnel    JSONB NOT NULL DEFAULT '[]',                -- 参测人员表 [{name,role,contact}]
+    cvss_enabled BOOLEAN NOT NULL DEFAULT false,             -- 报告中是否呈现 CVSS 评分
+    remark       TEXT NOT NULL DEFAULT '',                   -- 备注（模板用途说明等）
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_report_tpl_default ON report_templates(is_default) WHERE is_default;
+DROP TRIGGER IF EXISTS trg_report_tpl_upd ON report_templates;
+CREATE TRIGGER trg_report_tpl_upd BEFORE UPDATE ON report_templates
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 报告生成 job + 交付历史（一体）。状态机 pending→running→done|failed，
+-- 非法迁移由 AdvanceReportStatus 拒绝（矩阵纯函数 CanAdvanceReport 单测覆盖）。
+-- task_ids/project_id 二选一（CHECK 保证与 scope 一致）；finding_ids 为勾选子集
+-- （空数组=任务/项目内全部 findings）。error/warning 存截断后的文本
+-- （warning 例：伪资产反向校验剔除清单，见 report.FilterPseudoTargets）。
+CREATE TABLE IF NOT EXISTS reports (
+    id           BIGSERIAL PRIMARY KEY,
+    scope        TEXT NOT NULL CHECK (scope IN ('task','project')),  -- 报告粒度：单任务/项目汇总
+    task_ids     BIGINT,                              -- scope='task'：来源任务 id
+    project_id   BIGINT,                              -- scope='project'：来源项目 id
+    template_id  BIGINT,                              -- 所用模板；NULL=取全局默认模板
+    locale       TEXT NOT NULL DEFAULT 'zh-CN',       -- 输出语言（入参>模板>zh-CN）
+    format       TEXT NOT NULL DEFAULT 'docx',        -- 交付格式 docx|md（本棒两种都走桩）
+    status       TEXT NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending','running','done','failed')),
+    file_path    TEXT NOT NULL DEFAULT '',            -- 产物绝对路径（done 后非空）
+    error        TEXT NOT NULL DEFAULT '',            -- failed 原因（入库前截断）
+    warning      TEXT NOT NULL DEFAULT '',            -- 成功但带警示（如剔除伪目标）
+    finding_ids  BIGINT[] NOT NULL DEFAULT '{}',      -- 勾选的 finding 子集；'{}'=全部
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),  -- 入队（pending）时刻
+    started_at   TIMESTAMPTZ,                         -- 迁移到 running 时刻
+    finished_at  TIMESTAMPTZ,                         -- 迁移到 done/failed 时刻
+    CONSTRAINT ck_reports_scope_key CHECK (
+        (scope = 'task'    AND task_ids IS NOT NULL AND project_id IS NULL) OR
+        (scope = 'project' AND project_id IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_reports_status_time ON reports(status, created_at DESC);
+
+-- 报告全局设置（单例表：key 恒 'default'）。template_id=NULL → 用 is_default 模板。
+CREATE TABLE IF NOT EXISTS report_settings (
+    key            TEXT PRIMARY KEY DEFAULT 'default',  -- 单例哨兵值，恒 'default'
+    template_id    BIGINT,                              -- 全局默认报告模板（NULL=回退 is_default 行）
+    default_locale TEXT NOT NULL DEFAULT 'zh-CN'        -- 未显式指定 locale 时的输出语言
+);
