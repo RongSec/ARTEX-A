@@ -31,7 +31,8 @@ func jsonResult(v any) (actool.Result, error) {
 // 它们像流量工具一样 seed 进 tools 表、按 agent 绑定(只绑给编排 agent 才可见)。
 
 // hostTools is the runtime host-tool provider fed to ToolAugment: traffic tools
-// (gated by capture) + cross-task orchestration tools + user-defined custom tools.
+// (gated by capture) + cross-task orchestration tools + finding-retest tools +
+// platform tools + observer/reader project tools + user-defined custom tools.
 // The second return is the names of custom tools flagged `deferred` (schema
 // withheld, routed via SearchExtraTools/ExecuteExtraTool). Per-agent binding still
 // decides who actually sees any of them.
@@ -40,7 +41,9 @@ func jsonResult(v any) (actool.Result, error) {
 func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools := append(s.m.HostTools(), s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
-	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
+	tools = append(tools, s.platformTools()...)        // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
+	tools = append(tools, s.projectObserverTools()...) // observer 四工具(读投影/下钻图/写洞察/推 hint)
+	tools = append(tools, s.projectReaderTools()...)   // reader 两工具(读全项目洞察/写全局洞察)
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)
