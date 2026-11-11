@@ -383,7 +383,7 @@ func buildPanel(packet string, o Options) []panelRow {
 			maxLines := 120
 			for i, ln := range body {
 				if i >= maxLines {
-					rows = append(rows, panelRow{kind: rowMuted, text: fmt.Sprintf("……（共 %d 行，超出已截断）", len(body))})
+					rows = append(rows, panelRow{kind: rowMuted, text: fmt.Sprintf("... (共 %d 行, 超出已截断)", len(body))})
 					break
 				}
 				kind := rowCode
