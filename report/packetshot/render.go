@@ -102,6 +102,8 @@ var cjkFontCandidates = []string{
 	`C:\Windows\Fonts\simsun.ttc`,
 	"/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
 	"/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+	"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+	"/usr/share/fonts/truetype/droid/DroidSansFallback.ttf",
 	"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
 	"/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
 	"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
