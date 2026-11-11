@@ -123,6 +123,11 @@ type Server struct {
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
 	side        *sideQuestionState
+
+	// reportRenderer 是 T15 报告 job 的渲染器注入点（nil = 内置 Markdown 桩
+	// renderReportStub）。**T16 docx（pybuilder）实装替换此字段即可**，job
+	// 生命周期/API/表结构零改动。见 reportgen.go。
+	reportRenderer ReportRenderer
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -979,6 +984,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/oob/hits/{id}", s.oobHitDetail)
 	mux.HandleFunc("GET /api/oob/capability", s.oobCapability)
 	mux.HandleFunc("GET /api/oob/payloads", s.oobPayloads)
+
+	// ==== T15 报告中心（artex-hs F4）：模板 CRUD/全局设置/生成 job/历史 ====
+	// 路由全部 /api/ 前缀 → 自动过 requireAuth(JWT)+CORS。前缀零遮蔽：与原版
+	// GET /api/report（?task= 快速预览）是不同精确路径（详见 reportgen.go 头注）。
+	mux.HandleFunc("GET /api/report-templates", s.reportTemplateList)
+	mux.HandleFunc("POST /api/report-templates", s.reportTemplateCreate)
+	mux.HandleFunc("PATCH /api/report-templates/{id}", s.reportTemplateUpdate)
+	mux.HandleFunc("DELETE /api/report-templates/{id}", s.reportTemplateDelete)
+	mux.HandleFunc("POST /api/report-templates/{id}/set-default", s.reportTemplateSetDefault)
+	mux.HandleFunc("GET /api/report-settings", s.reportSettingsGet)
+	mux.HandleFunc("PATCH /api/report-settings", s.reportSettingsPatch)
+	mux.HandleFunc("POST /api/report/generate", s.reportGenerate)
+	mux.HandleFunc("GET /api/report/jobs/{id}", s.reportJobGet)
+	mux.HandleFunc("GET /api/report/jobs/{id}/download", s.reportJobDownload)
+	mux.HandleFunc("GET /api/reports", s.reportsList)
+	mux.HandleFunc("DELETE /api/reports/{id}", s.reportsDelete)
 
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
