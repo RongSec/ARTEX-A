@@ -285,7 +285,14 @@ func parseChatPatch(raw string, base *db.ReportTemplate) (map[string]json.RawMes
 				warnings = append(warnings, "style 不是对象，已忽略")
 				continue
 			}
+			// V2 实跑观察项：纪律要求 AI 把未动键抄全（全量替换语义），存量
+			// 扩展键会每轮被报未知键刷屏。降噪：只对**本轮新引入**（base 里
+			// 原本没有）的未知键报 warning；存量透传键不报。语义不变。
+			baseKeys := baseStyleKeySet(base)
 			for _, unknown := range unknownStyleKeys(m) {
+				if baseKeys[unknown] {
+					continue
+				}
 				warnings = append(warnings, fmt.Sprintf("style 含未知键 %q（交付端忽略该键）", unknown))
 			}
 			out[k] = v // 未知键透传（pybuilder 忽略未知键，无害）
@@ -388,6 +395,23 @@ func unknownStyleKeys(m map[string]any) []string {
 		}
 	}
 	return out
+}
+
+// baseStyleKeySet 解析 base 模板 style 的既有键集（解析失败=空集，退化为
+// 全报 warning 的旧行为，宁多报不漏报）。
+func baseStyleKeySet(base *db.ReportTemplate) map[string]bool {
+	set := map[string]bool{}
+	if base == nil || len(base.Style) == 0 {
+		return set
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(base.Style, &m) != nil {
+		return set
+	}
+	for k := range m {
+		set[k] = true
+	}
+	return set
 }
 
 // mergeTemplateDraft 把 patch 合并进 base 得全量模板（全量替换语义：键在

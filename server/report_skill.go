@@ -119,12 +119,9 @@ func (s *Server) reportTemplateToSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	slug := skillSlugFor(t.Name, t.ID)
 	dir := filepath.Join(s.skillDir, slug)
-	if err := os.MkdirAll(s.skillDir, 0o755); err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
 	// 哨兵判定：目录已有 SKILL.md 且不含哨兵 = 非本机制创建 → 409；
 	// 含哨兵 = 幂等覆盖。判定抽成 canOverwriteSkillExport（纯函数，单测）。
+	// 先判后建：409 拒绝路径不留下我们创建的空白目录。
 	mdPath := filepath.Join(dir, "SKILL.md")
 	if old, err := os.ReadFile(mdPath); err == nil {
 		if !canOverwriteSkillExport(string(old)) {
@@ -133,6 +130,12 @@ func (s *Server) reportTemplateToSkill(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if !os.IsNotExist(err) {
 		writeErr(w, 500, "读取 skill 目录失败: "+err.Error())
+		return
+	}
+	// BUG-1 修复（V2 实跑）：MkdirAll 必须建到 slug 子目录 dir——原先只建
+	// s.skillDir 根目录，新模板首次导出时 dir 不存在，后续 WriteFile 必 500。
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		writeErr(w, 500, err.Error())
 		return
 	}
 	view := reportSkillTemplateView{

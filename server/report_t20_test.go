@@ -1,7 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -198,5 +204,99 @@ func TestRenderDraftBytesDispatch(t *testing.T) {
 	}
 	if _, pure := renderDraftBytes("  HTML ", in, ""); !pure {
 		t.Fatal("html case/trim broken")
+	}
+}
+
+// TestToSkillCreatesSlugDir BUG-1 回归（V2 实跑：首导必 500）：新模板（中文名
+// →回退 report-t<id>，slug 子目录此前不存在）首次 to-skill 必须成功建目录+三
+// 文件；重复导出幂等 200；skillDir 下同名目录存在但 SKILL.md 无哨兵 → 409 且
+// 不覆写。
+func TestToSkillCreatesSlugDir(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer m.Close()
+	skillDir := t.TempDir()
+	s := New(context.Background(), m, skillDir, t.TempDir(), t.TempDir())
+	h := s.Handler()
+	tok, err := signJWT(s.jwtKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func(path string) (int, string) {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(""))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+
+	tpl, err := m.pg.CreateReportTemplate(db.ReportTemplateInput{
+		Name:       "BUG1 中文模板",
+		OutputLang: "zh-CN",
+		Skeleton:   db.ParseSkeletonJSON(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slug := skillSlugFor(tpl.Name, tpl.ID)
+	dir := filepath.Join(skillDir, slug)
+
+	// 首导：dir 不存在 → 必须 200 且三文件齐（BUG-1 旧行为=500）。
+	code, body := post("/api/report-templates/" + strconv.FormatInt(tpl.ID, 10) + "/to-skill")
+	if code != 200 {
+		t.Fatalf("first export must succeed, got %d %s", code, body)
+	}
+	for _, f := range []string{"SKILL.md", "template.json", "manifest.json"} {
+		if b, err := os.ReadFile(filepath.Join(dir, f)); err != nil || len(b) == 0 {
+			t.Fatalf("%s missing/empty in %s: %v", f, dir, err)
+		}
+	}
+
+	// 幂等重导：200。
+	if code, body = post("/api/report-templates/" + strconv.FormatInt(tpl.ID, 10) + "/to-skill"); code != 200 {
+		t.Fatalf("re-export must be idempotent, got %d %s", code, body)
+	}
+
+	// 非哨兵同名目录 → 409 且不覆写。
+	tpl2, err := m.pg.CreateReportTemplate(db.ReportTemplateInput{
+		Name:       "Another 中文模板",
+		OutputLang: "zh-CN",
+		Skeleton:   db.ParseSkeletonJSON(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slug2 := skillSlugFor(tpl2.Name, tpl2.ID)
+	dir2 := filepath.Join(skillDir, slug2)
+	if err := os.MkdirAll(dir2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manual := "# 手工维护的 skill\n无哨兵"
+	if err := os.WriteFile(filepath.Join(dir2, "SKILL.md"), []byte(manual), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ = post("/api/report-templates/" + strconv.FormatInt(tpl2.ID, 10) + "/to-skill"); code != 409 {
+		t.Fatalf("non-sentinel dir must 409, got %d", code)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir2, "SKILL.md")); string(b) != manual {
+		t.Fatal("409 path must not overwrite manual skill")
+	}
+	// 409 路径不得新建不存在的目录：先造一个从未导出的模板验证。
+	tpl3, err := m.pg.CreateReportTemplate(db.ReportTemplateInput{
+		Name:       "Never Exported 三",
+		OutputLang: "zh-CN",
+		Skeleton:   db.ParseSkeletonJSON(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir3 := filepath.Join(skillDir, skillSlugFor(tpl3.Name, tpl3.ID))
+	if code, _ = post("/api/report-templates/" + strconv.FormatInt(tpl3.ID, 10) + "/to-skill"); code != 200 {
+		t.Fatalf("fresh export want 200 got %d", code)
+	}
+	if _, err := os.Stat(dir3); err != nil {
+		t.Fatalf("fresh export must create dir: %v", err)
 	}
 }

@@ -252,3 +252,54 @@ func TestExtractFencedJSON(t *testing.T) {
 		t.Fatal("non-json fence must not pass")
 	}
 }
+
+// TestParseChatPatchStyleWarnNoiseReduction V2 实跑观察项：模板存量扩展键
+// （base 里已有、非 knownStyleKeys）经 AI 按纪律"抄全"后回到 patch 时不得
+// 再报 warning；本轮新引入的未知键仍要报。
+func TestParseChatPatchStyleWarnNoiseReduction(t *testing.T) {
+	base := chatTestBase()
+	base.Style = json.RawMessage(`{"body_font":"仿宋","h2_size":15,"table_size":10.5}`)
+
+	t.Run("存量扩展键不报警告", func(t *testing.T) {
+		raw := `{"reply":"r","patch":{"style":{"body_font":"仿宋","h2_size":16,"table_size":10.5}}}`
+		patch, _, warnings, err := parseChatPatch(raw, base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if patch["style"] == nil {
+			t.Fatal("style must pass")
+		}
+		joined := strings.Join(warnings, "|")
+		if strings.Contains(joined, "h2_size") || strings.Contains(joined, "table_size") {
+			t.Fatalf("base-passthrough keys must not warn: %v", warnings)
+		}
+	})
+
+	t.Run("新引入未知键仍报", func(t *testing.T) {
+		raw := `{"reply":"r","patch":{"style":{"h2_size":16,"brand_new":1}}}`
+		_, _, warnings, err := parseChatPatch(raw, base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		joined := strings.Join(warnings, "|")
+		if !strings.Contains(joined, "brand_new") {
+			t.Fatalf("newly introduced unknown key must warn: %v", warnings)
+		}
+		if strings.Contains(joined, "h2_size") {
+			t.Fatalf("existing key must not warn: %v", warnings)
+		}
+	})
+
+	t.Run("base style 非法退化全报", func(t *testing.T) {
+		bad := chatTestBase()
+		bad.Style = json.RawMessage(`not json`)
+		raw := `{"reply":"r","patch":{"style":{"legacy_x":1}}}`
+		_, _, warnings, err := parseChatPatch(raw, bad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(strings.Join(warnings, "|"), "legacy_x") {
+			t.Fatalf("unparseable base must degrade to warn-all: %v", warnings)
+		}
+	})
+}
