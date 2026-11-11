@@ -503,6 +503,9 @@ export interface Finding {
   summary: string;
   evidence: string;
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
+  // reproduction 是 T14 结构化复现过程;仅详情接口返回,agent 未填时键缺席
+  // ('{}'列默认=未填)。有则详情页走分步呈现(入口点/前置/步骤卡片+证据图)。
+  reproduction?: Reproduction;
   intent_id?: string;
   param_id?: string;
   task_id?: string;
@@ -1783,3 +1786,30 @@ export interface ReportGenerateInput {
 
 // ReportDraftInput 是 POST /api/report/render-draft 的入参（同步小样，不落库）。
 export interface ReportDraftInput extends ReportGenerateInput {}
+
+// T14 结构化复现过程（后端 report.Reproduction 的 JSON 形状；仅 finding 详情
+// 接口透出，未填=键缺席）。steps[].exchange_id=自动关联的真实流量 id（可空）。
+export interface ReproStep {
+  request: string;
+  response: string;
+  expected?: string;
+  proves?: string;
+  exchange_id?: string;
+}
+export interface Reproduction {
+  entry_point?: string;
+  prerequisites?: string[];
+  steps: ReproStep[];
+  provenance?: string;
+}
+
+// T16(3/3) 发现证据截图（finding_evidence_images 行的线格式；url=同域可直接
+// 给 <img> 的绝对 API 路径，cookie 过鉴权）。
+export interface FindingEvidenceImage {
+  id: number;
+  step_index: number; // 复现步骤下标(从1计)；0=漏洞级
+  caption: string;
+  sort_order: number;
+  url: string;
+  created_at: string;
+}

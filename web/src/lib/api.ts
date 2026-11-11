@@ -74,6 +74,7 @@ import type {
   ProjectDetail,
   ProjectGraphResp,
   ProjectInsight,
+  FindingEvidenceImage,
   ReportDraftInput,
   ReportGenerateInput,
   ReportJob,
@@ -1454,6 +1455,37 @@ export const api = {
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
   rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
+
+  // ---- 发现证据截图（artex-hs T16(3/3)，/api/findings/{id}/evidence）----
+  // {id}=findings 表 id（与 detail 页句柄/finding_traffic_* 兄弟路由同口径）。
+  findingEvidence: (findingId: string | number) =>
+    get<FindingEvidenceImage[]>(`/findings/${findingId}/evidence`).then((r) => arr(r)),
+  uploadFindingEvidence: async (findingId: string | number, file: File, stepIndex: number, caption = ""): Promise<FindingEvidenceImage> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("step_index", String(stepIndex));
+    if (caption) fd.append("caption", caption);
+    // FormData 必须让浏览器自设 multipart 边界，不能走 http()（其会给 body
+    // 强设 application/json）。范式同 workspaceUpload。
+    if (MOCK) return { id: Date.now(), step_index: stepIndex, caption, sort_order: 0, url: "", created_at: new Date().toISOString() };
+    const token = getToken();
+    const r = await fetch(`/api/findings/${findingId}/evidence`, {
+      method: "POST",
+      body: fd,
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    });
+    if (!r.ok) {
+      let message = `上传失败: ${r.status}`;
+      try {
+        const p = (await r.json()) as { error?: unknown };
+        if (typeof p.error === "string" && p.error.trim()) message = p.error.trim();
+      } catch { /* 非 JSON 错误体保留状态码 */ }
+      throw new Error(message);
+    }
+    return r.json() as Promise<FindingEvidenceImage>;
+  },
+  deleteFindingEvidence: (findingId: string | number, evidenceId: number) =>
+    del<{ ok: boolean }>(`/findings/${findingId}/evidence/${evidenceId}`),
 
   // ---- 报告中心（artex-hs T15/T16）----
   // 模板 CRUD + 默认模板 + 全局设置 + 生成 job + 历史 + 同步调试小样。

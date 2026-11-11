@@ -834,6 +834,15 @@ func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.
 	}
 	merged := report.MergeVulns(vs)
 
+	// 3.5) 证据截图注入（T16(3/3) finding_evidence_images）：按 finding_id 把
+	// 各自截图挂到对应小节（step_index 相对该小节 reproduction 的步骤序）。
+	// 合并小节只取「胜者 finding」的图；去重键相同=同一复现，截图通常同源，
+	// 败者分散截图不并入（可接受边界，见 server 报告）。
+	imagesByFinding := s.loadEvidenceImages(fs)
+	for i := range merged {
+		merged[i].Images = imagesByFinding[merged[i].FindingID]
+	}
+
 	// 4) 检测目标表：候选抽取 + 伪资产反向校验。
 	var goalTexts []string
 	var anchorHosts []string
@@ -894,6 +903,36 @@ func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.
 		}
 	}
 	return in, warning, nil
+}
+
+// loadEvidenceImages 批量取这批 findings 的证据截图，按 finding_id 归组成
+// report.EvidenceImage（Path=绝对路径，缺文件跳过——盘上文件可能已被外部清理、
+// 表行残留；pybuilder 对缺文件本也容错）。无图返回空 map（调用方零特判）。
+func (s *Server) loadEvidenceImages(fs []*db.DBFinding) map[int64][]report.EvidenceImage {
+	out := map[int64][]report.EvidenceImage{}
+	if len(fs) == 0 {
+		return out
+	}
+	seen := map[int64]bool{}
+	for _, f := range fs {
+		if f.ID <= 0 || seen[f.ID] {
+			continue
+		}
+		seen[f.ID] = true
+		list, err := s.m.pg.ListFindingEvidenceImages(f.ID)
+		if err != nil {
+			log.Printf("[reportgen] evidence images fid=%d: %v", f.ID, err)
+			continue
+		}
+		for _, e := range list {
+			abs := filepath.Join(s.m.dir, filepath.FromSlash(e.Filename))
+			if fi, err := os.Stat(abs); err != nil || fi.IsDir() {
+				continue // 表行有、盘上无 → 跳过（不留占位）
+			}
+			out[f.ID] = append(out[f.ID], report.EvidenceImage{StepIndex: e.StepIndex, Path: abs, Caption: e.Caption})
+		}
+	}
+	return out
 }
 
 func taskMetaOf(t *db.Task) report.TaskMeta {

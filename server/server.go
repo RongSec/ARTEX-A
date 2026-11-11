@@ -1005,6 +1005,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/reports", s.reportsList)
 	mux.HandleFunc("DELETE /api/reports/{id}", s.reportsDelete)
 
+	// ==== T16(3/3) 发现证据截图（/api/findings 前缀，与 /api/exploration/findings
+	// 原版路由零重叠）：上传/列表/删除/原图服务。{id}=findings 表 id。====
+	mux.HandleFunc("POST /api/findings/{id}/evidence", s.findingEvidenceUpload)
+	mux.HandleFunc("GET /api/findings/{id}/evidence", s.findingEvidenceList)
+	mux.HandleFunc("DELETE /api/findings/{id}/evidence/{eid}", s.findingEvidenceDelete)
+	mux.HandleFunc("GET /api/findings/{id}/evidence/{eid}", s.findingEvidenceServe)
+
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (public — auth is enforced client-side and on the API). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).

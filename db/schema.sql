@@ -1591,3 +1591,25 @@ CREATE TABLE IF NOT EXISTS report_settings (
     template_id    BIGINT,                              -- 全局默认报告模板（NULL=回退 is_default 行）
     default_locale TEXT NOT NULL DEFAULT 'zh-CN'        -- 未显式指定 locale 时的输出语言
 );
+
+-- =====================================================================
+-- Q. 发现证据截图（artex-hs F4，T16(3/3)）：漏洞详情页逐步骤上传的截图
+-- =====================================================================
+-- 派工书列名写作 finding_node_id，但 0.3.15 所有 findings 子表
+-- （finding_retests / finding_traffic_bindings）与发现详情页句柄统一用
+-- findings 表 id（FindingDTO 未透出探索节点 id，detail 页 ?id= 即 findings.id）。
+-- 为与兄弟表一致、外键可 ON DELETE CASCADE 随漏洞存亡，这里键定为 finding_id
+-- （值=findings.id），列名偏差已上报 team-lead 待裁决。step_index 对应
+-- report.Reproduction.Steps 下标（从 1 计；0=漏洞级证据，不锚定单步）。
+-- filename 是相对 dataDir 的存储路径（data/report_assets/evidence/<fid>/<nano>），
+-- 静态服务按 id 反查后 ServeFile（不落可猜路径、防穿越）。sort_order 同步骤内排序。
+CREATE TABLE IF NOT EXISTS finding_evidence_images (
+    id          BIGSERIAL PRIMARY KEY,
+    finding_id  BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE, -- 值=findings.id（见上注）
+    step_index  INTEGER NOT NULL DEFAULT 0,           -- 复现步骤下标(从1计)；0=漏洞级
+    filename    TEXT NOT NULL,                         -- 相对 dataDir 的存储路径
+    caption     TEXT NOT NULL DEFAULT '',             -- 图注（可空）
+    sort_order  INTEGER NOT NULL DEFAULT 0,           -- 同步骤内展示序
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_fei_finding ON finding_evidence_images(finding_id, step_index, sort_order, id);
