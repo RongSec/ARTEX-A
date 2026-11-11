@@ -237,6 +237,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter()     // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
+		s.seedDefaultReportTemplate() // artex-hs T16: 内置「标准交付模板」幂等 seed(一次性)
+		// artex-hs T16: 报告渲染分派器(docx→pybuilder 子进程/失败回退 md；md→桩)。
+		s.reportRenderer = s.renderReportDispatch
 		// 项目投影异步消费者（artex-hs T10）。必须在 LoadExisting（restoreTaskRuntimes）
 		// 之前就位：taskFromPG 按 m.projectIndexer 是否为 nil 决定给 store 挂不挂
 		// OnGraphChange 回调。无 PG 时恒 nil=整条链路惰性（原版零回归）。
@@ -996,6 +999,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/report-settings", s.reportSettingsGet)
 	mux.HandleFunc("PATCH /api/report-settings", s.reportSettingsPatch)
 	mux.HandleFunc("POST /api/report/generate", s.reportGenerate)
+	mux.HandleFunc("POST /api/report/render-draft", s.reportRenderDraft)
 	mux.HandleFunc("GET /api/report/jobs/{id}", s.reportJobGet)
 	mux.HandleFunc("GET /api/report/jobs/{id}/download", s.reportJobDownload)
 	mux.HandleFunc("GET /api/reports", s.reportsList)

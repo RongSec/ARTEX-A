@@ -53,6 +53,26 @@ type VulnSection struct {
 	Description  string          `json:"description"`            // 漏洞摘要
 	Reproduction json.RawMessage `json:"reproduction,omitempty"` // T14 结构化复现（直读列，空/'{}'=未填）
 	SourceTasks  []int64         `json:"source_tasks"`           // 来源任务号（项目级合并后保留全部）
+
+	// T16 docx 渲染扩展（数据契约 v2，pybuilder 消费；全部 omitempty，
+	// T15 Markdown 桩忽略不影响）：
+	// ReportMD = finding.report 详细报告 Markdown 原文——无 reproduction 的
+	// 漏洞其「漏洞证明」段回退渲染此文本（硬规范③）。
+	ReportMD string `json:"report_md,omitempty"`
+	// Harm/Remediation = 危害/修复建议。本棒由 DB 现有字段能填则填、暂无
+	// 来源则空（AI 叙述注入后续棒），字段先行进契约。
+	Harm        string `json:"harm,omitempty"`
+	Remediation string `json:"remediation,omitempty"`
+	// Images = 证据截图（T16(3/3) finding_evidence_images 注入；按 step_index
+	// 穿插在对应步骤代码块之后）。Path 为绝对路径，py 端缺文件跳过。
+	Images []EvidenceImage `json:"images,omitempty"`
+}
+
+// EvidenceImage 是一张按复现步骤索引的证据截图引用。
+type EvidenceImage struct {
+	StepIndex int    `json:"step_index"`
+	Path      string `json:"path"`
+	Caption   string `json:"caption,omitempty"`
 }
 
 // ReportInput 是一次报告生成的完整输入（任务级/项目级共用）。
@@ -63,8 +83,11 @@ type ReportInput struct {
 	GeneratedAt time.Time `json:"generated_at"`
 
 	// 封面/组织元信息（来自模板；模板缺省时为空串/默认值）。
-	Issuer      string          `json:"issuer"`
-	LogoPath    string          `json:"logo_path"`
+	Issuer   string `json:"issuer"`
+	LogoPath string `json:"logo_path"`
+	// LogoAbs 是 LogoPath 相对 dataDir 解析后的绝对路径（server 组装时填；
+	// 文件不存在则留空）。pybuilder 插图只认 LogoAbs，不回读 dataDir。
+	LogoAbs     string          `json:"logo_abs,omitempty"`
 	Personnel   json.RawMessage `json:"personnel,omitempty"` // [{name,role,contact}]
 	CVSSEnabled bool            `json:"cvss_enabled"`
 	Remark      string          `json:"remark,omitempty"`
@@ -128,6 +151,7 @@ func VulnFromFinding(f *db.DBFinding, assetLabel func(int64) string) VulnSection
 		VulnClass:    strings.TrimSpace(f.VulnClass),
 		Description:  strings.TrimSpace(f.Summary),
 		Reproduction: f.Reproduction,
+		ReportMD:     strings.TrimSpace(f.Report),
 	}
 	if len(f.AssetIDs) > 0 {
 		if assetLabel != nil {
@@ -161,6 +185,18 @@ func MergeVulns(in []VulnSection) []VulnSection {
 			if sevRankOf(v.Severity) < sevRankOf(m.Severity) {
 				m.Severity = v.Severity // 取最高（rank 小=严重）
 			}
+			// 证据互补：胜者缺的结构化证据用败者的补上（同漏洞重复登记时，
+			// 后登记者可能带 reproduction/report）。
+			if !db.HasReproSteps(m.Reproduction) && db.HasReproSteps(v.Reproduction) {
+				m.Reproduction = v.Reproduction
+			}
+			if m.ReportMD == "" {
+				m.ReportMD = v.ReportMD
+			}
+			if m.Description == "" {
+				m.Description = v.Description
+			}
+			m.Images = append(m.Images, v.Images...)
 			m.SourceTasks = mergeInt64Unique(m.SourceTasks, v.SourceTasks)
 			continue
 		}

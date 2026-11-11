@@ -559,22 +559,205 @@ func (s *Server) renderReportStub(ctx context.Context, job *db.Report) (string, 
 	if err := ctx.Err(); err != nil {
 		return "", "", fmt.Errorf("报告渲染被取消: %w", err)
 	}
+	path, err := s.renderMarkdownArtifact(in, fmt.Sprintf("%d", job.ID), job.CreatedAt)
+	return path, warning, err
+}
+
+// renderMarkdownArtifact 把 ReportInput 渲染成 Markdown 落 <dataDir>/reports/
+// （临时文件原子改名）。prefix 拼在交付名前防撞（job 渲染=job id；回退链
+// 附 "-md" 标记）。warning 由调用方保留（回退场景=docx 失败原因）。
+func (s *Server) renderMarkdownArtifact(in *report.ReportInput, prefix string, at time.Time) (string, error) {
 	md := report.MarkdownFromInput(in)
+	dir := filepath.Join(s.m.dir, "reports")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("创建报告目录失败: %w", err)
+	}
+	name := fmt.Sprintf("%s-%s", prefix, report.ReportBaseName(in.Title, at, "md"))
+	path := filepath.Join(dir, name)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(md), 0o644); err != nil {
+		return "", fmt.Errorf("写入报告失败: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("落位报告失败: %w", err)
+	}
+	return path, nil
+}
+
+// ---------- T16 docx 分派器（默认 reportRenderer） ----------
+
+// renderReportDispatch 是 Server 启动时注入的默认渲染分派器：
+//   - format=md → Markdown 桩（T15 行为）；
+//   - format=docx → 组 ReportInput → report.GenerateDocx（pybuilder 子进程）；
+//     渲染失败**不判 job 失败**，回退 Markdown 桩交付、把 docx 失败原因追加进
+//     warning（交付可用性优先；无 python 环境也能拿到报告——验收红线）。
+//     产物名 = <jobID>-<任务名|项目名>-<YYYYMMDD>.<实际ext>（规范⑤交付名
+//     <名称>-<YYYYMMDD>.<ext> 加 job id 防撞前缀；下载端以真实产物后缀命名，
+//     ReportBaseName 防穿越）。
+func (s *Server) renderReportDispatch(ctx context.Context, job *db.Report) (string, string, error) {
+	in, warning, err := s.buildReportInput(ctx, job)
+	if err != nil {
+		return "", "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", fmt.Errorf("报告渲染被取消: %w", err)
+	}
+	if strings.ToLower(strings.TrimSpace(job.Format)) != "docx" {
+		path, err := s.renderMarkdownArtifact(in, fmt.Sprintf("%d", job.ID), job.CreatedAt)
+		return path, warning, err
+	}
 	dir := filepath.Join(s.m.dir, "reports")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", warning, fmt.Errorf("创建报告目录失败: %w", err)
 	}
-	name := fmt.Sprintf("%d-%s", job.ID, report.ReportBaseName(in.Title, job.CreatedAt, "md"))
-	path := filepath.Join(dir, name)
+	// 先写临时名（job 前缀+docx 扩展），成功后原子改名；失败走 md 回退链。
+	path := filepath.Join(dir, fmt.Sprintf("%d-%s", job.ID, report.ReportBaseName(in.Title, job.CreatedAt, "docx")))
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(md), 0o644); err != nil {
-		return "", warning, fmt.Errorf("写入报告失败: %w", err)
+	if err := report.GenerateDocx(ctx, in, tmp); err != nil {
+		_ = os.Remove(tmp)
+		mdPath, mdErr := s.renderMarkdownArtifact(in, fmt.Sprintf("%d", job.ID), job.CreatedAt)
+		if mdErr != nil {
+			return "", warning, fmt.Errorf("docx 渲染失败: %v；Markdown 回退也失败: %w", err, mdErr)
+		}
+		fb := truncateUTF8("docx 渲染失败已回退 Markdown: "+err.Error(), 800)
+		return mdPath, joinWarnings(warning, fb), nil
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return "", warning, fmt.Errorf("落位报告失败: %w", err)
 	}
 	return path, warning, nil
+}
+
+// joinWarnings 拼接两条告警（空者跳过），保证列表/详情单字段展示完整。
+func joinWarnings(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + "；" + b
+	}
+}
+
+// ---------- POST /api/report/render-draft ----------
+
+// reportRenderDraft 同步渲染模板调试小样：不落库、不进队列、不占 job 状态机。
+// 入参 {template_id?, scope:"task"|"project", task_id?|project_id?, finding_ids?,
+// locale?, format:"docx"|"md"}（缺 template_id=默认模板解析链；缺 format=docx）。
+// 与正式生成的差异仅是「临时目录出文件 → 字节流回传 → 即删」，数据组装/伪资产
+// 红线校验走同一条 buildReportInput 逻辑（调试所见=交付所得）。60s 超时保护。
+func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
+	if !s.pgReportDBGuard(w) {
+		return
+	}
+	var body struct {
+		TemplateID int64   `json:"template_id"`
+		Scope      string  `json:"scope"`
+		TaskID     int64   `json:"task_id"`
+		ProjectID  int64   `json:"project_id"`
+		FindingIDs []int64 `json:"finding_ids"`
+		Locale     string  `json:"locale"`
+		Format     string  `json:"format"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeErr(w, 400, "请求格式错误")
+		return
+	}
+	body.Scope = strings.TrimSpace(body.Scope)
+	if body.Scope == "" {
+		body.Scope = db.ReportScopeTask
+	}
+	if body.Scope != db.ReportScopeTask && body.Scope != db.ReportScopeProject {
+		writeErr(w, 400, "scope 必须是 task 或 project")
+		return
+	}
+	body.Format = strings.ToLower(strings.TrimSpace(body.Format))
+	if body.Format == "" {
+		body.Format = "docx"
+	}
+	if body.Format != "docx" && body.Format != "md" {
+		writeErr(w, 400, "format 仅支持 docx|md")
+		return
+	}
+	tmpl, err := s.m.pg.ResolveTemplateIDBySettings(body.TemplateID)
+	if err != nil {
+		writeErr(w, 500, "读取模板失败: "+err.Error())
+		return
+	}
+	if body.TemplateID > 0 && tmpl == nil {
+		writeErr(w, 400, "模板不存在")
+		return
+	}
+	locale := strings.TrimSpace(body.Locale)
+	if locale == "" && tmpl != nil {
+		locale = tmpl.OutputLang
+	}
+	if locale == "" {
+		locale = "zh-CN"
+	}
+
+	// 组一条「虚拟 job」直接喂 buildReportInput（不插 reports 表）。
+	vjob := &db.Report{
+		Scope:      body.Scope,
+		Format:     body.Format,
+		Locale:     locale,
+		FindingIDs: body.FindingIDs,
+		CreatedAt:  time.Now(),
+	}
+	if body.Scope == db.ReportScopeProject {
+		vjob.ProjectID = &body.ProjectID
+	} else {
+		vjob.TaskID = &body.TaskID
+	}
+	if tmpl != nil {
+		tid := tmpl.ID
+		vjob.TemplateID = &tid
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	in, warning, err := s.buildReportInput(ctx, vjob)
+	if err != nil {
+		writeErr(w, 400, "组装失败: "+err.Error()) // 任务/项目不存在、无 findings 等 → 400（调试语义）
+		return
+	}
+	if warning != "" {
+		w.Header().Set("X-Report-Warning", url.PathEscape(warning)) // 伪资产剔除在调试端同样透传
+	}
+
+	// 文件名 = draft-<模板名>-<YYYYMMDD>.<ext>（调试语义，防与正式交付混淆）。
+	tmplName := "默认模板"
+	if tmpl != nil && strings.TrimSpace(tmpl.Name) != "" {
+		tmplName = tmpl.Name
+	}
+	base := report.ReportBaseName("draft-"+tmplName, time.Now(), body.Format)
+
+	tmpDir, err := os.MkdirTemp("", "artex-draft-")
+	if err != nil {
+		writeErr(w, 500, "创建临时目录失败")
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+	outPath := filepath.Join(tmpDir, base)
+
+	if body.Format == "md" {
+		md := report.MarkdownFromInput(in)
+		if err := os.WriteFile(outPath, []byte(md), 0o644); err != nil {
+			writeErr(w, 500, "渲染失败: "+err.Error())
+			return
+		}
+	} else {
+		if err := report.GenerateDocx(ctx, in, outPath); err != nil {
+			writeErr(w, 502, "docx 渲染失败（无 python/python-docx？）: "+err.Error())
+			return
+		}
+	}
+	w.Header().Set("Content-Type", reportContentType(outPath))
+	w.Header().Set("Content-Disposition", contentDispositionAttachment(base))
+	http.ServeFile(w, r, outPath)
 }
 
 // ---------- ReportInput 组装（DB 取数 + 纯函数合并/校验） ----------
@@ -701,6 +884,14 @@ func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.
 		in.Remark = tmpl.Remark
 		in.Style = tmpl.Style
 		in.Prompts = tmpl.Prompts
+		// logo 存相对 dataDir 路径；pybuilder 插图只认绝对路径，这里解析并在
+		// 缺文件时留空（封面跳过插图，不影响其余渲染）。
+		if rel := strings.TrimSpace(tmpl.LogoPath); rel != "" {
+			abs := filepath.Join(s.m.dir, rel)
+			if fi, err := os.Stat(abs); err == nil && !fi.IsDir() {
+				in.LogoAbs = abs
+			}
+		}
 	}
 	return in, warning, nil
 }

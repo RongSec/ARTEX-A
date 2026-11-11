@@ -9,6 +9,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Autumn-27/artex/report"
 )
 
 func TestContentDispositionAttachment(t *testing.T) {
@@ -30,6 +33,35 @@ func TestContentDispositionAttachment(t *testing.T) {
 	h2 := contentDispositionAttachment("task-7.md")
 	if !strings.Contains(h2, `filename="task-7.md"`) {
 		t.Errorf("ascii name broken: %q", h2)
+	}
+}
+
+// TestJoinWarnings 分派器告警合并语义（docx 失败回退 md 时，伪资产剔除告警
+// 与回退原因告警都要保留）。
+func TestJoinWarnings(t *testing.T) {
+	if got := joinWarnings("", "b"); got != "b" {
+		t.Errorf("empty a: %q", got)
+	}
+	if got := joinWarnings("a", ""); got != "a" {
+		t.Errorf("empty b: %q", got)
+	}
+	if got := joinWarnings("剔除: x", "docx 失败"); got != "剔除: x；docx 失败" {
+		t.Errorf("merge: %q", got)
+	}
+}
+
+// TestDraftFilenameSanitized draft-<模板名>-<日期>.<ext> 经 ReportBaseName
+// 清洗后保留 draft 前缀与中文模板名（- 与 CJK 均是安全字符），且不含路径分隔。
+func TestDraftFilenameSanitized(t *testing.T) {
+	name := report.ReportBaseName("draft-标准交付模板", time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC), "docx")
+	if name != "draft-标准交付模板-20261111.docx" {
+		t.Errorf("draft name broken: %q", name)
+	}
+	bad := report.ReportBaseName("draft-../../x", time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC), "docx")
+	// 防穿越的正确性质 = 清洗后不含任何路径分隔符（../ 中的 / 已被替换为 _；
+	// 名内残留的连续点是合法文件名片段，落盘走 filepath.Join 仅完整段 ".." 才上溯）。
+	if strings.ContainsAny(bad, `/\`) {
+		t.Errorf("path separator leaked: %q", bad)
 	}
 }
 
@@ -64,6 +96,7 @@ func TestReportRoutesRegistered(t *testing.T) {
 		{http.MethodGet, "/api/report-settings"},
 		{http.MethodPatch, "/api/report-settings"},
 		{http.MethodPost, "/api/report/generate"},
+		{http.MethodPost, "/api/report/render-draft"},
 		{http.MethodGet, "/api/report/jobs/1"},
 		{http.MethodGet, "/api/report/jobs/1/download"},
 		{http.MethodGet, "/api/reports"},
