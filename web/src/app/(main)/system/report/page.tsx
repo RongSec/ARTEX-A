@@ -233,6 +233,19 @@ export default function ReportCenterPage() {
     setDirty(true);
   };
 
+  // style 关键字段编辑：空串=删除该覆盖键（回落后端默认样式常量表）；
+  // 数字串转数值；未知既有键原样保留（整体是 Record 拷贝-改-回写）。
+  const setStyle = (key: string, v: string | number | boolean) => {
+    setDraft((d) => {
+      if (!d) return d;
+      const st = { ...(d.style ?? {}) };
+      if (v === "") delete st[key];
+      else st[key] = v;
+      return { ...d, style: st };
+    });
+    setDirty(true);
+  };
+
   // ---- CRUD ----
   const save = async () => {
     if (!draft) return;
@@ -494,6 +507,7 @@ export default function ReportCenterPage() {
                   addPerson={addPerson}
                   removePerson={removePerson}
                   setPrompt={setPrompt}
+                  setStyle={setStyle}
                 />
               )}
 
@@ -602,7 +616,18 @@ interface EditorProps {
   addPerson: () => void;
   removePerson: (i: number) => void;
   setPrompt: (k: string, v: string) => void;
+  setStyle: (k: string, v: string | number | boolean) => void;
 }
+
+// 样式关键字段（与后端 pybuilder DEFAULTS 同名键；留空=用交付规范默认值）。
+const STYLE_FIELDS: { key: string; label: string; kind: "text" | "number" }[] = [
+  { key: "body_font", label: "正文字体(中文)", kind: "text" },
+  { key: "west_font", label: "西文字体", kind: "text" },
+  { key: "head_font", label: "标题字体", kind: "text" },
+  { key: "body_size", label: "正文磅号", kind: "number" },
+  { key: "h1_size", label: "章标题磅号", kind: "number" },
+  { key: "vuln_size", label: "漏洞节标题磅号", kind: "number" },
+];
 
 function TemplateEditor(p: EditorProps) {
   const { draft } = p;
@@ -692,6 +717,27 @@ function TemplateEditor(p: EditorProps) {
                 <Trash2Icon className="size-3.5" />
               </IconBtn>
             </div>
+          ))}
+        </div>
+      </div>
+
+      {/* style 关键字段（留空=用交付规范默认：仿宋正文/黑体标题/12pt 等） */}
+      <div>
+        <Label className="text-muted-foreground mb-1 block text-xs">样式（留空=交付规范默认值）</Label>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+          {STYLE_FIELDS.map((f) => (
+            <Field key={f.key} label={f.label}>
+              <Input
+                className="h-8"
+                type={f.kind === "number" ? "number" : "text"}
+                defaultValue={String((draft.style ?? {})[f.key] ?? "")}
+                placeholder={f.kind === "number" ? "默认" : "默认"}
+                onBlur={(e) => {
+                  const raw = e.target.value.trim();
+                  p.setStyle(f.key, f.kind === "number" && raw !== "" ? Number(raw) : raw);
+                }}
+              />
+            </Field>
           ))}
         </div>
       </div>

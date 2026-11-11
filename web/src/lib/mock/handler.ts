@@ -2481,6 +2481,18 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     if (m === "POST") throw new Error("演示模式不支持旁路提问");
   }
 
+  // ── 报告中心/证据截图(demo, T15/T16)：显式空态兜底 ──
+  // 证据列表若落到通用读兜底会返回 {}，前端 arr 对 {} 不判空再 .map 即崩；
+  // job 详情须带 status 键（历史轮询/StatusBadge 读它）。
+  if (seg[0] === "findings" && seg.at(-1) === "evidence") {
+    if (m === "GET") return [];
+    if (m === "POST") return { id: Date.now(), step_index: 0, caption: "", sort_order: 0, url: "", created_at: new Date().toISOString() };
+    return { ok: true };
+  }
+  if (seg[0] === "report" && seg[1] === "jobs" && m === "GET") {
+    return { id: Number(seg[2]) || 0, scope: "task", locale: "zh-CN", format: "docx", status: "done", file_path: "", error: "", warning: "", finding_ids: [], created_at: new Date().toISOString() };
+  }
+
   // ── 写操作兜底：成功但不落库 ──
   if (["POST", "PUT", "PATCH", "DELETE"].includes(m)) return { ok: true };
 
