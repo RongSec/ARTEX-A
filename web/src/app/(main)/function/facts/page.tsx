@@ -225,6 +225,7 @@ export default function FactsPage() {
       replaceFact(f.id, {
         ...updated,
         task_id: prev.task_id,
+        origin_fact: updated.origin_fact ?? prev.origin_fact,
         created_at: updated.created_at || prev.created_at,
         anchors: updated.anchors?.length ? updated.anchors : prev.anchors,
         machine_original: updated.machine_original ?? prev.machine_original,
@@ -453,6 +454,9 @@ function FactRow(props: {
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="truncate text-sm font-semibold">{f.summary || "（无摘要）"}</span>
             <MiniBadge className={src.cls}>{src.label}</MiniBadge>
+            {f.origin_fact && (
+              <MiniBadge className="border-transparent bg-muted text-muted-foreground">任务起点</MiniBadge>
+            )}
             <MiniBadge className="border-transparent bg-muted text-muted-foreground">
               {f.category || "其他"}
             </MiniBadge>

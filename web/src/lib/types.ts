@@ -1903,6 +1903,8 @@ export interface Fact extends FactTexts {
   category?: string;
   source: FactSource;
   edited: boolean;
+  // origin_fact=true：任务起点种子（建任务时写入的 origin fact），渲染「任务起点」灰徽。
+  origin_fact?: boolean;
   machine_original?: FactTexts;
   anchors: FactAnchor[];
   created_at: string;

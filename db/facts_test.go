@@ -44,6 +44,14 @@ func TestParseFactRowUnifiedDescription(t *testing.T) {
 	if n3 := ParseFactRow(r3); n3.Source != "human" {
 		t.Errorf("origin human → source human, got %q", n3.Source)
 	}
+	// 任务起点种子（state='origin'）→ OriginFact=true（裁决④：保留+灰徽，不排除）。
+	r0 := FactRow{NodeID: 30, Payload: factPayload("任务起点", "d", ""), Origin: "system", State: StateOrigin}
+	if n0 := ParseFactRow(r0); !n0.OriginFact {
+		t.Errorf("state=origin → OriginFact true, got false")
+	}
+	if n := ParseFactRow(FactRow{NodeID: 31, Payload: factPayload("s", "", ""), Origin: "work#1", State: "confirmed"}); n.OriginFact {
+		t.Errorf("state=confirmed must not be OriginFact")
+	}
 	// observer 分支（当前无写入方，契约保留）。
 	r4 := FactRow{NodeID: 4, Payload: factPayload("s4", "", ""), Origin: "observer"}
 	if n4 := ParseFactRow(r4); n4.Source != "observer" {

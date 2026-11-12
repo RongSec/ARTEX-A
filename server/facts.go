@@ -40,6 +40,7 @@ type factNodeDTO struct {
 	Category        string          `json:"category,omitempty"`
 	Source          string          `json:"source"`
 	Edited          bool            `json:"edited"`
+	OriginFact      bool            `json:"origin_fact,omitempty"` // 任务起点种子（前端「任务起点」灰徽）
 	MachineOriginal *factTextsDTO   `json:"machine_original,omitempty"`
 	Anchors         []factAnchorDTO `json:"anchors"`
 	CreatedAt       string          `json:"created_at"`
@@ -72,6 +73,7 @@ func factNodeToDTO(n db.FactNode, taskID int64) factNodeDTO {
 		Category:    n.Category,
 		Source:      n.Source,
 		Edited:      n.Edited,
+		OriginFact:  n.OriginFact,
 		CreatedAt:   rfc3339(n.CreatedAt),
 		UpdatedAt:   rfc3339(n.UpdatedAt),
 		Anchors:     []factAnchorDTO{},
@@ -184,7 +186,7 @@ func (s *Server) factEdit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad category: "+*body.Category)
 		return
 	}
-	payload, origin, found, err := s.m.PG().GetFactNodePayload(r.Context(), id)
+	payload, origin, state, found, err := s.m.PG().GetFactNodePayload(r.Context(), id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -217,7 +219,7 @@ func (s *Server) factEdit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "读取更新结果失败: "+err.Error())
 		return
 	}
-	n := db.ParseFactRow(db.FactRow{NodeID: id, Payload: json.RawMessage(raw), Origin: origin,
+	n := db.ParseFactRow(db.FactRow{NodeID: id, Payload: json.RawMessage(raw), Origin: origin, State: state,
 		CreatedAt: createdAt, UpdatedAt: updatedAt})
 	anchors, _ := s.m.PG().FactAnchorsByNode(r.Context(), []int64{id})
 	n.Anchors = anchors[id]

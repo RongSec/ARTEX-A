@@ -52,6 +52,7 @@ type FactRow struct {
 	NodeID      int64
 	Payload     json.RawMessage
 	Origin      string
+	State       string // confirmed | dismissed | origin（origin=任务起点种子）
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 	TaskID      int64
@@ -63,9 +64,9 @@ type FactRow struct {
 
 // FactQuery 是台账列表的过滤参数（零值=不过滤）。
 type FactQuery struct {
-	ProjectID  int64 // >0 时按项目过滤
-	Unassigned bool  // true=只看未挂项目（与 ProjectID 互斥）
-	TaskID     int64 // >0 时按任务过滤
+	ProjectID  int64  // >0 时按项目过滤
+	Unassigned bool   // true=只看未挂项目（与 ProjectID 互斥）
+	TaskID     int64  // >0 时按任务过滤
 	Q          string // 对 summary/description/detail 的 ILIKE 子串
 }
 
@@ -92,7 +93,7 @@ func (d *DB) ListFactRows(ctx context.Context, q FactQuery) ([]FactRow, error) {
 		conds = append(conds, fmt.Sprintf(
 			"(en.payload->>'summary' ILIKE %[1]s OR en.payload->>'description' ILIKE %[1]s OR en.payload->>'detail' ILIKE %[1]s)", m))
 	}
-	sqlText := `SELECT en.id, en.payload, COALESCE(en.origin,''), en.created_at, en.updated_at,
+	sqlText := `SELECT en.id, en.payload, COALESCE(en.origin,''), en.state, en.created_at, en.updated_at,
        t.id, t.name, t.status, t.project_id, COALESCE(p.name,'')
 FROM exploration_nodes en
 JOIN tasks t ON t.exploration_id = en.exploration_id
@@ -109,7 +110,7 @@ ORDER BY en.id DESC`
 		var r FactRow
 		var payload []byte
 		var projectID sql.NullInt64
-		if err := rows.Scan(&r.NodeID, &payload, &r.Origin, &r.CreatedAt, &r.UpdatedAt,
+		if err := rows.Scan(&r.NodeID, &payload, &r.Origin, &r.State, &r.CreatedAt, &r.UpdatedAt,
 			&r.TaskID, &r.TaskName, &r.TaskStatus, &projectID, &r.ProjectName); err != nil {
 			return nil, err
 		}
@@ -158,17 +159,17 @@ ORDER BY ea.node_id, a.id`, nodeIDs)
 
 // GetFactNodePayload 读取单个 fact 节点的 payload（编辑端点用）。
 // 返回 found=false 表示节点不存在或 kind≠fact。
-func (d *DB) GetFactNodePayload(ctx context.Context, nodeID int64) (payload json.RawMessage, origin string, found bool, err error) {
+func (d *DB) GetFactNodePayload(ctx context.Context, nodeID int64) (payload json.RawMessage, origin, state string, found bool, err error) {
 	var raw []byte
 	switch err := d.QueryRowContext(ctx,
-		`SELECT payload, COALESCE(origin,'') FROM exploration_nodes WHERE id=$1 AND kind='fact'`, nodeID).
-		Scan(&raw, &origin); {
+		`SELECT payload, COALESCE(origin,''), state FROM exploration_nodes WHERE id=$1 AND kind='fact'`, nodeID).
+		Scan(&raw, &origin, &state); {
 	case err == nil:
-		return json.RawMessage(raw), origin, true, nil
+		return json.RawMessage(raw), origin, state, true, nil
 	case err == sql.ErrNoRows:
-		return nil, "", false, nil
+		return nil, "", "", false, nil
 	default:
-		return nil, "", false, err
+		return nil, "", "", false, err
 	}
 }
 
@@ -204,6 +205,9 @@ type FactNode struct {
 	Category    string
 	// Source ∈ worker | observer | human（origin 列 + 编辑标记判定；见 factSource）。
 	Source string
+	// OriginFact=true 是任务起点种子（state='origin'，建任务时写入），前端渲染
+	// 「任务起点」灰徽章；可编辑（人工修订起点描述是合理需求）。
+	OriginFact bool
 	// Edited=payload.edited_by=="human"，即被人工改过。
 	Edited bool
 	// MachineOriginal 首编时固化的机器原文；未编辑过=nil。
@@ -232,13 +236,14 @@ func ParseFactRow(r FactRow) FactNode {
 	var p factPayloadShape
 	_ = json.Unmarshal(r.Payload, &p)
 	n := FactNode{
-		ID:         r.NodeID,
-		Summary:    p.Summary,
+		ID:          r.NodeID,
+		Summary:     p.Summary,
 		Description: p.Description,
 		Evidence:    p.Evidence,
 		Confidence:  p.Confidence,
 		Category:    p.Category,
 		Edited:      p.EditedBy == "human",
+		OriginFact:  r.State == StateOrigin,
 		CreatedAt:   r.CreatedAt,
 		UpdatedAt:   r.UpdatedAt,
 	}
