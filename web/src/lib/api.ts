@@ -36,6 +36,8 @@ import type {
   EvidenceBodyPreview,
   ExplorationNodePage,
   ExplorationNodeQuery,
+  Fact,
+  FactProjectGroup,
   Finding,
   FindingAssetTree,
   FindingDeepenResponse,
@@ -643,6 +645,19 @@ export const api = {
   findingAssetTree: (q: Omit<FindingQuery, "page" | "pageSize">) =>
     get<FindingAssetTree>(`/exploration/findings/asset-tree?${findingFilterParams(q).toString()}`),
   findingStats: () => get<FindingStats>("/exploration/findings/stats"),
+  // ---- 事实台账（V4-A）----
+  // listFacts 三层聚合（项目→任务→事实），project_id/task_id/q 可选过滤。
+  listFacts: (q?: { project_id?: string; task_id?: string; q?: string }) => {
+    const p = new URLSearchParams();
+    if (q?.project_id) p.set("project_id", q.project_id);
+    if (q?.task_id) p.set("task_id", q.task_id);
+    if (q?.q) p.set("q", q.q);
+    const s = p.toString();
+    return get<FactProjectGroup[]>(`/facts${s ? `?${s}` : ""}`).then(arr);
+  },
+  // patchFact 人工编辑一条事实；后端首编固化机器原文。
+  patchFact: (id: string, body: { summary?: string; description?: string; category?: string }) =>
+    patch<Fact>(`/facts/${encodeURIComponent(id)}`, body),
   // exportFindings 触发发现页导出并下载文件。scope=selected 时传 ids(finding_id 列表);
   // scope=filtered 时传当前筛选(沿用 FindingQuery 的筛选字段);scope=all 忽略筛选。
   exportFindings: async (opts: {

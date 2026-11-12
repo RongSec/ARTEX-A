@@ -812,6 +812,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
+	// 事实台账（V4-A）：跨任务三层聚合列表 + 人工编辑（首编留机器原文）。
+	mux.HandleFunc("GET /api/facts", s.factsQuery)
+	mux.HandleFunc("PATCH /api/facts/{nodeId}", s.factEdit)
 	mux.HandleFunc("GET /api/exploration/graph", s.explorationGraph)
 	mux.HandleFunc("GET /api/exploration/nodes", s.explorationNodes)
 	mux.HandleFunc("GET /api/exploration/activity", s.activity)

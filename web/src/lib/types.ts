@@ -1872,3 +1872,64 @@ export interface FindingEvidenceImage {
   url: string;
   created_at: string;
 }
+
+// ---- 事实台账（V4-A）----
+
+// FactSource：来源三分法。worker=探索图机器写入；observer=项目观察者（预留）；
+// human=主控/人工新增或人工编辑过。
+export type FactSource = "worker" | "observer" | "human";
+
+// FactAnchor：事实锚定的资产 chip（后端预标签）。
+export interface FactAnchor {
+  id: string;
+  type: string;
+  label: string;
+}
+
+// FactTexts：正文对（machine_original 复用）。
+export interface FactTexts {
+  summary: string;
+  description: string;
+}
+
+// Fact：台账叶子（一条事实节点）。description 是后端统一视图
+// （payload.description ?? detail）。
+export interface Fact extends FactTexts {
+  id: string;
+  task_id: string;
+  evidence?: string;
+  confidence?: string;
+  // category 人工可选维度（枚举见后端 FactCategoryOptions）；缺省展示"其他"。
+  category?: string;
+  source: FactSource;
+  edited: boolean;
+  machine_original?: FactTexts;
+  anchors: FactAnchor[];
+  created_at: string;
+  updated_at: string;
+}
+
+// FactTaskGroup：台账中间层（一个任务 + 其事实）。
+export interface FactTaskGroup {
+  id: string;
+  name: string;
+  status: string;
+  facts: Fact[];
+}
+
+// FactProjectGroup：台账顶层。project=null=未挂项目组。
+export interface FactProjectGroup {
+  project: { id: string; name: string } | null;
+  tasks: FactTaskGroup[];
+}
+
+// FactCategoryOptions 与后端 db.FactCategoryOptions 同步（编辑 select 选项）。
+export const FACT_CATEGORY_OPTIONS = [
+  "技术栈指纹",
+  "凭据",
+  "入口点",
+  "漏洞面",
+  "网络环境",
+  "防护行为",
+  "其他",
+] as const;
