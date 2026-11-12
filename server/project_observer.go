@@ -163,9 +163,20 @@ func (s *Server) toolPushTaskHint() actool.CoreTool {
 // project_ids 同样过滤——只保留开了 reader_enabled 的；被剔除的在返回体里
 // 如实标注 skipped_projects，不静默吞掉（agent 需要知道哪些项目不在视野内，
 // 免得对着空结果反复重试）。
+//
+// V4-E「资产优先」：返回体从「纯项目洞察数组」升级为对象，新增
+// cross_project_assets——同一资产出现在 ≥2 个项目里的聚合行（项目数/项目
+// 列表/finding 数/最近出现）。跨项目最强信号是资产重叠，这是 SQL join 的活，
+// 不该让模型从散文里猜；projects/insights 原字段形状不变（向后兼容）。
+// cross_project_assets 同样按 reader_enabled 可见集裁剪（否则会绕过项目级
+// opt-in 把未开闸项目的情报漏给 reader）。
 func (s *Server) toolReadAllProjectInsights() actool.CoreTool {
 	return roTool("read_all_project_insights",
-		"读多个项目的【项目洞察】(project_insights，observer 产出)，供跨项目串联。仅覆盖【开启阅读者开关(reader_enabled)】的 active 项目；project_ids 空=读全部已开启项目；返回按项目分组的 content/keywords/时间。",
+		"读跨项目阅读输入，两段：① cross_project_assets＝同一资产出现在 ≥2 个项目里的聚合行"+
+			"(资产标签/类型/涉及项目[id+名称]/发现数/最近出现，按项目数降序，最多 20 行)——跨项目信号先看这段；"+
+			"② projects＝各项目的项目洞察(project_insights，observer 产出)。"+
+			"仅覆盖【开启阅读者开关(reader_enabled)】的 active 项目；project_ids 空=读全部已开启项目。"+
+			"cross_project_assets 为空即无跨项目信号，不必再逐条翻 insights。",
 		objSchema(map[string]any{
 			"project_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：限定项目 id；空=全部已开启项目"},
 			"limit":       map[string]any{"type": "integer", "description": "每项目条数上限(可选，默认 50)"},
@@ -183,7 +194,11 @@ func (s *Server) toolReadAllProjectInsights() actool.CoreTool {
 			if a.Limit <= 0 {
 				a.Limit = 50
 			}
-			out := make([]map[string]any, 0, len(ids))
+			visible := make(map[int64]bool, len(ids))
+			for _, pid := range ids {
+				visible[pid] = true
+			}
+			projects := make([]map[string]any, 0, len(ids))
 			for _, pid := range ids {
 				list, err := s.m.pg.ListInsights(ctx, pid, nil, a.Limit)
 				if err != nil {
@@ -193,11 +208,21 @@ func (s *Server) toolReadAllProjectInsights() actool.CoreTool {
 				for _, it := range list {
 					items = append(items, map[string]any{"id": it.ID, "content": it.Content, "keywords": it.Keywords, "source_task_id": it.SourceTaskID, "created_at": it.CreatedAt})
 				}
-				out = append(out, map[string]any{"project_id": pid, "insights": items})
+				projects = append(projects, map[string]any{"project_id": pid, "insights": items})
+			}
+			cross, err := s.m.pg.CrossProjectAssetRows(ctx, 0)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			cross = db.FilterCrossProjectAssetsByProjects(cross, visible)
+			out := map[string]any{
+				"cross_project_assets": cross,
+				"projects":             projects,
 			}
 			if len(skipped) > 0 {
 				// 被 reader_enabled 闸剔除的项目如实回报（照 warn 不拒纪律）。
-				out = append(out, map[string]any{"skipped_projects": skipped, "note": "这些项目未开启 reader_enabled 或不是 active 项目，不在跨项目阅读视野内"})
+				out["skipped_projects"] = skipped
+				out["note"] = "这些项目未开启 reader_enabled 或不是 active 项目，不在跨项目阅读视野内"
 			}
 			return jsonResult(out)
 		})
@@ -318,13 +343,25 @@ const observerPrompt = "你是本项目的【跨任务观察者】：只读与�
 	"5) 仅当某目标任务【当下正需要】该信息时才 push_task_hint 直接提醒（每轮最多 2 条，宁少勿滥；hint 会唤醒对方 planner，滥用等于污染）。\n" +
 	"没有真发现就直接结束本轮，绝不写空洞 insight 或客套 hint。跨项目的事不归你管（那是 reader）。"
 
-// readerPrompt 是阅读者 system prompt 的默认正文。
-const readerPrompt = "你是【跨项目阅读者】：只读与总结，禁止执行任何渗透动作。\n" +
+// readerPromptV1 是上线时的默认正文（V4-E 之前）。存量库里未编辑过的 prompt
+// 与它逐字节相同——upgradeReaderPrompt 据此判断「可以安全升级」，用户改过的
+// 正文一律不覆盖。修改 readerPrompt 时必须同步把旧版文本迁到这里。
+const readerPromptV1 = "你是【跨项目阅读者】：只读与总结，禁止执行任何渗透动作。\n" +
 	"定时触发（每 30 分钟一轮）。工作步骤：\n" +
 	"1) read_all_project_insights 读各项目观察者积累的洞察；\n" +
 	"2) 串联跨项目的相似面——同一组件/同类入口/同一打法在多个项目重复出现（含同一资产出现在多项目）即为信号；\n" +
 	"3) 确有串联价值才 write_global_insight：正文指明涉及的项目/任务/资产证据链，source_projects 填全涉及项目 id。\n" +
 	"宁少勿滥：单项目内部的事已由观察者处理，没有跨项目信号就空转结束，不要复述单项目 insight、不要写空洞总结。"
+
+// readerPrompt 是阅读者 system prompt 的默认正文（V4-E：资产优先输入）。
+const readerPrompt = "你是【跨项目阅读者】：只读与总结，禁止执行任何渗透动作。\n" +
+	"触发时机：项目收官时点亮一轮，另有定时兜底（每 30 分钟一轮）。工作步骤：\n" +
+	"1) read_all_project_insights 拿本轮输入，【第一步先看 cross_project_assets】——它已经把「同一资产/同一组件出现在 ≥2 个项目」join 好了（资产标签/类型/涉及项目[id+名称]/发现数/最近出现）。" +
+	"cross_project_assets 为空＝本轮没有跨项目信号，【直接空转结束】，不要再去逐条翻 projects 里的 insights 找感觉；\n" +
+	"2) cross_project_assets 非空时，就围绕这些行写全局洞察：每条必须点名【是哪个资产、涉及哪几个项目】，说清结论——同一资产上的同类漏洞面该搬到哪个项目、同一组件版本问题在哪几个项目重复出现、同一入口/打法可怎么复用或去重。" +
+	"需要背景细节时可回看对应项目的 insights 印证，但不要复述单项目内容；\n" +
+	"3) 确有串联价值才 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
+	"宁少勿滥：单项目内部的事已由观察者处理，没有跨项目资产信号就空转结束，不要写空洞总结。"
 
 // observerGraphMessage 是 on_project_graph 触发器的用户消息模板（scheduler
 // 会在其后追加渲染好的变更清单正文）。
@@ -431,6 +468,12 @@ func (s *Server) seedProjectTools() {
 	s.seedObserverAgent()
 	s.seedReaderAgent()
 
+	// V4-E：reader prompt 默认正文升级。seedReaderAgent 有一次性 flag 早退，
+	// SeedPromptIfEmpty 又是「已有任一版本就 no-op」，所以存量库里已建好的
+	// reader 永远拿不到新正文——必须像下面 SetAgentToolBase 那样每次启动
+	// 无条件收编（区别只在收编动作本身是幂等的：见 upgradeReaderPrompt）。
+	s.upgradeReaderPrompt()
+
 	// V4 安全面：只读总结型 agent 剥离执行底座（tool_base='none'，装配层不再注入
 	// DefaultTools，见 agent/chat.go chatBaseTools——reader 触发会话实测 21 次
 	// Bash 直连 psql 越权侦查，conv#60 DB 明文密码进活动流）。
@@ -441,5 +484,82 @@ func (s *Server) seedProjectTools() {
 		if err := s.m.pg.SetAgentToolBase(key, "none"); err != nil {
 			log.Printf("[project-tools] 设置 %s tool_base 失败: %v", key, err)
 		}
+	}
+}
+
+// readerPromptUpgradeFlag 是「新默认正文已收编」的一次性标记（settings 表）。
+// 与 seedReaderAgent 的 flag 不同：这条只在真的处理过（播种/升级）后置位，
+// agent 尚不存在时留空，下次启动再试。
+const readerPromptUpgradeFlag = "reader_prompt_asset_first_v4e"
+
+// readerPromptUpgrade 是 upgradeReaderPrompt 的纯判定结果（无库可单测）。
+type readerPromptUpgrade int
+
+const (
+	// readerPromptKeep：当前正文已被用户编辑——不覆盖。
+	readerPromptKeep readerPromptUpgrade = iota
+	// readerPromptSeed：当前为空（seed 曾失败）——直接播种新默认。
+	readerPromptSeed
+	// readerPromptReplace：当前与旧默认逐字节相同（用户没编辑过）——追加新版本。
+	readerPromptReplace
+)
+
+// readerPromptUpgradeFor 是「能不能升级」的纯判定。
+func readerPromptUpgradeFor(cur string) readerPromptUpgrade {
+	switch strings.TrimSpace(cur) {
+	case "":
+		return readerPromptSeed
+	case readerPromptV1:
+		return readerPromptReplace
+	default:
+		return readerPromptKeep
+	}
+}
+
+// upgradeReaderPrompt 把存量库 reader 的 system prompt 升到资产优先版：
+//
+//   - 当前 prompt 为空（seed 曾失败）→ 播种新默认；
+//   - 当前 prompt 与旧默认（readerPromptV1）逐字节相同＝用户没编辑过 → 追加
+//     一个新版本（SavePrompt 保留历史，可在 UI 回滚）；
+//   - 已被用户编辑 → 不覆盖，只记一行日志并置 flag（避免每次启动重复提示）。
+//
+// 用「逐字节比对旧默认」而不是无条件 ResetPromptToDefault：后者会把用户手写
+// 的正文冲掉。这也是不能照搬 SetAgentToolBase「无脑写」的原因——tool_base 是
+// 单选列，prompt 是版本历史，无条件写会每重启多一版垃圾版本。
+func (s *Server) upgradeReaderPrompt() {
+	pg := s.m.pg
+	if pg == nil {
+		return
+	}
+	if v, _, _ := pg.GetSetting(readerPromptUpgradeFlag); v == "true" {
+		return
+	}
+	a, err := pg.GetAgentByKey("reader")
+	if err != nil || a == nil {
+		return // agent 还没建（被用户删掉/seed 未跑）→ 不置 flag，下次再试
+	}
+	cur, err := pg.CurrentPrompt(a.ID)
+	if err != nil {
+		log.Printf("[reader] 读取当前 prompt 失败: %v", err)
+		return
+	}
+	switch readerPromptUpgradeFor(cur) {
+	case readerPromptSeed:
+		if err := pg.SeedPromptIfEmpty(a.ID, readerPrompt); err != nil {
+			log.Printf("[reader] 播种新默认 prompt 失败: %v", err)
+			return
+		}
+		log.Printf("[reader] 已播种「资产优先」默认 prompt")
+	case readerPromptReplace:
+		if _, err := pg.SavePrompt(a.ID, readerPrompt, "V4-E 默认正文升级：资产优先输入", "system"); err != nil {
+			log.Printf("[reader] 升级默认 prompt 失败: %v", err)
+			return
+		}
+		log.Printf("[reader] 已把未编辑的默认 prompt 升级为「资产优先」版（历史版本保留）")
+	default:
+		log.Printf("[reader] 当前 prompt 已被用户编辑，跳过默认正文升级（如需新流程请手动恢复内置默认）")
+	}
+	if err := pg.SetSetting(readerPromptUpgradeFlag, "true"); err != nil {
+		log.Printf("[reader] 写入 prompt 升级标记失败: %v", err)
 	}
 }
