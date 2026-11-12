@@ -120,7 +120,9 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: autumn27/artex
+          # 发布镜像命名空间随发布方走；需在 repo secrets 配置自己的
+          # DOCKERHUB_USERNAME/TOKEN 后此 job 才会真正推送成功。
+          images: rongsec/artex-a
           tags: |
             type=ref,event=tag
             type=raw,value=latest

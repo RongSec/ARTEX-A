@@ -1,13 +1,18 @@
 <div align="center">
 
-# ARTEX
+# ARTEX-A
 
 AI 自主渗透测试系统（Go 后端 + Next.js 前端）
-
 
 🌐 **在线 Demo**： [https://artex-demo.vercel.app/](https://artex-demo.vercel.app/)
 
 </div>
+
+> **ARTEX-A** 是基于 [ARTEX](https://github.com/Autumn-27/ARTEX)（v0.3.15，AGPL-3.0）二次开发的版本，
+> 面向内网巡检与交付场景：项目维度批量下发渗透任务、跨任务只读观察者视图、发现项复现落库并自动
+> 关联录制流量、报文一步生成截图，以及按交付排版规范（仿宋正文/黑体标题）直出 Word 报告的中心；
+> 同时内置三层安全红线（资产范围硬拦截、破坏性操作审批、本机系统凭据裸读拦截），未授权目标一律拒打。
+> 上游致谢与血缘声明见下文「许可与免责声明」与文末「ARTEX-A 二开增补说明」。
 
 ---
 
@@ -69,8 +74,8 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 ### 方式一：一键安装脚本（推荐）
 
 ```bash
-git clone https://github.com/Autumn-27/ARTEX.git
-cd ARTEX
+git clone https://github.com/RongSec/ARTEX-A.git
+cd ARTEX-A
 ./install.sh
 ```
 
@@ -84,10 +89,10 @@ cd ARTEX
 ### 方式二：Docker Compose（手动）
 
 ```bash
-git clone https://github.com/Autumn-27/ARTEX.git
-cd ARTEX
+git clone https://github.com/RongSec/ARTEX-A.git
+cd ARTEX-A
 cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
-docker compose up -d          # 拉取 autumn27/artex 镜像 + postgres
+docker compose up -d          # 拉取 rongsec/artex-a 镜像 + postgres
 # → http://localhost:8787
 ```
 
@@ -100,7 +105,7 @@ docker compose up -d          # 拉取 autumn27/artex 镜像 + postgres
 
 ### 方式三：下载预编译二进制（Releases）
 
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载对应平台的 zip，解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`：
+到 [Releases](https://github.com/RongSec/ARTEX-A/releases) 下载对应平台的 zip，解压后得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/` + `config.example.json`：
 
 ```bash
 cp config.example.json config.json   # 填好 database 连接
@@ -160,7 +165,7 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 ### 方式二：一键更新脚本
 
 ```bash
-cd ARTEX
+cd ARTEX-A
 ./update.sh
 ```
 
@@ -172,7 +177,7 @@ cd ARTEX
 ### 方式三：Docker Compose（手动）
 
 ```bash
-cd ARTEX
+cd ARTEX-A
 git pull                       # 更新 compose / 脚本（可选）
 # 指定版本：在 .env 设 ARTEX_TAG=v0.2.0；不设则用 latest
 docker compose pull artex
@@ -182,7 +187,7 @@ docker image prune -f          # 清理旧镜像（可选）
 
 ### 方式四：预编译二进制（Releases）
 
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
+到 [Releases](https://github.com/RongSec/ARTEX-A/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
 
 ```bash
 cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./
@@ -497,3 +502,15 @@ https://github.com/oritera/Cairn
 ### 免责声明
 
 本项目按“现状（AS IS）”提供，不附带任何明示或默示的担保。作者及贡献者不对使用本工具（无论使用方式是否得当）所导致的任何直接或间接损失、数据丢失、系统损坏或法律纠纷承担责任。**下载、安装或使用本项目，即表示你已阅读、理解并同意上述全部条款。**
+
+---
+
+## ARTEX-A 二开增补说明
+
+本项目（ARTEX-A）基于 **ARTEX v0.3.15**（上游 [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX)，AGPL-3.0）复制基线后二次开发，聚焦**授权内网巡检与交付场景**：项目-任务批量下发、跨任务观察者、发现复现落库与流量/报文截图关联、交付规范 Word 报告中心，以及资产范围/审批/本机凭据三层安全红线。
+
+- 二开工程细节（工具链、本地开发命令、部署示例、基线管理）见 [README.artex-hs.md](README.artex-hs.md)；
+- Go 模块路径保持 `github.com/Autumn-27/artex` 不变（import 路径 ≠ 发布地址，为降低依赖解析与合并上游成本）；
+- 依 AGPL-3.0 义务：本 fork 保留上游版权声明、以同源协议开源，全部修改可从本仓库公开源码追溯。
+
+> 使用边界提示：上游「允许使用范围」条款针对通用发布；ARTEX-A 的目标场景为**自有或已获书面授权**的内网资产巡检与渗透验证，使用者仍须自行确保授权链条完整并承担全部合规责任。

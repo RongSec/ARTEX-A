@@ -1,7 +1,7 @@
-# artex-hs — ARTEX 二开工程（HS 定制版）
+# ARTEX-A 二开工程说明
 
-本工程基于 **ARTEX v0.3.15**（原版快照，上游 `github.com/Autumn-27/artex`）复制基线后进行二次开发。
-原版说明见 [README.md](./README.md)，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
+本工程（ARTEX-A）基于 **ARTEX v0.3.15**（原版快照，上游 `github.com/Autumn-27/artex`）复制基线后进行二次开发。
+主说明见 [README.md](./README.md)，变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
 > ⚠️ Go 模块名保持 `github.com/Autumn-27/artex` 不变（不改 go.mod），以降低依赖解析与后续合并上游的成本；二开差异全部以代码提交追溯。
 
@@ -16,7 +16,7 @@
 | L3 | 报告增强 | 参考 AntiFox 报告机制：发现富化、证据链、报告模板与排版增强 |
 | L4 | Word 报告中心 | 生成标准交付用 Word（.docx）渗透测试报告，报告中心统一管理与下载 |
 
-详细架构与任务分解见团队架构设计文档（software-architect 产出）。
+各条线的实现随版本发布，逐条变更可在 [CHANGELOG.md](./CHANGELOG.md) 与 git 历史中追溯。
 
 ## 环境与工具链
 
@@ -42,20 +42,20 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 - 前端 `build:static` 产出 `web/out/`，由 `-tags embedui` 内嵌进单一 Go 二进制；
 - 数据库为 PostgreSQL（连接配置复制 `config.example.json` 为 `config.json`，或用环境变量 `ARTEX_PG_DSN`）。
 
-## 目标部署
+## 目标部署（示例）
 
 | 项 | 值 |
 | --- | --- |
-| 服务器 | `192.0.2.10` |
+| 服务器 | `<TARGET_HOST>`（替换为你的部署主机地址） |
 | 应用端口 | `8801`（前端 + API/SSE，对应 `-addr :8801`） |
 | 流量代理端口 | `8802`（对应 `-proxy :8802`） |
-| 数据库 | PostgreSQL 库名 `db_artexhs` |
+| 数据库 | PostgreSQL 库名 `artex_a` |
 
 启动示例：
 
 ```bash
 ./artex -addr :8801 -proxy 127.0.0.1:8802
-# ARTEX_PG_DSN=postgres://user:pass@127.0.0.1:5432/db_artexhs?sslmode=disable
+# ARTEX_PG_DSN=postgres://user:pass@127.0.0.1:5432/artex_a?sslmode=disable
 ```
 
 ## 基线管理

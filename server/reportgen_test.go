@@ -23,7 +23,7 @@ func TestContentDispositionAttachment(t *testing.T) {
 	if strings.Contains(h, "示例") {
 		t.Errorf("raw utf8 leaked into header: %q", h)
 	}
-	if !strings.Contains(h, `%E4%B8%AD%E5%8C%96`) {
+	if !strings.Contains(h, `%E7%A4%BA%E4%BE%8B`) {
 		t.Errorf("percent-encoding wrong: %q", h)
 	}
 	if !strings.HasPrefix(h, `attachment; filename="`) {

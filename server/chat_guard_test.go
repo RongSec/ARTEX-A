@@ -160,14 +160,14 @@ func TestParseChatPatch(t *testing.T) {
 	})
 
 	t.Run("中文内容全链路", func(t *testing.T) {
-		raw := "```json\n{\"reply\":\"把出具方改成「示例科技安全」并加一条备注\",\"patch\":{\"issuer\":\"示例科技安全\",\"remark\":\"仅限内部使用\"}}\n```"
+		raw := "```json\n{\"reply\":\"把出具方改成「示例安全团队」并加一条备注\",\"patch\":{\"issuer\":\"示例安全团队\",\"remark\":\"仅限内部使用\"}}\n```"
 		patch, reply, _, err := parseChatPatch(raw, base)
-		if err != nil || !strings.Contains(reply, "示例科技安全") {
+		if err != nil || !strings.Contains(reply, "示例安全团队") {
 			t.Fatalf("cn roundtrip: %v %q", err, reply)
 		}
 		var iss string
 		_ = json.Unmarshal(patch["issuer"], &iss)
-		if iss != "示例科技安全" {
+		if iss != "示例安全团队" {
 			t.Fatalf("issuer=%q", iss)
 		}
 	})
