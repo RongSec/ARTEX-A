@@ -182,6 +182,83 @@ func TestShortCircuitHostCredentialRemoteExempt(t *testing.T) {
 // record_fact/report_finding 的正文引用被拦命令原文（含 /app/jwt.key、
 // /etc/shadow 字样）是审计刚需——文本里出现路径 ≠ 读取路径。
 // 同一文本换 Bash/Read 执行面照旧 deny（各自档）。
+// ============================================================================
+// V4-D 修复2：相对形态平台配置 deny 收紧（裸相对名 + 读命令紧邻第一参数）
+// 取舍与已知上限见 shortcircuit.go platformConfigBareReadRe 注释。
+// ============================================================================
+
+func TestShortCircuitBarePlatformConfigDeny(t *testing.T) {
+	deny := []struct{ desc, in string }{
+		{"cat config.json（实测#49）", `{"command":"cat config.json"}`},
+		{"cat .jwt", `{"command":"cat .jwt"}`},
+		{"cat jwt.key", `{"command":"cat jwt.key"}`},
+		{"单引号包裹", `{"command":"cat 'config.json'"}`},
+		{"双引号包裹", `{"command":"cat \"jwt.key\""}`},
+		{"cp 外传首参", `{"command":"cp config.json /tmp/x"}`},
+		{"head 首参", `{"command":"head .jwt"}`},
+		{"strings 首参", `{"command":"strings jwt.key"}`},
+		{"管道后置", `{"command":"cat config.json | grep dsn"}`},
+		{"bash -c 内联", `{"command":"bash -c 'cat config.json'"}`},
+		{"转义解码后", `{"command":"cat \u0063onfig.json"}`},
+	}
+	for _, c := range deny {
+		dec := shortCircuit("Bash", []byte(c.in))
+		if dec == nil || dec.Action != "deny" {
+			t.Fatalf("%s：输入 %s 应被 deny，得到 %+v", c.desc, c.in, dec)
+		}
+	}
+}
+
+// 防误伤组：路径语境/粘连/非读命令/第二参数位/备份名一律放过。
+func TestShortCircuitBarePlatformConfigNoOverBlock(t *testing.T) {
+	allow := []struct{ desc, in string }{
+		{"靶场同名文件", `{"command":"cat /tmp/foo/config.json"}`},
+		{"工作区子目录", `{"command":"cat ./out/config.json"}`},
+		{"粘连文件名", `{"command":"cat my_config.json"}`},
+		{"备份名放过", `{"command":"cat config.json.bak"}`},
+		{"非读命令", `{"command":"echo config.json"}`},
+		{"flag 占首参", `{"command":"head -5 config.json"}`},
+		{"第二参数位", `{"command":"cp a.txt config.json"}`},
+		{"grep 目标名", `{"command":"grep dsn /etc/config.json"}`},
+		{"写命令不拦", `{"command":"rm config.json"}`},
+		{"ls 目录", `{"command":"ls -la"}`},
+		{"普通打靶", `{"command":"nmap -sV 10.0.0.5"}`},
+	}
+	for _, c := range allow {
+		if dec := shortCircuit("Bash", []byte(c.in)); dec != nil {
+			t.Fatalf("%s：输入 %s 不应命中短路表，得到 %+v", c.desc, c.in, dec)
+		}
+	}
+}
+
+// recordOnlyTools 豁免语义维持不变：record_fact 文本引用 "cat config.json"
+// （如实记录被拦命令原文）不得被新档误伤。
+func TestShortCircuitBarePlatformConfigRecordExempt(t *testing.T) {
+	quote := `{"content":"worker 执行 cat config.json 与 cat jwt.key 均被短路表拦截，如实记录命令原文备审计"}`
+	for _, tool := range []string{"record_fact", "report_finding", "add_hint", "insert_assets"} {
+		if dec := shortCircuit(tool, []byte(quote)); dec != nil {
+			t.Fatalf("%s 纯记录工具不应被新档误伤，得到 %+v", tool, dec)
+		}
+	}
+	// 对照：同文本走执行面照旧 deny。
+	if dec := shortCircuit("Bash", []byte(`{"command":"cat config.json && cat jwt.key"}`)); dec == nil || dec.Action != "deny" {
+		t.Fatalf("Bash 同命令应被 deny，得到 %+v", dec)
+	}
+}
+
+// 既有 /app 绝对路径档不得被改坏（回归钉）：新档是叠加，不是替换。
+func TestShortCircuitAbsoluteCredentialStillDeny(t *testing.T) {
+	for _, in := range []string{
+		`{"command":"cat /app/jwt.key"}`,
+		`{"command":"cat ../../../jwt.key"}`,
+		`{"command":"cat /app/data/jwt.key"}`,
+	} {
+		if dec := shortCircuit("Bash", []byte(in)); dec == nil || dec.Action != "deny" {
+			t.Fatalf("既有绝对/回溯档回归失败：%s 得到 %+v", in, dec)
+		}
+	}
+}
+
 func TestShortCircuitRecordOnlyToolsExempt(t *testing.T) {
 	quote := `{"content":"worker 曾尝试 cat /etc/shadow 与 cat /app/jwt.key，被短路表拦截，如实记录命令原文备审计"}`
 	for _, tool := range []string{"record_fact", "report_finding", "update_finding_report", "add_hint", "add_task_hint", "insert_assets"} {

@@ -140,6 +140,36 @@ var platformCredentialRe = regexp.MustCompile(
 var platformCredentialLooseRe = regexp.MustCompile(
 	`(?i)/app/(?:data/)?j[\s._-]*w[\s._-]*t[\s._-]*\.?[\s._-]*k[\s._-]*e[\s._-]*y`)
 
+// platformConfigBareReadRe 是 V4-D 修复2：worker cwd（<data>/sessions/<key>）下
+// 平台注入的配置文件就叫 config.json / .jwt / jwt.key（相对名），实测 #49
+// `cat config.json` 被判官按"纯只读 ALLOW"放行——判官 prompt 无法区分相对名
+// 读的是工作文件还是平台配置，只能靠代码档收紧。
+//
+// 【判定收窄与取舍】（任务书裁决，逐条钉在测试里）：
+//   - 只拦【读命令】(cat/head/tail/less/more/cp/mv/sed/awk/strings) 后
+//     【紧邻第一参数】恰为这三个裸名（可带引号包裹）。
+//     `head -5 config.json`（第一参数是 flag）、`cp a config.json`（第二
+//     参数位）不拦——按字面执行收窄，宁漏不误伤：worker 工作目录里注入的
+//     配置也可能同名，且打靶取证常引用同名靶机文件（/tmp/x/config.json、
+//     my_config.json 一律放过，见负向用例）。
+//   - 裸名【前】必须是命令边界（行首/空白/引号/命令分隔符），前接 `/` 或
+//     字母数字不命中：`cat /tmp/foo/config.json`、`cat my_config.json` 放过。
+//   - 裸名【后】是词尾边界（行尾/空白/引号/管道重定向等），`cat config.json.bak`
+//     放过（`.` 不在尾类里，RE2 无环视故用消费式；这也意味着
+//     `cat config.json.orig` 这类备份名不拦——备份文件不是活动凭据，接受）。
+//   - echo/输出型命令（非读命令表内）后跟裸名不拦：`echo config.json` 无
+//     读取语义。
+//
+// 与 platformCredentialRe 同为平台凭据档：不吃远程指代豁免（靶机上不存在
+// 名为 jwt.key 的平台配置，`ssh x 'cat jwt.key'` 读到的仍可能是本机文件——
+// 但那是字符串级判据的固有上限，既有注释已声明）；recordOnlyTools 豁免在
+// 调用侧维持不变。已知残留漏判面：shell 变量展开（f=config.json; cat $f）、
+// 引号内换行首置等需 realpath 级执行前校验才闭合（V2 G-02①-b 范畴）。
+var platformConfigBareReadRe = regexp.MustCompile(
+	`(?i)(?:^|[\s"'` + "`" + `;&|(])` +
+		`(?:cat|head|tail|less|more|cp|mv|sed|awk|strings)[\s"'` + "`" + `]+` +
+		`["']?(?:config\.json|\.jwt|jwt\.key)(?:$|[\s"'` + "`" + `;|&)<>{[=,)])`)
+
 // ============================================================================
 // host 系统凭据档（红线实跑缺陷1 的修复；相对 reArtex 原版为【新增增强】，
 // 非回归——已 diff 确认原版 platformCredentialRe 同样只覆盖 ARTEX 平台自身
@@ -449,8 +479,8 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 		// 【刻意不套远程指代豁免】：与 host 档的不对称是有意设计，理由见
 		// 文件头注释——靶机上不存在 /app/jwt.key，"远程读它"只可能是本机。
 		decoded := decodedInputText(input)
-		if platformCredentialRe.Match(input) || platformCredentialLooseRe.Match(input) ||
-			(decoded != "" && (platformCredentialRe.MatchString(decoded) || platformCredentialLooseRe.MatchString(decoded))) {
+		if platformCredentialRe.Match(input) || platformCredentialLooseRe.Match(input) || platformConfigBareReadRe.Match(input) ||
+			(decoded != "" && (platformCredentialRe.MatchString(decoded) || platformCredentialLooseRe.MatchString(decoded) || platformConfigBareReadRe.MatchString(decoded))) {
 			return &intercept.Decision{
 				Action:   "deny",
 				RuleName: "[代码常量] 平台凭据/进程环境",
