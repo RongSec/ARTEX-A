@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"net/http/httptest"
 	"testing"
 
@@ -100,6 +101,29 @@ func TestInterceptFilterHTTP(t *testing.T) {
 		}
 		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &body) != nil || body.Total != tc.total || len(body.Items) != tc.rows || body.Page != tc.page {
 			t.Fatalf("%s: %d %s", tc.query, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// TestInterceptFilterParamsShortcircuitEnum decision_source 白名单须含
+// shortcircuit（代码常量短路档，红线对抗复验发现原白名单缺该值导致按来源
+// 过滤取不到短路记录）。非法值/大写仍 400 语义不变。
+func TestInterceptFilterParamsShortcircuitEnum(t *testing.T) {
+	q, err := url.ParseQuery("decision_source=shortcircuit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := interceptFilterParams(q)
+	if err != nil {
+		t.Fatalf("shortcircuit must be accepted: %v", err)
+	}
+	if f.DecisionSource != "shortcircuit" {
+		t.Fatalf("filter lost: %+v", f)
+	}
+	for _, bad := range []string{"SHORTCIRCUIT", "bogus"} {
+		qb, _ := url.ParseQuery("decision_source=" + bad)
+		if _, err := interceptFilterParams(qb); err == nil {
+			t.Fatalf("%q must still be rejected", bad)
 		}
 	}
 }
