@@ -662,8 +662,10 @@ function ReportCenterInner() {
             </CardContent>
           </Card>
 
-          {/* 中：实时预览 */}
-          <Card className="flex min-h-[60vh] flex-col lg:min-h-0">
+          {/* 中：实时预览。V3-R5：lg 下全列高（视口高减页头/工具条约 10rem，
+              与页面顶栏+标题的实测占位对齐），iframe 内部自然滚动到全文=
+              默认完整显示，不需要用户先开任何开关。 */}
+          <Card className="flex min-h-[60vh] flex-col lg:h-[calc(100dvh-10rem)] lg:min-h-0">
             <CardContent className="flex min-h-0 flex-1 flex-col p-3">
               <TemplatePreview
                 draft={draft}

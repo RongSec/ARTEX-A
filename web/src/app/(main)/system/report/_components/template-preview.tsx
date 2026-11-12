@@ -1,7 +1,13 @@
 "use client";
 
-// 报告中心·实时预览列（artex-hs T21）：iframe 展示 render-draft(format=html)
-// 的产物。防抖 800ms + AbortController 取消 in-flight（连改只发最后一次）。
+// 报告中心·实时预览列（artex-hs T21；V3-R5 默认完整显示）。iframe 展示
+// render-draft(format=html) 的产物。防抖 800ms + AbortController 取消
+// in-flight（连改只发最后一次）。
+//
+// V3-R5：预览列默认即全列高（父 Card 提供 lg 视口高，见 report/page.tsx
+// 中列 `lg:h-[calc(100dvh-10rem)]`；本组件根节点 h-full + iframe flex-1
+// min-h-0，iframe 内部自然滚动到全文，不再被压成小块），另在工具条右上角
+// 提供「全屏查看」=近全屏 Dialog iframe（Esc/遮罩关）。无需用户先开开关。
 //
 // 数据源三选一（设计 §1.2A/D）：
 //   demo   = 内置样例（后端 fixture 旁路，跳任务取数与伪资产红线）
@@ -15,11 +21,12 @@
 
 import * as React from "react";
 
-import { DownloadIcon, EyeIcon, RefreshCwIcon } from "lucide-react";
+import { DownloadIcon, EyeIcon, MaximizeIcon, RefreshCwIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Spinner } from "@/components/ui/spinner";
 import { api } from "@/lib/api";
@@ -50,6 +57,9 @@ export function TemplatePreview(props: {
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState("");
   const [warning, setWarning] = React.useState("");
+  // V3-R5：右上角「全屏查看」=近全屏 Dialog iframe（默认预览列已全列高，
+  // 这里再给一个更大视口；Esc/遮罩关）。
+  const [fullscreen, setFullscreen] = React.useState(false);
   const abortRef = React.useRef<AbortController | null>(null);
   const urlRef = React.useRef<string | null>(null);
   const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -177,6 +187,10 @@ export function TemplatePreview(props: {
           <Button variant="outline" size="sm" onClick={() => void renderDocx()} disabled={!targetReady}>
             <DownloadIcon /> docx 交付预览
           </Button>
+          {/* V3-R5：全屏看渲染产物（blob URL 同一份，无需重渲）。 */}
+          <Button variant="outline" size="sm" onClick={() => setFullscreen(true)} disabled={!url}>
+            <MaximizeIcon /> 全屏查看
+          </Button>
         </div>
       </div>
 
@@ -191,6 +205,8 @@ export function TemplatePreview(props: {
         )}
       </div>
 
+      {/* V3-R5：预览区吃满父列剩余高度（父 Card 在 lg 下给视口高，见
+          report/page.tsx 中列），iframe 内部自然滚动到全文=默认完整显示。 */}
       <div className="relative min-h-0 flex-1 overflow-hidden rounded-lg border bg-white">
         {err ? (
           <div className="text-muted-foreground flex h-full items-center justify-center p-6 text-center text-sm">
@@ -211,6 +227,19 @@ export function TemplatePreview(props: {
           </div>
         )}
       </div>
+
+      {/* 全屏查看：近全屏 Dialog + 同一 blob URL iframe，Esc/遮罩关。 */}
+      <Dialog open={fullscreen} onOpenChange={setFullscreen}>
+        <DialogContent
+          className="flex h-[94dvh] w-[96vw] max-w-none flex-col gap-2 overflow-hidden sm:max-w-none"
+          aria-label="报告预览·全屏"
+        >
+          <DialogTitle className="text-sm text-muted-foreground">报告预览（全屏）</DialogTitle>
+          {url && (
+            <iframe title="报告预览（全屏）" src={url} className="min-h-0 w-full flex-1 rounded-md border bg-white" sandbox="allow-same-origin" />
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
