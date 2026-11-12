@@ -4,11 +4,14 @@ package server
 //
 //  1. 自动通道（旁路，零回归）：finding_repro.go 的 reproEnricher 回填
 //     exchange_id 成功后同协程续渲——对每个**有新关联**的复现步骤渲染
-//     request/response 两张 PNG 落盘（report_assets/evidence/<fid>/
-//     auto-<step>-req|resp-<nano>.png），并写 finding_evidence_images 行
-//     （source='auto'，caption 带 `packet#<exchange_id>` 渲染指纹）。
-//     幂等覆盖：先删该 (step,kind) 的旧 auto 行+文件再插新——**paste/upload
-//     手工行永不动**（source='auto' 隔离，红线）。
+//     **一张** request+response 纵向双面板合成 PNG 落盘
+//     （report_assets/evidence/<fid>/auto-<step>-<nano>.png），并写
+//     finding_evidence_images 行（source='auto'，caption 带
+//     `packet#<exchange_id> step<N>` 渲染指纹）。
+//     幂等覆盖：先删该 **step** 的全部旧 auto 行+文件再插新——**paste/upload
+//     手工行永不动**（source='auto' 隔离，红线）。按 step 粒度删除谓词使
+//     V2 遗留的 req/resp 双图存量在下次重渲时自然收敛成单图（不做全表扫
+//     描式主动清理，零迁移成本）。
 //  2. 手动补渲：POST /api/findings/{id}/evidence/auto-generate（存量 finding
 //     一键补图；query ?step_index=N 只渲单步）。全同步、返回 {steps,rendered}。
 //  3. 开关双层：全局 db setting `packet_shot_enabled`（默认 **false**=零
@@ -37,9 +40,10 @@ import (
 // settingPacketShotEnabled 全局自动截图闸（默认 false=零回归）。
 const settingPacketShotEnabled = "packet_shot_enabled"
 
-// packetShotOpts 渲染选项（本期固定默认：宽 980、脱敏+行号开、隐藏/马赛克
-// 关。模板 style.packet_shot 覆盖留后续——截图发生在 finding 落库期，与
-// 报告模板无绑定，塞 style 里语义错位；偏差已记交付报告）。
+// packetShotOpts 渲染选项（V3 起默认宽 1400、Scale 1.5、脱敏+行号开、隐藏/
+// 马赛克关——一步 req+resp 合成一张大图，报告内可读。模板 style.packet_shot
+// 覆盖留后续——截图发生在 finding 落库期，与报告模板无绑定，塞 style 里语义
+// 错位；偏差已记交付报告）。
 func (s *Server) packetShotOpts() packetshot.Options {
 	return packetshot.DefaultOptions()
 }
@@ -94,18 +98,7 @@ func (s *Server) renderPacketShots(findingID int64, repro []byte, force bool, st
 		if !force && strings.TrimSpace(st.ExchangeID) == "" {
 			continue
 		}
-		done := false
-		if strings.TrimSpace(st.Request) != "" {
-			if s.renderPacketShotImage(findingID, step, "req", st.Request, st.ExchangeID) {
-				done = true
-			}
-		}
-		if strings.TrimSpace(st.Response) != "" {
-			if s.renderPacketShotImage(findingID, step, "resp", st.Response, st.ExchangeID) {
-				done = true
-			}
-		}
-		if done {
+		if s.renderPacketShot(findingID, step, st.Request, st.Response, st.ExchangeID) {
 			n++
 		}
 	}
@@ -115,24 +108,29 @@ func (s *Server) renderPacketShots(findingID int64, repro []byte, force bool, st
 	return n
 }
 
-// renderPacketShotImage 渲单报文 PNG 并幂等替换该 (finding,step,kind) 的
-// auto 行。先渲染→临时文件→改名→删旧行+旧文件→插新行：任一步失败=清理
-// 半途文件、旧行保留（宁缺毋滥）。kind ∈ {req,resp}；req/resp 两行同 step
-// 共存是预期（一步两张图），删旧按文件名 "-<kind>-" 段隔离。
-func (s *Server) renderPacketShotImage(findingID int64, step int, kind, packet, exchangeID string) (ok bool) {
+// renderPacketShot 渲一步的 req+resp **单张**合成 PNG（render.go 的双面板
+// 布局：请求在上、响应在下），幂等替换该 finding step 的全部 auto 行。
+// 先渲染→临时文件→改名→删旧行+旧文件→插新行：任一步失败=清理半途文件、
+// 旧行保留（宁缺毋滥）。删除谓词只按 step（V2 的 req/resp 旧双图行一并
+// 清掉=存量自动收敛成单图）；手工行 source 不同天然躲开。
+// req/resp 全空=无可渲，返回 false。
+func (s *Server) renderPacketShot(findingID int64, step int, req, resp, exchangeID string) (ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[packetshot] finding %d step %d %s panic（已吞）: %v", findingID, step, kind, r)
+			log.Printf("[packetshot] finding %d step %d panic（已吞）: %v", findingID, step, r)
 			ok = false
 		}
 	}()
-	pngBytes, err := packetshot.Render(packet, "", s.packetShotOpts())
+	if strings.TrimSpace(req) == "" && strings.TrimSpace(resp) == "" {
+		return false
+	}
+	pngBytes, err := packetshot.Render(req, resp, s.packetShotOpts())
 	if err != nil {
-		log.Printf("[packetshot] finding %d step %d %s 渲染失败: %v", findingID, step, kind, err)
+		log.Printf("[packetshot] finding %d step %d 渲染失败: %v", findingID, step, err)
 		return false
 	}
 	dirRel := filepath.Join("report_assets", "evidence", strconv.FormatInt(findingID, 10))
-	name := fmt.Sprintf("auto-%d-%s-%d.png", step, kind, time.Now().UnixNano())
+	name := fmt.Sprintf("auto-%d-%d.png", step, time.Now().UnixNano())
 	absTmp := filepath.Join(s.m.dir, dirRel, name+".tmp")
 	abs := filepath.Join(s.m.dir, dirRel, name)
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
@@ -153,15 +151,14 @@ func (s *Server) renderPacketShotImage(findingID int64, step int, kind, packet, 
 	if xid == "" {
 		xid = "-"
 	}
-	caption := fmt.Sprintf("packet#%s step%d %s", xid, step, kind)
-	// req 在前 resp 在后（步内排序留空隙）。
-	sortOrder := (step-1)*100 + 10 + map[bool]int{true: 0, false: 10}[kind == "req"]
+	caption := fmt.Sprintf("packet#%s step%d", xid, step)
+	sortOrder := step * 100
 
-	// 幂等替换旧 auto 行（只同 kind；手工行 source 不同天然躲开）。
+	// 幂等替换该 step 全部 auto 行（含 V2 的 "-req-"/"-resp-" 旧命名形态；
+	// 手工行 source 不同天然躲开）。
 	if old, err := s.m.pg.ListFindingEvidenceImages(findingID); err == nil {
 		for _, e := range old {
-			if e.Source == db.EvidenceSourceAuto && e.StepIndex == step &&
-				strings.Contains(filepath.Base(filepath.FromSlash(e.Filename)), "-"+kind+"-") {
+			if e.Source == db.EvidenceSourceAuto && e.StepIndex == step {
 				if _, del, derr := s.m.pg.DeleteFindingEvidenceImage(e.ID, findingID); derr == nil && del {
 					_ = os.Remove(filepath.Join(s.m.dir, filepath.FromSlash(e.Filename)))
 				}
@@ -171,7 +168,7 @@ func (s *Server) renderPacketShotImage(findingID int64, step int, kind, packet, 
 	relSlash := filepath.ToSlash(filepath.Join(dirRel, name))
 	if _, err := s.m.pg.AddFindingEvidenceImageSource(findingID, step, relSlash, caption, sortOrder, db.EvidenceSourceAuto); err != nil {
 		_ = os.Remove(abs)
-		log.Printf("[packetshot] finding %d step %d %s 入库失败: %v", findingID, step, kind, err)
+		log.Printf("[packetshot] finding %d step %d 入库失败: %v", findingID, step, err)
 		return false
 	}
 	return true

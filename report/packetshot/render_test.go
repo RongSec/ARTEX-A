@@ -21,7 +21,8 @@ const sampleResp = "HTTP/1.1 200 OK\r\n" +
 	"\r\n" +
 	"{\"token\":\"abcdefghijklmnopqrstuvwx\",\"ok\":true,\"n\":42}"
 
-// TestRenderRequestPNG 请求报文渲染出合法 PNG（尺寸=宽×高>0）。
+// TestRenderRequestPNG 请求报文渲染出合法 PNG（尺寸=宽×高>0；V3 默认
+// 1400×Scale1.5）。
 func TestRenderRequestPNG(t *testing.T) {
 	pngBytes, err := Render(sampleReq, "", DefaultOptions())
 	if err != nil {
@@ -32,8 +33,32 @@ func TestRenderRequestPNG(t *testing.T) {
 		t.Fatalf("not a valid PNG: %v", err)
 	}
 	b := img.Bounds()
-	if b.Dx() != 980 || b.Dy() < 100 {
+	if b.Dx() != 1400 || b.Dy() < 100 {
 		t.Fatalf("canvas size wrong: %v", b)
+	}
+}
+
+// TestRenderDefaultOptionsV3 V3 拍板默认：宽 1400、Scale 1.5、脱敏+行号开。
+func TestRenderDefaultOptionsV3(t *testing.T) {
+	o := DefaultOptions()
+	if o.Width != 1400 || o.Scale != 1.5 || !o.MaskHeaders || !o.Desensitize || !o.LineNumbers {
+		t.Fatalf("V3 defaults changed: %+v", o)
+	}
+	// Scale 放大可感知：同一单报文，默认(1.5) 比 1.0 高。
+	base := o
+	base.Scale = 1
+	small, err := Render(sampleReq, sampleResp, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	big, err := Render(sampleReq, sampleResp, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i1, _ := png.Decode(bytes.NewReader(small))
+	i2, _ := png.Decode(bytes.NewReader(big))
+	if i2.Bounds().Dy() <= i1.Bounds().Dy() {
+		t.Fatalf("scale 1.5 must be taller than 1.0: %v vs %v", i1.Bounds(), i2.Bounds())
 	}
 }
 

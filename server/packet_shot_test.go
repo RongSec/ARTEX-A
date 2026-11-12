@@ -1,10 +1,11 @@
 package server
 
-// T22 报文自动截图的 server 侧测试：
+// T22（V3 改版：一步 req+resp 合成单图）报文自动截图的 server 侧测试：
 //   - 无库：auto-generate 路由冒烟（注册期无 panic + pg=nil 命中 503 而非 404）、
 //     stepFilter 纯逻辑（force+filter 语义）、默认关闸行为；
-//   - PG 集成（无库 skip）：auto 行幂等覆盖、**paste/upload 手工行永不动**、
-//     全局闸、盘上文件不堆积。
+//   - PG 集成（无库 skip）：auto 行幂等覆盖（每步 **1 行 1 图**）、**paste/upload
+//     手工行永不动**、V2 遗留同 step 双 auto 行在下次重渲时收敛成单图（存量
+//     自动迁移）、全局闸、盘上文件不堆积。
 
 import (
 	"context"
@@ -48,7 +49,7 @@ func t22ReproJSON(t *testing.T, xid1 string) []byte {
 	return raw
 }
 
-// listAutoFiles 列 finding 证据目录下匹配 -kind- 的 auto png 文件数。
+// listAutoFiles 列 finding 证据目录下的 auto png 文件数。
 func t22CountAutoPNG(t *testing.T, dataDir string, fid int64) int {
 	t.Helper()
 	dir := filepath.Join(dataDir, "report_assets", "evidence", fmt.Sprint(fid))
@@ -100,8 +101,10 @@ func TestPacketShotGateOff(t *testing.T) {
 }
 
 // TestPacketShotAutoIdempotentAndManualUntouched 红线用例（PG）：
-// 闸开→step1（有 exchange_id）渲染 2 张 auto；重跑幂等（行数/文件数不涨、
-// 旧文件删掉）；手工 paste 行与 upload 行在任何自动重渲后原样保留。
+// 闸开→step1（有 exchange_id）渲染 **1 张** req+resp 合成 auto 图；重跑幂等
+// （行数/文件数不涨、旧文件删掉）；手工 paste 行与 upload 行在任何自动重渲
+// 后原样保留；V2 遗留的同 step 双 auto 行（旧 -req-/-resp- 命名）在下次重渲
+// 时被 step 粒度删除谓词一并清掉=存量收敛成单图。
 func TestPacketShotAutoIdempotentAndManualUntouched(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
@@ -134,7 +137,8 @@ func TestPacketShotAutoIdempotentAndManualUntouched(t *testing.T) {
 		t.Fatalf("gate off left rows: %d", len(list))
 	}
 
-	// 2) 开闸→只渲 step1（step2 无 exchange_id=宁缺毋滥跳过）。
+	// 2) 开闸→只渲 step1（step2 无 exchange_id=宁缺毋滥跳过），一步一张
+	//    req+resp 合成图。
 	if err := m.pg.SetSetting(settingPacketShotEnabled, "true"); err != nil {
 		t.Fatal(err)
 	}
@@ -142,8 +146,8 @@ func TestPacketShotAutoIdempotentAndManualUntouched(t *testing.T) {
 		t.Fatalf("want 1 step rendered, got %d", n)
 	}
 	list, _ = m.pg.ListFindingEvidenceImages(fid)
-	if len(list) != 2 {
-		t.Fatalf("want req+resp two auto rows, got %d", len(list))
+	if len(list) != 1 {
+		t.Fatalf("want 1 merged auto row, got %d", len(list))
 	}
 	for _, e := range list {
 		if e.Source != db.EvidenceSourceAuto || e.StepIndex != 1 {
@@ -152,10 +156,13 @@ func TestPacketShotAutoIdempotentAndManualUntouched(t *testing.T) {
 		if !strings.Contains(e.Caption, "packet#ex-1001") {
 			t.Fatalf("caption missing fingerprint: %q", e.Caption)
 		}
+		if !strings.Contains(e.Caption, "step1") {
+			t.Fatalf("caption missing step: %q", e.Caption)
+		}
 	}
 	files1 := t22CountAutoPNG(t, dataDir, fid)
-	if files1 != 2 {
-		t.Fatalf("want 2 png on disk, got %d", files1)
+	if files1 != 1 {
+		t.Fatalf("want 1 png on disk, got %d", files1)
 	}
 
 	// 3) 用户手工贴一张（paste）+ 传一张（upload）。
@@ -167,14 +174,23 @@ func TestPacketShotAutoIdempotentAndManualUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 4) 重渲幂等：auto 行数不变、盘上 auto 文件不涨（旧文件删+新文件写）、
-	//    手工两行原样。
+	// 3.5) 模拟 V2 遗留存量：同 step 手工再插两行旧命名（-req-/-resp-）的
+	//      auto 行（行存在、盘上文件可有可无——删除谓词只认 DB 行）。
+	for _, kind := range []string{"req", "resp"} {
+		legacy := fmt.Sprintf("report_assets/evidence/%d/auto-1-%s-1700000000000000000.png", fid, kind)
+		if _, err := m.pg.AddFindingEvidenceImageSource(fid, 1, legacy, fmt.Sprintf("packet#ex-1001 step1 %s", kind), 110, db.EvidenceSourceAuto); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 4) 重渲幂等+存量收敛：step1 的 auto 行（含 V2 双图遗留）全清重插=1 行，
+	//    盘上 auto 文件=1（旧文件删+新文件写），手工两行原样。
 	if n := s.renderPacketShots(fid, repro, false, nil); n != 1 {
 		t.Fatalf("re-render want 1, got %d", n)
 	}
 	list, _ = m.pg.ListFindingEvidenceImages(fid)
-	if len(list) != 4 {
-		t.Fatalf("idempotent re-render changed row count: %d", len(list))
+	if len(list) != 3 {
+		t.Fatalf("merged auto row + 2 manual rows expected after legacy convergence, got %d", len(list))
 	}
 	manualKept, uploadKept := false, false
 	for _, e := range list {
@@ -188,12 +204,18 @@ func TestPacketShotAutoIdempotentAndManualUntouched(t *testing.T) {
 	if !manualKept || !uploadKept {
 		t.Fatalf("manual rows must never be touched: paste=%v upload=%v", manualKept, uploadKept)
 	}
-	if files2 := t22CountAutoPNG(t, dataDir, fid); files2 != 2 {
-		t.Fatalf("auto png files must stay 2 after re-render (old deleted), got %d", files2)
+	if files2 := t22CountAutoPNG(t, dataDir, fid); files2 != 1 {
+		t.Fatalf("auto png files must stay 1 after re-render (old deleted), got %d", files2)
+	}
+	// 遗留双 auto 行必须已被 step 粒度删除谓词清掉（=存量收敛完成）。
+	for _, e := range list {
+		if strings.Contains(e.Filename, "-req-") || strings.Contains(e.Filename, "-resp-") {
+			t.Fatalf("V2 legacy auto rows must converge to single merged row, got %q", e.Filename)
+		}
 	}
 
-	// 5) 手动通道（force）stepFilter 单步：step2 无 exchange_id 也渲，caption
-	//    记 '-'；step1 已有 auto 行不受影响。
+	// 5) 手动通道（force）stepFilter 单步：step2 无 exchange_id 也渲（1 张
+	//    合成图），caption 记 '-'；step1 已有 auto 行不受影响。
 	if n := s.renderPacketShots(fid, repro, true, []int{2}); n != 1 {
 		t.Fatalf("force step2 want 1, got %d", n)
 	}
@@ -207,8 +229,8 @@ func TestPacketShotAutoIdempotentAndManualUntouched(t *testing.T) {
 			}
 		}
 	}
-	if step2Auto != 2 {
-		t.Fatalf("step2 req+resp auto rows want 2, got %d", step2Auto)
+	if step2Auto != 1 {
+		t.Fatalf("step2 merged auto rows want 1, got %d", step2Auto)
 	}
 }
 
@@ -255,7 +277,7 @@ func TestPacketShotAutoGenerateHandler(t *testing.T) {
 	if err := m.pg.UpdateFindingReproduction(fid, t22ReproJSON(t, "")); err != nil {
 		t.Fatal(err)
 	}
-	// 2) 全量补渲=2 步全渲（手动不受闸/未关联约束）。
+	// 2) 全量补渲=2 步全渲（手动不受闸/未关联约束），每步一张合成图。
 	code, out := post(fmt.Sprintf("/api/findings/%d/evidence/auto-generate", fid))
 	if code != http.StatusOK {
 		t.Fatalf("generate want 200, got %d %v", code, out)
@@ -263,8 +285,8 @@ func TestPacketShotAutoGenerateHandler(t *testing.T) {
 	if out["steps"] != float64(2) || out["rendered"] != float64(2) {
 		t.Fatalf("result=%v want steps=2 rendered=2", out)
 	}
-	if files := t22CountAutoPNG(t, dataDir, fid); files != 4 {
-		t.Fatalf("want 4 png (req+resp × 2 steps), got %d", files)
+	if files := t22CountAutoPNG(t, dataDir, fid); files != 2 {
+		t.Fatalf("want 2 png (1 merged × 2 steps), got %d", files)
 	}
 	// 3) 单步 + 越界。
 	if code, _ := post(fmt.Sprintf("/api/findings/%d/evidence/auto-generate?step_index=1", fid)); code != http.StatusOK {
@@ -273,9 +295,9 @@ func TestPacketShotAutoGenerateHandler(t *testing.T) {
 	if code, _ := post(fmt.Sprintf("/api/findings/%d/evidence/auto-generate?step_index=9", fid)); code != http.StatusBadRequest {
 		t.Fatalf("bad step want 400, got %d", code)
 	}
-	// 幂等：跑完单步后总数仍 4（重渲替换不堆积）。
-	if files := t22CountAutoPNG(t, dataDir, fid); files != 4 {
-		t.Fatalf("idempotent disk count want 4, got %d", files)
+	// 幂等：跑完单步后总数仍 2（重渲替换不堆积）。
+	if files := t22CountAutoPNG(t, dataDir, fid); files != 2 {
+		t.Fatalf("idempotent disk count want 2, got %d", files)
 	}
 }
 

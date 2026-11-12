@@ -50,34 +50,35 @@ type Options struct {
 	KeepHeaders      []string // 从默认冗余清单豁免的头名
 }
 
-// DefaultOptions 任务书默认：宽 980、脱敏全开、行号开、隐藏/马赛克关。
+// DefaultOptions 默认（V3 起）：宽 1400、Scale 1.5（字号/行高/边距同乘，
+// 报告里截图放大可读）、脱敏全开、行号开、隐藏/马赛克关。
 func DefaultOptions() Options {
-	return Options{Width: 980, Scale: 1, MaskHeaders: true, Desensitize: true, LineNumbers: true}
+	return Options{Width: 1400, Scale: 1.5, MaskHeaders: true, Desensitize: true, LineNumbers: true}
 }
 
 // 调色板（浅色，近 Burp 报文视图）。
 var (
-	colBG    = color.NRGBA{255, 255, 255, 255}
-	colCard  = color.NRGBA{246, 248, 250, 255}
-	colBand  = color.NRGBA{236, 240, 244, 255}
-	colBorder = color.NRGBA{208, 215, 222, 255}
-	colText  = color.NRGBA{31, 35, 40, 255}
-	colMuted = color.NRGBA{110, 119, 129, 255}
-	colKey   = color.NRGBA{9, 105, 218, 255}  // JSON key 蓝
-	colStr   = color.NRGBA{10, 128, 67, 255}  // 串绿
-	colNum   = color.NRGBA{154, 103, 0, 255}  // 数橙
-	colLit   = color.NRGBA{130, 80, 223, 255} // 布尔/null 紫
+	colBG      = color.NRGBA{255, 255, 255, 255}
+	colCard    = color.NRGBA{246, 248, 250, 255}
+	colBand    = color.NRGBA{236, 240, 244, 255}
+	colBorder  = color.NRGBA{208, 215, 222, 255}
+	colText    = color.NRGBA{31, 35, 40, 255}
+	colMuted   = color.NRGBA{110, 119, 129, 255}
+	colKey     = color.NRGBA{9, 105, 218, 255}  // JSON key 蓝
+	colStr     = color.NRGBA{10, 128, 67, 255}  // 串绿
+	colNum     = color.NRGBA{154, 103, 0, 255}  // 数橙
+	colLit     = color.NRGBA{130, 80, 223, 255} // 布尔/null 紫
 	colHdrName = color.NRGBA{9, 105, 218, 255}
-	colWhite = color.NRGBA{255, 255, 255, 255}
+	colWhite   = color.NRGBA{255, 255, 255, 255}
 )
 
 // 徽标底色（按 method 首字母 / 状态码首位）。
 var (
-	colBadgeReq    = color.NRGBA{9, 105, 218, 255}
-	colBadge2xx    = color.NRGBA{26, 127, 55, 255}
-	colBadge3xx    = color.NRGBA{4, 108, 192, 255}
-	colBadge4xx    = color.NRGBA{154, 103, 0, 255}
-	colBadge5xx    = color.NRGBA{207, 34, 46, 255}
+	colBadgeReq = color.NRGBA{9, 105, 218, 255}
+	colBadge2xx = color.NRGBA{26, 127, 55, 255}
+	colBadge3xx = color.NRGBA{4, 108, 192, 255}
+	colBadge4xx = color.NRGBA{154, 103, 0, 255}
+	colBadge5xx = color.NRGBA{207, 34, 46, 255}
 )
 
 // ---------- 字体：CJK 探测（sync.Once）+ 加载 ----------
@@ -174,11 +175,11 @@ const (
 )
 
 type panelRow struct {
-	kind    rowKind
-	name    string // 头行的 Name（rowText 且有值时着色区分）
-	text    string // 主体文本（rowText=value 段 / rowJSON|Code=行内容）
-	num     int    // 行号（>0 才画）
-	mosaic  bool   // 尾部叠马赛克（Mosaic 命中）
+	kind   rowKind
+	name   string // 头行的 Name（rowText 且有值时着色区分）
+	text   string // 主体文本（rowText=value 段 / rowJSON|Code=行内容）
+	num    int    // 行号（>0 才画）
+	mosaic bool   // 尾部叠马赛克（Mosaic 命中）
 }
 
 // ---------- 排版 + 绘制主流程 ----------
@@ -260,7 +261,7 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 				}
 				x = drawMixed(img, r.text, x, ty, colText, monoFace, cjkFace, fs.cjkOK)
 				if r.mosaic {
-					drawMosaicBox(img, x, ty-asc, pad, int(monoFace.Metrics().Height.Ceil()))
+					drawMosaicBox(img, x, ty-asc, pad, int(monoFace.Metrics().Height.Ceil()), s)
 				}
 			case rowJSON:
 				if r.num > 0 {
@@ -283,7 +284,7 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 					x = drawMixed(img, t.text, x, ty, c, monoFace, cjkFace, fs.cjkOK)
 				}
 				if r.mosaic {
-					drawMosaicBox(img, x, ty-asc, pad, int(monoFace.Metrics().Height.Ceil()))
+					drawMosaicBox(img, x, ty-asc, pad, int(monoFace.Metrics().Height.Ceil()), s)
 				}
 			case rowCode:
 				if r.num > 0 {
@@ -293,7 +294,7 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 				}
 				x = drawMixed(img, r.text, x, ty, colText, monoFace, cjkFace, fs.cjkOK)
 				if r.mosaic {
-					drawMosaicBox(img, x, ty-asc, pad, int(monoFace.Metrics().Height.Ceil()))
+					drawMosaicBox(img, x, ty-asc, pad, int(monoFace.Metrics().Height.Ceil()), s)
 				}
 			}
 			ty += lineH
@@ -464,12 +465,15 @@ func badgeColor(badge string) color.NRGBA {
 	}
 }
 
-// drawMosaicBox 在 (x0,y0) 起画 6px 交替块遮罩（宽度=后续未画区，此处
-// 覆盖到 pad 宽即可——调用点在文本画完后，x 已是文本尾，矩形取文本右侧
-// 一小段与行高；简化：从 x 往左回盖整行的做法更稳——取 x-420..x 区间）。
-func drawMosaicBox(dst *image.NRGBA, xEnd, yTop, pad, h int) {
-	x0 := max(2, xEnd-420)
-	const blk = 6
+// drawMosaicBox 在 (x0,y0) 起画 6px（×scale）交替块遮罩（宽度=后续未画区，
+// 此处覆盖到 pad 宽即可——调用点在文本画完后，x 已是文本尾，矩形取文本右侧
+// 一小段与行高；简化：从 x 往左回盖整行的做法更稳——取 x-420·scale..x 区间）。
+func drawMosaicBox(dst *image.NRGBA, xEnd, yTop, pad, h int, scale float64) {
+	if scale <= 0 {
+		scale = 1
+	}
+	x0 := max(2, xEnd-int(420*scale))
+	blk := max(1, int(6*scale))
 	for y := yTop; y < yTop+h; y += blk {
 		for x := x0; x < xEnd; x += blk {
 			if (x/blk+y/blk)%2 == 0 {
