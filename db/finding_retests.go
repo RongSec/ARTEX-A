@@ -112,8 +112,9 @@ func (d *DB) CreateFindingRetest(ctx context.Context, findingID int64, notes str
 		return nil, nil, false, err
 	}
 	msg := r.InitialMessage()
+	// 与 AppendConvActivity 同规矩：conversation_activities 第二写入点，凭据脱敏兜底。
 	_, err = tx.ExecContext(ctx, `INSERT INTO conversation_activities(conversation_id,worker,kind,summary,detail) VALUES ($1,$2,'user',$3,$4)`,
-		c.ID, FindingRetestAgentKey, fmt.Sprintf("请复测漏洞 #%d", findingID), msg)
+		c.ID, FindingRetestAgentKey, sanitizeActivityText(fmt.Sprintf("请复测漏洞 #%d", findingID)), sanitizeActivityText(msg))
 	if err != nil {
 		return nil, nil, false, err
 	}

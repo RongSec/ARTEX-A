@@ -234,13 +234,18 @@ func (d *DB) DeleteConversations(ids []int64) ([]int64, error) {
 // AppendConvActivity records one step of a conversation (human message or an agent
 // execution step) and returns its id. Mirrors ExplorationStore.AppendActivity but
 // keyed by conversation_id. Reuses the Activity struct (NodeID is ignored here).
+//
+// V4 安全面（层2 纵深防御）：summary/detail 落库前一律过 sanitizeActivityText
+// 打码明文凭据（PGPASSWORD、postgres:// 连接串、Bearer token）——工具输出回流到
+// 活动流的路径很多（Bash stdout、MCP 返回、报错文本），逐点过滤防不胜防，收敛到
+// 唯一写入点兜底。对所有 agent 生效。
 func (d *DB) AppendConvActivity(convID int64, a Activity) (int64, error) {
 	var id int64
 	err := d.QueryRow(`
 INSERT INTO conversation_activities(conversation_id, worker, kind, tool, tool_use_id, is_error, summary, detail, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
 VALUES ($1,NULLIF($2,''),NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),$6,NULLIF($7,''),NULLIF($8,''),$9,$10,$11,$12)
 RETURNING id`, convID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError,
-		utf8Clean(a.Summary), utf8Clean(a.Detail), a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens).Scan(&id)
+		utf8Clean(sanitizeActivityText(a.Summary)), utf8Clean(sanitizeActivityText(a.Detail)), a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens).Scan(&id)
 	return id, err
 }
 
