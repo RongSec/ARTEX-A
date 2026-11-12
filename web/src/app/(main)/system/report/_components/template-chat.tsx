@@ -87,7 +87,7 @@ export function TemplateChat(props: {
         )}
       </div>
 
-      <div ref={scrollRef} className="min-h-32 flex-1 space-y-2 overflow-y-auto rounded-lg border p-2 text-sm">
+      <div ref={scrollRef} className="max-h-52 min-h-32 flex-1 space-y-2 overflow-y-auto rounded-lg border p-2 text-sm">
         {messages.length === 0 ? (
           <p className="text-muted-foreground py-6 text-center text-xs">
             用自然语言描述想改的模板设定，例如：把漏洞明细标题改成「发现事项」、正文字体换成宋体、关掉声明章。
@@ -123,7 +123,10 @@ export function TemplateChat(props: {
 
       <div className="flex items-end gap-2">
         <Textarea
-          className="min-h-16 flex-1"
+          // 单行起步、内容自动增高（field-sizing-content），上限约 3 行；
+          // 默认 min-h-16（≈4行）压掉，让对话区整体更矮、右列免滚动看全。
+          rows={1}
+          className="max-h-[7.5rem] min-h-8 flex-1"
           placeholder={disabled ? "模板保存后才能对话调整" : "描述要改的模板设定…（Enter 发送，Shift+Enter 换行）"}
           value={input}
           disabled={disabled || sending}

@@ -693,7 +693,7 @@ function ReportCenterInner() {
               </CardContent>
             </Card>
 
-            <Collapsible defaultOpen={false} className="shrink-0">
+            <Collapsible defaultOpen className="shrink-0">
               <Card>
                 <CollapsibleTrigger asChild>
                   <CardHeader className="cursor-pointer py-3">
