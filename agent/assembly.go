@@ -33,6 +33,36 @@ type DeferredInfo struct {
 // until a user assigns a skill/MCP to the agent in the UI.
 var ToolAugment func(ctx context.Context, agentKey string) (extra []actool.CoreTool, def DeferredInfo, cleanup func())
 
+// ToolBaseResolver, if set, reports an agent's execution-base mode from the DB
+// ("default" | "none"). "none" marks a read-only summary agent (observer/
+// reader): chat-style runners must NOT inject the SDK DefaultTools base
+// (Bash/Read/Write/Edit/…) for it — only skills/MCP/host-bound tools. Returns
+// "default" (or empty) for every other agent, so worker/planner/mainagent keep
+// their full base untouched. The server wires it to agents.tool_base.
+var ToolBaseResolver func(agentKey string) string
+
+// agentToolBase is "none" only when the resolver explicitly says so; nil
+// resolver or any other value → "default" (fail-open toward legacy behavior,
+// never strip an agent by accident).
+func agentToolBase(agentKey string) string {
+	if ToolBaseResolver != nil && ToolBaseResolver(agentKey) == "none" {
+		return "none"
+	}
+	return "default"
+}
+
+// chatBaseTools is the execution base for the chat-style runner (ChatAgent):
+// SDK DefaultTools for a normal agent, nil for a tool_base='none' read-only
+// agent. Kept as a pure function of the resolver so assembly tests can pin the
+// stripping without a DB. MainAgent/worker/planner build their own task-graph
+// bases and never call this — their DefaultTools injection is unchanged.
+func chatBaseTools(agentKey string) []actool.CoreTool {
+	if agentToolBase(agentKey) == "none" {
+		return nil
+	}
+	return actool.DefaultTools()
+}
+
 // AugmentTools returns base plus the agent's visible skill/MCP tools, the
 // DeferredInfo, and a cleanup func the caller must defer (closes MCP clients).
 // Built-in base tools are kept as-is — never filtered (内置工具留代码层，不做可见性过滤).

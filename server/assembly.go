@@ -211,6 +211,20 @@ func seedPrompts(pg *db.DB) {
 // and缺省入参 get injected. MCP/skill/host tools have no row and pass through.
 func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
+	// V4 安全面：把 agents.tool_base 接到装配层。resolver 每次 Chat run 调一次，
+	// 直读 DB（无缓存=用户改配置立即生效）；查不到 agent 行按 default 放行，
+	// 绝不误伤执行型 agent（worker/planner/mainagent 的 base 由各自代码构造，
+	// 不经过本 resolver 的剥离路径——chatBaseTools 只服务 ChatAgent）。
+	agent.ToolBaseResolver = func(agentKey string) string {
+		a, err := pg.GetAgentByKey(agentKey)
+		if err != nil || a == nil {
+			return "default"
+		}
+		if a.ToolBase == "none" {
+			return "none"
+		}
+		return "default"
+	}
 	// Seed the built-in domain tools (first-insert only; DO NOTHING preserves edits).
 	// No startup prune: rows we didn't seed are left alone so future user-defined
 	// custom tools (system=false, added via the UI) survive restarts.

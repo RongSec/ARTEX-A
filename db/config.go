@@ -462,14 +462,18 @@ type Agent struct {
 	TriggerRunMode     string `json:"trigger_run_mode"`
 	TriggerMergeMode   string `json:"trigger_merge_mode"`
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
+	// ToolBase 执行底座(V4 安全面):default=照旧注入 SDK DefaultTools(Bash/Read/Write…);
+	// none=只读型 agent(observer/reader),装配时剥离执行底座,仅保留 skills/MCP/hostTools
+	// 绑定增补。写入白名单见 SetAgentToolBase,非法值读取侧按 default 处理。
+	ToolBase string `json:"tool_base"`
 }
 
-const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
+const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),COALESCE(tool_base,'default'),llm_profile_id`
 
 func scanAgent(sc interface{ Scan(...any) error }) (*Agent, error) {
 	var a Agent
 	var prof sql.NullInt64 // llm_profile_id 可空:未绑定时为 NULL
-	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof)
+	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &a.ToolBase, &prof)
 	if err == nil && prof.Valid {
 		v := prof.Int64
 		a.LLMProfileID = &v
@@ -677,6 +681,19 @@ func (d *DB) SetAgentRunSeconds(key string, runSecs int) error {
 		runSecs = 0
 	}
 	_, err := d.Exec(`UPDATE agents SET run_seconds=$1 WHERE key=$2`, runSecs, key)
+	return err
+}
+
+// SetAgentToolBase sets an agent's execution-base mode: "default" keeps the SDK
+// DefaultTools base (Bash/Read/Write/…) injected at assembly; "none" strips it so
+// read-only summary agents (observer/reader) only ever see their bound
+// skills/MCP/host tools. Enum is whitelisted here — anything else falls back to
+// "default" so a dirty value can never silently strip a worker's base.
+func (d *DB) SetAgentToolBase(key, toolBase string) error {
+	if toolBase != "none" {
+		toolBase = "default"
+	}
+	_, err := d.Exec(`UPDATE agents SET tool_base=$1 WHERE key=$2`, toolBase, key)
 	return err
 }
 

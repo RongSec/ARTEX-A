@@ -430,4 +430,16 @@ func (s *Server) seedProjectTools() {
 	}
 	s.seedObserverAgent()
 	s.seedReaderAgent()
+
+	// V4 安全面：只读总结型 agent 剥离执行底座（tool_base='none'，装配层不再注入
+	// DefaultTools，见 agent/chat.go chatBaseTools——reader 触发会话实测 21 次
+	// Bash 直连 psql 越权侦查，conv#60 DB 明文密码进活动流）。
+	// 刻意放在两 seed 之外、每次启动幂等执行：seed 函数有一次性 flag 早退，存量库
+	// 里已建的 observer/reader 行若只写在 seed 内永远收编不到。其余 agent 不写此
+	// 列，保持 schema 默认 'default'（worker/planner/mainagent/reporter 底座不变）。
+	for _, key := range []string{"observer", "reader"} {
+		if err := s.m.pg.SetAgentToolBase(key, "none"); err != nil {
+			log.Printf("[project-tools] 设置 %s tool_base 失败: %v", key, err)
+		}
+	}
 }

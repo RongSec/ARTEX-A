@@ -118,7 +118,10 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// Pure assistant: DefaultTools as the base; AugmentTools layers in the key's
 	// visible skills/MCP and lets the DB tools table filter/override. DefaultTools
 	// have no tools-table rows, so they always pass through.
-	base := actool.DefaultTools()
+	//
+	// V4 安全面：tool_base='none' 的只读型 agent（observer/reader——prompt 明令禁止
+	// 执行渗透动作）不注入执行底座，见 chatBaseTools。
+	base := chatBaseTools(agentKey)
 	ctx = WithRunInfo(ctx, RunInfo{SessionID: sessionID})
 	tools, def, cleanup := AugmentTools(ctx, agentKey, base)
 	defer cleanup()

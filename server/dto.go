@@ -560,6 +560,9 @@ type AgentDTO struct {
 	TriggerRunMode     string `json:"trigger_run_mode"`
 	TriggerMergeMode   string `json:"trigger_merge_mode"`
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
+	// ToolBase 执行底座(V4 安全面):default=注入 DefaultTools;none=只读型,装配层剥离
+	// 执行底座(仅 skills/MCP/hostTools)。透出给前端展示,暂无编辑控件(最小面)。
+	ToolBase string `json:"tool_base"`
 	// binding counts (populated only by the list endpoint) — shown on agent cards.
 	McpCount   int `json:"mcp_count"`
 	SkillCount int `json:"skill_count"`
@@ -583,6 +586,7 @@ func agentDTO(a *db.Agent) AgentDTO {
 		TriggerRunMode:     a.TriggerRunMode,
 		TriggerMergeMode:   a.TriggerMergeMode,
 		TriggerMaxParallel: a.TriggerMaxParallel,
+		ToolBase:           a.ToolBase,
 	}
 }
 

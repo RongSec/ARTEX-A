@@ -784,6 +784,7 @@ CREATE TABLE IF NOT EXISTS agents (
     trigger_run_mode     TEXT    NOT NULL DEFAULT 'serial'  CHECK (trigger_run_mode IN ('serial','parallel')),
     trigger_merge_mode   TEXT    NOT NULL DEFAULT 'all' CHECK (trigger_merge_mode IN ('by_task','all','none')),
     trigger_max_parallel INTEGER NOT NULL DEFAULT 5,
+    tool_base         TEXT    NOT NULL DEFAULT 'default' CHECK (tool_base IN ('default','none')),
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT agents_role_ck CHECK (role IN ('goals','main','planner','worker','assistant'))
@@ -792,6 +793,10 @@ CREATE TABLE IF NOT EXISTS agents (
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_run_mode     TEXT    NOT NULL DEFAULT 'serial';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_merge_mode   TEXT    NOT NULL DEFAULT 'all';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_max_parallel INTEGER NOT NULL DEFAULT 5;
+-- 只读型 agent 执行底座开关(V4 安全面):'none'=装配时不注入 SDK DefaultTools(Bash/Read/Write…),
+-- 仅保留 skills/MCP/hostTools 绑定增补。observer/reader seed 置 none;其余 agent 保持 default。
+-- 迁移不带 CHECK(照 trigger_* 先例):旧库存量安全 + 后端写入白名单兜底。
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS tool_base TEXT NOT NULL DEFAULT 'default';
 -- per-agent LLM 绑定(agent 级默认模型):列自初版即在上方 CREATE 中,此 ALTER 仅为极旧库兜底(幂等)。
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
 -- run_seconds 单次 run 墙钟默认 600→1200:只改列默认(影响将来新插入的行),不动旧库存量行。
