@@ -9,7 +9,7 @@ import (
 
 // T18（N2）：整项目收官自动写报告。
 //
-// 挂点=Manager.OnTaskTerminal（nil 短路，由 installAutoReportHook 在 server.New
+// 挂点=Manager.OnTaskTerminal（nil 短路，由 installTerminalHooks 在 server.New
 // 的 PG 就绪分支装配）。任务终态 → 查所属项目 auto_report → 去抖（项目还有
 // 未终态任务=还没收官，跳过）→ 整项目收官 → 建 project 级报告 job（复用
 // reportgen.go 的 InsertReport + runReportJob 状态机，与手动 /api/report/generate
@@ -42,12 +42,18 @@ func projectSettled(all, terminal map[int64]bool) (settled bool, taskCount int) 
 	return true, len(all)
 }
 
-// installAutoReportHook 装配终态钩子（仅 server.New 的 PG 非空分支调用一次）。
-func (s *Server) installAutoReportHook() {
+// installTerminalHooks 装配任务终态钩子（仅 server.New 的 PG 非空分支调用一次）。
+// 两段旁路按注册顺序串联，互不短路（自动报告失败不该挡住 reader 唤起，反之亦然）：
+//  1. onTaskTerminalAutoReport —— 整项目收官自动写报告（T18）
+//  2. onTaskTerminalReaderNudge —— 项目收官唤起一轮 reader（V4-E / E3）
+func (s *Server) installTerminalHooks() {
 	if s.m == nil || s.m.pg == nil {
 		return
 	}
-	s.m.OnTaskTerminal = s.onTaskTerminalAutoReport
+	s.m.OnTaskTerminal = func(taskID int64, status string) {
+		s.onTaskTerminalAutoReport(taskID, status)
+		s.onTaskTerminalReaderNudge(taskID, status)
+	}
 }
 
 // onTaskTerminalAutoReport 是钩子实现。入参可能来自任意任务（含无项目任务），

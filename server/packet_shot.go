@@ -207,7 +207,7 @@ func (s *Server) findingEvidenceAutoGenerate(w http.ResponseWriter, r *http.Requ
 
 // installPacketShot 一次性 seed 设置键（InsertSettingIfAbsent=仅缺时补显式
 // 'false'，已有值不覆——前端设置页读到确定值）。在 server.New 的 PG 分支
-// 调用（照 installAutoReportHook）。
+// 调用（照 installTerminalHooks）。
 func (s *Server) installPacketShot() {
 	if s.m == nil || s.m.pg == nil {
 		return

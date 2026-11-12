@@ -27,8 +27,8 @@ import (
 // sharing the process-wide asset store. ID is the PG task id as a string; ExpID
 // is the exploration the task owns.
 type Task struct {
-	ID           string `json:"id"`
-	ExpID        int64  `json:"exploration_id"`
+	ID    string `json:"id"`
+	ExpID int64  `json:"exploration_id"`
 	// ProjectID 项目归属（artex-hs T05）；nil=无项目，行为与基线一致。
 	ProjectID    *int64 `json:"project_id,omitempty"`
 	Name         string `json:"name"` // 可选任务名称;空=未命名
@@ -267,6 +267,9 @@ type Manager struct {
 	// 两个钩子协程会各自查库都见全终态；互斥 + HasOpenProjectReport 在途检查
 	// 把「查收官→入队」压成一个不交错的动作，后到者看到在途 job 直接跳过。
 	autoReportMu sync.Map // int64(projectID) -> *sync.Mutex
+	// projectSettleNudgeAt 记录「项目收官 → 唤起 reader」的上次触发时刻（V4-E）。
+	// 同项目 60s 内只唤起一轮（并发收官/收官后复活再收官都会重复进钩子）。
+	projectSettleNudgeAt sync.Map // int64(projectID) -> time.Time
 }
 
 // Settings keys the UI toggles at runtime.
@@ -865,7 +868,7 @@ func taskFromPG(m *Manager, pt *pgdb.Task, store *pgdb.ExplorationStore, ic *int
 	m.bindGraphHook(store, pt)
 	return &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
-		ProjectID: cloneInt64Ptr(pt.ProjectID),
+		ProjectID:  cloneInt64Ptr(pt.ProjectID),
 		Name:       pt.Name,
 		CategoryID: cloneInt64Ptr(pt.CategoryID), CategoryName: pt.CategoryName,
 		PinnedAt:    unixOrZero(pt.PinnedAt),

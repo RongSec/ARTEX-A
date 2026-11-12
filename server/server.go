@@ -247,7 +247,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		m.projectIndexer.Start(s.ctx)
 		// 任务终态→整项目自动报告钩子（artex-hs T18）。nil 守卫在装配内部，
 		// 钩子本体在 Manager.emitTaskTerminal 判空短路=原版零行为。
-		s.installAutoReportHook()
+		s.installTerminalHooks()
 		// T22 报文自动截图：一次性 seed 全局闸 packet_shot_enabled（默认关
 		// =零回归；渲染入口在 reproEnricher 续渲 + 手动端点，闸判定在使用侧）。
 		s.installPacketShot()
