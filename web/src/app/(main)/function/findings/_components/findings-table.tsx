@@ -7,15 +7,14 @@ import Link from "next/link";
 import {
   ArrowUpRightIcon,
   ChevronRightIcon,
-  FileTextIcon,
   FlaskConicalIcon,
   RotateCcwIcon,
   ShieldAlertIcon,
   Trash2Icon,
 } from "lucide-react";
 
-import { CopyButton } from "@/components/copy-button";
-import { Markdown } from "@/components/markdown";
+import { FindingDetailBody } from "@/components/finding-detail-body";
+import { Skeleton } from "@/components/ui/skeleton";
 import { StatusBadge } from "@/components/status-badge";
 import {
   AlertDialog,
@@ -63,7 +62,10 @@ export interface FindingEdit {
   severity: Severity;
 }
 
-export type FindingReport = { status: "loading" | "done" | "error"; text: string };
+// V3-R1 展开行详情缓存:列表 DTO 没有 reproduction/report,展开时按
+// finding_id GET 一次完整 detail;done 时 finding=详情对象,交给与详情页
+// 同构的 FindingDetailBody 渲染。error 态给重试按钮(onRetryDetail)。
+export type FindingReport = { status: "loading" | "done" | "error"; finding: Finding | null };
 
 // Exploration node ids are only unique inside a task. Prefer the persisted
 // finding id and otherwise namespace the node id by task so editing one group
@@ -96,7 +98,10 @@ interface FindingsTableProps {
   /** 当前展开行的 findingRowKey;null = 全部收起。 */
   expandedKey: string | null;
   onToggleRow: (finding: Finding) => void;
+  /** 展开行完整详情缓存(按 findingRowKey 存;V3-R1,与详情页同构渲染)。 */
   reports: Record<string, FindingReport>;
+  /** 详情加载失败后的重试(page 层事件回调重新 fetch,非 effect)。 */
+  onRetryDetail: (finding: Finding) => void;
   edit: FindingEdit | null;
   onEditChange: React.Dispatch<React.SetStateAction<FindingEdit | null>>;
   saving: boolean;
@@ -120,6 +125,7 @@ export function FindingsTable({
   expandedKey,
   onToggleRow,
   reports,
+  onRetryDetail,
   edit,
   onEditChange,
   saving,
@@ -398,42 +404,35 @@ export function FindingsTable({
                         {f.evidence}
                       </pre>
 
-                      {/* 详细报告(Markdown):展开时按 finding_id 懒加载,免进详情页即可查看。 */}
-                      {f.finding_id && (
-                        <div className="flex flex-col gap-1.5">
-                          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                            <span className="flex items-center gap-2">
-                              <FileTextIcon className="size-3.5" />
-                              详细报告
-                            </span>
-                            {reports[rowKey]?.status === "done" && reports[rowKey]?.text.trim() && (
-                              <CopyButton
-                                text={reports[rowKey]?.text}
-                                successMessage="已复制详细报告"
-                                variant="ghost"
-                                className="h-6 px-2 text-xs"
-                              />
-                            )}
-                          </div>
-                          {(() => {
-                            const rep = reports[rowKey];
-                            if (!rep || rep.status === "loading")
-                              return <p className="text-xs text-muted-foreground">加载中…</p>;
-                            if (rep.status === "error")
-                              return <p className="text-xs text-muted-foreground">报告加载失败。</p>;
-                            if (!rep.text.trim())
-                              return <p className="text-xs text-muted-foreground">暂无详细报告。</p>;
+                      {/* V3-R1 展开行=详情视图:列表 DTO 无 reproduction/report,
+                          展开时按 finding_id 懒拉完整 detail(page 层事件回调缓存,
+                          按 rowKey 分键,行间不串),渲染与详情页同构的
+                          FindingDetailBody(分步复现卡片+详细报告回退)。 */}
+                      {f.finding_id &&
+                        (() => {
+                          const rep = reports[rowKey];
+                          if (!rep || rep.status === "loading") {
+                            return <ExpandedDetailSkeleton />;
+                          }
+                          if (rep.status === "error" || !rep.finding) {
                             return (
-                              // break-words 会继承到段落/列表,pre 另加
-                              // whitespace-pre-wrap 让代码块也换行——否则长代码行/长 URL
-                              // 会撑宽 colSpan 单元格,把整张表挤出横向滚动条。
-                              <div className="min-w-0 break-words rounded-md border bg-background px-3 py-2 [&_pre]:whitespace-pre-wrap">
-                                <Markdown text={rep.text} />
+                              <div className="flex flex-col items-center gap-2 rounded-md border border-dashed bg-background px-3 py-6">
+                                <p className="text-xs text-muted-foreground">详情加载失败。</p>
+                                <Button size="xs" variant="outline" onClick={() => onRetryDetail(f)}>
+                                  <RotateCcwIcon data-icon="inline-start" />
+                                  重试
+                                </Button>
                               </div>
                             );
-                          })()}
-                        </div>
-                      )}
+                          }
+                          // break-words+whitespace-pre-wrap 防长代码行/长 URL 撑宽
+                          // colSpan 单元格把整张表挤出横向滚动条(原报告区同款约束)。
+                          return (
+                            <div className="min-w-0 break-words [&_pre]:whitespace-pre-wrap">
+                              <FindingDetailBody finding={rep.finding} evidenceId={f.finding_id} />
+                            </div>
+                          );
+                        })()}
                     </div>
                   </TableCell>
                 </TableRow>
@@ -450,5 +449,26 @@ export function FindingsTable({
         )}
       </TableBody>
     </Table>
+  );
+}
+
+// ExpandedDetailSkeleton 展开行详情加载中的骨架屏:粗描一个复现卡片 +
+// 详细报告 Card 的轮廓,避免加载完成时布局跳动过大。
+function ExpandedDetailSkeleton() {
+  return (
+    <div className="flex flex-col gap-3" role="status" aria-label="加载详情中">
+      <Skeleton className="h-8 w-40" />
+      <div className="rounded-md border p-3">
+        <Skeleton className="mb-2 h-4 w-24" />
+        <Skeleton className="mb-2 h-3 w-3/4" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+      <div className="flex flex-col gap-2 rounded-md border p-3">
+        <Skeleton className="h-4 w-20" />
+        <Skeleton className="h-3 w-full" />
+        <Skeleton className="h-3 w-5/6" />
+        <Skeleton className="h-3 w-2/3" />
+      </div>
+    </div>
   );
 }

@@ -8,13 +8,10 @@ import { useSearchParams } from "next/navigation";
 import { ArrowLeftIcon, ArrowUpRightIcon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
-import { CopyButton } from "@/components/copy-button";
-import { FindingReproView } from "@/components/finding-repro-view";
+import { FindingDetailBody } from "@/components/finding-detail-body";
 import { FindingRetestPanel } from "@/components/finding-retest-panel";
 import { FindingTrafficPanel } from "@/components/finding-traffic-panel";
-import { Markdown } from "@/components/markdown";
 import { StatusBadge } from "@/components/status-badge";
-import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -195,31 +192,9 @@ function FindingDetailInner() {
                 readOnly={finding.inherited}
                 onChanged={load}
               />
-              {/* T16(3/3) 分步呈现：有 reproduction → 结构化复现卡片（步骤+流量
-                  +证据图）；无 → 回退下方 report Markdown（原版行为，零回归）。 */}
-              {finding.reproduction?.steps?.length ? (
-                <FindingReproView findingId={id} repro={finding.reproduction} readOnly={finding.inherited} />
-              ) : null}
-              {/* 证据下方：详细报告(Markdown 渲染)。有逐字复现时详细报告是
-                  补充说明（标题标注），无复现时它仍是正文（回退主路径）。 */}
-              <Card>
-                <CardHeader className="flex-row items-center justify-between">
-                  <CardTitle className="text-sm">{finding.reproduction?.steps?.length ? "详细报告（补充）" : "详细报告"}</CardTitle>
-                  {finding.report && <CopyButton text={finding.report} successMessage="已复制详细报告" />}
-                </CardHeader>
-                <CardContent>
-                  {finding.report_stale ? (
-                    <Alert>
-                      <AlertDescription>流量证据已变更，详细报告待更新。</AlertDescription>
-                    </Alert>
-                  ) : null}
-                  {finding.report ? (
-                    <Markdown text={finding.report} />
-                  ) : (
-                    <p className="text-sm text-muted-foreground">暂无详细报告。</p>
-                  )}
-                </CardContent>
-              </Card>
+              {/* V3-R1：分步复现卡片+详细报告抽成共用子组件，与发现列表
+                  展开行同一份呈现（「展开的和进入详情一致」）。 */}
+              <FindingDetailBody finding={finding} evidenceId={id} />
             </div>
 
             {/* 右栏：状态区 */}

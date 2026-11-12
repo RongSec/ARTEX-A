@@ -723,16 +723,40 @@ export default function FindingsPage() {
     ],
   );
 
-  // 行内展开的详细报告缓存按全局稳定行键存。report 是大段 Markdown,列表查询不带它,
-  // 故展开时才按 finding_id 单独拉取一次;done 且文本为空 = 该漏洞暂无报告。
+  // 行内展开的详情缓存按全局稳定行键存。reproduction/report 列表查询不带,
+  // 故展开时才按 finding_id 单独拉取一次完整 detail(V3-R1,展开行=详情视图)。
   const [reports, setReports] = React.useState<Record<string, FindingReport>>({});
+  // 每行的 fetch 请求序号:快速收起/展开或重试时,过期响应按 key 幂等丢弃,
+  // 行间互不污染(仅在 toggleRow/retryDetail 事件回调里读写,非 effect)。
+  const detailRequests = React.useRef<Record<string, number>>({});
+
+  // loadFindingDetail 拉一行完整详情并写缓存;同 key 的迟到响应只认最新序号。
+  const loadFindingDetail = React.useCallback((rowKey: string, findingId: string) => {
+    const request = (detailRequests.current[rowKey] ?? 0) + 1;
+    detailRequests.current[rowKey] = request;
+    setReports((r) => ({ ...r, [rowKey]: { status: "loading", finding: null } }));
+    api
+      .getFinding(findingId)
+      .then((full) => {
+        setReports((r) => {
+          if (detailRequests.current[rowKey] !== request) return r; // 过期响应:丢弃
+          return { ...r, [rowKey]: { status: "done", finding: full } };
+        });
+      })
+      .catch(() => {
+        setReports((r) => {
+          if (detailRequests.current[rowKey] !== request) return r;
+          return { ...r, [rowKey]: { status: "error", finding: null } };
+        });
+      });
+  }, []);
 
   // 行内可编辑缓冲:当前展开行的名称/类别/严重等级,展开时用该行数据初始化,收起清空。
   // 单行展开,故一份缓冲即可。
   const [edit, setEdit] = React.useState<FindingEdit | null>(null);
   const [saving, setSaving] = React.useState(false);
 
-  // toggle 展开/收起一行;新展开时初始化编辑缓冲,并(尚未取过时)按 finding_id 拉一次报告缓存。
+  // toggle 展开/收起一行;新展开时初始化编辑缓冲,并(尚未取过时)按 finding_id 拉一次详情缓存。
   const toggleRow = React.useCallback(
     (f: Finding) => {
       const key = findingRowKey(f);
@@ -744,14 +768,18 @@ export default function FindingsPage() {
       }
       setEdit({ name: f.name ?? "", vulnclass: f.vulnclass, severity: f.severity });
       if (!f.finding_id || reports[key]) return;
-      const fid = f.finding_id;
-      setReports((r) => ({ ...r, [key]: { status: "loading", text: "" } }));
-      api
-        .getFinding(fid)
-        .then((full) => setReports((r) => ({ ...r, [key]: { status: "done", text: full.report ?? "" } })))
-        .catch(() => setReports((r) => ({ ...r, [key]: { status: "error", text: "" } })));
+      loadFindingDetail(key, f.finding_id);
     },
-    [expanded, reports],
+    [expanded, loadFindingDetail, reports],
+  );
+
+  // retryDetail 展开行详情加载失败的手动重试(按钮事件回调,非 effect)。
+  const retryDetail = React.useCallback(
+    (f: Finding) => {
+      if (!f.finding_id) return;
+      loadFindingDetail(findingRowKey(f), f.finding_id);
+    },
+    [loadFindingDetail],
   );
 
   // saveEdit 保存当前展开行的名称/类别/严重等级,回写本地列表并刷新统计(类别下拉/严重计数可能变)。
@@ -772,6 +800,19 @@ export default function FindingsPage() {
               : x,
           ),
         );
+        // 展开行详情缓存里的同名行同步刷新,否则展开视图与列表显示不一致。
+        const rowKey = findingRowKey(f);
+        setReports((r) => {
+          const cached = r[rowKey];
+          if (cached?.status !== "done" || !cached.finding) return r;
+          return {
+            ...r,
+            [rowKey]: {
+              ...cached,
+              finding: { ...cached.finding, name: updated.name, vulnclass: updated.vulnclass, severity: updated.severity },
+            },
+          };
+        });
         toast.success("已保存");
         api
           .findingStats()
@@ -869,6 +910,7 @@ export default function FindingsPage() {
     expandedKey: expanded,
     onToggleRow: toggleRow,
     reports,
+    onRetryDetail: retryDetail,
     edit,
     onEditChange: setEdit,
     saving,
