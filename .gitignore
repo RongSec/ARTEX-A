@@ -63,3 +63,5 @@ Thumbs.db
 /bench/
 /Dockerfile.bench
 /Dockerfile.bench.v2
+# 本地 Go 构建缓存目录（不提交）
+/.gocache/
