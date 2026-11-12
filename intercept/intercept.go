@@ -445,7 +445,13 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 // falls back to the configured FailAction. Ask verdicts carry the human-approval
 // timeout so the existing HandleAsk consumes them unchanged.
 func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.RawMessage) (Decision, bool) {
-	cfg := i.judgeConfig()
+	return i.judgeWithConfig(ctx, i.judgeConfig(), tool, arguments)
+}
+
+// judgeWithConfig 是 Judge 的无库可测核：配置由调用方传入，db 只在
+// judgeConfig() 读设置时被触及。与 judgeFailAction/matchRule 同款抽法 ——
+// 「交不交裁、按什么裁」是安全语义，必须能在没有库的环境里确定性测。
+func (i *Interceptor) judgeWithConfig(ctx context.Context, cfg JudgeConfig, tool string, arguments json.RawMessage) (Decision, bool) {
 	i.mu.RLock()
 	rv := i.reviewer
 	i.mu.RUnlock()
@@ -505,6 +511,48 @@ func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.Raw
 		out.TimeoutAction = cfg.AskTimeoutAction
 	}
 	return out, true
+}
+
+// judgeAskOverridesHuman 纯函数：判官对 ask 规则交裁的 verdict 是否能直接终结
+// 审批（true），还是必须回落人工审批（false）。
+//
+// 只有【模型真实给出的】allow/deny 才终结；以下三种一律回落人工：
+//   - judged=false：判官未开启或 reviewer 未接线；
+//   - ModelFallback=true：判官报错/超时/输出不可解析。失败时不走 FailAction
+//     而交人工，是因为这里的上下文与无规则命中路径不同 —— ask 规则命中说明
+//     人工通道必然可用，回落 deny 会白白晾着能拍板的人，回落 allow 等于
+//     「让判官失效就必然放行」，交人工是唯一既不被绕过也不被卡死的语义。
+//     fail-closed 不因此改变：人工通道自身仍是 pending+超时 60s→deny。
+//   - 模型给出 ask verdict：用户配 ask 的本意就是人来看一眼，模型再转一次
+//     人工没有理由用判官的 300s 超时替换规则自带的审批超时。
+func judgeAskOverridesHuman(d Decision, judged bool) bool {
+	return judged && !d.ModelFallback && (d.Action == "allow" || d.Action == "deny")
+}
+
+// JudgeAskVerdict 把一条命中 ask 规则的调用交给模型判官裁决（V4-D 修复1）。
+// 此前 Judge() 只在【无任何规则命中】时运行，用户显式配置 action=ask 的规则
+// 命中后直接进人工等待（实测 60s 超时即 deny）——判官开着时这不是预期语义。
+//
+// 返回 (verdict, true) 仅当判官开启、已接线且给出终局 allow/deny；返回
+// (Decision{}, false) 时调用方保持现 ask 语义转人工审批。rule 传入的是
+// Match() 命中的规则 Decision，用于把规则名带回审计留痕。
+//
+// RuleID 保持 Judge() 置的 0 → DB 行 decision_source 按 reason 的 [模型] 前缀
+// 归为 model（见 db.interceptSource），规则归属仍记在 audit.RuleName 里。
+func (i *Interceptor) JudgeAskVerdict(ctx context.Context, rule Decision, tool string, arguments json.RawMessage) (Decision, bool) {
+	return i.askVerdictWithConfig(ctx, i.judgeConfig(), rule, tool, arguments)
+}
+
+// askVerdictWithConfig 是 JudgeAskVerdict 的无库可测核（配置注入版），与
+// judgeWithConfig 同款抽法：设置读取留在外层，路由与留痕语义可脱离 DB 测。
+func (i *Interceptor) askVerdictWithConfig(ctx context.Context, cfg JudgeConfig, rule Decision, tool string, arguments json.RawMessage) (Decision, bool) {
+	d, judged := i.judgeWithConfig(ctx, cfg, tool, arguments)
+	if !judgeAskOverridesHuman(d, judged) {
+		return Decision{}, false
+	}
+	d.RuleName = rule.RuleName
+	d.Message = "[模型] ask 规则[" + rule.RuleName + "]交模型裁决：" + strings.TrimPrefix(d.Message, "[模型] ")
+	return d, true
 }
 
 func judgeActionLabel(action string) string {

@@ -146,6 +146,16 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 			return hook.Result{}
 		}
 		dec = d
+	} else if dec.Action == "ask" {
+		// V4-D 修复1：ask 规则命中且判官开启时，先交模型快速裁决，人工只兜底。
+		// 判官 allow→放行、deny→拒绝（均 decision_source=model 留痕）；判官
+		// 故障/超时/不可解析或判官本身转人工 → 回落现 ask 语义（pending +
+		// 规则超时 60s→deny，fail-closed 不变）。判官未开启时 JudgeAskVerdict
+		// 直接返回 false，行为与改动前逐字节一致。
+		// 【只有 ask 这一档改变路由】：deny 是硬规则不因模型翻案，allow 照旧。
+		if d, ok := g.interceptor.JudgeAskVerdict(ctx, dec, ev.ToolName, ev.Input); ok {
+			dec = d
+		}
 	}
 	switch dec.Action {
 	case "deny":
