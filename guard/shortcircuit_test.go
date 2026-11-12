@@ -1,6 +1,9 @@
 package guard
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestShortCircuitPlatformToolsAsk(t *testing.T) {
 	for _, tool := range []string{
@@ -311,6 +314,102 @@ func TestShortCircuitDisableFlag(t *testing.T) {
 	defer func() { ShortCircuitEnabled = true }()
 	if dec := shortCircuit("create_mcp", []byte(`{}`)); dec != nil {
 		t.Fatal("feature flag 关闭后短路表不应生效")
+	}
+}
+
+// ============================================================================
+// V4-E：heredoc 正文剥离（裸相对名档不再误伤「正文里引用被拦命令原文」）
+// 取舍/不对称/残余风险见 shortcircuit.go stripHeredocBodies 上方注释。
+// ============================================================================
+
+// bashCommand 把整段 shell 文本包成 Bash 工具的 JSON 入参（含换行的 heredoc
+// 必须走 json.Marshal 编码，手写字面量会得到非法 JSON）。
+func bashCommand(cmd string) []byte {
+	b, _ := json.Marshal(map[string]string{"command": cmd})
+	return b
+}
+
+// 正文是数据：写结果摘要时引用 `cat config.json` 原文不得 deny。
+func TestShortCircuitHeredocBodyDataNotDenied(t *testing.T) {
+	allow := []struct{ desc, cmd string }{
+		{"引号分隔符写摘要（实测形态）", "cat > /tmp/result_summary.txt <<'EOF'\n[1] cat config.json\nEOF"},
+		{"裸分隔符", "cat > f <<EOF\n[x] cat config.json\nEOF"},
+		{"<<- 形态", "cat > f <<-EOF\n\t[1] cat jwt.key\n\tEOF"},
+		{"双引号分隔符", "cat >> notes.md <<\"EOF\"\n复现命令: cat .jwt\nEOF"},
+		{"正文多次出现", "cat > f <<'EOF'\ncat config.json\ncat jwt.key\nEOF"},
+		{"结束标记后的命令不受影响", "cat > f <<'EOF'\n[1] cat config.json\nEOF\necho done"},
+		{"未终止 heredoc", "cat > f <<'EOF'\n[1] cat config.json"},
+		{"正文含包管理器命令", "cat > f <<'EOF'\n$ cat config.json # 平台配置\nEOF"},
+	}
+	for _, c := range allow {
+		if dec := shortCircuit("Bash", bashCommand(c.cmd)); dec != nil {
+			t.Fatalf("%s：heredoc 正文是数据，不应命中短路表，得到 %+v", c.desc, dec)
+		}
+	}
+}
+
+// 正文被当命令执行：解释器消费的 heredoc 正文不剥离，仍拦。
+func TestShortCircuitHeredocBodyCodeStillDenied(t *testing.T) {
+	deny := []struct{ desc, cmd string }{
+		{"bash 消费", "bash <<'EOF'\ncat config.json\nEOF"},
+		{"bash 带 flag", "bash -s <<EOF\ncat jwt.key\nEOF"},
+		{"sudo bash 消费", "sudo -u root bash <<-EOF\n\tcat config.json\n\tEOF"},
+		{"ssh 远端 shell 消费", "ssh host bash <<EOF\ncat .jwt\nEOF"},
+	}
+	for _, c := range deny {
+		dec := shortCircuit("Bash", bashCommand(c.cmd))
+		if dec == nil || dec.Action != "deny" {
+			t.Fatalf("%s：正文是被执行的命令，应 deny，得到 %+v", c.desc, dec)
+		}
+	}
+}
+
+// 平台凭据档不受剥离影响：heredoc 写入正文含 /app/jwt.key 仍 deny
+// （不对称的正面钉：这条走的是 platformCredentialRe 原文匹配）。
+func TestShortCircuitHeredocPlatformCredentialStillDenied(t *testing.T) {
+	for _, cmd := range []string{
+		"cat > f <<'EOF'\ncat /app/jwt.key\nEOF",
+		"cat > f <<'EOF'\ncat /proc/1/environ\nEOF",
+		"bash <<'EOF'\ncat /app/data/jwt.key\nEOF",
+	} {
+		dec := shortCircuit("Bash", bashCommand(cmd))
+		if dec == nil || dec.Action != "deny" {
+			t.Fatalf("heredoc 正文含平台凭据路径应仍 deny：%q 得到 %+v", cmd, dec)
+		}
+	}
+}
+
+// 剥离不影响本档原有判定：正常裸读照拦、既有负向集照放。
+func TestShortCircuitHeredocStripKeepsBareReadVerdicts(t *testing.T) {
+	deny := []string{"cat config.json", "cat jwt.key", "cat .jwt", "cat config.json | grep dsn"}
+	for _, cmd := range deny {
+		if dec := shortCircuit("Bash", bashCommand(cmd)); dec == nil || dec.Action != "deny" {
+			t.Fatalf("正常裸读应仍 deny：%q 得到 %+v", cmd, dec)
+		}
+	}
+	allow := []string{"cat /tmp/x/config.json", "cat my_config.json", "echo config.json", "head -5 config.json"}
+	for _, cmd := range allow {
+		if dec := shortCircuit("Bash", bashCommand(cmd)); dec != nil {
+			t.Fatalf("负向集应仍不拦：%q 得到 %+v", cmd, dec)
+		}
+	}
+}
+
+// 纯函数层：剥离只动正文，保留行数/起始与结束标记行；解释器形态原样保留。
+func TestStripHeredocBodies(t *testing.T) {
+	cases := []struct{ desc, in, want string }{
+		{"无 heredoc 原样", "cat config.json", "cat config.json"},
+		{"正文剥为空行", "cat > f <<'EOF'\ndata\nEOF", "cat > f <<'EOF'\n\nEOF"},
+		{"多 heredoc 顺序剥离", "cat <<'A' <<B\nx\nA\ny\nB", "cat <<'A' <<B\n\nA\n\nB"},
+		{"解释器消费保留正文", "bash <<'EOF'\nrm -rf /\nEOF", "bash <<'EOF'\nrm -rf /\nEOF"},
+		{"here-string 无正文", "cat <<< x", "cat <<< x"},
+		{"引号内的 << 不算", `echo "a << b"`, `echo "a << b"`},
+		{"未终止则剥到结尾", "cat <<EOF\nx\ny", "cat <<EOF\n\n"},
+	}
+	for _, c := range cases {
+		if got := stripHeredocBodies(c.in); got != c.want {
+			t.Fatalf("%s：stripHeredocBodies(%q) = %q，期望 %q", c.desc, c.in, got, c.want)
+		}
 	}
 }
 

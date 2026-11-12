@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/Autumn-27/artex/intercept"
@@ -169,6 +170,239 @@ var platformConfigBareReadRe = regexp.MustCompile(
 	`(?i)(?:^|[\s"'` + "`" + `;&|(])` +
 		`(?:cat|head|tail|less|more|cp|mv|sed|awk|strings)[\s"'` + "`" + `]+` +
 		`["']?(?:config\.json|\.jwt|jwt\.key)(?:$|[\s"'` + "`" + `;|&)<>{[=,)])`)
+
+// ============================================================================
+// V4-E：heredoc 正文剥离（修 platformConfigBareReadRe 的正文误伤）
+//
+// 实测问题：agent 用 `cat > /path/result_summary.txt <<'EOF' … [1] cat config.json
+// … EOF` 写结果摘要，正文里的「[1] cat config.json」是【数据】（摘要里引用了
+// 一条被拦命令的原文），不是要执行的命令，却被 platformConfigBareReadRe 当成
+// `cat config.json` 命中 deny——正是 recordOnlyTools 注释里那条「如实记录被拦
+// 命令原文不得被误伤」的同类问题，只是换成了 Bash heredoc 这首载体。
+//
+// 修法：按行扫描，命中 `<<[-]?['"]?NAME['"]?` 后进入正文态，直到出现与分隔符
+// 完全相同的行（或输入结束）为止；正文行整段替换为空行（保留行数，便于定位），
+// heredoc 起始行与结束标记行本身保留。
+//
+// 【刻意不对称】只对 platformConfigBareReadRe（裸相对名读）生效。
+// platformCredentialRe / platformCredentialLooseRe 维持原文匹配：
+// `bash <<EOF … cat /app/jwt.key … EOF` 这类「正文被当命令执行」的路径不能
+// 因为剥离而放过，而平台签名密钥是本表存在的理由，宁可保留这档误伤。
+//
+// 【残余风险（已知上限，诚实声明）】
+//  1. `cat <<EOF | bash` 这种「正文经管道喂给解释器」的形态：解释器不在
+//     heredoc 起始行，剥离后正文不再参与 platformConfigBareReadRe 匹配 →
+//     可绕过裸相对名档。属字符串预筛的固有上限（与 shell 变量展开同源），
+//     闭合需 shell AST 或 realpath 级校验。
+//  2. 分隔符非标识符形态（如 `<< 'E-O-F'`）不进入剥离，正文照旧参与匹配
+//     —— fail-closed 方向（宁可误伤，不放过执行面）。
+//  3. 解释器判定见 heredocBodyIsCode 的白名单（bash/sh/zsh/python/eval 等）：
+//     未收录的解释器按「正文是数据」处理，同上属可接受漏判。
+// ============================================================================
+
+// heredocSpec 是一处 heredoc 起始符的解析结果。
+type heredocSpec struct {
+	delim string // 结束标记（不含引号）
+	dash  bool   // <<- 形态：结束行允许前导 tab
+	strip bool   // true=正文是数据，剥离；false=正文当命令（解释器消费），保留
+}
+
+// heredocCodeTokens 是「会把正文当代码执行」的命令词白名单（取 basename）。
+var heredocCodeTokens = map[string]bool{
+	"bash": true, "sh": true, "zsh": true, "dash": true, "ksh": true, "ksh93": true,
+	"mksh": true, "ash": true, "fish": true, "csh": true, "tcsh": true,
+	"source": true, ".": true, "eval": true,
+	"python": true, "python3": true, "perl": true, "ruby": true,
+}
+
+// heredocBodyIsCode 判定 heredoc 起始行 prefix（`<<` 之前的部分）是否以
+// 「解释器」为消费方——是则正文是代码、不得剥离（`bash <<EOF`、
+// `sudo bash <<EOF`、`ssh host bash <<EOF`）。
+//
+// 只认「命令位」（首个 token 或最后一个 token）命中解释器名：`cat > bash`
+// 这种把 bash 当文件名的写法不会被误判（中间位不认），宁漏不误伤方向与
+// platformConfigBareReadRe 的收窄纪律一致。
+func heredocBodyIsCode(prefix string) bool {
+	fields := strings.FieldsFunc(prefix, func(r rune) bool {
+		switch r {
+		case ' ', '\t', ';', '|', '&', '(', ')', '`', '{', '}':
+			return true
+		}
+		return false
+	})
+	for i, tok := range fields {
+		tok = strings.Trim(tok, `"'`)
+		if tok == "" {
+			continue
+		}
+		if k := strings.LastIndexByte(tok, '/'); k >= 0 {
+			tok = tok[k+1:]
+		}
+		if !heredocCodeTokens[strings.ToLower(tok)] {
+			continue
+		}
+		if i == 0 || i == len(fields)-1 {
+			return true
+		}
+	}
+	return false
+}
+
+func isIdentStartByte(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isIdentByte(c byte) bool {
+	return isIdentStartByte(c) || (c >= '0' && c <= '9')
+}
+
+// scanHeredocSpecs 扫描单行里的全部 heredoc 起始符（引号外的 << 运算符）。
+// `<<<` 是 here-string（单行输入，无正文），不进入正文态。
+func scanHeredocSpecs(line string) []heredocSpec {
+	var specs []heredocSpec
+	var inSingle, inDouble bool
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		case inDouble:
+			if c == '\\' {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '<':
+			if i+1 >= len(line) || line[i+1] != '<' {
+				continue
+			}
+			if i+2 < len(line) && line[i+2] == '<' {
+				i += 2 // <<< here-string
+				continue
+			}
+			j := i + 2
+			dash := false
+			if j < len(line) && line[j] == '-' {
+				dash = true
+				j++
+			}
+			var quote byte
+			if j < len(line) && (line[j] == '\'' || line[j] == '"') {
+				quote = line[j]
+				j++
+			}
+			start := j
+			if j >= len(line) || !isIdentStartByte(line[j]) {
+				continue
+			}
+			for j < len(line) && isIdentByte(line[j]) {
+				j++
+			}
+			name := line[start:j]
+			if quote != 0 {
+				if j >= len(line) || line[j] != quote {
+					continue
+				}
+				j++
+			}
+			specs = append(specs, heredocSpec{delim: name, dash: dash, strip: !heredocBodyIsCode(line[:i])})
+			i = j - 1
+		}
+	}
+	return specs
+}
+
+// isHeredocTerminator 判定某行是否为该 heredoc 的结束标记行。<<- 形态允许
+// 前导 tab（POSIX）；行尾 \r 一并容忍（仓库有 CRLF 检出）。
+func isHeredocTerminator(line string, sp heredocSpec) bool {
+	l := strings.TrimSuffix(line, "\r")
+	if sp.dash {
+		l = strings.TrimLeft(l, "\t")
+	}
+	return l == sp.delim
+}
+
+// stripHeredocBodies 把 heredoc 正文行整段替换为空行（保留行数与起始/结束
+// 标记行），供 platformConfigBareReadRe 在「不含数据正文」的文本上匹配。
+// 解释器消费的 heredoc（heredocBodyIsCode）正文原样保留。
+func stripHeredocBodies(cmd string) string {
+	if !strings.Contains(cmd, "<<") {
+		return cmd
+	}
+	lines := strings.Split(cmd, "\n")
+	out := make([]string, 0, len(lines))
+	i := 0
+	for i < len(lines) {
+		out = append(out, lines[i])
+		specs := scanHeredocSpecs(lines[i])
+		i++
+		for _, sp := range specs {
+			for i < len(lines) {
+				body := lines[i]
+				i++
+				if isHeredocTerminator(body, sp) {
+					out = append(out, body)
+					break
+				}
+				if sp.strip {
+					out = append(out, "")
+				} else {
+					out = append(out, body)
+				}
+			}
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// jsonStringValuesText 把 JSON 对象的【全部顶层字段】拼成一段真文本（字符串
+// 顺带完成 JSON 转义还原，非字符串值按 JSON 序列化）。
+//
+// 存在的理由：heredoc 剥离是按【行】做的，必须在真文本上做——原始 JSON 字节
+// 里换行是字面量 `\n`、`<<` 是 `\u003c\u003c`，按行扫描根本看不见 heredoc
+// 起始符。非 JSON（不以 '{' 开头）返回 ok=false，调用方退回原始字节串。
+// 键排序保证拼接顺序确定（同一入参多次求值结果一致）。
+func jsonStringValuesText(input []byte) (string, bool) {
+	if len(input) == 0 || input[0] != '{' {
+		return "", false
+	}
+	var m map[string]any
+	if err := json.Unmarshal(input, &m); err != nil {
+		return "", false
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		switch t := m[k].(type) {
+		case string:
+			b.WriteString(t)
+		case nil:
+			// 跳过
+		default:
+			if enc, err := json.Marshal(t); err == nil {
+				b.Write(enc)
+			}
+		}
+		b.WriteByte('\n')
+	}
+	return b.String(), true
+}
 
 // ============================================================================
 // host 系统凭据档（红线实跑缺陷1 的修复；相对 reArtex 原版为【新增增强】，
@@ -479,8 +713,20 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 		// 【刻意不套远程指代豁免】：与 host 档的不对称是有意设计，理由见
 		// 文件头注释——靶机上不存在 /app/jwt.key，"远程读它"只可能是本机。
 		decoded := decodedInputText(input)
-		if platformCredentialRe.Match(input) || platformCredentialLooseRe.Match(input) || platformConfigBareReadRe.Match(input) ||
-			(decoded != "" && (platformCredentialRe.MatchString(decoded) || platformCredentialLooseRe.MatchString(decoded) || platformConfigBareReadRe.MatchString(decoded))) {
+		// V4-E：heredoc 正文是【数据】不是命令（写结果摘要时正文引用被拦命令
+		// 原文，被裸相对名档误伤）——只对 platformConfigBareReadRe 用剥离后的
+		// 文本匹配。platformCredentialRe/Loose 维持原文匹配：`bash <<EOF …
+		// cat /app/jwt.key … EOF` 的正文是被执行的命令，不能因剥离而放过
+		// （不对称理由与残余风险见 stripHeredocBodies 上方注释）。
+		// 剥离必须在真文本（JSON 转义还原、换行还原）上做，见 jsonStringValuesText。
+		readText := string(input)
+		if t, ok := jsonStringValuesText(input); ok {
+			readText = t
+		}
+		bareReadHit := platformConfigBareReadRe.MatchString(stripHeredocBodies(readText)) ||
+			(decoded != "" && platformConfigBareReadRe.MatchString(stripHeredocBodies(decoded)))
+		if platformCredentialRe.Match(input) || platformCredentialLooseRe.Match(input) || bareReadHit ||
+			(decoded != "" && (platformCredentialRe.MatchString(decoded) || platformCredentialLooseRe.MatchString(decoded))) {
 			return &intercept.Decision{
 				Action:   "deny",
 				RuleName: "[代码常量] 平台凭据/进程环境",
