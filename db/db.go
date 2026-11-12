@@ -282,6 +282,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV4(); err != nil {
 		return fmt.Errorf("seed intercept rules v4: %w", err)
 	}
+	if err := d.bumpV4ExclusivePriorities(); err != nil {
+		return fmt.Errorf("bump v4 exclusive priorities: %w", err)
+	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
 	}
@@ -654,13 +657,13 @@ func (d *DB) seedDefaultInterceptRulesV4() error {
 			name:     "[内置] 云对象存储批量删除 aws s3 rm --recursive / rb",
 			pattern:  `(?i)\baws\s+s3\s+rm\b[^|\n]{0,200}--recursive\b|\baws\s+s3\s+rb\b|\baws\s+s3api\s+delete-(?:bucket|objects)\b`,
 			message:  "禁止通过 aws s3 批量删除对象或删除存储桶（rm --recursive / rb / s3api delete-bucket|delete-objects），可能不可逆地清空目标数据",
-			priority: 90,
+			priority: 110, // 高于 v1 泛化 rm --recursive(100)：专属规则先命中，拦截文案与审计归属才是"云对象存储"语义
 		},
 		{
 			name:     "[内置] 基础设施销毁 terraform destroy",
 			pattern:  `(?i)\bterraform\s+destroy\b`,
 			message:  "禁止执行 terraform destroy，会销毁已部署的基础设施",
-			priority: 90,
+			priority: 110, // 同 aws s3：专属语义规则压过泛化规则，保证归属/文案可解释
 		},
 		{
 			name:     "[内置] 清空计划任务 crontab -r",
@@ -698,4 +701,18 @@ WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 		}
 	}
 	return d.SetSetting("intercept_default_rules_v4", "done")
+}
+
+// bumpV4ExclusivePriorities 把 V4 两条专属规则（云对象存储/基础设施销毁）的
+// priority 从旧值 90 提到 110，使其压过 v1 泛化 rm --recursive(100)——否则
+// `aws s3 rm --recursive` 归属到泛规则，拦截文案与审计溯源呈现"递归删除"
+// 而非云语义（红线对抗测试 Q2 偏差项）。只动仍是出厂值 90 的行：用户手工
+// 调过优先级的不覆盖。每次启动幂等执行（两行 UPDATE，开销可忽略），故不受
+// seed flag 早退影响——已种过 V4 的存量库同样完成迁移。
+func (d *DB) bumpV4ExclusivePriorities() error {
+	_, err := d.Exec(`UPDATE intercept_rules SET priority = 110
+WHERE priority = 90 AND name IN (
+  '[内置] 云对象存储批量删除 aws s3 rm --recursive / rb',
+  '[内置] 基础设施销毁 terraform destroy')`)
+	return err
 }
