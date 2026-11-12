@@ -22,6 +22,7 @@ func TestShortCircuitRuleNamesCarrySourcePrefix(t *testing.T) {
 		{"平台工具需审批", "create_custom_tool", `{"command":"http://127.0.0.1"}`},
 		{"平台凭据", "Bash", `{"command":"cat /app/jwt.key"}`},
 		{"进程环境块", "Bash", `{"command":"cat /proc/1/environ"}`},
+		{"host 系统凭据（缺陷1 新增档）", "Bash", `{"command":"cat /etc/shadow"}`},
 	}
 	for _, c := range cases {
 		dec := shortCircuit(c.tool, []byte(c.in))
