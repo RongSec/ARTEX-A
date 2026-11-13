@@ -271,20 +271,29 @@ func (s *Server) readerVisibleProjects(projectIDs []int64) (visible []int64, ski
 	return visible, skipped, nil
 }
 
-// toolWriteGlobalInsight 写一条跨项目全局洞察（reader 产出）。只进
-// global_insights（默认不注入 planner，只读旁路）；source_projects=串联涉及
-// 的项目集，供展示回链。
+// toolWriteGlobalInsight 写一条跨项目全局洞察（reader 产出）。进
+// global_insights；source_projects=串联涉及的项目集，供展示回链。
+//
+// V5-A：asset_keys 是注入 planner 的唯一命中依据（与任务 open 意图锚定资产的
+// 归一化键求交集）。入参缺省时刻意做一次「从正文反查已知资产键」的推导——
+// 候选集=来源项目下出现过的资产键（AssetKeysForProjects，归一化规则与注入侧
+// AssetKeysForIDs 同源），命中=正文里出现该键（大小写不敏感子串）。推导不出
+// 就落空数组 → 该条永不注入（只能人工看），绝不硬塞无关键去骗命中。
 func (s *Server) toolWriteGlobalInsight() actool.CoreTool {
 	return wrTool("write_global_insight",
-		"写一条【跨项目全局洞察】(global_insights)：多个项目里重复出现的同类面（同组件/同类入口/同一打法跨项目可迁移）。source_projects 填涉及的每个项目 id。宁少勿滥；单项目内部的事写 write_project_insight，别写这里。",
+		"写一条【跨项目全局洞察】(global_insights)：多个项目里重复出现的同类面（同组件/同类入口/同一打法跨项目可迁移）。source_projects 填涉及的每个项目 id。"+
+			"asset_keys 填洞察点名的资产键（域名/IP/URL，如 [\"canal.example.com\",\"10.0.0.8\"]）——planner 靠它把这条读回正在打该资产的任务；不填则从正文自动匹配来源项目的已知资产，匹配不到就不会被注入。"+
+			"宁少勿滥；单项目内部的事写 write_project_insight，别写这里。",
 		objSchema(map[string]any{
 			"content":         strParam("洞察正文(跨项目证据链式陈述，指明各项目 task/资产)"),
 			"source_projects": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "涉及的项目 id(≥1)"},
+			"asset_keys":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：命中资产键(域名/IP/URL)；缺省从正文匹配来源项目的已知资产"},
 		}, "content", "source_projects"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
-				Content        string  `json:"content"`
-				SourceProjects []int64 `json:"source_projects"`
+				Content        string   `json:"content"`
+				SourceProjects []int64  `json:"source_projects"`
+				AssetKeys      []string `json:"asset_keys"`
 			}
 			_ = json.Unmarshal(in, &a)
 			if len(a.SourceProjects) == 0 {
@@ -303,11 +312,24 @@ func (s *Server) toolWriteGlobalInsight() actool.CoreTool {
 			if len(visible) == 0 {
 				return actool.Errorf("source_projects 全部未开启 reader_enabled 或不可见，无有效来源项目"), nil
 			}
-			g, err := s.m.pg.WriteGlobalInsight(ctx, a.Content, visible)
+			// V5-A：入参缺省 → 从正文推导。候选集查库失败按「推导失败=空」处理
+			// （洞察照写，只是不参与注入；不因一次旁路查询抖动丢掉 reader 的产出）。
+			var derivedNote string
+			if len(a.AssetKeys) == 0 {
+				if cands, err := s.m.pg.AssetKeysForProjects(ctx, visible); err == nil {
+					a.AssetKeys = db.DeriveAssetKeys(a.Content, cands)
+					if len(a.AssetKeys) == 0 {
+						derivedNote = "；正文未匹配到已知资产键，本条不会被注入 planner"
+					}
+				} else {
+					derivedNote = fmt.Sprintf("；资产键推导失败(%v)，本条不会被注入 planner", err)
+				}
+			}
+			g, err := s.m.pg.WriteGlobalInsight(ctx, a.Content, visible, a.AssetKeys)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return actool.Text(fmt.Sprintf("global insight %d written (projects %v)", g.ID, visible)), nil
+			return actool.Text(fmt.Sprintf("global insight %d written (projects %v, asset_keys %v)%s", g.ID, visible, g.AssetKeys, derivedNote)), nil
 		})
 }
 
@@ -464,6 +486,17 @@ func (s *Server) seedProjectTools() {
 		if err := s.m.PG().SeedTool(t.Name(), t.Description(), schema, emptyBindings); err != nil {
 			log.Printf("[project-tools] seed %s: %v", t.Name(), err)
 		}
+	}
+	// V5-A：planner 的洞察否决工具。与 observer/reader 工具不同——它默认【只绑
+	// planner】（首插生效：用户日后在工具页取消绑定也不会被重启复活）。旧库首次
+	// 启动由这条 SeedTool 补行，随后 ToolResolve 按 agents 过滤，其他 agent 看不到。
+	rt := s.toolRejectInsight()
+	if schema, err := json.Marshal(rt.InputSchema()); err != nil {
+		log.Printf("[project-tools] seed %s schema: %v", rt.Name(), err)
+	} else if agents, err := json.Marshal([]string{"planner"}); err != nil {
+		log.Printf("[project-tools] seed %s agents: %v", rt.Name(), err)
+	} else if err := s.m.PG().SeedTool(rt.Name(), rt.Description(), schema, agents); err != nil {
+		log.Printf("[project-tools] seed %s: %v", rt.Name(), err)
 	}
 	s.seedObserverAgent()
 	s.seedReaderAgent()

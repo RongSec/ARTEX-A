@@ -1519,19 +1519,50 @@ CREATE TABLE IF NOT EXISTS project_insights (
     content         TEXT NOT NULL,                         -- 洞察正文（"同 CMS 版本 X 的 Y 组件历史可借 Z 打法"）
     source_task_id  BIGINT,                                -- 触发写此洞察时 observer 正看的任务
     keywords        TEXT[] NOT NULL DEFAULT '{}',          -- 与 planner 命中匹配用（组件名/CMS/端口/中间件…）
+    -- V5-A 洞察生命周期：active=可注入；rejected=planner 显式否决（reject_insight 工具）；
+    -- superseded=被同资产的新洞察覆盖（只在 global_insights 生效，本项目表保留同列以统一读写）。
+    status          TEXT NOT NULL DEFAULT 'active'
+                      CHECK (status IN ('active','rejected','superseded')),
+    rejected_reason TEXT NOT NULL DEFAULT '',              -- 否决原因（人工/planner 留痕，供复核）
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_pins_proj ON project_insights(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pins_kw   ON project_insights USING GIN(keywords);
+CREATE INDEX IF NOT EXISTS idx_pins_status ON project_insights(project_id, status, created_at DESC);
 
--- reader 产出：跨项目洞察。默认不注入 planner（跨项目噪声/token 成本），仅全局视图/报告展示。
+-- reader 产出：跨项目洞察。V5-A 起可按资产键注入 planner——
+-- asset_keys 是与 project_index.asset_keys/planner 命中键同源的归一化键集合，
+-- 为空 = 永不注入（只能人工看）；status='rejected' 由 planner 的 reject_insight
+-- 置位；同资产写新洞察时旧行置 superseded、superseded_by 指新 id。
 CREATE TABLE IF NOT EXISTS global_insights (
     id              BIGSERIAL PRIMARY KEY,
     content         TEXT NOT NULL,                         -- 洞察正文
     source_projects BIGINT[] NOT NULL DEFAULT '{}',        -- 串联涉及的 project id 列表
+    asset_keys      TEXT[] NOT NULL DEFAULT '{}',          -- 注入命中键（与任务 open 意图锚定资产求交集）
+    status          TEXT NOT NULL DEFAULT 'active'
+                      CHECK (status IN ('active','rejected','superseded')),
+    superseded_by   BIGINT,                                -- 覆盖本行的新洞察 id（status='superseded' 时）
+    rejected_reason TEXT NOT NULL DEFAULT '',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_gins_time ON global_insights(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gins_keys ON global_insights USING GIN(asset_keys);
+CREATE INDEX IF NOT EXISTS idx_gins_status ON global_insights(status, created_at DESC);
+
+-- 存量库补列（幂等；CREATE 段已含同名列，双写法照 projects/finding_evidence_images 先例）。
+ALTER TABLE project_insights ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE project_insights ADD COLUMN IF NOT EXISTS rejected_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE global_insights ADD COLUMN IF NOT EXISTS asset_keys TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE global_insights ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE global_insights ADD COLUMN IF NOT EXISTS superseded_by BIGINT;
+ALTER TABLE global_insights ADD COLUMN IF NOT EXISTS rejected_reason TEXT NOT NULL DEFAULT '';
+-- 存量库上补 status 取值约束（ALTER ADD CONSTRAINT 不支持 IF NOT EXISTS，照 assets 先例先 DROP）。
+ALTER TABLE project_insights DROP CONSTRAINT IF EXISTS project_insights_status_check;
+ALTER TABLE project_insights ADD CONSTRAINT project_insights_status_check
+    CHECK (status IN ('active','rejected','superseded'));
+ALTER TABLE global_insights DROP CONSTRAINT IF EXISTS global_insights_status_check;
+ALTER TABLE global_insights ADD CONSTRAINT global_insights_status_check
+    CHECK (status IN ('active','rejected','superseded'));
 
 -- =====================================================================
 -- P. 报告中心（artex-hs F4，T15）：报告模板 / 生成 job+历史 / 全局设置

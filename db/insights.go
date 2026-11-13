@@ -3,7 +3,13 @@ package db
 // 项目洞察（project_insights，observer 产出）与全局洞察（global_insights，
 // reader 产出）的读写。架构 §1.5/§1.6、§2.4：observer 把跨任务可借鉴处写成
 // 洞察行，planner 侧按「open 意图锚定 asset_keys ∩ keywords 交集命中优先、
-// 不足按 created_at DESC 补至 ≤limit」限量注入；global_insights 默认不注入。
+// 不足按 created_at DESC 补至 ≤limit」限量注入。
+//
+// V5-A（跨项目勾连回流）：global_insights 带 asset_keys 后也能注入 planner——
+// 同一套归一化资产键（AssetKeysForIDs/assetKeyFor）求交集，命中才注入，且
+// 渲染时显式标注「来自其他项目、仅作假设」。同资产写新洞察会把旧行置
+// superseded（生命周期），planner 还可用 reject_insight 把某条置 rejected。
+// 两条只影响「是否还参与注入」，不物理删行（可人工复核/回滚）。
 
 import (
 	"context"
@@ -11,18 +17,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
 
 // Insight 是 project_insights 表的一行。
 type Insight struct {
-	ID           int64     `json:"id"`
-	ProjectID    int64     `json:"project_id"`
-	Content      string    `json:"content"`
-	SourceTaskID int64     `json:"source_task_id,omitempty"` // 0=未知/无来源任务（DB 存 NULL）
-	Keywords     []string  `json:"keywords"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID             int64     `json:"id"`
+	ProjectID      int64     `json:"project_id"`
+	Content        string    `json:"content"`
+	SourceTaskID   int64     `json:"source_task_id,omitempty"` // 0=未知/无来源任务（DB 存 NULL）
+	Keywords       []string  `json:"keywords"`
+	Status         string    `json:"status"`                    // active|rejected|superseded
+	RejectedReason string    `json:"rejected_reason,omitempty"` // status='rejected' 时的原因
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // GlobalInsight 是 global_insights 表的一行（reader 跨项目产出）。
@@ -30,11 +39,25 @@ type GlobalInsight struct {
 	ID             int64     `json:"id"`
 	Content        string    `json:"content"`
 	SourceProjects []int64   `json:"source_projects"`
+	AssetKeys      []string  `json:"asset_keys"` // 归一化资产键；空=永不注入 planner
+	Status         string    `json:"status"`     // active|rejected|superseded
+	SupersededBy   int64     `json:"superseded_by,omitempty"`
+	RejectedReason string    `json:"rejected_reason,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 }
 
 // ErrInsightNotFound 按 id 删除/更新时目标不存在。
 var ErrInsightNotFound = errors.New("insight not found")
+
+// ErrInsightKindInvalid 是 RejectInsight 收到非 project/global 的 kind。
+var ErrInsightKindInvalid = errors.New("insight kind must be project or global")
+
+// 洞察生命周期状态（与 schema 的 CHECK 同值域）。
+const (
+	InsightStatusActive     = "active"
+	InsightStatusRejected   = "rejected"
+	InsightStatusSuperseded = "superseded"
+)
 
 // WriteInsight 追加一条项目洞察。content 必填（空白拒写，防 observer 空转
 // 产生垃圾行——与 projects.go CreateProject 的名称校验同风格）。
@@ -48,15 +71,15 @@ func (d *DB) WriteInsight(ctx context.Context, projectID int64, content string, 
 	if sourceTaskID > 0 {
 		srcArg = sourceTaskID
 	}
-	in := &Insight{ProjectID: projectID, Content: content, SourceTaskID: sourceTaskID, Keywords: keywords}
+	in := &Insight{ProjectID: projectID, Content: content, SourceTaskID: sourceTaskID, Keywords: keywords, Status: InsightStatusActive}
 	var src sql.NullInt64
 	var kwJSON string
 	err := d.QueryRowContext(ctx, `
 INSERT INTO project_insights(project_id, content, source_task_id, keywords)
 VALUES ($1, $2, $3, $4::text[])
-RETURNING id, project_id, content, source_task_id, array_to_json(keywords)::text, created_at`,
+RETURNING id, project_id, content, source_task_id, array_to_json(keywords)::text, status, rejected_reason, created_at`,
 		projectID, utf8Clean(content), srcArg, marshalTextArray(keywords)).
-		Scan(&in.ID, &in.ProjectID, &in.Content, &src, &kwJSON, &in.CreatedAt)
+		Scan(&in.ID, &in.ProjectID, &in.Content, &src, &kwJSON, &in.Status, &in.RejectedReason, &in.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -67,9 +90,12 @@ RETURNING id, project_id, content, source_task_id, array_to_json(keywords)::text
 	return in, nil
 }
 
-// ListInsights 返回某项目的洞察（新在前）。matchKeywords 非空时，交集命中的
-// 行排在前（命中数降序），其余按 created_at DESC 补位——与 §2.4 的注入限量
-// 算法同口径，调用方取前 limit 条即得「命中优先」序列。limit<=0 默认 50。
+// ListInsights 返回某项目【active】的洞察（新在前）。matchKeywords 非空时，
+// 交集命中的行排在前（命中数降序），其余按 created_at DESC 补位——与 §2.4 的
+// 注入限量算法同口径，调用方取前 limit 条即得「命中优先」序列。limit<=0 默认 50。
+//
+// V5-A：rejected/superseded 行不参与注入（WHERE status='active'），但仍留在
+// 表里供人工复核；管理面需要全量时请直接查表。
 func (d *DB) ListInsights(ctx context.Context, projectID int64, matchKeywords []string, limit int) ([]Insight, error) {
 	if limit <= 0 {
 		limit = 50
@@ -78,12 +104,18 @@ func (d *DB) ListInsights(ctx context.Context, projectID int64, matchKeywords []
 	order := "created_at DESC, id DESC"
 	if len(matchKeywords) > 0 {
 		args = append(args, marshalTextArray(matchKeywords))
-		// cardinality(交集) 降序=命中多者优先；0（不相交）行靠后、按时间补位。
-		order = "cardinality(keywords & $" + fmt.Sprint(len(args)) + "::text[]) DESC, " + order
+		// 命中数降序=命中多者优先；0（不相交）行靠后、按时间补位。
+		//
+		// 注意：这里原本用数组交集运算符 `keywords & $N::text[]`，但 `&` 在
+		// PostgreSQL 里只由 intarray 扩展提供 int[] 版本，text[] 从来不可用
+		// （PG16 实测 42883: operator does not exist: text[] & text[]）——只要
+		// 有关键词就整条查询报错，resolver 静默退化到零注入。改成 unnest+ANY
+		// 的等价计数，语义相同（交集的基数）且不依赖扩展。
+		order = "(SELECT count(*) FROM unnest(keywords) kw WHERE kw = ANY($" + fmt.Sprint(len(args)) + "::text[])) DESC, " + order
 	}
 	args = append(args, limit)
-	rows, err := d.QueryContext(ctx, `SELECT id, project_id, content, source_task_id, array_to_json(keywords)::text, created_at
-FROM project_insights WHERE project_id=$1
+	rows, err := d.QueryContext(ctx, `SELECT id, project_id, content, source_task_id, array_to_json(keywords)::text, status, rejected_reason, created_at
+FROM project_insights WHERE project_id=$1 AND status='active'
 ORDER BY `+order+` LIMIT $`+fmt.Sprint(len(args)), args...)
 	if err != nil {
 		return nil, err
@@ -94,7 +126,7 @@ ORDER BY `+order+` LIMIT $`+fmt.Sprint(len(args)), args...)
 		var in Insight
 		var src sql.NullInt64
 		var kwJSON string
-		if err := rows.Scan(&in.ID, &in.ProjectID, &in.Content, &src, &kwJSON, &in.CreatedAt); err != nil {
+		if err := rows.Scan(&in.ID, &in.ProjectID, &in.Content, &src, &kwJSON, &in.Status, &in.RejectedReason, &in.CreatedAt); err != nil {
 			return nil, err
 		}
 		if src.Valid {
@@ -137,32 +169,60 @@ func (d *DB) DeleteProjectInsight(ctx context.Context, projectID, id int64) erro
 // WriteGlobalInsight 追加一条跨项目洞察（reader 产出）。content 必填；
 // sourceProjects 记录串联涉及的项目 id 集（不校验存在性：只读旁路，
 // 项目随后被删也不该让洞察写入失败——source 列无 FK 正是此意）。
-func (d *DB) WriteGlobalInsight(ctx context.Context, content string, sourceProjects []int64) (*GlobalInsight, error) {
+//
+// V5-A：assetKeys 是注入命中键（归一化资产键，见 AssetKeysForProjects /
+// DeriveAssetKeys），空=永不注入。写入是【同资产覆盖】的原子操作——插入新行后
+// 同一事务把「status='active' 且 asset_keys 与新键相交」的旧行置 superseded、
+// superseded_by=新 id，保证同一资产只留最新一条可注入洞察（旧行留档可查，
+// 不物理删）。
+func (d *DB) WriteGlobalInsight(ctx context.Context, content string, sourceProjects []int64, assetKeys []string) (*GlobalInsight, error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return nil, errors.New("global insight content is required")
 	}
-	g := &GlobalInsight{Content: content, SourceProjects: sourceProjects}
-	var spJSON string
-	err := d.QueryRowContext(ctx, `
-INSERT INTO global_insights(content, source_projects)
-VALUES ($1, $2::bigint[])
-RETURNING id, content, array_to_json(source_projects)::text, created_at`,
-		utf8Clean(content), marshalInt64Array(sourceProjects)).
-		Scan(&g.ID, &g.Content, &spJSON, &g.CreatedAt)
+	g := &GlobalInsight{Content: content, SourceProjects: sourceProjects, AssetKeys: assetKeys, Status: InsightStatusActive}
+	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = tx.Rollback() }() // 已 Commit 后 Rollback 是 no-op
+	var spJSON, akJSON string
+	err = tx.QueryRowContext(ctx, `
+INSERT INTO global_insights(content, source_projects, asset_keys)
+VALUES ($1, $2::bigint[], $3::text[])
+RETURNING id, content, array_to_json(source_projects)::text, array_to_json(asset_keys)::text,
+          status, COALESCE(superseded_by,0), rejected_reason, created_at`,
+		utf8Clean(content), marshalInt64Array(sourceProjects), marshalTextArray(assetKeys)).
+		Scan(&g.ID, &g.Content, &spJSON, &akJSON, &g.Status, &g.SupersededBy, &g.RejectedReason, &g.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if len(assetKeys) > 0 {
+		// 同资产覆盖：只动 active 行（rejected 是人/planner 的明确判断，不该被
+		// 新写悄悄复活成 superseded；superseded 已是历史，无需再改）。
+		if _, err := tx.ExecContext(ctx, `
+UPDATE global_insights SET status='superseded', superseded_by=$1
+WHERE status='active' AND id<>$1 AND asset_keys && $2::text[]`,
+			g.ID, marshalTextArray(assetKeys)); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	_ = json.Unmarshal([]byte(spJSON), &g.SourceProjects)
+	_ = json.Unmarshal([]byte(akJSON), &g.AssetKeys)
 	return g, nil
 }
 
-// ListGlobalInsights 返回全局洞察（新在前）。limit<=0 默认 50。
+// ListGlobalInsights 返回全局洞察（新在前，含已否决/被覆盖行——这是查看面，
+// 不是注入面）。limit<=0 默认 50。
 func (d *DB) ListGlobalInsights(ctx context.Context, limit int) ([]GlobalInsight, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	rows, err := d.QueryContext(ctx, `SELECT id, content, array_to_json(source_projects)::text, created_at
+	rows, err := d.QueryContext(ctx, `SELECT id, content, array_to_json(source_projects)::text,
+       array_to_json(asset_keys)::text, status, COALESCE(superseded_by,0), rejected_reason, created_at
 FROM global_insights ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -171,12 +231,158 @@ FROM global_insights ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
 	var out []GlobalInsight
 	for rows.Next() {
 		var g GlobalInsight
-		var spJSON string
-		if err := rows.Scan(&g.ID, &g.Content, &spJSON, &g.CreatedAt); err != nil {
+		var spJSON, akJSON string
+		if err := rows.Scan(&g.ID, &g.Content, &spJSON, &akJSON, &g.Status, &g.SupersededBy, &g.RejectedReason, &g.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(spJSON), &g.SourceProjects)
+		_ = json.Unmarshal([]byte(akJSON), &g.AssetKeys)
 		out = append(out, g)
 	}
 	return out, rows.Err()
 }
+
+// ListCrossProjectInsights 返回【可注入】的跨项目洞察：status='active' 且
+// asset_keys 与 matchKeys 相交（GIN 索引 idx_gins_keys），新在前。matchKeys
+// 为空直接返回空——没有任何本任务锚定键时，「跨项目经验」只可能误导，宁可不注入。
+func (d *DB) ListCrossProjectInsights(ctx context.Context, matchKeys []string, limit int) ([]GlobalInsight, error) {
+	if len(matchKeys) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := d.QueryContext(ctx, `SELECT id, content, array_to_json(source_projects)::text,
+       array_to_json(asset_keys)::text, status, COALESCE(superseded_by,0), rejected_reason, created_at
+FROM global_insights
+WHERE status='active' AND asset_keys && $1::text[]
+ORDER BY created_at DESC, id DESC LIMIT $2`, marshalTextArray(matchKeys), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GlobalInsight
+	for rows.Next() {
+		var g GlobalInsight
+		var spJSON, akJSON string
+		if err := rows.Scan(&g.ID, &g.Content, &spJSON, &akJSON, &g.Status, &g.SupersededBy, &g.RejectedReason, &g.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(spJSON), &g.SourceProjects)
+		_ = json.Unmarshal([]byte(akJSON), &g.AssetKeys)
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// RejectInsight 把一条洞察置为 rejected 并记原因（planner 的 reject_insight
+// 工具）。kind 只接受 project/global。幂等：已 rejected 再拒 → changed=false
+// 且不报错（重复调用无副作用）；id 不存在 → ErrInsightNotFound。
+// reason 为空时保留原 rejected_reason（不把已有留痕抹成空串）。
+func (d *DB) RejectInsight(ctx context.Context, kind string, id int64, reason string) (changed bool, err error) {
+	var table string
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "project":
+		table = "project_insights"
+	case "global":
+		table = "global_insights"
+	default:
+		return false, ErrInsightKindInvalid
+	}
+	if id <= 0 {
+		return false, ErrInsightNotFound
+	}
+	reason = strings.TrimSpace(reason)
+	var got int64
+	err = d.QueryRowContext(ctx, `UPDATE `+table+`
+SET status='rejected', rejected_reason=CASE WHEN $2<>'' THEN $2 ELSE rejected_reason END
+WHERE id=$1 AND status<>'rejected' RETURNING id`, id, utf8Clean(reason)).Scan(&got)
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	// 没有行被更新：要么不存在，要么本来就是 rejected（幂等路径）。
+	var exists int64
+	if err2 := d.QueryRowContext(ctx, `SELECT id FROM `+table+` WHERE id=$1`, id).Scan(&exists); err2 != nil {
+		if errors.Is(err2, sql.ErrNoRows) {
+			return false, ErrInsightNotFound
+		}
+		return false, err2
+	}
+	return false, nil
+}
+
+// AssetKeysForProjects 返回这些项目下【出现过的资产】的归一化键集合
+// （assetKeyFor 同款：URL > 域名 > root_domain > IP）。关联链以真实 schema 为准：
+// assets.task_ids（BIGINT[]）∩ 项目下未删任务的 id。
+//
+// 用途：reader 写 global_insight 时没给 asset_keys，就从正文里匹配这些已知键
+// （DeriveAssetKeys）——写入侧与注入侧（AssetKeysForIDs）用同一套归一化规则，
+// 交集才可能命中。
+func (d *DB) AssetKeysForProjects(ctx context.Context, projectIDs []int64) ([]string, error) {
+	if len(projectIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := d.QueryContext(ctx, `
+SELECT DISTINCT COALESCE(a.domain,''), COALESCE(a.root_domain,''), COALESCE(a.ip,''), COALESCE(a.url,'')
+FROM assets a
+WHERE a.task_ids && ARRAY(
+    SELECT t.id FROM tasks t
+    WHERE t.project_id = ANY($1::bigint[]) AND t.deleted_at IS NULL
+)`, marshalInt64Array(projectIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	var out []string
+	for rows.Next() {
+		var domain, root, ip, u string
+		if err := rows.Scan(&domain, &root, &ip, &u); err != nil {
+			return nil, err
+		}
+		if k := assetKeyFor(domain, root, ip, u); k != "" && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Strings(out) // 确定性（调用方/测试不依赖 SQL 返回序）
+	return out, nil
+}
+
+// DeriveAssetKeys 是纯函数：从洞察正文里挑出命中的已知资产键（子串、大小写
+// 不敏感），去重后按字典序返回。
+//
+// 召回边界（有意为之）：只做「已知键 ⊂ 正文」的单向子串命中，不做模糊/拼音/
+// 端口补齐；短于 deriveAssetKeyMinLen 的键不参与（避免 "a.io" 之类的极短域名
+// 在长正文里误命中）。正文若只写了组件名（canal/nginx）而没有资产键，则一条
+// 也匹配不到——这种洞察 asset_keys 落空=不注入，只能人工看（宁缺勿滥）。
+func DeriveAssetKeys(content string, candidates []string) []string {
+	body := strings.ToLower(content)
+	if body == "" || len(candidates) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range candidates {
+		k := strings.ToLower(strings.TrimSpace(c))
+		if len(k) < deriveAssetKeyMinLen || seen[k] {
+			continue
+		}
+		if strings.Contains(body, k) {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// deriveAssetKeyMinLen 是 DeriveAssetKeys 参与匹配的最短键长度（字节）。
+// 归一化键是主机名/IP/URL，全部 ASCII，字节长度≈字符长度。
+const deriveAssetKeyMinLen = 4

@@ -517,21 +517,26 @@ type TaskInsightContext struct {
 	ExplorationID int64
 	ProjectID     int64 // 0=未挂项目
 	ObserverOn    bool  // projects.observer_enabled（项目不存在/未挂=false）
+	// ReaderOn 是 projects.reader_enabled（V5-A）：跨项目洞察注入的开关。与写出侧
+	// readerVisibleProjects 同源——没 opt-in 的项目既不参与 reader 聚合，也不该
+	// 收到读回来的跨项目条目（否则等于绕过 opt-in）。
+	ReaderOn bool
 }
 
 func (d *DB) TaskInsightContext(ctx context.Context, taskID int64) (*TaskInsightContext, error) {
 	var c TaskInsightContext
 	var pid sql.NullInt64
-	var on sql.NullBool
+	var on, readerOn sql.NullBool
 	err := d.QueryRowContext(ctx, `
-SELECT t.exploration_id, t.project_id, p.observer_enabled
+SELECT t.exploration_id, t.project_id, p.observer_enabled, p.reader_enabled
 FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
-WHERE t.id=$1 AND t.deleted_at IS NULL`, taskID).Scan(&c.ExplorationID, &pid, &on)
+WHERE t.id=$1 AND t.deleted_at IS NULL`, taskID).Scan(&c.ExplorationID, &pid, &on, &readerOn)
 	if err != nil {
 		return nil, err // ErrNoRows=任务不存在/已删，调用方按空处理
 	}
 	c.ProjectID = pid.Int64
 	c.ObserverOn = on.Bool
+	c.ReaderOn = readerOn.Bool
 	return &c, nil
 }
 
