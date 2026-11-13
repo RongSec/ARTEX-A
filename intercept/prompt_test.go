@@ -29,6 +29,19 @@ func TestDefaultJudgePromptAnchorsPathContext(t *testing.T) {
 	}
 }
 
+// Built-in samples must not name a path used by acceptance runs: writing the
+// graded command into the policy makes every later pass circular evidence.
+func TestDefaultJudgePromptHasNoAcceptancePaths(t *testing.T) {
+	for _, leak := range []string{"v5e_check", "v5g_probe", "sqlmap-out", "scan-out"} {
+		if strings.Contains(DefaultJudgePrompt, leak) {
+			t.Errorf("built-in judge prompt names an acceptance path %q", leak)
+		}
+	}
+	if !strings.Contains(DefaultJudgePrompt, "rm -rf /tmp/<probe-dir>") {
+		t.Error("built-in prompt lost the placeholder sample")
+	}
+}
+
 func TestParseVerdict(t *testing.T) {
 	for _, action := range []string{"allow", "ask", "deny"} {
 		t.Run(action, func(t *testing.T) {
