@@ -16,9 +16,11 @@ import (
 // 的 G-01① 与 G-02①-a）
 //
 // 设计约束（V2 §6.3「安全类回退键脱离 settings 热改面」）：
-//  1. 必须是【代码常量】，不进 DB 规则行、不受任何 settings 键覆盖。
-//     理由：settings 热改无校验，持 JWT 者一次 PUT /api/settings 即可整体关闭
-//     全部防线（H2-A4）。DB 规则行同理可被 DELETE。
+//  1. 规则【不进 DB 规则行、不受任何 settings 键覆盖】。理由：settings 热改
+//     无校验，持 JWT 者一次 PUT /api/settings 即可整体关闭全部防线（H2-A4）。
+//     DB 规则行同理可被 DELETE。V6-CFG 起规则可落在
+//     <dataDir>/shortcircuit_rules.json，但只能「写文件 + 重启进程」生效，
+//     不存在运行时热改入口；进程内求值仍只读启动时装入的包级变量。
 //  2. 求值位置在 applyIntercept 的【最前面】，先于 IsToolEnabled。
 //     否则不在 intercept_enabled_tools 名单内的工具会直接放行，本表形同虚设。
 //  3. 回滚仅经编译期 feature flag（ShortCircuitEnabled）+ 环境变量 + 重启，
@@ -59,10 +61,9 @@ func disableFlagFromEnv() (bool, string) {
 // platformDenyTools 比 ask 更严的一档。MCP 注册是凭据汇：stdio 传输会以容器 root
 // 拉起任意二进制，http/sse 传输则把 env 字段当 HTTP header 回放。所以「新建 MCP」
 // 等价于「让平台对任意地址带任意 header 发请求」，不该由 agent 在测评中途自行开通。
-var platformDenyTools = map[string]bool{
-	"create_mcp": true,
-	"update_mcp": true,
-}
+// 默认名单见 shortcircuit_config.go 的 Defaults().Tools.Deny（V6-CFG 起可由
+// <dataDir>/shortcircuit_rules.json 覆盖，仍需重启生效）。
+var platformDenyTools map[string]bool
 
 // platformAskTools 是 G-01① 的对象：改平台配置的工具一律 ask，不直接 deny —— 建自定义
 // 工具 / skill 是 auto agent 的合法日常操作，拦死会废掉平台运维能力。MCP 见上。
@@ -70,12 +71,7 @@ var platformDenyTools = map[string]bool{
 // create_skill 不在此表：新建技能文件不覆盖既有行为，其后果由动作层护栏兜住
 // （护栏拦行为不拦内容，故写进 skill 的内容无法绕过工具层策略），日常操作不该
 // 被人工审批打断。它落在 platformAllowTools —— 显式判定放行，不是漏判。
-var platformAskTools = map[string]bool{
-	"create_custom_tool":    true,
-	"update_custom_tool":    true,
-	"update_skill_file":     true,
-	"delete_assets_by_host": true,
-}
+var platformAskTools map[string]bool
 
 // platformAllowTools 是低危面：代码常量【显式判定放行】。
 //
@@ -85,9 +81,7 @@ var platformAskTools = map[string]bool{
 //
 // 收录标准：① 不覆盖既有行为（新建不同于改写）；② 其后果由动作层护栏兜住
 // （护栏拦行为不拦内容，故写进 skill 的内容无法绕过工具层策略）。
-var platformAllowTools = map[string]bool{
-	"create_skill": true,
-}
+var platformAllowTools map[string]bool
 
 // platformCredentialRe 是 G-02①-a 的对象：只拦 ARTEX 平台自身的凭据。
 //
@@ -111,26 +105,9 @@ var platformAllowTools = map[string]bool{
 // 【本表的固有上限】这是对工具入参的字符串预筛，不是路径解析级强制。
 // `cat $(realpath ../../../jwt.key)` 这类经 shell 展开后才现形的路径绕得过。
 // 真正闭合要等 env 白名单 + 执行前 realpath 校验。
-var platformCredentialRe = regexp.MustCompile(
-	`(?i)(` +
-		// 平台签名密钥（现行 + 旧版遗留两处位置）
-		`/app/(?:data/)?jwt\.key` +
-		`|/app/\.env\b` +
-		// MITM CA 私钥/证书
-		`|/app/data/traffic/_ca/[^\s"']*\.(?:pem|key|crt)` +
-		// 相对路径回溯到平台密钥（cwd 为 /app/data/sessions/<key>：
-		// 两层 .. 到 /app/data/jwt.key（旧版遗留位），三层 .. 到 /app/jwt.key）。
-		// 少于一层的 ../jwt.key 是同级的会话/目标文件，不该拦。
-		`|(?:\.\./){2,}jwt\.key` +
-		// /proc 族：任意 PID 的环境块 / 命令行 / 内存。
-		// environ 用一条覆盖形态的规则收口：pid 段可以是数字、self、*、
-		// [0-9]*、$$ 等任意写法，文件名段也可能是 glob（envi*on）。
-		// 只认字面形态的话，cat /proc/*/environ 就绕过去了。
-		`|/proc/[^\s"']*envi[^\s"']*` +
-		`|/proc/\d+/cmdline` +
-		`|/proc/\d+/mem` +
-		`)`,
-)
+// 默认模式见 shortcircuit_config.go 的 Defaults().PlatformPaths；
+// 逐条列出而非按目录/扩展名通配的理由见上方注释。
+var platformCredentialRe *regexp.Regexp
 
 // 宽字符类补充规则：覆盖 jwt.key 被插入空白/分隔符的绕过变形
 // （如 "/app/j w t . k e y"）。深解码只处理 JSON 转义，对字面插入的
@@ -138,8 +115,9 @@ var platformCredentialRe = regexp.MustCompile(
 //
 // 必须带 /app/ 前缀：裸的 `j[\s._-]*w…` 会连渗透目标上名为 jwt.key 的
 // 文件一起拦掉，而那可能正是要取的证据。
-var platformCredentialLooseRe = regexp.MustCompile(
-	`(?i)/app/(?:data/)?j[\s._-]*w[\s._-]*t[\s._-]*\.?[\s._-]*k[\s._-]*e[\s._-]*y`)
+// 默认模式见 Defaults().PlatformLoosePatterns。必须带 /app/ 前缀：裸的
+// `j[\s._-]*w…` 会连渗透目标上名为 jwt.key 的文件一起拦掉。
+var platformCredentialLooseRe *regexp.Regexp
 
 // platformConfigBareReadRe 是 V4-D 修复2：worker cwd（<data>/sessions/<key>）下
 // 平台注入的配置文件就叫 config.json / .jwt / jwt.key（相对名），实测 #49
@@ -173,10 +151,9 @@ var platformCredentialLooseRe = regexp.MustCompile(
 // 但那是字符串级判据的固有上限，既有注释已声明）；recordOnlyTools 豁免在
 // 调用侧维持不变。已知残留漏判面：shell 变量展开（f=config.json; cat $f）、
 // 引号内换行首置等需 realpath 级执行前校验才闭合（V2 G-02①-b 范畴）。
-var platformConfigBareReadRe = regexp.MustCompile(
-	`(?i)(?:^|[\s"'` + "`" + `;&|(])` +
-		`(?:cat|head|tail|less|more|cp|mv|sed|awk|strings)[\s"'` + "`" + `]+` +
-		`["']?(?:config\.json|\.jwt|jwt\.key)(?:$|[\s"'` + "`" + `;|&)<>{[=,)])`)
+// 默认裸名见 Defaults().BareReadNames（config.json / .jwt / jwt.key），
+// 由 compileBareReadNames 用固定读命令骨架 + QuoteMeta 拼装。
+var platformConfigBareReadRe *regexp.Regexp
 
 // ============================================================================
 // V4-E：heredoc 正文剥离（修 platformConfigBareReadRe 的正文误伤）
@@ -593,22 +570,17 @@ const hostPathEnd = `(?:[\s.,:;` + "`" + `"'/&|<>}{)\]}*-]|$)`
 // 注意 【不含】 /etc/passwd：世界可读，打靶与本机侦察都常读，拦它是过拦
 // （任务书红线：别过拦）。主机私钥 ssh_host_*key* 单独一条正则处理（.pub
 // 公钥要放过，RE2 不支持负环视，拆出去用代码判定）。
-var hostSystemCredentialRe = regexp.MustCompile(
-	`(?i)(?:` +
-		hostPathStart +
-		`/etc/s[\s._-]*h[\s._-]*a[\s._-]*d[\s._-]*o[\s._-]*w` + hostPathEnd +
-		`|` + hostPathStart + `/etc/gshadow` + hostPathEnd +
-		`|` + hostPathStart +
-		`/etc/s[\s._-]*u[\s._-]*d[\s._-]*o[\s._-]*e[\s._-]*r[\s._-]*s(?:\.d)?` + hostPathEnd +
-		`|` + hostPathStart + `/root/\.ssh/[^\s"'` + "`" + `]+` + hostPathEnd +
-		`)`,
-)
+// 默认路径片段见 Defaults().HostPaths；编译时自动套 hostPathStart/hostPathEnd
+// （RE2 无环视，词首/词尾边界只能用消费式字符类）。
+var hostSystemCredentialRe *regexp.Regexp
 
 // sshHostKeyRe 命中 /etc/ssh/ssh_host_* 私钥路径。公钥 .pub 不构成凭据
 // 泄露不该拦，但 RE2 没有 (?!\.pub)，命中后在 hostSystemCredentialHit 里
 // 用代码检查尾缀过滤。
-var sshHostKeyRe = regexp.MustCompile(
-	`(?i)` + hostPathStart + `/etc/ssh/ssh_host_[^\s"'` + "`" + `]*key`)
+// 默认模式见 Defaults().SSHHostKeyPatterns；编译时套 hostPathStart。
+// 公钥 .pub 不构成凭据泄露不该拦，但 RE2 没有 (?!\.pub)，命中后在
+// hostSystemCredentialHit 里用代码检查尾缀过滤。
+var sshHostKeyRe *regexp.Regexp
 
 // remoteRefRe 是"远程目标指代"语境判据：命令串里【任意位置】出现任一形态，
 // 即认为读取指令与远端靶机有关，host 系统凭据档整体豁免。
@@ -635,20 +607,9 @@ var sshHostKeyRe = regexp.MustCompile(
 //
 // 靶机名恰好等于本机主机名时也无法靠字符串区分——要求测试者主动拿本机
 // 当靶，属自伤场景，接受。
-var remoteRefRe = regexp.MustCompile(
-	`(?i)(` +
-		`(?:^|[\s"'` + "`" + `;&|(<>$])(?:ssh|scp|sftp|rsync|proxychains(?:4|chain)?[0-9]*|netcat|ncat|nc|winrm|ansible)\b` +
-		`|(?:^|[\s"'` + "`" + `;&|(<>$])(?:mysql|psql|mariadb)\b[^\n]*?\s-{1,2}h(?:ost)?[=\s]` +
-		`|@(?:\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9][a-z0-9._-]*[a-z0-9])(?:[:/'"\s)|,;-]|$)` +
-		`|https?://\S` +
-		// V6-FP：容器/编排 exec 形态（`docker exec c cat /etc/shadow`）读的是
-		// 目标容器内的同名文件，属合法战果，整体豁免 host 档。动词必须在
-		// 命令位（复用上面的边界类），避免把 /var/lib/docker/ 这类路径里的
-		// docker 字样误认成远程指代。平台凭据档不吃远程豁免（shortCircuit
-		// 中平台档先于 host 档求值），`docker exec x cat /app/jwt.key` 仍 deny。
-		`|(?:^|[\s"'` + "`" + `;&|(<>$])(?:docker|podman|kubectl)\b[^\n]*?\bexec\b` +
-		`)`,
-)
+// 默认模式见 Defaults().RemoteExemptPatterns。命令位边界：ssh/nc 等动词必须
+// 出现在【命令位置】，避免把 /root/.ssh、/etc/ssh/ 里的 ssh 误认成远程指代。
+var remoteRefRe *regexp.Regexp
 
 // recordOnlyTools 是【纯记录类工具】白名单（红线实跑缺陷2 的豁免对象）：
 // 不落盘执行、不触发进程，只把文本写进 DB/证据库。证据文本里引用被拦命令
@@ -667,20 +628,9 @@ var remoteRefRe = regexp.MustCompile(
 // IO 的一律不豁免（Bash、shell_open/shell_send、Read/Write/Edit、http_*、
 // nuclei 等），命令执行类照旧全匹配两档凭据正则。
 // 显式白名单常量，便于代码审查：豁免了谁、为什么豁免，一屏看全。
-var recordOnlyTools = map[string]bool{
-	"record_fact":           true,
-	"report_finding":        true,
-	"update_finding_report": true,
-	"add_hint":              true,
-	"add_task_hint":         true,
-	"add_intent":            true,
-	"prove_goal":            true,
-	"goal_met":              true,
-	"set_goals":             true,
-	"set_constraints":       true,
-	"insert_assets":         true,
-	"bind_finding_traffic":  true,
-}
+// 默认名单见 Defaults().RecordOnlyTools（来源与收录标准见上方注释）。名单本身
+// 也可经配置文件覆盖，同样需重启生效——它只影响误伤面，不影响凭据档本体。
+var recordOnlyTools map[string]bool
 
 // hostScanFields 是 host 系统凭据档【只扫描】的参数字段：命令体与文件路径。
 // 刻意不含 pattern——Grep/search 类工具的 pattern 是正则不是路径，拦
@@ -948,6 +898,15 @@ const (
 // RuleName 一律带 "[代码常量]" 前缀：db.interceptSource 靠它把记录归为
 // shortcircuit 来源（跨包约定，见 guard/shortcircuit_source_test.go）。
 func shortCircuit(toolName string, input []byte) *intercept.Decision {
+	// 配置文件非法时 main 会拒绝启动；这里再兜一层 fail-closed：万一进程在
+	// 测试/嵌入场景里带着坏配置跑起来，宁可全拒，也不能静默退化成空规则。
+	if err := shortCircuitConfigError(); err != nil {
+		return &intercept.Decision{
+			Action:   "deny",
+			RuleName: "[代码常量] 短路规则配置非法（fail-closed）",
+			Message:  "短路规则配置文件加载失败，按 fail-closed 策略拒绝全部工具调用：" + err.Error(),
+		}
+	}
 	if !ShortCircuitEnabled {
 		return nil
 	}

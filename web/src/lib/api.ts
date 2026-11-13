@@ -93,6 +93,8 @@ import type {
   SessionTokenUsage,
   Settings,
   Severity,
+  ShortCircuitConfig,
+  ShortCircuitState,
   SkillCall,
   SkillItem,
   SSProject,
@@ -919,6 +921,16 @@ export const api = {
   // ---- app settings (runtime toggles) ----
   settings: () => get<Settings>(`/settings`),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
+
+  // ---- 短路规则（V6-CFG）----
+  // 只写文件，不热改内存；三个写/重启动作都要求管理员 JWT（由 http 统一带）。
+  shortCircuit: () => get<ShortCircuitState>(`/system/shortcircuit`),
+  saveShortCircuit: (config: ShortCircuitConfig) =>
+    put<{ ok: boolean; need_restart: boolean; file_path: string }>(`/system/shortcircuit`, { config }),
+  resetShortCircuit: () =>
+    post<{ ok: boolean; need_restart: boolean; file_path: string }>(`/system/shortcircuit/reset`, {}),
+  restartServer: () =>
+    post<{ ok: boolean; scheduled: boolean; delay_seconds: number; log_file: string }>(`/system/restart`, {}),
   // Run a real "test" search with the given (or saved) config to verify it works.
   testWebSearch: (patch: {
     web_search_backend?: string;

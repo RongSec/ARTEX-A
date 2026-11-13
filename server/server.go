@@ -134,6 +134,12 @@ type Server struct {
 	// intercept_preview.go。
 	judgeTestOnce sync.Once
 	judgeTestRate *judgeTestRateLimiter
+
+	// 短路规则重启端点（V6-CFG）的测试缝：nil = 真实重启（spawn sh -> os.Exit）。
+	// 测试只验证「已排程 + 审计落库」，用这两个钩子避免真的结束测试进程。
+	restartFunc  func() error
+	exitFunc     func(int)
+	restartDelay time.Duration
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -853,6 +859,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/records/{id}", s.pgGetLLMRecord)
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
+	// 短路规则（V6-CFG）：文件级配置，保存后必须重启才生效（不提供热改）。
+	// 与 settings 同权限：仅需管理员 JWT（requireAuth 统一校验）。
+	mux.HandleFunc("GET /api/system/shortcircuit", s.shortCircuitGet)
+	mux.HandleFunc("PUT /api/system/shortcircuit", s.shortCircuitPut)
+	mux.HandleFunc("POST /api/system/shortcircuit/reset", s.shortCircuitReset)
+	mux.HandleFunc("POST /api/system/restart", s.systemRestart)
 	// 漏洞 IM 推送。渠道是「多实例 + 各自过滤规则」的资源，因此独立成一组
 	// REST 接口，而不是塞进扁平的 /api/settings 键值里。
 	mux.HandleFunc("GET /api/notify/meta", s.notifyMeta)

@@ -63,6 +63,12 @@ func New() *Guard { return newGuard(nil) }
 func NewWithInterceptor(ic *intercept.Interceptor) *Guard { return newGuard(ic) }
 
 func newGuard(ic *intercept.Interceptor) *Guard {
+	// V6-CFG：短路表在首个 Guard 初始化时读一次 <dataDir>/shortcircuit_rules.json。
+	// 加载失败时 main 会拒绝启动（见 cmd/artex）；这里只留下日志，运行期由
+	// shortCircuit 的 fail-closed 分支兜底。
+	if err := InitShortCircuit(); err != nil {
+		log.Printf("[guard] ⚠ 短路规则配置加载失败（将按 fail-closed 全拒）: %v", err)
+	}
 	g := &Guard{
 		attrib:     map[string]int{},
 		judgeCache: newJudgeVerdictCache(time.Now, judgeVerdictTTL, judgeVerdictCacheCap),

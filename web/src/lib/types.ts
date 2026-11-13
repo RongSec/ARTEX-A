@@ -911,6 +911,33 @@ export interface TrafficHost {
   count: number;
 }
 
+// ---- 短路规则（V6-CFG）：文件级红线配置，保存后需重启服务端才生效 ----
+export interface ShortCircuitTools {
+  deny: string[];
+  ask: string[];
+  allow: string[];
+}
+
+export interface ShortCircuitConfig {
+  version: number;
+  tools: ShortCircuitTools;
+  platform_paths: string[];
+  platform_loose_patterns: string[];
+  bare_read_names: string[];
+  host_paths: string[];
+  ssh_host_key_patterns: string[];
+  remote_exempt_patterns: string[];
+  record_only_tools: string[];
+}
+
+export interface ShortCircuitState {
+  config: ShortCircuitConfig; // 当前【生效】配置（重启前不会变）
+  defaults: ShortCircuitConfig; // 代码内置默认，供「恢复默认」
+  file_path: string;
+  loaded_at: string;
+  dirty: boolean; // 文件内容与生效配置不同 = 需重启
+}
+
 // ---- App settings (runtime toggles) ----
 export interface Settings {
   traffic_capture: boolean;
