@@ -128,6 +128,12 @@ type Server struct {
 	// renderReportStub）。**T16 docx（pybuilder）实装替换此字段即可**，job
 	// 生命周期/API/表结构零改动。见 reportgen.go。
 	reportRenderer ReportRenderer
+
+	// 试判（POST /api/intercept/judge/test）的 per-token 限流器：进程内存、
+	// 重启清零。sync.Once 惰性初始化，保证 &Server{} 直构的测试也能用。见
+	// intercept_preview.go。
+	judgeTestOnce sync.Once
+	judgeTestRate *judgeTestRateLimiter
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -979,6 +985,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intercept/judge", s.interceptGetJudgeConfig)
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // 兜底审批累计 token 用量
+	// 试判：只计算三层判定，不执行命令、不写 intercept_pending/audit_events。
+	mux.HandleFunc("POST /api/intercept/judge/test", s.interceptJudgeTest)
 
 	// ==== T04 外挂工具链（artex-full 摘取）：Nuclei POC + OOB 回连观测 ====
 	// 直接调 /opt/artex/bin/nuclei 与 /opt/artex/nuclei-templates、只读
