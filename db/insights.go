@@ -1,15 +1,20 @@
 package db
 
-// 项目洞察（project_insights，observer 产出）与全局洞察（global_insights，
-// reader 产出）的读写。架构 §1.5/§1.6、§2.4：observer 把跨任务可借鉴处写成
-// 洞察行，planner 侧按「open 意图锚定 asset_keys ∩ keywords 交集命中优先、
+// 统一阅读者洞察（V6-U2）：observer（项目内）与 reader（跨项目）两条链合成
+// 一套表 project_insights，用 scope 列区分：scope='project' 项目洞察
+// （project_id 指向所属项目）、scope='cross' 跨项目洞察（project_id=NULL）。
+// planner 侧按「open 意图锚定 asset_keys ∩ keywords/asset_keys 交集命中优先、
 // 不足按 created_at DESC 补至 ≤limit」限量注入。
 //
-// V5-A（跨项目勾连回流）：global_insights 带 asset_keys 后也能注入 planner——
-// 同一套归一化资产键（AssetKeysForIDs/assetKeyFor）求交集，命中才注入，且
-// 渲染时显式标注「来自其他项目、仅作假设」。同资产写新洞察会把旧行置
-// superseded（生命周期），planner 还可用 reject_insight 把某条置 rejected。
-// 两条只影响「是否还参与注入」，不物理删行（可人工复核/回滚）。
+// 兼容：GlobalInsight 结构与 WriteGlobalInsight/ListGlobalInsights/
+// ListCrossProjectInsights/RejectInsight 的函数签名全部保留（工具 kind 枚举
+// project/global 不变），内部 SQL 一律指向 project_insights 且带 scope='cross'。
+// 旧 global_insights 表在 V6-U1 迁移里改名归档，Go 层不再读写它。
+//
+// V5-A（跨项目勾连回流）：cross 行带 asset_keys 后也能注入 planner——同一套
+// 归一化资产键求交集，命中才注入，且渲染时显式标注「来自其他项目、仅作假设」。
+// 同资产写新洞察会把旧行置 superseded（生命周期），planner 还可用
+// reject_insight 把某条置 rejected。两条只影响「是否还参与注入」，不物理删行。
 
 import (
 	"context"
@@ -22,7 +27,7 @@ import (
 	"time"
 )
 
-// Insight 是 project_insights 表的一行。
+// Insight 是 project_insights 里 scope='project' 的项目洞察一行。
 type Insight struct {
 	ID             int64     `json:"id"`
 	ProjectID      int64     `json:"project_id"`
@@ -34,7 +39,8 @@ type Insight struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// GlobalInsight 是 global_insights 表的一行（reader 跨项目产出）。
+// GlobalInsight 是 project_insights 里 scope='cross' 的跨项目洞察（reader 产出）
+// 的视图结构。表名虽已合并，结构/字段名保持不变——工具与渲染层无需改动。
 type GlobalInsight struct {
 	ID             int64     `json:"id"`
 	Content        string    `json:"content"`
@@ -75,8 +81,8 @@ func (d *DB) WriteInsight(ctx context.Context, projectID int64, content string, 
 	var src sql.NullInt64
 	var kwJSON string
 	err := d.QueryRowContext(ctx, `
-INSERT INTO project_insights(project_id, content, source_task_id, keywords)
-VALUES ($1, $2, $3, $4::text[])
+INSERT INTO project_insights(project_id, content, source_task_id, keywords, scope)
+VALUES ($1, $2, $3, $4::text[], 'project')
 RETURNING id, project_id, content, source_task_id, array_to_json(keywords)::text, status, rejected_reason, created_at`,
 		projectID, utf8Clean(content), srcArg, marshalTextArray(keywords)).
 		Scan(&in.ID, &in.ProjectID, &in.Content, &src, &kwJSON, &in.Status, &in.RejectedReason, &in.CreatedAt)
@@ -115,7 +121,7 @@ func (d *DB) ListInsights(ctx context.Context, projectID int64, matchKeywords []
 	}
 	args = append(args, limit)
 	rows, err := d.QueryContext(ctx, `SELECT id, project_id, content, source_task_id, array_to_json(keywords)::text, status, rejected_reason, created_at
-FROM project_insights WHERE project_id=$1 AND status='active'
+FROM project_insights WHERE project_id=$1 AND scope='project' AND status='active'
 ORDER BY `+order+` LIMIT $`+fmt.Sprint(len(args)), args...)
 	if err != nil {
 		return nil, err
@@ -156,7 +162,7 @@ func (d *DB) DeleteInsight(ctx context.Context, id int64) error {
 // 且每删一条多一次往返）。ErrInsightNotFound 同时覆盖"不存在"与"不属于该项目"
 // 两态（对调用方语义一致：这条你删不了）。
 func (d *DB) DeleteProjectInsight(ctx context.Context, projectID, id int64) error {
-	res, err := d.ExecContext(ctx, `DELETE FROM project_insights WHERE id=$1 AND project_id=$2`, id, projectID)
+	res, err := d.ExecContext(ctx, `DELETE FROM project_insights WHERE id=$1 AND project_id=$2 AND scope='project'`, id, projectID)
 	if err != nil {
 		return err
 	}
@@ -188,8 +194,8 @@ func (d *DB) WriteGlobalInsight(ctx context.Context, content string, sourceProje
 	defer func() { _ = tx.Rollback() }() // 已 Commit 后 Rollback 是 no-op
 	var spJSON, akJSON string
 	err = tx.QueryRowContext(ctx, `
-INSERT INTO global_insights(content, source_projects, asset_keys)
-VALUES ($1, $2::bigint[], $3::text[])
+INSERT INTO project_insights(content, source_projects, asset_keys, scope, project_id)
+VALUES ($1, $2::bigint[], $3::text[], 'cross', NULL)
 RETURNING id, content, array_to_json(source_projects)::text, array_to_json(asset_keys)::text,
           status, COALESCE(superseded_by,0), rejected_reason, created_at`,
 		utf8Clean(content), marshalInt64Array(sourceProjects), marshalTextArray(assetKeys)).
@@ -201,8 +207,8 @@ RETURNING id, content, array_to_json(source_projects)::text, array_to_json(asset
 		// 同资产覆盖：只动 active 行（rejected 是人/planner 的明确判断，不该被
 		// 新写悄悄复活成 superseded；superseded 已是历史，无需再改）。
 		if _, err := tx.ExecContext(ctx, `
-UPDATE global_insights SET status='superseded', superseded_by=$1
-WHERE status='active' AND id<>$1 AND asset_keys && $2::text[]`,
+UPDATE project_insights SET status='superseded', superseded_by=$1
+WHERE scope='cross' AND status='active' AND id<>$1 AND asset_keys && $2::text[]`,
 			g.ID, marshalTextArray(assetKeys)); err != nil {
 			return nil, err
 		}
@@ -223,7 +229,7 @@ func (d *DB) ListGlobalInsights(ctx context.Context, limit int) ([]GlobalInsight
 	}
 	rows, err := d.QueryContext(ctx, `SELECT id, content, array_to_json(source_projects)::text,
        array_to_json(asset_keys)::text, status, COALESCE(superseded_by,0), rejected_reason, created_at
-FROM global_insights ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
+FROM project_insights WHERE scope='cross' ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +249,7 @@ FROM global_insights ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
 }
 
 // ListCrossProjectInsights 返回【可注入】的跨项目洞察：status='active' 且
-// asset_keys 与 matchKeys 相交（GIN 索引 idx_gins_keys），新在前。matchKeys
+// asset_keys 与 matchKeys 相交（GIN 索引 idx_pins_asset），新在前。matchKeys
 // 为空直接返回空——没有任何本任务锚定键时，「跨项目经验」只可能误导，宁可不注入。
 func (d *DB) ListCrossProjectInsights(ctx context.Context, matchKeys []string, limit int) ([]GlobalInsight, error) {
 	if len(matchKeys) == 0 {
@@ -254,8 +260,8 @@ func (d *DB) ListCrossProjectInsights(ctx context.Context, matchKeys []string, l
 	}
 	rows, err := d.QueryContext(ctx, `SELECT id, content, array_to_json(source_projects)::text,
        array_to_json(asset_keys)::text, status, COALESCE(superseded_by,0), rejected_reason, created_at
-FROM global_insights
-WHERE status='active' AND asset_keys && $1::text[]
+FROM project_insights
+WHERE scope='cross' AND status='active' AND asset_keys && $1::text[]
 ORDER BY created_at DESC, id DESC LIMIT $2`, marshalTextArray(matchKeys), limit)
 	if err != nil {
 		return nil, err
@@ -276,17 +282,14 @@ ORDER BY created_at DESC, id DESC LIMIT $2`, marshalTextArray(matchKeys), limit)
 }
 
 // RejectInsight 把一条洞察置为 rejected 并记原因（planner 的 reject_insight
-// 工具）。kind 只接受 project/global。幂等：已 rejected 再拒 → changed=false
-// 且不报错（重复调用无副作用）；id 不存在 → ErrInsightNotFound。
-// reason 为空时保留原 rejected_reason（不把已有留痕抹成空串）。
+// 工具）。kind 只接受 project/global，并作为【scope 断言】（V6-U2 单表后）：
+// global→'cross'、project→'project'，防跨 scope 误否决——拿 global kind 去否决
+// 一条项目洞察会被「该 scope 下不存在」挡回。幂等：已 rejected 再拒 →
+// changed=false 且不报错（重复调用无副作用）；id 不存在/不属于该 scope →
+// ErrInsightNotFound。reason 为空时保留原 rejected_reason（不抹掉已有留痕）。
 func (d *DB) RejectInsight(ctx context.Context, kind string, id int64, reason string) (changed bool, err error) {
-	var table string
-	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "project":
-		table = "project_insights"
-	case "global":
-		table = "global_insights"
-	default:
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if kind != "project" && kind != "global" {
 		return false, ErrInsightKindInvalid
 	}
 	if id <= 0 {
@@ -294,18 +297,20 @@ func (d *DB) RejectInsight(ctx context.Context, kind string, id int64, reason st
 	}
 	reason = strings.TrimSpace(reason)
 	var got int64
-	err = d.QueryRowContext(ctx, `UPDATE `+table+`
+	err = d.QueryRowContext(ctx, `UPDATE project_insights
 SET status='rejected', rejected_reason=CASE WHEN $2<>'' THEN $2 ELSE rejected_reason END
-WHERE id=$1 AND status<>'rejected' RETURNING id`, id, utf8Clean(reason)).Scan(&got)
+WHERE id=$1 AND scope=CASE WHEN $3='global' THEN 'cross' ELSE 'project' END
+  AND status<>'rejected' RETURNING id`, id, utf8Clean(reason), kind).Scan(&got)
 	if err == nil {
 		return true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	// 没有行被更新：要么不存在，要么本来就是 rejected（幂等路径）。
+	// 没有行被更新：要么不存在/不属于该 scope，要么本来就是 rejected（幂等路径）。
 	var exists int64
-	if err2 := d.QueryRowContext(ctx, `SELECT id FROM `+table+` WHERE id=$1`, id).Scan(&exists); err2 != nil {
+	if err2 := d.QueryRowContext(ctx, `SELECT id FROM project_insights
+WHERE id=$1 AND scope=CASE WHEN $2='global' THEN 'cross' ELSE 'project' END`, id, kind).Scan(&exists); err2 != nil {
 		if errors.Is(err2, sql.ErrNoRows) {
 			return false, ErrInsightNotFound
 		}
