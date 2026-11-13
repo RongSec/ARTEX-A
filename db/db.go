@@ -285,6 +285,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.bumpV4ExclusivePriorities(); err != nil {
 		return fmt.Errorf("bump v4 exclusive priorities: %w", err)
 	}
+	if err := d.downgradeRmRecursiveToAsk(); err != nil {
+		return fmt.Errorf("downgrade rm -rf rule to ask: %w", err)
+	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
 	}
@@ -348,6 +351,15 @@ ON CONFLICT (agent_id, skill_name) DO NOTHING`, key, skillName); err != nil {
 	return nil
 }
 
+// rmRecursiveRuleName / rmRecursivePattern 是 v1 种子「递归强制删除 rm -rf」
+// 的出厂 name 与 pattern。downgradeRmRecursiveToAsk 用这两个值当迁移守卫
+// （只动仍是出厂 pattern 的行，用户改过正则的自定义规则不碰），所以 pattern
+// 常量必须保持 v1 出厂原值：将来要调这条正则，请另加迁移，不要就地改。
+const (
+	rmRecursiveRuleName = "[内置] 递归强制删除 rm -rf"
+	rmRecursivePattern  = `(?i)\brm\b.{0,80}(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|--recursive|--no-preserve-root)`
+)
+
 // seedDefaultInterceptRules inserts built-in safety intercept rules once on
 // first startup. The seed is gated by a settings flag so user edits (disable,
 // delete, re-order) are never overwritten on subsequent restarts.
@@ -363,17 +375,30 @@ func (d *DB) seedDefaultInterceptRules() error {
 		action   string
 		message  string
 		priority int
+		// timeout 只在 action=ask 时才有意义：v1 这批规则原本全是 deny，
+		// 审批超时字段一律 false（deny 用不上）。规则 #1 降为 ask 后必须显式
+		// 打开，否则 HandleAsk 走「无超时」分支无限等待人工——判官未启用或
+		// 判官故障回落时，一条 rm -rf 能把整个 task 挂死。true = 60s 无人
+		// 处理即按 timeout_action=deny 收敛（fail-closed）。
+		timeout bool
 	}
 	rules := []rule{
 		// ── 系统破坏性命令 (priority 100) ──────────────────────────────────
 		{
-			name:     "[内置] 递归强制删除 rm -rf",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `(?i)\brm\b.{0,80}(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|--recursive|--no-preserve-root)`,
-			action:   "deny",
-			message:  "禁止执行递归强制删除（rm -rf / rm --recursive），可能永久损坏系统或靶机环境",
+			name:    rmRecursiveRuleName,
+			target:  "tool_input",
+			typ:     "regex",
+			pattern: rmRecursivePattern,
+			// V5-E：deny → ask。正则只能看出「递归强制删除」，看不出 rm 的目标
+			// 归属——`rm -rf /tmp/sqlmap-out`（清理本次扫描产物）与
+			// `rm -rf /var/www/html`（删目标生产文件）在字面上同构，一刀切 deny
+			// 必然误伤前者（实测对照 24 条里唯一误伤项）。改为交判官按
+			// 「可逆性 × 作用对象」两根轴裁决（intercept/prompt.go），
+			// 判官未启用时 ask 仍走人工审批（60s 超时 deny），不会变成放行。
+			action:   "ask",
+			message:  "递归强制删除（rm -rf / rm --recursive）需按作用对象确认：删除生产文件或系统路径将被拒绝，清理本次测试产物可放行",
 			priority: 100,
+			timeout:  true,
 		},
 		{
 			name:     "[内置] 删除系统关键目录",
@@ -529,9 +554,9 @@ func (d *DB) seedDefaultInterceptRules() error {
 	for _, r := range rules {
 		if _, err := d.Exec(`
 INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-VALUES ($1, true, $2, $3, $4, $5, $6, $7, false, 60, 'deny')
+VALUES ($1, true, $2, $3, $4, $5, $6, $7, $8, 60, 'deny')
 ON CONFLICT DO NOTHING`,
-			r.name, r.priority, r.target, r.typ, r.pattern, r.action, r.message,
+			r.name, r.priority, r.target, r.typ, r.pattern, r.action, r.message, r.timeout,
 		); err != nil {
 			return fmt.Errorf("rule %q: %w", r.name, err)
 		}
@@ -714,5 +739,33 @@ func (d *DB) bumpV4ExclusivePriorities() error {
 WHERE priority = 90 AND name IN (
   '[内置] 云对象存储批量删除 aws s3 rm --recursive / rb',
   '[内置] 基础设施销毁 terraform destroy')`)
+	return err
+}
+
+// downgradeRmRecursiveToAsk 把存量库里规则 #1「[内置] 递归强制删除 rm -rf」
+// 的 deny 降为 ask（V5-E）。
+//
+// 为什么降：规则正则只看「rm + 递归强制」，看不出目标归属，于是
+// `rm -rf /tmp/sqlmap-out`（清理自己的扫描产物）与 `rm -rf /var/www/html`
+// （删目标生产文件）同样命中——实测 24 条对照里唯一误伤就是前者。目标归属
+// 无法用正则判定，交判官按「可逆性 × 作用对象」两根轴裁决（见
+// intercept/prompt.go 的 D4 / A2）；判官未启用时 ask 仍走人工审批
+// （HandleAsk，规则自带 60s 超时 → deny），fail-closed 语义不变。
+//
+// 守卫：只改仍是出厂形态的行——action='deny'（尚未降级）、pattern 为出厂
+// 原值、且审批超时还是 v1 的 false/deny。用户改过正则或改过超时配置的规则
+// 视为自定义规则，语义已不由我们定义，一律不动（不动即保持 deny，不会松）。
+// 每次启动幂等执行（一条 UPDATE，开销可忽略），故不受 seed flag 早退影响——
+// 已种过 v1 的存量库同样完成迁移；新库种出来就是 ask+超时，本条命中 0 行。
+func (d *DB) downgradeRmRecursiveToAsk() error {
+	// action 降 ask 必须同时打开审批超时：v1 这批规则是 deny，timeout_enabled
+	// 一律 false，而 HandleAsk 的无超时分支是「等到用户决定或任务被取消」——
+	// 判官未启用、或判官故障回落人工时，一条 rm -rf 会把 task 无限挂住。
+	// 打开后 = 60s 无人处理按 timeout_action=deny 收敛，fail-closed 不变。
+	_, err := d.Exec(`UPDATE intercept_rules
+SET action = 'ask', timeout_enabled = true
+WHERE name = $1 AND pattern = $2
+  AND action = 'deny' AND timeout_enabled = false AND timeout_action = 'deny'`,
+		rmRecursiveRuleName, rmRecursivePattern)
 	return err
 }
