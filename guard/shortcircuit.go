@@ -834,6 +834,91 @@ func decodedInputText(input []byte) string {
 	return b.String()
 }
 
+// ============================================================================
+// V6-WRITE：「执行面文本」与「正文文本」分离（修平台凭据档硬误伤）
+//
+// 实网缺陷（线上 8801，任务 #46，intercept_pending id=141）：agent 用 Write
+// 写验收结果文件 redline_result.txt，正文里如实引用了被拦命令原文
+// `cat /app/jwt.key`（验收样本逐条结果），平台凭据档对【整段 raw 字节】做
+// 正则 → 正文里的 "/app/jwt.key" 命中 → denied/shortcircuit，成果保存不下来。
+//
+// 这与 recordOnlyTools 已修过的「证据文本引用被拦命令」是同一类问题：文本里
+// 出现凭据路径 ≠ 读取/写入该凭据。但 Write/Edit/MultiEdit 【能真正落盘】，
+// 不能像纯记录类工具那样整体豁免——写到 /app/jwt.key 必须拦。故取「只改扫描
+// 输入、不豁免工具」：对文件写入类工具，平台凭据档只扫描【执行面字段】
+// （file_path / path / command / args），丢弃 content / new_string /
+// old_string / notes / description 等【正文文本】字段。
+//
+// 【为什么「整体豁免 Write」不行】把 Write 加进 recordOnlyTools（或另立一个
+// 同类豁免名单）会在 `if !recordOnlyTools[toolName]` 这一层把该工具的【全部】
+// 凭据档判定一并跳过：file_path=/app/jwt.key、/app/.env、/proc/1/environ、
+// ../../../jwt.key 这些「写到平台凭据本体」的真实攻击将随之放行——短路表是
+// 唯一不受 DB 热改面影响的防线，整体豁免等于给它开一个可写任意路径的洞。
+// 执行面/正文分离只收窄「扫哪段字节」，路径字段照旧全量匹配，故 deny 语义
+// 与放行语义同时保住。
+//
+// 【刻意不改变的面】Bash / ExecuteExtraTool / Read 等一律原样返回原始字节，
+// 一字不改：Bash heredoc 正文被当命令执行（V4-E 的不对称）、ExecuteExtraTool
+// 嵌套 params.command（V6-MCP）、Read 的 file_path 都依赖原始全字节扫描。
+// recordOnlyTools / hostScanText / remoteRefRe 均不触碰。
+// ============================================================================
+
+// platformWriteTools 是【会把正文文本写进文件】的工具注册名（已逐一核对
+// norma tool 包：files.go 的 Write/Edit、multiedit.go 的 MultiEdit；
+// TodoWrite 写的是内存 TodoStore 不是文件，不属同类，故不收）。
+//
+// 这不是「豁免名单」：这些工具仍完整经过所有短路表判定，只是平台凭据档的
+// 扫描输入被收窄为执行面文本。收录标准 = 入参里存在「正文文本」字段
+// （content / new_string / old_string / edits…）且动作会落盘。
+var platformWriteTools = map[string]bool{
+	"Write":     true,
+	"Edit":      true,
+	"MultiEdit": true,
+}
+
+// platformExecutionFields 是文件写入类工具里【执行面】的字段名白名单：
+// 目标路径与（少数变体携带的）命令/参数。其余字段一律视为正文文本丢弃。
+// 字段表与 decodedInputText / hostScanFields 的命名口径一致。
+var platformExecutionFields = map[string]bool{
+	"file_path": true,
+	"path":      true,
+	"command":   true,
+	"args":      true,
+}
+
+// platformExecutionText 返回平台凭据档应当扫描的字节：
+//   - 文件写入类工具（platformWriteTools）→ 仅保留 JSON 顶层执行面字段
+//     （file_path/path/command/args），重新序列化为 JSON 对象；正文字段
+//     （content/new_string/old_string/notes/description/edits…）整支丢弃。
+//     保留 JSON 对象形态（而非拼成纯文本）是为了让 decodedInputText /
+//     jsonStringValuesText 这两条既有路径能在同一份字节上照常求值——转义
+//     绕过仍由 decoded 分支覆盖。非 JSON 对象 / 解析失败 → 退回原始字节
+//     （fail-closed：宁可多扫，不放过执行面）。
+//   - 其它工具 → 原样返回 input（同一底层切片，一字不变）。
+func platformExecutionText(toolName string, input []byte) []byte {
+	if !platformWriteTools[toolName] {
+		return input
+	}
+	if len(input) == 0 || input[0] != '{' {
+		return input
+	}
+	var m map[string]any
+	if err := json.Unmarshal(input, &m); err != nil {
+		return input
+	}
+	exec := make(map[string]any, len(platformExecutionFields))
+	for k, v := range m {
+		if platformExecutionFields[k] {
+			exec[k] = v
+		}
+	}
+	out, err := json.Marshal(exec)
+	if err != nil {
+		return input
+	}
+	return out
+}
+
 const (
 	msgPlatformAsk = "该工具用于修改平台自身配置（建/改自定义工具、skill、资产库）。" +
 		"已转人工确认，确认后即可执行。"
@@ -902,19 +987,28 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 	// 读取（实跑缺陷2：record_fact 因证据文本引用 /app/jwt.key 被误伤，
 	// agent 被迫改写措辞）。命令执行类照旧全字段匹配。
 	if !recordOnlyTools[toolName] {
+		// V6-WRITE：平台凭据档的扫描输入区分「执行面」与「正文」。文件写入类
+		// 工具（Write/Edit/MultiEdit）只扫 file_path/path/command/args，丢弃
+		// content/new_string/old_string 等正文文本——否则正文里如实引用
+		// `cat /app/jwt.key` 就会被硬 deny（id=141）。其它工具原样全字节，
+		// 保持 V4-E / V6-MCP 等既有语义。详见 platformExecutionText 注释。
+		execInput := platformExecutionText(toolName, input)
 		// 平台凭据档：raw + JSON 深解码后文本都扫（堵 \u002f 转义绕过——
 		// 原始字节里不存在 '/' 时字面正则永不命中，而执行的是解码后的命令）。
+		// raw 与 decoded 都基于 execInput，正文文本不进入任一分支。
 		// 【刻意不套远程指代豁免】：与 host 档的不对称是有意设计，理由见
 		// 文件头注释——靶机上不存在 /app/jwt.key，"远程读它"只可能是本机。
-		decoded := decodedInputText(input)
+		decoded := decodedInputText(execInput)
 		// V4-E：heredoc 正文是【数据】不是命令（写结果摘要时正文引用被拦命令
 		// 原文，被裸相对名档误伤）——只对 platformConfigBareReadRe 用剥离后的
 		// 文本匹配。platformCredentialRe/Loose 维持原文匹配：`bash <<EOF …
 		// cat /app/jwt.key … EOF` 的正文是被执行的命令，不能因剥离而放过
 		// （不对称理由与残余风险见 stripHeredocBodies 上方注释）。
 		// 剥离必须在真文本（JSON 转义还原、换行还原）上做，见 jsonStringValuesText。
-		readText := string(input)
-		if t, ok := jsonStringValuesText(input); ok {
+		// V6-WRITE：readText 同样基于 execInput，写入类工具正文里的
+		// `cat config.json` 不再进入裸相对名档。
+		readText := string(execInput)
+		if t, ok := jsonStringValuesText(execInput); ok {
 			readText = t
 		}
 		// V6-FP2：裸相对名档先剥离 heredoc 正文、再屏蔽 echo/printf/tee 引号
@@ -924,7 +1018,7 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 			return platformConfigBareReadRe.MatchString(maskWriteCommandQuoteArgs(stripHeredocBodies(t)))
 		}
 		bareReadHit := bareScan(readText) || (decoded != "" && bareScan(decoded))
-		if platformCredentialRe.Match(input) || platformCredentialLooseRe.Match(input) || bareReadHit ||
+		if platformCredentialRe.Match(execInput) || platformCredentialLooseRe.Match(execInput) || bareReadHit ||
 			(decoded != "" && (platformCredentialRe.MatchString(decoded) || platformCredentialLooseRe.MatchString(decoded))) {
 			return &intercept.Decision{
 				Action:   "deny",
@@ -934,6 +1028,8 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 		}
 		// host 系统凭据档：只扫执行面字段（command/file_path 等），远程
 		// 指代豁免——`ssh root@target 'cat /etc/shadow'` 是合法打靶战果。
+		// 仍用原始 input：hostScanText 自身按 hostScanFieldsSet/hostSkipFields
+		// 做字段感知，content 等正文已被它跳过，无需（也不应）改动。
 		if hostSystemCredentialHit(hostScanText(input)) {
 			return &intercept.Decision{
 				Action:   "deny",
