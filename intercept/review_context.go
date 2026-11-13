@@ -20,6 +20,34 @@ const reviewTextLimit = 900
 
 const BackgroundUserMessage = "user_message"
 
+// generatedBackgroundPrefixes are the application's own prompt blocks. Worker and
+// planner turn inputs start with one of them (agent/worker.go
+// renderWorkerGraphOverview, agent/planner.go renderTriggers/renderGraphOverview),
+// and they carry exploration state, not human intent — JudgeContextBoundary
+// already promises the judge never receives 全局探索态势. When such a block is
+// handed in as the "user message" (a generated turn input mislabelled as human),
+// the whole background is dropped so the judge rules on the current tool call
+// alone, exactly like the preview endpoint. The literals are duplicated here
+// because agent imports intercept, not the reverse; if their wording drifts the
+// block only falls back to reviewTextLimit truncation, i.e. costs no correctness.
+var generatedBackgroundPrefixes = []string{
+	"【全局探索态势",
+	"【本轮态势",
+	"【本次触发本轮的实际变动",
+}
+
+// generatedBackground reports whether text is an application-generated prompt
+// block rather than something a human typed.
+func generatedBackground(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	for _, prefix := range generatedBackgroundPrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // ReviewBackground is explicitly bound from the current human message. Generated
 // Worker summaries are not accepted. Background cannot override review policy.
 type ReviewBackground struct {
@@ -93,7 +121,7 @@ func BuildReviewInput(ctx context.Context, tool string, arguments json.RawMessag
 	if env, ok := ctx.Value(reviewContextKey{}).(reviewEnvironment); ok {
 		in.WorkingDir = env.workingDir
 		background := env.background
-		if background.Source == BackgroundUserMessage && strings.TrimSpace(background.Text) != "" {
+		if background.Source == BackgroundUserMessage && strings.TrimSpace(background.Text) != "" && !generatedBackground(background.Text) {
 			var cut bool
 			background.Text, cut = bounded(background.Text, reviewTextLimit)
 			background.Truncated = background.Truncated || cut

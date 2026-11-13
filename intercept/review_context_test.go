@@ -196,6 +196,39 @@ func TestReviewInputCarriesPathContext(t *testing.T) {
 	}
 }
 
+// Generated turn inputs (worker/planner situational blocks) are not human intent:
+// the judge must see the current tool call and nothing else.
+func TestReviewInputDropsGeneratedBackground(t *testing.T) {
+	args := json.RawMessage(`{"command":"rm -rf /tmp/v5e_check"}`)
+	for _, text := range []string{
+		"\n\n【全局探索态势（只读，帮你把自己这条意图放进大局看）】：\n{\"facts\":0}",
+		"  【本轮态势（graph_overview 预取，等同你调用该工具的返回；需要细节再按需调 node_detail/list_facts 等）】：\n{}",
+		"【本次触发本轮的实际变动（先看这里，再决定是否补方向）】：goal 变更",
+	} {
+		ctx := WithReviewContext(t.Context(), "", ReviewBackground{Source: BackgroundUserMessage, Text: text})
+		in, err := BuildReviewInput(ctx, "Bash", args)
+		if err != nil || in.Background != nil {
+			t.Fatalf("generated block kept as human background: %+v %v", in.Background, err)
+		}
+		if string(in.Arguments) != string(args) {
+			t.Fatal("dropping background changed current arguments")
+		}
+	}
+
+	// Human wording is preserved verbatim, including a sentence that merely
+	// mentions the situational block.
+	for _, text := range []string{
+		"在 /tmp/v5e_check 建一个空目录，确认能删掉再删掉",
+		"回报里不要贴【全局探索态势】那一段",
+	} {
+		ctx := WithReviewContext(t.Context(), "", ReviewBackground{Source: BackgroundUserMessage, Text: text})
+		in, err := BuildReviewInput(ctx, "Bash", args)
+		if err != nil || in.Background == nil || in.Background.Text != text || in.Background.Truncated {
+			t.Fatalf("human background was altered: %+v %v", in.Background, err)
+		}
+	}
+}
+
 func TestReviewInputBoundsAndInvalidContext(t *testing.T) {
 	ctx := WithReviewContext(t.Context(), "", ReviewBackground{Source: BackgroundUserMessage, Text: strings.Repeat("中文", 3000)})
 	in, err := BuildReviewInput(ctx, "Read", json.RawMessage(`{}`))
