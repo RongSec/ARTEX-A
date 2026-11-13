@@ -1528,7 +1528,7 @@ CREATE TABLE IF NOT EXISTS project_insights (
 );
 CREATE INDEX IF NOT EXISTS idx_pins_proj ON project_insights(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pins_kw   ON project_insights USING GIN(keywords);
-CREATE INDEX IF NOT EXISTS idx_pins_status ON project_insights(project_id, status, created_at DESC);
+-- 注：idx_pins_status 依赖 status 列，存量库上必须在下方 ALTER ADD COLUMN 之后建，见「存量库补列」段末。
 
 -- reader 产出：跨项目洞察。V5-A 起可按资产键注入 planner——
 -- asset_keys 是与 project_index.asset_keys/planner 命中键同源的归一化键集合，
@@ -1546,8 +1546,7 @@ CREATE TABLE IF NOT EXISTS global_insights (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_gins_time ON global_insights(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_gins_keys ON global_insights USING GIN(asset_keys);
-CREATE INDEX IF NOT EXISTS idx_gins_status ON global_insights(status, created_at DESC);
+-- 注：idx_gins_keys 依赖 asset_keys 列，存量库上必须在下方 ALTER ADD COLUMN 之后建，见「存量库补列」段末。
 
 -- 存量库补列（幂等；CREATE 段已含同名列，双写法照 projects/finding_evidence_images 先例）。
 ALTER TABLE project_insights ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
@@ -1563,6 +1562,12 @@ ALTER TABLE project_insights ADD CONSTRAINT project_insights_status_check
 ALTER TABLE global_insights DROP CONSTRAINT IF EXISTS global_insights_status_check;
 ALTER TABLE global_insights ADD CONSTRAINT global_insights_status_check
     CHECK (status IN ('active','rejected','superseded'));
+-- 依赖新列（status/asset_keys）的索引必须在补列之后创建：存量库上
+-- CREATE TABLE IF NOT EXISTS 是空操作，表里还没有这些列，前置建索引会
+-- 直接报 42703 导致启动失败（V5 部署实测踩到，全新库不暴露）。
+CREATE INDEX IF NOT EXISTS idx_gins_keys ON global_insights USING GIN(asset_keys);
+CREATE INDEX IF NOT EXISTS idx_pins_status ON project_insights(project_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_gins_status ON global_insights(status, created_at DESC);
 
 -- =====================================================================
 -- P. 报告中心（artex-hs F4，T15）：报告模板 / 生成 job+历史 / 全局设置
