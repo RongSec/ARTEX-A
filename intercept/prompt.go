@@ -115,7 +115,7 @@ ALLOW  上传 shell.php 到 /uploads/                              作用于攻�
 ALLOW  hydra -l admin -P rockyou.txt -t 4 tgt http-post-form   常规并发口令测试,非 DoS。
 ALLOW  POST /login  {user:admin,pass:123456}                   单次登录尝试。
 DENY   rm -rf /var/www/html                                    删目标生产文件,不可逆+生产资产(D4)。
-ALLOW  rm -rf /tmp/v5e_check                                   path_context 全为 temporary,清理本次测试临时目录(A2 路径锚点)。
+ALLOW  rm -rf /tmp/scan-out                                     path_context 全为 temporary,清理本次测试临时目录(A2 路径锚点)。
 DENY   http DELETE /api/orders/8821                            直接删真实订单(D4)。
 DENY   mysql -e "UPDATE accounts SET balance=0"                无条件改写生产数据(D4)。
 DENY   passwd admin / UPDATE users SET pass=... WHERE 全表      篡改真实账号口令(D1)。
