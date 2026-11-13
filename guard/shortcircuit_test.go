@@ -120,7 +120,8 @@ func TestShortCircuitHostSystemCredentialDeny(t *testing.T) {
 		{"裸 cat shadow", "Bash", `{"command":"cat /etc/shadow"}`},
 		{"more sudoers", "Bash", `{"command":"more /etc/sudoers"}`},
 		{"sudoers.d 目录", "Bash", `{"command":"ls /etc/sudoers.d"}`},
-		{"root ssh 目录", "Bash", `{"command":"ls /root/.ssh"}`},
+		// V6-FP：列目录本体 `ls /root/.ssh[/]` 是只读侦察、不泄露私钥，改为
+		// 放行（覆盖见 shortcircuit_falsepositive_test.go）；此处只拦子路径文件。
 		{"root 私钥", "Bash", `{"command":"cat /root/.ssh/id_rsa"}`},
 		{"head 主机私钥", "Bash", `{"command":"head /etc/ssh/ssh_host_rsa_key"}`},
 		{"ed25519 主机私钥", "Bash", `{"command":"cat /etc/ssh/ssh_host_ed25519_key"}`},
@@ -173,6 +174,8 @@ func TestShortCircuitHostCredentialRemoteExempt(t *testing.T) {
 		{"shadowx 非路径", `{"command":"cat /etc/shadowx"}`},
 		{"主机公钥放行", `{"command":"cat /etc/ssh/ssh_host_rsa_key.pub"}`},
 		{"靶机战果文档标题", `{"command":"grep -c root notes.md"}`},
+		{"V6-FP 列 root ssh 目录", `{"command":"ls -la /root/.ssh/"}`},
+		{"V6-FP 列 root ssh 目录(无尾斜杠)", `{"command":"ls /root/.ssh"}`},
 	}
 	for _, c := range allow {
 		if dec := shortCircuit("Bash", []byte(c.in)); dec != nil {
@@ -201,7 +204,9 @@ func TestShortCircuitBarePlatformConfigDeny(t *testing.T) {
 		{"head 首参", `{"command":"head .jwt"}`},
 		{"strings 首参", `{"command":"strings jwt.key"}`},
 		{"管道后置", `{"command":"cat config.json | grep dsn"}`},
-		{"bash -c 内联", `{"command":"bash -c 'cat config.json'"}`},
+		// V6-FP：前置边界类去掉 `'` 后，`bash -c 'cat config.json'` 里读命令
+		// 紧贴引号、不再是命令位边界，按「宁漏不误伤」取舍漏判（返回 nil）。
+		// 依任务书写进注释，不作失败用例；详见 shortcircuit_falsepositive_test.go。
 		{"转义解码后", `{"command":"cat \u0063onfig.json"}`},
 	}
 	for _, c := range deny {

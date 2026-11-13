@@ -153,8 +153,13 @@ var platformCredentialLooseRe = regexp.MustCompile(
 //     参数位）不拦——按字面执行收窄，宁漏不误伤：worker 工作目录里注入的
 //     配置也可能同名，且打靶取证常引用同名靶机文件（/tmp/x/config.json、
 //     my_config.json 一律放过，见负向用例）。
-//   - 裸名【前】必须是命令边界（行首/空白/引号/命令分隔符），前接 `/` 或
+//   - 裸名【前】必须是命令边界（行首/空白/`;&|(`/反引号），前接 `/` 或
 //     字母数字不命中：`cat /tmp/foo/config.json`、`cat my_config.json` 放过。
+//     V6-FP：边界类【不再含】 `"`/`'` —— `echo "cat config.json" >
+//     /tmp/notes.txt` 里引号内只是被写入的数据，旧类会把它当成读命令起点
+//     误伤。代价是 `bash -c "cat config.json"` / `bash -c 'cat config.json'`
+//     这类读命令紧贴引号的形态会漏判，按「宁漏不误伤」接受（字符串预筛
+//     固有上限，闭合需 shell AST / realpath 级执行前校验）。
 //   - 裸名【后】是词尾边界（行尾/空白/引号/管道重定向等），`cat config.json.bak`
 //     放过（`.` 不在尾类里，RE2 无环视故用消费式；这也意味着
 //     `cat config.json.orig` 这类备份名不拦——备份文件不是活动凭据，接受）。
@@ -167,7 +172,7 @@ var platformCredentialLooseRe = regexp.MustCompile(
 // 调用侧维持不变。已知残留漏判面：shell 变量展开（f=config.json; cat $f）、
 // 引号内换行首置等需 realpath 级执行前校验才闭合（V2 G-02①-b 范畴）。
 var platformConfigBareReadRe = regexp.MustCompile(
-	`(?i)(?:^|[\s"'` + "`" + `;&|(])` +
+	`(?i)(?:^|[\s` + "`" + `;&|(])` +
 		`(?:cat|head|tail|less|more|cp|mv|sed|awk|strings)[\s"'` + "`" + `]+` +
 		`["']?(?:config\.json|\.jwt|jwt\.key)(?:$|[\s"'` + "`" + `;|&)<>{[=,)])`)
 
@@ -453,7 +458,10 @@ const hostPathEnd = `(?:[\s.,:;` + "`" + `"'/&|<>}{)\]}*-]|$)`
 //
 //	/etc/shadow /etc/gshadow            —— 口令哈希（含 shadow-/gshadow- 备份）
 //	/etc/sudoers, /etc/sudoers.d/       —— 提权面配置
-//	/root/.ssh（目录或其下文件）         —— 本机 root SSH 私钥/authorized_keys
+//	/root/.ssh/<子路径>                 —— 本机 root SSH 私钥/authorized_keys
+//	                                     （V6-FP：目录本体 `ls /root/.ssh/`
+//	                                     属只读侦察、不泄露私钥，不再命中；
+//	                                     只有指向目录下具体文件才拦）
 //
 // shadow/sudoers 两条允许【字符间插入空白/分隔符】的变形（`/etc/sh a d o w`、
 // `/etc/s_u_d_o_e_r_s`），因深解码只处理 JSON 转义、对字面插空无效，严谨度
@@ -469,7 +477,7 @@ var hostSystemCredentialRe = regexp.MustCompile(
 		`|` + hostPathStart + `/etc/gshadow` + hostPathEnd +
 		`|` + hostPathStart +
 		`/etc/s[\s._-]*u[\s._-]*d[\s._-]*o[\s._-]*e[\s._-]*r[\s._-]*s(?:\.d)?` + hostPathEnd +
-		`|` + hostPathStart + `/root/\.ssh` + hostPathEnd +
+		`|` + hostPathStart + `/root/\.ssh/[^\s"'` + "`" + `]+` + hostPathEnd +
 		`)`,
 )
 
@@ -484,6 +492,7 @@ var sshHostKeyRe = regexp.MustCompile(
 //
 // 覆盖：ssh/scp/sftp/rsync/nc(ncat)/netcat/proxychains(4/chain) 等远程执行
 // 与传输工具、mysql|psql|mariadb 的 -h/--host 形态、winrm/ansible、
+// docker|podman|kubectl 的 exec 形态（V6-FP：目标容器内读取属合法战果）、
 // 任意 `@<host>`（user@10.1.2.3、root@target，RE2 无环视故消费一个边界
 // 字符，避免邮箱串误判）、以及 `http(s)://` URL（URL host 必为远端；含
 // @IP 的 curl 上传属打靶外传战利品，任务书明列豁免项）。本机平台面已由
@@ -509,6 +518,12 @@ var remoteRefRe = regexp.MustCompile(
 		`|(?:^|[\s"'` + "`" + `;&|(<>$])(?:mysql|psql|mariadb)\b[^\n]*?\s-{1,2}h(?:ost)?[=\s]` +
 		`|@(?:\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9][a-z0-9._-]*[a-z0-9])(?:[:/'"\s)|,;-]|$)` +
 		`|https?://\S` +
+		// V6-FP：容器/编排 exec 形态（`docker exec c cat /etc/shadow`）读的是
+		// 目标容器内的同名文件，属合法战果，整体豁免 host 档。动词必须在
+		// 命令位（复用上面的边界类），避免把 /var/lib/docker/ 这类路径里的
+		// docker 字样误认成远程指代。平台凭据档不吃远程豁免（shortCircuit
+		// 中平台档先于 host 档求值），`docker exec x cat /app/jwt.key` 仍 deny。
+		`|(?:^|[\s"'` + "`" + `;&|(<>$])(?:docker|podman|kubectl)\b[^\n]*?\bexec\b` +
 		`)`,
 )
 
