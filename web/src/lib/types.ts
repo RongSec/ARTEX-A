@@ -1626,11 +1626,11 @@ export interface Project {
   status: "active" | "archived";
   owner: string;
   concurrency: number; // 项目内批量任务并发数：1=严格串行
-  observer_enabled: boolean; // V6 统一阅读者主开关（项目内观察+跨项目串联）
+  observer_enabled: boolean; // V6-DUAL 跨任务（项目内）阅读开关：项目洞察写/触发/注入
   // T18 项目设置扩展三字段。report_template_id=null → 走默认模板链。
   report_template_id: number | null;
   auto_report: boolean; // 整项目收官自动写报告（默认关）
-  reader_enabled: boolean; // 兼容别名：与 observer_enabled 恒同值（后端镜像写）
+  reader_enabled: boolean; // V6-DUAL 跨项目阅读开关：跨项目聚合/来源校验/注入。与 observer_enabled 互相独立
   created_at: string;
   updated_at: string;
 }

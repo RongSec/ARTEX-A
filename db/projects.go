@@ -16,12 +16,12 @@ type Project struct {
 	Status          string `json:"status"` // active | archived
 	Owner           string `json:"owner"`
 	Concurrency     int    `json:"concurrency"`      // 项目内批量任务并发数（1=串行）
-	ObserverEnabled bool   `json:"observer_enabled"` // B3 观察者总开关（默认关）
+	ObserverEnabled bool   `json:"observer_enabled"` // 跨任务/项目内阅读开关（scope='project'；默认关）
 	// T18 项目设置扩展三列。ReportTemplateID=nil → 走默认模板链；指针区分
 	// 「未设置」与「显式 0」，PATCH 语义与其余两列一致。
 	ReportTemplateID *int64    `json:"report_template_id"`
 	AutoReport       bool      `json:"auto_report"`    // 整项目收官自动写报告（默认关）
-	ReaderEnabled    bool      `json:"reader_enabled"` // 允许跨项目 reader 聚合本项目（默认关）
+	ReaderEnabled    bool      `json:"reader_enabled"` // 跨项目阅读开关（scope='cross' 聚合/来源校验/注入；默认关）
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 }
@@ -92,14 +92,14 @@ func (d *DB) CreateProject(in CreateProjectInput) (*Project, error) {
 	if in.ReportTemplateID != nil && *in.ReportTemplateID > 0 {
 		tmpl = *in.ReportTemplateID
 	}
-	// V6-U4 统一阅读者：observer_enabled 是主开关、reader_enabled 是兼容别名，
-	// 两列镜像写同值（任一入参为 true 即开，兼容只传 reader 的旧调用路径）。
-	enabled := in.ObserverEnabled || in.ReaderEnabled
+	// V6-DUAL：两个尺度各自独立开关，各写各的列，互不镜像——
+	//   observer_enabled = 跨任务/项目内（scope='project' 洞察的写/触发/注入）
+	//   reader_enabled   = 跨项目（scope='cross' 的聚合/来源校验/注入）
 	return scanProject(d.QueryRow(`
 INSERT INTO projects(name, description, owner, concurrency, observer_enabled, report_template_id, auto_report, reader_enabled)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING `+projectCols, name, strings.TrimSpace(in.Description), strings.TrimSpace(in.Owner),
-		normalizeProjectConcurrency(concurrency), enabled, tmpl, in.AutoReport, enabled))
+		normalizeProjectConcurrency(concurrency), in.ObserverEnabled, tmpl, in.AutoReport, in.ReaderEnabled))
 }
 
 // GetProject 返回单个项目；不存在时返回 ErrProjectNotFound。
@@ -223,20 +223,8 @@ type UpdateProjectPatch struct {
 // UpdateProject 应用局部更新并返回新行。status 非法值返回错误（DDL 有 CHECK，
 // 提前在 server 侧挡掉好过让 PG 抛 23514）。
 func (d *DB) UpdateProject(id int64, patch UpdateProjectPatch) (*Project, error) {
-	// V6-U4 统一阅读者：PATCH 只要动了任一开关字段，就把两列镜像写成同值
-	// （observer 主开关 + reader 兼容别名）。放在数据层而非 HTTP 层，保证所有
-	// 调用路径两列恒等，API 仍接受两个字段名、RETURNING 返回两字段同值。
-	if patch.ObserverEnabled != nil || patch.ReaderEnabled != nil {
-		enabled := false
-		if patch.ObserverEnabled != nil {
-			enabled = *patch.ObserverEnabled
-		}
-		if patch.ReaderEnabled != nil {
-			enabled = enabled || *patch.ReaderEnabled
-		}
-		patch.ObserverEnabled = &enabled
-		patch.ReaderEnabled = &enabled
-	}
+	// V6-DUAL：两层开关各自独立——只动了哪个字段就只写哪列，绝不把另一列
+	// 一并覆盖（V6-U4 的镜像写已撤销）。API 侧同样按「键出现才置指针」。
 	if patch.Status != nil {
 		switch *patch.Status {
 		case "active", "archived":

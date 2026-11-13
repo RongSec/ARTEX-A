@@ -15,7 +15,10 @@ package server
 //
 // 工具经 SeedTool 入库 + AddAgentToToolBinding 绑定到 reader；触发运行策略
 // serial+merge=all（整波合并）；tool_base='none'（只读红线，两 key 都保留）。
-// 真正的开关在 projects.observer_enabled（V6-U4 起与 reader_enabled 镜像同值）。
+// 两个尺度各自独立开关（V6-DUAL）：projects.observer_enabled 管跨任务/项目内
+// 那一路（write_project_insight / on_project_graph / 项目段注入），
+// projects.reader_enabled 管跨项目那一路（read_all_project_insights /
+// write_global_insight / 跨项目段注入）。同一个 agent、两把闸。
 
 import (
 	"context"

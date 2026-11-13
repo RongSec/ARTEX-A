@@ -260,3 +260,55 @@ func TestInsightQuota(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildInsightBodyDualSwitch 守 V6-DUAL：跨任务（项目内）与跨项目是两个
+// 独立尺度、两道独立闸门，绝不归一回一个开关（纯函数，无库）。
+//   - observer=true/reader=false → 只有项目段，无【跨项目】；
+//   - observer=false/reader=true → 只有跨项目段；
+//   - 两者都 false → 空（三停之「注入停」）；
+//   - 两者都 true → 两段都有（项目段在前、跨项目段在后）。
+func TestBuildInsightBodyDualSwitch(t *testing.T) {
+	projectRows := []db.Insight{{Content: "项目经验：同项目内可复用", SourceTaskID: 1}}
+	crossRows := []db.GlobalInsight{{
+		ID: 9, Content: "跨项目经验：别处已打通", Status: db.InsightStatusActive,
+		AssetKeys: []string{"canal.example.com:8080"},
+	}}
+	m := insightMatch{Anchors: []string{"canal.example.com:8080"}}
+
+	cases := []struct {
+		name                   string
+		observerOn, readerOn   bool
+		wantProject, wantCross bool
+	}{
+		{"跨任务开/跨项目关", true, false, true, false},
+		{"跨任务关/跨项目开", false, true, false, true},
+		{"两者都关", false, false, false, false},
+		{"两者都开", true, true, true, true},
+	}
+	for _, c := range cases {
+		tctx := &db.TaskInsightContext{ProjectID: 1, ObserverOn: c.observerOn, ReaderOn: c.readerOn}
+		body, scope, crossN := buildInsightBody(tctx, m, projectRows, crossRows, nil)
+		gotProject := strings.Contains(body, "项目经验：同项目内可复用")
+		gotCross := strings.Contains(body, "【跨项目】")
+		if gotProject != c.wantProject || gotCross != c.wantCross {
+			t.Errorf("%s: project=%v cross=%v want project=%v cross=%v body=%q",
+				c.name, gotProject, gotCross, c.wantProject, c.wantCross, body)
+		}
+		if c.wantCross {
+			if scope != insightCrossScopeAnchored || crossN != 1 {
+				t.Errorf("%s: scope=%q crossN=%d want anchored/1", c.name, scope, crossN)
+			}
+		} else if scope != "" || crossN != 0 {
+			t.Errorf("%s: 跨项目关时应无档位注入，got scope=%q crossN=%d", c.name, scope, crossN)
+		}
+		if !c.wantProject && !c.wantCross && body != "" {
+			t.Errorf("%s: 两闸全关应零注入，got %q", c.name, body)
+		}
+		if c.wantProject && c.wantCross {
+			lines := strings.Split(strings.TrimSpace(body), "\n")
+			if len(lines) != 2 || !strings.HasPrefix(lines[0], "- 来源任务#") || !strings.HasPrefix(lines[1], "- 【跨项目】") {
+				t.Errorf("%s: 应为项目段在前、跨项目段在后，got %q", c.name, body)
+			}
+		}
+	}
+}

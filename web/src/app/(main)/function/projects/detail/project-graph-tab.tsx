@@ -75,8 +75,8 @@ export function ProjectGraphTab({ project, onChanged }: { project: Project; onCh
   const [auto, setAuto] = React.useState(true);
   const [rebuilding, setRebuilding] = React.useState(false);
 
-  // V6 统一阅读者本地镜像：observer_enabled 主开关(reader_enabled 兼容别名同值)，
-  // 工具条单开关即时反馈，PATCH 成功后同步父级 detail。
+  // 跨任务（项目内）开关的本地镜像：只动 observer_enabled 这一列（V6-DUAL：
+  // 跨项目阅读是另一个独立开关，工具条绝不连带改它）；PATCH 成功后同步父级 detail。
   const [observer, setObserver] = React.useState(project.observer_enabled);
   React.useEffect(() => setObserver(project.observer_enabled), [project.observer_enabled]);
 
@@ -121,14 +121,14 @@ export function ProjectGraphTab({ project, onChanged }: { project: Project; onCh
     }
   }
 
-  // V6 统一阅读者：observer_enabled 主开关 + reader_enabled 兼容别名同值提交
-  // （后端 Create/Update 会镜像写两列，这里显式传两字段保旧版后端兼容）。
+  // V6-DUAL：这里只切「跨任务阅读（项目内）」= observer_enabled 单列；
+  // 跨项目阅读（reader_enabled）在项目设置里单独开关，不随这里联动。
   async function toggleObserver(on: boolean) {
     const prev = observer;
     setObserver(on); // 乐观翻转；失败回滚
     try {
-      await api.updateProject(project.id, { observer_enabled: on, reader_enabled: on });
-      toast.success(on ? "已开启统一阅读者（项目内观察与跨项目串联生效；投影本就常开）" : "已关闭统一阅读者（停止触发与注入；大图投影保留）");
+      await api.updateProject(project.id, { observer_enabled: on });
+      toast.success(on ? "已开启跨任务阅读（项目内触发与洞察注入生效；投影本就常开）" : "已关闭跨任务阅读（停止项目内触发与注入；大图投影保留）");
       onChanged();
     } catch (e) {
       setObserver(prev);
@@ -147,9 +147,9 @@ export function ProjectGraphTab({ project, onChanged }: { project: Project; onCh
             {groups.length} 任务 · {totalNodes} 节点
           </span>
           <Separator orientation="vertical" className="h-4" />
-          <label className="flex items-center gap-2 text-xs" htmlFor="pg-unified">
-            <Switch id="pg-unified" checked={observer} onCheckedChange={toggleObserver} />
-            统一阅读者
+          <label className="flex items-center gap-2 text-xs" htmlFor="pg-observer">
+            <Switch id="pg-observer" checked={observer} onCheckedChange={toggleObserver} />
+            跨任务阅读
           </label>
           <span className="text-muted-foreground text-xs">并发 {project.concurrency}</span>
           <div className="ml-auto flex items-center gap-2">

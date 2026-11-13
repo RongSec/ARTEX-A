@@ -206,6 +206,19 @@ func TestProjectInsightResolverInjectsCrossProject(t *testing.T) {
 	if !strings.Contains(got, "项目经验：该主机历史上有未认证后台") {
 		t.Errorf("关掉 reader_enabled 不该影响 observer 洞察: %q", got)
 	}
+
+	// V6-DUAL 反向：observer_enabled=false / reader_enabled=true → 只剩跨项目
+	// 段（两个尺度各自开关，不是同一把闸）。
+	if _, err := pg.Exec(`UPDATE projects SET observer_enabled=false, reader_enabled=true WHERE id=$1`, pid); err != nil {
+		t.Fatal(err)
+	}
+	got = s.projectInsightResolverFor()(taskID)
+	if strings.Contains(got, "项目经验：该主机历史上有未认证后台") {
+		t.Errorf("observer_enabled=false 时不该注入项目洞察: %q", got)
+	}
+	if !strings.Contains(got, "【跨项目】") || !strings.Contains(got, "跨项目经验：同资产在另一项目已打通该入口") {
+		t.Errorf("reader_enabled=true 时跨项目条目应仍在: %q", got)
+	}
 }
 
 // createV5CInsightFixture 造「项目 + 任务」并注册清理；返回 project id 与数字

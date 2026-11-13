@@ -1419,8 +1419,8 @@ export const api = {
   // createProject 建项目。四开关字段（observer_enabled/report_template_id/
   // auto_report/reader_enabled）后端 create 已收齐（方案 A 对齐 PATCH 字段集）；
   // report_template_id 省略/null=走默认模板链。
-  // V6 统一阅读者：observer_enabled 是主开关、reader_enabled 是兼容别名。
-  // 调用方提交时两字段应同值（后端 Create/Update 镜像写两列同值并返回同值）。
+  // V6-DUAL：observer_enabled（跨任务/项目内）与 reader_enabled（跨项目）是
+  // 两个独立开关——各传各的值、后端各写各的列、各自回显，互不镜像。
   createProject: (input: {
     name: string;
     description?: string;

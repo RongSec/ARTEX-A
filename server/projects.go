@@ -138,6 +138,8 @@ func (m *Manager) EnqueueTaskProjectBatch(id string) error {
 // projectsCreate 建项目。body {name, description?, owner?, concurrency?,
 // observer_enabled?, report_template_id?, auto_report?, reader_enabled?}
 // （后三字段 T18，observer_enabled T19 方案 A 补齐=与 PATCH 字段集对齐；缺省全关）。
+// V6-DUAL：observer_enabled（跨任务/项目内）与 reader_enabled（跨项目）各自
+// 独立生效、各自回显，互不镜像。
 func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name             string `json:"name"`

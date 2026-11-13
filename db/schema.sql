@@ -1436,10 +1436,10 @@ CREATE TABLE IF NOT EXISTS projects (
                         CHECK (status IN ('active','archived')),
     owner             TEXT NOT NULL DEFAULT '',             -- 负责人，可留空
     concurrency       INTEGER NOT NULL DEFAULT 2,           -- 项目内批量任务并发数：1=严格串行，2=同时两任务
-    observer_enabled  BOOLEAN NOT NULL DEFAULT false,       -- 观察者开关：默认关闭。[T12 定稿]只管两件事：触发 observer + 注入 insight；project_index 投影常开（大图 tab 数据源，关着也能看）
+    observer_enabled  BOOLEAN NOT NULL DEFAULT false,       -- 跨任务（项目内）阅读开关：默认关闭。管 scope='project' 洞察的写入/图变更触发/项目段注入；project_index 投影常开（大图 tab 数据源，关着也能看）。与 reader_enabled 互相独立（V6-DUAL）
     report_template_id BIGINT,                             -- 项目默认报告模板（report_templates.id）；NULL=走默认模板链。无 FK：模板行允许被删（view-time/建 job 时判缺回退默认，照 tasks.template_id 同款策略）
     auto_report       BOOLEAN NOT NULL DEFAULT false,      -- 整项目收官自动写报告：默认关闭。任务终态钩子查此开关决定是否建 project 级报告 job（T18）
-    reader_enabled    BOOLEAN NOT NULL DEFAULT false,      -- 允许跨项目 reader 聚合本项目洞察：默认关闭=行为等于基线（T18）
+    reader_enabled    BOOLEAN NOT NULL DEFAULT false,      -- 跨项目阅读开关：默认关闭=行为等于基线（T18）。管 scope='cross' 洞察的聚合/来源校验/跨项目段注入；与 observer_enabled 互相独立（V6-DUAL）
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -1635,10 +1635,17 @@ BEGIN
     FROM _v6_pins_map m
     WHERE pi.scope = 'cross' AND pi.superseded_by = m.old_id;
 
-    -- 语义 A（一开全开，用户要测统一阅读者的作用）：存量项目把兼容别名
-    -- reader_enabled 对齐到主开关 observer_enabled。放在一次性迁移里，之后
-    -- 用户经 API 改开关会镜像写两列，不会被这里覆盖。
-    UPDATE projects SET reader_enabled = observer_enabled;
+    -- V6-DUAL（撤销 V6-U4 的「统一阅读者单开关」）：两个尺度恢复为各自独立
+    -- 的开关，两列不再对齐/镜像——observer_enabled 管跨任务（项目内），
+    -- reader_enabled 管跨项目。因此这里**刻意不写** reader_enabled：
+    -- 从 V5 及更早直接升级的库保留用户原本独立设置的 reader_enabled 值。
+    --
+    -- 存量数据（V6-U4/U5 镜像期）恢复规则：镜像期 Create/Update 会把两列写成
+    -- 同值，历史意图已不可恢复（无法区分「本来就都想开」与「被镜像写出来的」），
+    -- 故不做任何自动改写，一律保持现值：
+    --   - 两列相等 → 保持 reader_enabled 现值（不擅自关跨项目阅读）；
+    --   - 两列不等 → 保持现状（用户已按独立开关改过）。
+    -- 需要收紧的项目由操作者在项目设置里单独关掉对应开关。
 
     -- 归档留回滚：改名而不 DROP；同时释放 serial sequence 名，避免下次启动
     -- CREATE TABLE IF NOT EXISTS global_insights 重建空表时 sequence 撞名报错。
