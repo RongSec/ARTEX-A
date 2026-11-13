@@ -1,20 +1,21 @@
 package server
 
-// observer / reader 的宿主工具与一次性 seed（artex-hs T11，架构 §2.2/§2.3）。
+// 统一阅读者的宿主工具与一次性 seed（artex-hs T11 / V6-U3）。
 //
-// observer（跨任务观察者）：由 on_project_graph 触发（fireProjectGraph），拿
-// 到的是「某项目本批图变更清单」。工具四件：query_project_index（读投影）、
-// get_task_graph_digest（下钻单任务图，复用 graph_overview 语义）、
-// write_project_insight（写项目洞察）、push_task_hint（给目标任务插提示并
-// 唤醒其 planner——复用原版 add_task_hint 的 delegateToTask 路径，落库/唤醒
-// 与人工插话逐字节同路）。
+// V6-U3 把 observer（项目内跨任务观察）与 reader（跨项目串联）两条独立链合成
+// 一套：一个 agent（主 key=reader，收官 nudge 硬编码）、一条 trigger
+// （OnProjectGraph + IntervalSec 双条件）、一份 prompt（按触发前缀判别作用域）。
+// observer agent 行保留作只读别名，但不再新建触发（seedObserverAgent 早退）。
 //
-// reader（跨项目阅读者）：interval 触发（1800s），读全项目洞察串联成全局
-// 洞察。工具两件：read_all_project_insights / write_global_insight。
+// 六工具名不变：observer 四件（query_project_index / get_task_graph_digest /
+// write_project_insight / push_task_hint）+ reader 两件（read_all_project_insights /
+// write_global_insight）。两个聚合出口 projectObserverTools()/
+// projectReaderTools() 保持原样（装配单测按数量断言），统一绑定用
+// unifiedReaderToolKeys（六件全绑到 reader）。
 //
-// 默认全关：projects.observer_enabled 默认 false（无事件可触发）；reader 的
-// 触发器行建好但 enabled=false。工具经 SeedTool 入库 + AddAgentToToolBinding
-// 绑定到各自 agent（照 reporter 的 bind 方式），其他 agent 不可见。
+// 工具经 SeedTool 入库 + AddAgentToToolBinding 绑定到 reader；触发运行策略
+// serial+merge=all（整波合并）；tool_base='none'（只读红线，两 key 都保留）。
+// 真正的开关在 projects.observer_enabled（V6-U4 起与 reader_enabled 镜像同值）。
 
 import (
 	"context"
@@ -351,6 +352,15 @@ func (s *Server) projectReaderTools() []actool.CoreTool {
 	}
 }
 
+// unifiedReaderToolKeys 是统一阅读者 agent（key=reader）绑定的全部六工具
+// （V6-U3）：observer 四件 + reader 两件，工具名一律不变。两个聚合出口
+// projectObserverTools()/projectReaderTools() 仍需按原数量分别服务装配链，
+// 故合并只发生在「绑定集合」这一层，不动那两个函数。
+var unifiedReaderToolKeys = []string{
+	"query_project_index", "get_task_graph_digest", "write_project_insight", "push_task_hint",
+	"read_all_project_insights", "write_global_insight",
+}
+
 // ---------- seed（照 reporter 样板 orchestration.go:735） ----------
 
 // observerPrompt 是观察者 system prompt 的默认正文（SeedPromptIfEmpty 播种，
@@ -386,14 +396,55 @@ const readerPrompt = "你是【跨项目阅读者】：只读与总结，禁止�
 	"宁少勿滥：单项目内部的事已由观察者处理，没有跨项目资产信号就空转结束，不要写空洞总结。"
 
 // observerGraphMessage 是 on_project_graph 触发器的用户消息模板（scheduler
-// 会在其后追加渲染好的变更清单正文）。
+// 会在其后追加渲染好的变更清单正文）。V6 起单 trigger 用下方带前缀的
+// unifiedGraphMessage；本常量保留给 observer 别名 seed 的回退路径。
 const observerGraphMessage = "项目探索图发生了新变更，请依职责观察。"
 
-// seedObserverAgent 预置「跨任务观察者」自定义 agent（builtin=false，可在
-// UI 编辑/删除）：绑定投影四工具 + on_project_graph 触发器（一次性 flag；
-// 用户删掉后不重建）。默认惰性：无项目开 observer_enabled 时永远没有事件，
-// 触发器 enabled=true 只是「机制就绪」，真正的开关在 projects.observer_enabled。
+// V6-U3 统一阅读者：单 trigger 双条件的两个消息前缀。图变更触发带
+// 【scope=project】，定时触发带【scope=cross】——readerUnifiedPrompt 据此判别
+// 本轮做「项目内观察」还是「跨项目串联」。一条 trigger 同时开两条件，
+// scheduler 的 fireProjectGraph/fireIntervals 各认 OnProjectGraph/IntervalSec
+// （last_projgraph_id 水位与 last_fire 两套状态独立，不串）。
+const unifiedGraphMessage = "【scope=project】项目探索图发生了新变更，请依职责观察。"
+const unifiedIntervalMessage = "【scope=cross】定时跨项目阅读：读各项目洞察，串联跨项目相似面。"
+
+// unifiedReaderTrigger 构造统一阅读者的【唯一】触发器行：双条件 + enabled=true。
+// seedReaderAgent（全新库建行）与 unifyReaderAgent（存量库收敛）共用，口径单源。
+func unifiedReaderTrigger() *db.AgentTrigger {
+	return &db.AgentTrigger{
+		AgentKey: "reader", Enabled: true, OnProjectGraph: true, IntervalSec: 1800,
+		ProjectGraphMessage: unifiedGraphMessage,
+		IntervalMessage:     unifiedIntervalMessage,
+	}
+}
+
+// readerUnifiedPrompt 是统一阅读者（单 agent/单 trigger）的默认正文：把 observer
+// 五步与 reader 跨项目三步合成一份，用触发消息前缀判别本轮作用域。
+// 旧默认 readerPromptV1（V4-E 之前）与 readerPrompt（V4-E 资产优先版）保留作
+// upgradeReaderPrompt 的「逐字节比对旧默认才升级」基准——用户手改的一律不覆盖。
+const readerUnifiedPrompt = "你是【统一阅读者】：只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
+	"触发时机：项目探索图变更（图变更触发）或定时兜底（每 30 分钟一轮）；一条触发器同时挂这两个条件。\n" +
+	"【先看触发消息前缀判别本轮作用域】\n" +
+	"· 【scope=project】（项目图变更，消息里还带本批变更清单）：做项目内跨任务观察——\n" +
+	"  1) query_project_index 总览全项目投影（可按 kinds/severities/asset_keys 过滤）；\n" +
+	"  2) 从变更清单里的 task_id/kind 定位变更点，必要时 get_task_graph_digest 下钻该任务完整探索图；\n" +
+	"  3) 与其他任务投影比对——同 CMS/同组件同版本/同类漏洞入口都是高价值借鉴信号；\n" +
+	"  4) 确有可借鉴处用 write_project_insight 落库（短、事实性、可执行，keywords 必带命中键）；\n" +
+	"  5) 仅当某目标任务【当下正需要】该信息才 push_task_hint 提醒（每轮最多 2 条，宁少勿滥）。\n" +
+	"· 【scope=cross】（定时触发）：做跨项目串联——\n" +
+	"  1) read_all_project_insights 拿本轮输入，【先看 cross_project_assets】——它已 join 好「同一资产/组件出现在 ≥2 个项目」；为空即无跨项目信号，直接空转结束；\n" +
+	"  2) cross_project_assets 非空时围绕这些行写全局洞察，点名是哪个资产、涉及哪几个项目、同一资产上的同类漏洞面该搬到哪；\n" +
+	"  3) 确有串联价值才 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
+	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。"
+
+// seedObserverAgent 是 V6 之前的「跨任务观察者」seed（回退路径保留）。
+// V6-U3 起 observer 退化为只读别名：收敛完成后（reader_unified_v1 置位）
+// 一律早退，不再新建 agent/触发器；收官 nudge 硬编码的主 key 是 reader，
+// 工具/触发器/prompt 全归它。存量库里已存在的 observer agent 行保留不动。
 func (s *Server) seedObserverAgent() {
+	if v, _, _ := s.m.pg.GetSetting(readerUnifiedFlag); v == "true" {
+		return
+	}
 	const flag = "observer_agent_seed_v1"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
@@ -436,8 +487,10 @@ func (s *Server) seedObserverAgent() {
 	log.Printf("[observer] 已预置「跨任务观察者」agent + 项目图变更触发器")
 }
 
-// seedReaderAgent 预置「跨项目阅读者」自定义 agent：绑定两工具，触发器行
-// 建好但【enabled=false】（间隔 1800s）——跨项目读写默认关死，用户手动开。
+// seedReaderAgent 预置「统一阅读者」自定义 agent（V6-U3）：绑定六工具 +
+// 单条双条件触发器（OnProjectGraph + IntervalSec=1800 + enabled=true）。
+// 一次性 flag 保护；存量库的旧 reader（只绑两工具/触发器 enabled=false）
+// 由紧随其后的 unifyReaderAgent 收敛，本函数因自己的 flag 已置位会早退。
 func (s *Server) seedReaderAgent() {
 	const flag = "reader_agent_seed_v1"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
@@ -448,37 +501,112 @@ func (s *Server) seedReaderAgent() {
 	if exist, _ := s.m.pg.GetAgentByKey("reader"); exist != nil {
 		return
 	}
-	a, err := s.m.pg.CreateAgent("reader", "跨项目阅读者",
-		"跨项目洞察串联：定时读各项目的观察者洞察，发现跨项目重复的同类面写成全局洞察。默认停用，需在触发器页手动启用。")
+	a, err := s.m.pg.CreateAgent("reader", "统一阅读者",
+		"统一阅读者：项目内观察(图变更触发)与跨项目串联(定时触发)共用一个 agent、一条双条件触发器。读全项目投影/单任务图、写项目洞察、必要时提醒任务；定时读跨项目资产信号、写跨项目洞察。")
 	if err != nil {
 		log.Printf("[reader] 创建 agent 失败: %v", err)
 		return
 	}
-	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerPrompt); err != nil {
+	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPrompt); err != nil {
 		log.Printf("[reader] seed prompt 失败: %v", err)
 	}
-	if err := s.m.pg.SetAgentTriggerBehavior("reader", "serial", "all", 1); err != nil {
+	// serial+merge=all：整波图变更合并成一次会话（observer 原策略），max_parallel=2。
+	if err := s.m.pg.SetAgentTriggerBehavior("reader", "serial", "all", 2); err != nil {
 		log.Printf("[reader] 设置触发运行策略失败: %v", err)
 	}
-	if err := s.m.pg.AddAgentToToolBinding("reader", []string{
-		"read_all_project_insights", "write_global_insight",
-	}); err != nil {
+	if err := s.m.pg.AddAgentToToolBinding("reader", unifiedReaderToolKeys); err != nil {
 		log.Printf("[reader] 绑定工具失败: %v", err)
 	}
-	// 触发器：interval 1800s，enabled=false（默认不开——拍板：reader 全局默认关）。
-	if _, err := s.m.pg.CreateTrigger(&db.AgentTrigger{
-		AgentKey: "reader", Enabled: false, IntervalSec: 1800,
-		IntervalMessage: "定时跨项目阅读：读各项目洞察，串联跨项目相似面。",
-	}); err != nil {
-		log.Printf("[reader] 创建触发器失败: %v", err)
+	if _, err := s.m.pg.CreateTrigger(unifiedReaderTrigger()); err != nil {
+		log.Printf("[reader] 创建双条件触发器失败: %v", err)
 	}
-	log.Printf("[reader] 已预置「跨项目阅读者」agent + 定时触发器(默认停用)")
+	log.Printf("[reader] 已预置「统一阅读者」agent + 单条双条件触发器(on_project_graph+interval, enabled)")
 }
 
-// seedProjectTools 把 observer/reader 六工具 SeedTool 入库（首插生效），并
-// 依次跑两 agent 的 seed。由 seedOrchestrationTools 末尾调用——agent 绑定要
-// 求工具行先存在（reporter 同款顺序依赖）。绑定不给 auto/planner：跨任务
-// 读图+写 hint 是观察者特权，最小暴露面。
+// readerUnifiedFlag 是「统一阅读者收敛已完成」的一次性标记（settings 表）。
+// 双重用途：unifyReaderAgent 自己只跑一次；seedObserverAgent 见它即早退
+// （observer 不再新建 agent/触发器）。
+const readerUnifiedFlag = "reader_unified_v1"
+
+// unifyReaderAgent 把存量库的两条独立链收敛成一条（V6-U3），一次性执行：
+//   - reader 补绑六工具（AddAgentToToolBinding 幂等 append）；
+//   - 触发器：先去重（reader 名下只留一条），再执行裁决指定的
+//     UPDATE agent_triggers SET agent_key='reader' WHERE agent_key='observer'，
+//     最后合并成一条双条件 enabled=true 的 trigger，删掉多余行；
+//   - prompt 升级交给 upgradeReaderPrompt（逐字节比对旧默认 + 新 flag）。
+//
+// 全新库里 seedReaderAgent 已建好双条件 trigger/六工具/unified prompt，
+// 本函数跑起来是幂等 no-op 后置 flag；不覆盖用户手改。
+func (s *Server) unifyReaderAgent() {
+	pg := s.m.pg
+	if pg == nil {
+		return
+	}
+	if v, _, _ := pg.GetSetting(readerUnifiedFlag); v == "true" {
+		return
+	}
+	defer func() { _ = pg.SetSetting(readerUnifiedFlag, "true") }()
+
+	if err := pg.AddAgentToToolBinding("reader", unifiedReaderToolKeys); err != nil {
+		log.Printf("[reader-unify] 补绑六工具失败: %v", err)
+	}
+
+	// ① 先去重：reader 名下只保留第一条，删掉多余重复触发行。
+	rdr, err := pg.ListTriggersFor("reader")
+	if err != nil {
+		log.Printf("[reader-unify] 读 reader 触发器失败: %v", err)
+		return
+	}
+	for i := 1; i < len(rdr); i++ {
+		if err := pg.DeleteTrigger(rdr[i].ID); err != nil {
+			log.Printf("[reader-unify] 删除重复 reader 触发器 %d 失败: %v", rdr[i].ID, err)
+		}
+	}
+	// ② 裁决指定 SQL：observer 的触发行归到 reader 主 key。
+	if _, err := pg.Exec(`UPDATE agent_triggers SET agent_key='reader' WHERE agent_key='observer'`); err != nil {
+		log.Printf("[reader-unify] 迁移 observer 触发器失败: %v", err)
+		return
+	}
+	// ③ 合并成唯一一条双条件 trigger（补齐消息/开关），删掉其余行。
+	all, err := pg.ListTriggersFor("reader")
+	if err != nil {
+		log.Printf("[reader-unify] 复读 reader 触发器失败: %v", err)
+		return
+	}
+	if len(all) == 0 {
+		if _, err := pg.CreateTrigger(unifiedReaderTrigger()); err != nil {
+			log.Printf("[reader-unify] 新建双条件触发器失败: %v", err)
+		}
+		return
+	}
+	keep := all[0]
+	keep.Enabled = true
+	keep.OnProjectGraph = true
+	keep.IntervalSec = 1800
+	// 前缀是双条件 trigger 判别作用域的功能必需：存量行的旧 message 不带前缀，
+	// 这里保留用户可能写过的正文、只补前缀（不覆盖用户手改）；全新库已带前缀
+	// 则原样保留，收敛本身幂等。
+	if !strings.HasPrefix(strings.TrimSpace(keep.ProjectGraphMessage), "【scope=project】") {
+		keep.ProjectGraphMessage = unifiedGraphMessage + " " + strings.TrimSpace(keep.ProjectGraphMessage)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(keep.IntervalMessage), "【scope=cross】") {
+		keep.IntervalMessage = unifiedIntervalMessage + " " + strings.TrimSpace(keep.IntervalMessage)
+	}
+	if err := pg.UpdateTrigger(keep); err != nil {
+		log.Printf("[reader-unify] 更新双条件触发器失败: %v", err)
+	}
+	for _, t := range all[1:] {
+		if err := pg.DeleteTrigger(t.ID); err != nil {
+			log.Printf("[reader-unify] 删除多余触发器 %d 失败: %v", t.ID, err)
+		}
+	}
+	log.Printf("[reader-unify] 已收敛为 reader 单 agent / 单条双条件触发器")
+}
+
+// seedProjectTools 把六工具 SeedTool 入库（首插生效），并跑统一阅读者的
+// seed/收敛/升级。由 seedOrchestrationTools 末尾调用——agent 绑定要求工具行
+// 先存在（reporter 同款顺序依赖）。绑定不给 auto/planner：跨任务读图+写 hint
+// 是阅读者特权，最小暴露面。tool_base='none' 两 key 都保留（只读安全红线）。
 func (s *Server) seedProjectTools() {
 	emptyBindings, _ := json.Marshal([]string{})
 	for _, t := range append(s.projectObserverTools(), s.projectReaderTools()...) {
@@ -498,13 +626,16 @@ func (s *Server) seedProjectTools() {
 	} else if err := s.m.PG().SeedTool(rt.Name(), rt.Description(), schema, agents); err != nil {
 		log.Printf("[project-tools] seed %s: %v", rt.Name(), err)
 	}
-	s.seedObserverAgent()
+	// V6-U3 顺序：先建 reader（全新库）→ 再收敛存量库双链（置 reader_unified_v1）
+	// → observer 见 flag 早退 → 最后升级 prompt。
 	s.seedReaderAgent()
+	s.unifyReaderAgent()
+	s.seedObserverAgent()
 
-	// V4-E：reader prompt 默认正文升级。seedReaderAgent 有一次性 flag 早退，
-	// SeedPromptIfEmpty 又是「已有任一版本就 no-op」，所以存量库里已建好的
-	// reader 永远拿不到新正文——必须像下面 SetAgentToolBase 那样每次启动
-	// 无条件收编（区别只在收编动作本身是幂等的：见 upgradeReaderPrompt）。
+	// V6-U3：reader prompt 默认正文升级到统一阅读者版。seedReaderAgent 有
+	// 一次性 flag 早退，SeedPromptIfEmpty 又是「已有任一版本就 no-op」，所以
+	// 存量库里已建好的 reader 永远拿不到新正文——必须每次启动无条件收编
+	// （动作本身幂等：逐字节比对旧默认才升级，见 upgradeReaderPrompt）。
 	s.upgradeReaderPrompt()
 
 	// V4 安全面：只读总结型 agent 剥离执行底座（tool_base='none'，装配层不再注入
@@ -520,10 +651,12 @@ func (s *Server) seedProjectTools() {
 	}
 }
 
-// readerPromptUpgradeFlag 是「新默认正文已收编」的一次性标记（settings 表）。
-// 与 seedReaderAgent 的 flag 不同：这条只在真的处理过（播种/升级）后置位，
-// agent 尚不存在时留空，下次启动再试。
-const readerPromptUpgradeFlag = "reader_prompt_asset_first_v4e"
+// readerPromptUpgradeFlag 是「统一阅读者默认正文已收编」的一次性标记
+// （V6-U3 新 flag，替代 reader_prompt_asset_first_v4e——旧 flag 对已升级过
+// V4-E 的存量库会早退，拿不到统一版正文）。与 seedReaderAgent 的 flag 不同：
+// 这条只在真的处理过（播种/升级/确认已编辑）后置位，agent 尚不存在时留空，
+// 下次启动再试。
+const readerPromptUpgradeFlag = "reader_prompt_unified_v6"
 
 // readerPromptUpgrade 是 upgradeReaderPrompt 的纯判定结果（无库可单测）。
 type readerPromptUpgrade int
@@ -537,24 +670,27 @@ const (
 	readerPromptReplace
 )
 
-// readerPromptUpgradeFor 是「能不能升级」的纯判定。
+// readerPromptUpgradeFor 是「能不能升级」的纯判定（V6-U3）：旧默认有两个
+// ——readerPromptV1（V4-E 之前）与 readerPrompt（V4-E 资产优先版）。当前与
+// 任一逐字节相同＝用户没编辑过，升到 readerUnifiedPrompt；已是统一版或用户
+// 手改的正文一律 Keep，不覆盖。
 func readerPromptUpgradeFor(cur string) readerPromptUpgrade {
 	switch strings.TrimSpace(cur) {
 	case "":
 		return readerPromptSeed
-	case readerPromptV1:
+	case readerPromptV1, readerPrompt:
 		return readerPromptReplace
 	default:
 		return readerPromptKeep
 	}
 }
 
-// upgradeReaderPrompt 把存量库 reader 的 system prompt 升到资产优先版：
+// upgradeReaderPrompt 把存量库 reader 的 system prompt 升到统一阅读者版：
 //
 //   - 当前 prompt 为空（seed 曾失败）→ 播种新默认；
-//   - 当前 prompt 与旧默认（readerPromptV1）逐字节相同＝用户没编辑过 → 追加
-//     一个新版本（SavePrompt 保留历史，可在 UI 回滚）；
-//   - 已被用户编辑 → 不覆盖，只记一行日志并置 flag（避免每次启动重复提示）。
+//   - 当前 prompt 与任一旧默认（readerPromptV1 / readerPrompt）逐字节相同
+//     ＝用户没编辑过 → 追加一个新版本（SavePrompt 保留历史，可在 UI 回滚）；
+//   - 已是统一版或已被用户编辑 → 不覆盖，只记一行日志并置 flag。
 //
 // 用「逐字节比对旧默认」而不是无条件 ResetPromptToDefault：后者会把用户手写
 // 的正文冲掉。这也是不能照搬 SetAgentToolBase「无脑写」的原因——tool_base 是
@@ -578,19 +714,19 @@ func (s *Server) upgradeReaderPrompt() {
 	}
 	switch readerPromptUpgradeFor(cur) {
 	case readerPromptSeed:
-		if err := pg.SeedPromptIfEmpty(a.ID, readerPrompt); err != nil {
+		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPrompt); err != nil {
 			log.Printf("[reader] 播种新默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已播种「资产优先」默认 prompt")
+		log.Printf("[reader] 已播种「统一阅读者」默认 prompt")
 	case readerPromptReplace:
-		if _, err := pg.SavePrompt(a.ID, readerPrompt, "V4-E 默认正文升级：资产优先输入", "system"); err != nil {
+		if _, err := pg.SavePrompt(a.ID, readerUnifiedPrompt, "V6-U3 默认正文升级：统一阅读者单 agent/单 trigger", "system"); err != nil {
 			log.Printf("[reader] 升级默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已把未编辑的默认 prompt 升级为「资产优先」版（历史版本保留）")
+		log.Printf("[reader] 已把未编辑的默认 prompt 升级为「统一阅读者」版（历史版本保留）")
 	default:
-		log.Printf("[reader] 当前 prompt 已被用户编辑，跳过默认正文升级（如需新流程请手动恢复内置默认）")
+		log.Printf("[reader] 当前 prompt 已是统一版或被用户编辑，跳过默认正文升级（如需新流程请手动恢复内置默认）")
 	}
 	if err := pg.SetSetting(readerPromptUpgradeFlag, "true"); err != nil {
 		log.Printf("[reader] 写入 prompt 升级标记失败: %v", err)
