@@ -1511,16 +1511,24 @@ CREATE TABLE IF NOT EXISTS project_graph_events (
 );
 CREATE INDEX IF NOT EXISTS idx_pge_scan ON project_graph_events(project_id, id);  -- 水位 WHERE project_id=$1 AND id>$last ORDER BY id
 
--- observer 产出：项目级洞察。content 供 planner 限量注入，keywords 与任务
--- open 意图锚定的 asset_keys 求交集命中优先（GIN）。
+-- 统一阅读者洞察表（V6-U1）：一套表用 scope 区分两种作用域——
+--   scope='project'：项目洞察，project_id 指向所属项目（随项目级联删），
+--                    keywords/source_task_id 是命中键与来源任务；
+--   scope='cross'  ：跨项目洞察，project_id=NULL（不挂任何项目、不被级联删），
+--                    source_projects/asset_keys 供跨项目注入命中。
+-- 「WHERE project_id=$1」的既有 API 因 cross 行 project_id=NULL 天然隔离，
+-- 不需要视图。status 生命周期（active/rejected/superseded）对两种 scope 通用。
 CREATE TABLE IF NOT EXISTS project_insights (
     id              BIGSERIAL PRIMARY KEY,
-    project_id      BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, -- observer 产出随项目存亡，级联删
-    content         TEXT NOT NULL,                         -- 洞察正文（"同 CMS 版本 X 的 Y 组件历史可借 Z 打法"）
-    source_task_id  BIGINT,                                -- 触发写此洞察时 observer 正看的任务
-    keywords        TEXT[] NOT NULL DEFAULT '{}',          -- 与 planner 命中匹配用（组件名/CMS/端口/中间件…）
-    -- V5-A 洞察生命周期：active=可注入；rejected=planner 显式否决（reject_insight 工具）；
-    -- superseded=被同资产的新洞察覆盖（只在 global_insights 生效，本项目表保留同列以统一读写）。
+    project_id      BIGINT REFERENCES projects(id) ON DELETE CASCADE, -- cross 行置 NULL（不挂项目）；project 行随项目级联删
+    content         TEXT NOT NULL,                         -- 洞察正文
+    source_task_id  BIGINT,                                -- project 行：触发写此洞察时正看的任务
+    keywords        TEXT[] NOT NULL DEFAULT '{}',          -- project 行：与 planner 命中匹配用
+    scope           TEXT NOT NULL DEFAULT 'project'
+                      CHECK (scope IN ('project','cross')),
+    source_projects BIGINT[] NOT NULL DEFAULT '{}',        -- cross 行：串联涉及的 project id
+    asset_keys      TEXT[] NOT NULL DEFAULT '{}',          -- cross 行：注入命中键（归一化资产键）
+    superseded_by   BIGINT,                                -- cross 行：覆盖本行的新洞察 id
     status          TEXT NOT NULL DEFAULT 'active'
                       CHECK (status IN ('active','rejected','superseded')),
     rejected_reason TEXT NOT NULL DEFAULT '',              -- 否决原因（人工/planner 留痕，供复核）
@@ -1528,12 +1536,16 @@ CREATE TABLE IF NOT EXISTS project_insights (
 );
 CREATE INDEX IF NOT EXISTS idx_pins_proj ON project_insights(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pins_kw   ON project_insights USING GIN(keywords);
--- 注：idx_pins_status 依赖 status 列，存量库上必须在下方 ALTER ADD COLUMN 之后建，见「存量库补列」段末。
+-- 注：idx_pins_status / idx_pins_scope / idx_pins_asset 依赖 status/scope/asset_keys
+-- 列，存量库上必须在下方 ALTER ADD COLUMN 之后建，见「存量库补列」段末。
 
--- reader 产出：跨项目洞察。V5-A 起可按资产键注入 planner——
--- asset_keys 是与 project_index.asset_keys/planner 命中键同源的归一化键集合，
--- 为空 = 永不注入（只能人工看）；status='rejected' 由 planner 的 reject_insight
--- 置位；同资产写新洞察时旧行置 superseded、superseded_by 指新 id。
+-- V6 之前的跨项目洞察表（遗留）。DDL 保留的理由：① 全新库与存量库走同一套
+-- 幂等重放；② TestSchemaContainsProjectGraphTables 的 DDL 字面锚点；③ 迁移时
+-- 从它逐行读出存量数据。迁移完成后本表由下方 DO 块改名归档
+-- （global_insights_archive_20261113），Go 层（V6-U2 起）不再读写它——所有读写
+-- 都走 project_insights 且带 scope='cross'。改名后每次启动的 CREATE IF NOT
+-- EXISTS 会重建一个空壳表，无害（无数据、无代码引用），仅为幂等。
+-- asset_keys 是与 planner 命中键同源的归一化键集合；superseded_by 指新 id。
 CREATE TABLE IF NOT EXISTS global_insights (
     id              BIGSERIAL PRIMARY KEY,
     content         TEXT NOT NULL,                         -- 洞察正文
@@ -1549,12 +1561,21 @@ CREATE INDEX IF NOT EXISTS idx_gins_time ON global_insights(created_at DESC);
 -- 注：idx_gins_keys 依赖 asset_keys 列，存量库上必须在下方 ALTER ADD COLUMN 之后建，见「存量库补列」段末。
 
 -- 存量库补列（幂等；CREATE 段已含同名列，双写法照 projects/finding_evidence_images 先例）。
+-- 旧的 status/rejected_reason 补列（V5-A 遗产）保留，供更早的存量库逐级升级。
 ALTER TABLE project_insights ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
 ALTER TABLE project_insights ADD COLUMN IF NOT EXISTS rejected_reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE global_insights ADD COLUMN IF NOT EXISTS asset_keys TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE global_insights ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
 ALTER TABLE global_insights ADD COLUMN IF NOT EXISTS superseded_by BIGINT;
 ALTER TABLE global_insights ADD COLUMN IF NOT EXISTS rejected_reason TEXT NOT NULL DEFAULT '';
+-- V6-U1 统一阅读者：project_insights 补 scope 分区列（双写法同 CREATE 段）。
+-- 存量库旧行补列后 scope='project'（项目洞察保持原语义）。
+ALTER TABLE project_insights ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'project';
+ALTER TABLE project_insights ADD COLUMN IF NOT EXISTS source_projects BIGINT[] NOT NULL DEFAULT '{}';
+ALTER TABLE project_insights ADD COLUMN IF NOT EXISTS asset_keys TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE project_insights ADD COLUMN IF NOT EXISTS superseded_by BIGINT;
+-- cross 行 project_id=NULL（不挂任何项目），故解除原 NOT NULL。
+ALTER TABLE project_insights ALTER COLUMN project_id DROP NOT NULL;
 -- 存量库上补 status 取值约束（ALTER ADD CONSTRAINT 不支持 IF NOT EXISTS，照 assets 先例先 DROP）。
 ALTER TABLE project_insights DROP CONSTRAINT IF EXISTS project_insights_status_check;
 ALTER TABLE project_insights ADD CONSTRAINT project_insights_status_check
@@ -1562,12 +1583,68 @@ ALTER TABLE project_insights ADD CONSTRAINT project_insights_status_check
 ALTER TABLE global_insights DROP CONSTRAINT IF EXISTS global_insights_status_check;
 ALTER TABLE global_insights ADD CONSTRAINT global_insights_status_check
     CHECK (status IN ('active','rejected','superseded'));
--- 依赖新列（status/asset_keys）的索引必须在补列之后创建：存量库上
+-- scope 取值约束同样先 DROP 再 ADD（幂等）。
+ALTER TABLE project_insights DROP CONSTRAINT IF EXISTS project_insights_scope_check;
+ALTER TABLE project_insights ADD CONSTRAINT project_insights_scope_check
+    CHECK (scope IN ('project','cross'));
+-- 依赖新列（status/scope/asset_keys）的索引必须在补列之后创建：存量库上
 -- CREATE TABLE IF NOT EXISTS 是空操作，表里还没有这些列，前置建索引会
 -- 直接报 42703 导致启动失败（V5 部署实测踩到，全新库不暴露）。
 CREATE INDEX IF NOT EXISTS idx_gins_keys ON global_insights USING GIN(asset_keys);
 CREATE INDEX IF NOT EXISTS idx_pins_status ON project_insights(project_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gins_status ON global_insights(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pins_scope ON project_insights(scope, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pins_asset ON project_insights USING GIN(asset_keys);
+
+-- =====================================================================
+-- V6-U1 统一阅读者一次性迁移：存量 global_insights 逐行并入
+-- project_insights(scope='cross')，原表改名 global_insights_archive_20261113
+-- 留回滚（不 DROP）。以「归档表是否存在」为哨兵，归档后每次启动重放本文件
+-- 都直接短路——迁移与 superseded_by 重映射绝不重复。
+-- =====================================================================
+DO $$
+DECLARE
+    r      record;
+    new_id bigint;
+BEGIN
+    IF to_regclass('public.global_insights_archive_20261113') IS NOT NULL THEN
+        RETURN; -- 已迁移：幂等短路
+    END IF;
+    IF to_regclass('public.global_insights') IS NULL THEN
+        RETURN; -- 无遗留表（全新库理论上不会走到这里）
+    END IF;
+
+    -- 逐行插入单表并记 old→new 映射：cross 行 project_id=NULL，其余字段
+    -- （content/source_projects/asset_keys/status/rejected_reason/created_at）原样保留。
+    CREATE TEMP TABLE _v6_pins_map(old_id bigint PRIMARY KEY, new_id bigint) ON COMMIT DROP;
+    FOR r IN SELECT id, content, source_projects, asset_keys, status,
+                    superseded_by, rejected_reason, created_at
+             FROM global_insights ORDER BY id LOOP
+        INSERT INTO project_insights(project_id, content, source_task_id, keywords,
+                                     scope, source_projects, asset_keys, status,
+                                     superseded_by, rejected_reason, created_at)
+        VALUES (NULL, r.content, NULL, '{}', 'cross', r.source_projects, r.asset_keys,
+                r.status, r.superseded_by, r.rejected_reason, r.created_at)
+        RETURNING id INTO new_id;
+        INSERT INTO _v6_pins_map(old_id, new_id) VALUES (r.id, new_id);
+    END LOOP;
+
+    -- 重映射 superseded_by：旧值指向 global_insights 的 id，改成迁移后的新行 id。
+    -- 只在 scope='cross' 行上做，绝不碰项目洞察；悬空旧 id（无映射）保留原样。
+    UPDATE project_insights pi SET superseded_by = m.new_id
+    FROM _v6_pins_map m
+    WHERE pi.scope = 'cross' AND pi.superseded_by = m.old_id;
+
+    -- 语义 A（一开全开，用户要测统一阅读者的作用）：存量项目把兼容别名
+    -- reader_enabled 对齐到主开关 observer_enabled。放在一次性迁移里，之后
+    -- 用户经 API 改开关会镜像写两列，不会被这里覆盖。
+    UPDATE projects SET reader_enabled = observer_enabled;
+
+    -- 归档留回滚：改名而不 DROP；同时释放 serial sequence 名，避免下次启动
+    -- CREATE TABLE IF NOT EXISTS global_insights 重建空表时 sequence 撞名报错。
+    ALTER TABLE global_insights RENAME TO global_insights_archive_20261113;
+    ALTER SEQUENCE IF EXISTS global_insights_id_seq RENAME TO global_insights_archive_20261113_id_seq;
+END $$;
 
 -- =====================================================================
 -- P. 报告中心（artex-hs F4，T15）：报告模板 / 生成 job+历史 / 全局设置
