@@ -662,21 +662,55 @@ func (d *DB) TaskAssetIDs(ctx context.Context, taskID int64) ([]int64, error) {
 	return out, rows.Err()
 }
 
+// TaskFindingAssetIDs 返回该任务 findings.asset_ids 里出现过的资产 id（去重、
+// 升序、上限 500）。V6-XPROJ 的新命中维度：任务已落库 finding 时，其关联资产
+// 是「本任务真打过」的资产，比目标文本/名称分词这类弱键更可靠，可在锚定意图与
+// assets.task_ids 都为空时补位。asset_ids 是 JSONB 数组（元素=assets.id），
+// 与 asset_cross.go / finding_assets.go 的关联链同一口径。
+func (d *DB) TaskFindingAssetIDs(ctx context.Context, taskID int64) ([]int64, error) {
+	if taskID <= 0 {
+		return nil, nil
+	}
+	rows, err := d.QueryContext(ctx, `
+SELECT DISTINCT (elem.value)::bigint
+FROM findings f
+CROSS JOIN LATERAL jsonb_array_elements_text(
+    CASE WHEN jsonb_typeof(f.asset_ids) = 'array' THEN f.asset_ids ELSE '[]'::jsonb END
+) AS elem(value)
+WHERE f.task_id = $1 AND elem.value ~ '^[0-9]+$'
+ORDER BY 1
+LIMIT 500`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // TaskInsightContext 一次查回 insight 注入决策所需的全部字段：任务的
-// exploration 归属 + 项目观察者开关（LEFT JOIN——未挂项目时 enabled=false）+
-// 任务名称/目标（V5-C 障碍1 的第三级命中键来源：目标文本里的 host:port）。
+// exploration 归属 + 项目两个独立开关（LEFT JOIN——未挂项目时均为 false；
+// observer_enabled=跨任务/项目内、reader_enabled=跨项目）+
+// 任务名称/目标（V5-C 障碍1 的第三级命中键来源：目标文本里的 host:port）+
+// 项目名称（V6-XPROJ 分词命中维度）。
 // 单行查询、每 planner 轮一次，无缓存=挂/摘与开关翻转即时生效。
 type TaskInsightContext struct {
 	ExplorationID int64
-	ProjectID     int64 // 0=未挂项目
-	ObserverOn    bool  // projects.observer_enabled（主开关；项目不存在/未挂=false）
-	// ReaderOn 是 projects.reader_enabled（V6-U4 起兼容别名）：由 U1 迁移与
-	// U4 镜像写保证与 ObserverOn 同值。跨项目洞察注入仍按它单独判断，保留
-	// 「直接改单列关跨项目」的既有语义（readerVisibleProjects 同 opt-in 口径）。
+	ProjectID     int64  // 0=未挂项目
+	ProjectName   string // projects.name（弱键分词来源；未挂项目为空）
+	ObserverOn    bool   // projects.observer_enabled：跨任务/项目内尺度（scope='project'；不存在/未挂=false）
+	// ReaderOn 是 projects.reader_enabled：跨项目尺度（scope='cross'）。与
+	// ObserverOn **互相独立**（V6-DUAL）：没开跨项目阅读的项目照样可以有项目内
+	// 洞察，只是不参与跨项目聚合、也收不到读回来的跨项目条目（写出侧
+	// readerVisibleProjects 同一 opt-in 口径）。
 	ReaderOn bool
-	// Enabled 是统一阅读者的【单一开关】= 主开关 ObserverOn。V6-U4 注入侧
-	// 总闸门只读它；两个子查询仍按 ObserverOn/ReaderOn 分流（镜像后恒等）。
-	Enabled bool
 	// TaskName/TaskGoal 供 resolver 在锚定资产为空时从目标文本轻量提取 host:port。
 	TaskName string
 	TaskGoal string
@@ -687,17 +721,16 @@ func (d *DB) TaskInsightContext(ctx context.Context, taskID int64) (*TaskInsight
 	var pid sql.NullInt64
 	var on, readerOn sql.NullBool
 	err := d.QueryRowContext(ctx, `
-SELECT t.exploration_id, t.project_id, p.observer_enabled, p.reader_enabled, t.name, t.goal
+SELECT t.exploration_id, t.project_id, COALESCE(p.name,''), p.observer_enabled, p.reader_enabled, t.name, t.goal
 FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
 WHERE t.id=$1 AND t.deleted_at IS NULL`, taskID).
-		Scan(&c.ExplorationID, &pid, &on, &readerOn, &c.TaskName, &c.TaskGoal)
+		Scan(&c.ExplorationID, &pid, &c.ProjectName, &on, &readerOn, &c.TaskName, &c.TaskGoal)
 	if err != nil {
 		return nil, err // ErrNoRows=任务不存在/已删，调用方按空处理
 	}
 	c.ProjectID = pid.Int64
 	c.ObserverOn = on.Bool
 	c.ReaderOn = readerOn.Bool
-	c.Enabled = c.ObserverOn // 统一阅读者单一开关取主开关（两列镜像同值）
 	return &c, nil
 }
 

@@ -281,6 +281,38 @@ ORDER BY created_at DESC, id DESC LIMIT $2`, marshalTextArray(matchKeys), limit)
 	return out, rows.Err()
 }
 
+// ListRecentCrossProjectInsights 返回最近 limit 条【active】的跨项目洞察（新在
+// 前）。V6-XPROJ：本任务没有任何锚定资产键时的退化注入来源——观察者经验在
+// 「本任务尚未锚定资产」时仍有全局参照价值，故不再因交集为空整段不注入；
+// 调用方（server/project_insight.go）只取 insightCrossMax 条并要求 reader 闸门
+// 打开。limit<=0 默认 50。
+func (d *DB) ListRecentCrossProjectInsights(ctx context.Context, limit int) ([]GlobalInsight, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := d.QueryContext(ctx, `SELECT id, content, array_to_json(source_projects)::text,
+       array_to_json(asset_keys)::text, status, COALESCE(superseded_by,0), rejected_reason, created_at
+FROM project_insights
+WHERE scope='cross' AND status='active'
+ORDER BY created_at DESC, id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GlobalInsight
+	for rows.Next() {
+		var g GlobalInsight
+		var spJSON, akJSON string
+		if err := rows.Scan(&g.ID, &g.Content, &spJSON, &akJSON, &g.Status, &g.SupersededBy, &g.RejectedReason, &g.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(spJSON), &g.SourceProjects)
+		_ = json.Unmarshal([]byte(akJSON), &g.AssetKeys)
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
 // RejectInsight 把一条洞察置为 rejected 并记原因（planner 的 reject_insight
 // 工具）。kind 只接受 project/global，并作为【scope 断言】（V6-U2 单表后）：
 // global→'cross'、project→'project'，防跨 scope 误否决——拿 global kind 去否决
