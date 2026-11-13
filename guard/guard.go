@@ -10,6 +10,7 @@ package guard
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"regexp"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ type Guard struct {
 	attrib      map[string]int // failure attribution counts (Observer / G5)
 	reg         *hook.Registry
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
+	judgeCache  *judgeVerdictCache     // 白名单外工具的判官结论缓存（见 judge_all.go）
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -44,7 +46,11 @@ func New() *Guard { return newGuard(nil) }
 func NewWithInterceptor(ic *intercept.Interceptor) *Guard { return newGuard(ic) }
 
 func newGuard(ic *intercept.Interceptor) *Guard {
-	g := &Guard{attrib: map[string]int{}, interceptor: ic}
+	g := &Guard{
+		attrib:      map[string]int{},
+		interceptor: ic,
+		judgeCache:  newJudgeVerdictCache(time.Now, judgeVerdictTTL, judgeVerdictCacheCap),
+	}
 	g.reg = hook.NewRegistry().
 		On(hook.PreToolUse, g.preToolUse).
 		On(hook.PostToolUse, g.postToolUse)
@@ -134,7 +140,10 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		return hook.Result{}
 	}
 	if !g.interceptor.IsToolEnabled(ev.ToolName) {
-		return hook.Result{}
+		// 白名单外（MCP / 自定义工具）：规则只覆盖 intercept_enabled_tools 里的
+		// 面，这里不跑 Match，但必须过判官 —— 改动前这一行直接放行，于是这些
+		// 工具既不跑规则、也不过模型，两道防线全绕开。开关见 intercept_judge_all_tools。
+		return g.judgeOutsideWhitelist(ctx, ev, g.interceptor.JudgeAllToolsEnabled(), g.interceptor.Judge)
 	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
 	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
@@ -157,14 +166,58 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 			dec = d
 		}
 	}
+	return g.applyDecision(ctx, ev, dec)
+}
+
+// judgeOutsideWhitelist 给白名单外的工具调用补上判官这一道（V5-B）。
+//
+// 规则匹配跳过（规则的匹配面是白名单内的工具），但判官仍然是全覆盖的安全
+// 兜底：模型 allow/deny 照常执行并落库（decision_source=model，由 reason 的
+// [模型] 前缀 + RuleID=0 归类），ask 走人工审批（判官 ask verdict 自带超时）。
+// 判官未开启/未接线时 Judge 返回 judged=false，保持改动前的放行语义。
+//
+// 缓存：同一次会话内 (tool, sha256(input)) 相同的调用复用结论（TTL 5 分钟、
+// 上限 500、LRU），命中时不重复调模型，但每次都落库留痕（applyDecision 里
+// 的 Log），审计链不缺条目。
+//
+// enabled/judge 由调用方传入，是为了让这条路由能在没有数据库的环境里用假
+// 判官测（见 judge_all_test.go）。
+func (g *Guard) judgeOutsideWhitelist(ctx context.Context, ev hook.Event, enabled bool, judge judgeFunc) hook.Result {
+	if !shouldJudgeBeyondWhitelist(enabled, ev.ToolName) {
+		return hook.Result{}
+	}
+	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
+	key := judgeCacheKey(ctx, ev.ToolName, ev.Input)
+	if dec, ok := g.judgeCache.get(key); ok {
+		log.Printf("[judge] nonwhitelist=1 cache=hit tool=%s action=%s", ev.ToolName, dec.Action)
+		return g.applyDecision(ctx, ev, dec)
+	}
+	dec, judged := judge(ctx, ev.ToolName, ev.Input)
+	if !judged {
+		return hook.Result{}
+	}
+	if cacheableJudgeVerdict(dec) {
+		g.judgeCache.put(key, dec)
+	}
+	log.Printf("[judge] nonwhitelist=1 cache=miss tool=%s action=%s model_fallback=%t",
+		ev.ToolName, dec.Action, dec.ModelFallback)
+	return g.applyDecision(ctx, ev, dec)
+}
+
+// applyDecision 把一条判定落到工具调用上（规则命中与判官裁决共用）。
+func (g *Guard) applyDecision(ctx context.Context, ev hook.Event, dec intercept.Decision) hook.Result {
 	switch dec.Action {
 	case "deny":
 		// 观测:deny 命中不阻塞审批,直接记一条 denied（历史/任务拦截页可见）。
-		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "denied")
+		if g.interceptor != nil {
+			g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "denied")
+		}
 		return g.block(ev.ToolName, systemBlockMessage(dec.Message), "")
 	case "allow":
 		// Record explicit rule and model approvals so review details remain auditable.
-		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "allowed")
+		if g.interceptor != nil {
+			g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), dec, ev.ToolName, ev.Input, "allowed")
+		}
 		return hook.Result{}
 	case "ask":
 		// If the worker context is already cancelled (task stopped / killed), block

@@ -3432,6 +3432,9 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
 		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
 		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
+		// 白名单外工具（MCP/自定义）是否也送判官，默认开；关掉即退回「白名单外
+		// 直接放行」的旧行为（省判官 token 的唯一开关）。
+		"intercept_judge_all_tools": s.m.pg.GetBool(intercept.SettingJudgeAllTools, true),
 	}
 }
 
@@ -3505,6 +3508,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyEnabled    *bool   `json:"notify_enabled"`
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
+		// 白名单外工具（MCP/自定义）是否也送判官；每调用读一次，切换即时生效。
+		JudgeAllTools *bool `json:"intercept_judge_all_tools"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -3563,6 +3568,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if req.Workers != nil {
 		if err := s.m.SetWorkers(*req.Workers); err != nil {
 			writeErr(w, 400, err.Error())
+			return
+		}
+	}
+	if req.JudgeAllTools != nil {
+		// guard 每次白名单外调用读一遍，切换即时生效，无需重建 agent。
+		if err := s.m.pg.SetBool(intercept.SettingJudgeAllTools, *req.JudgeAllTools); err != nil {
+			writeErr(w, 500, err.Error())
 			return
 		}
 	}

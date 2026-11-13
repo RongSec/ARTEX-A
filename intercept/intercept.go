@@ -43,6 +43,23 @@ func ConvIDFromContext(ctx context.Context) int64 {
 	return v
 }
 
+// SessionScope 返回当前调用所属会话/任务的稳定标识，供调用方按「同一次会话」
+// 分区缓存（见 guard 的判官结论缓存）。
+//
+// 会话 ID 优先；后台任务的 context 带 taskID/agentName 而没有会话 ID，用它们
+// 兜底；两者皆无时返回空串 —— 由调用方决定空串的语义（缓存实现把它当作单一
+// 分区，仍受 TTL 与容量上限约束）。
+func SessionScope(ctx context.Context) string {
+	if id := ConvIDFromContext(ctx); id != 0 {
+		return "conv:" + strconv.FormatInt(id, 10)
+	}
+	taskID, agentName := taskInfoFromCtx(ctx)
+	if taskID != "" || agentName != "" {
+		return "task:" + taskID + "/" + agentName
+	}
+	return ""
+}
+
 // taskCtxKey is a separate unexported key type for task context values.
 type taskCtxKey int
 
@@ -247,6 +264,18 @@ func (i *Interceptor) IsToolEnabled(name string) bool {
 	return i.enabledTools[name]
 }
 
+// JudgeAllToolsEnabled 报告白名单外的工具是否也要送判官
+// （setting intercept_judge_all_tools，默认 true）。
+//
+// 读不到设置时按 true：漏判的代价是「MCP/自定义工具完全不受审查」这条安全
+// 缺口，多调一次模型的代价只是 token；要省成本必须显式写 false。
+func (i *Interceptor) JudgeAllToolsEnabled() bool {
+	if i == nil || i.db == nil {
+		return true
+	}
+	return i.db.GetBool(SettingJudgeAllTools, true)
+}
+
 // GetEnabledTools returns the ordered list of tool names that are currently
 // configured to enter the intercept rule system. When the setting has never been
 // saved the hard-coded default list is returned.
@@ -309,6 +338,13 @@ const (
 	settingJudgeAskTimeoutSecs   = "llm_judge_ask_timeout_seconds"
 	settingJudgeAskTimeoutAction = "llm_judge_ask_timeout_action"
 )
+
+// SettingJudgeAllTools 是「白名单外工具也送判官」的开关键（默认 true）。
+//
+// 默认开：intercept_enabled_tools 只列了内置的 8 个工具，MCP / 自定义工具
+// 不在名单里 —— 关掉这个开关等于这些工具既不跑规则、也不过模型，两道防线
+// 全部绕开。需要省 token 时才由管理员显式关掉，退回「白名单外直接放行」。
+const SettingJudgeAllTools = "intercept_judge_all_tools"
 
 // Judge default values.
 //
