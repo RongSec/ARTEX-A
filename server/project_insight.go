@@ -2,11 +2,14 @@ package server
 
 // T12 项目洞察 → planner 注入（架构 §2.4，裁决1 后的定稿语义）。
 //
-// 门控链（每 planner 轮现查，零缓存——projects.observer_enabled 翻转与洞察
-// 增删即时生效，与 SetConstraintInject 同款「闭包每轮读」范式）：
-//   任务存在 → 挂了项目 → 该项目 observer_enabled=true → 才可能注入。
+// 门控链（每 planner 轮现查，零缓存——统一阅读者开关翻转与洞察增删即时生效，
+// 与 SetConstraintInject 同款「闭包每轮读」范式）：
+//   任务存在 → 挂了项目 → 该项目统一阅读者开关为 true → 才可能注入。
+//   （observer_enabled 主开关，reader_enabled 兼容别名，两列镜像同值。）
 // 任一不满足返回 ""（planner 侧 projectInsightsRendered 见空串即整段不出现，
 // prompt 与原版逐字节一致 = 三停收编后的"注入停"）。
+// V6-U4：项目/跨项目两次查询保留为两个适配函数，但 U2 起内部都走
+// project_insights 单表、按 scope='project' / scope='cross' 分流。
 //
 // 限量与命中：ListInsights(matchKeywords=当前任务 open 意图锚定资产的归一化
 // 键) 让「与本任务正在打的资产相交」的洞察排最前，取 ≤3 条、每条正文截
@@ -15,10 +18,11 @@ package server
 //
 // V5-A 跨项目回流：同一预算（≤3 条）里项目洞察与跨项目条目按配额分配
 // （V5-C 障碍3：项目洞察最多 2 条；存在可注入跨项目行时项目洞察压到 2，
-// 至少给跨项目留 1 位；跨项目最多 2 条）。global_insights 中 status='active'
-// 且 asset_keys 与本任务命中键相交的条目才注入；该项目 reader_enabled=false
-// 时整段跨项目条目都不注入（与写出侧 readerVisibleProjects 同一 opt-in 口径）。
-// 跨项目条目额外带「仅作假设」标注。
+// 至少给跨项目留 1 位；跨项目最多 2 条）。project_insights 中 scope='cross'
+// 且 status='active' 且 asset_keys 与本任务命中键相交的条目才注入；该项目
+// reader_enabled=false 时整段跨项目条目都不注入（兼容别名与主开关镜像同值，
+// 与写出侧 readerVisibleProjects 同一 opt-in 口径）。跨项目条目额外带
+// 「仅作假设」标注。
 //
 // V5-C 命中键来源（障碍1，三级并集，任一级非空即停）：
 //   a. 本探索图 state IN ('open','running') 的意图锚定资产（running 也很常见：
@@ -66,7 +70,7 @@ const (
 // insightErrWarner 限频告器（一次构造、跨 planner 轮共享，CAS 防并发刷屏）。
 // 返回是否真的打了这条日志（测试可直调断言，不劫持全局 log 输出）。
 type insightErrWarner struct {
-	last     atomic.Int64 // 上次告警时刻（unix nano）
+	last       atomic.Int64 // 上次告警时刻（unix nano）
 	suppressed atomic.Int64 // 距上次告警后被限频吞掉的错误数
 }
 
@@ -111,16 +115,18 @@ func (s *Server) projectInsightResolverFor() func(taskID int64) string {
 		if tctx.ProjectID <= 0 {
 			return "" // 未挂项目
 		}
-		// 项目洞察看 observer_enabled，跨项目条目看 reader_enabled（V5-A：与写出
-		// 侧 readerVisibleProjects 同阈，避免绕过项目级 opt-in）。两者全关=三停之一
-		// 的"注入停"，原版逐字节零注入。
-		if !tctx.ObserverOn && !tctx.ReaderOn {
+		// V6-U4 统一阅读者：单一开关闸门。tctx.Enabled 取主开关
+		// observer_enabled（reader_enabled 是镜像兼容别名、与它同值）；关则
+		// 整段零注入（三停之一"注入停"，原版逐字节一致）。下面两次查询保留
+		// 为适配函数，U2 起内部各走 project_insights 单表、按 scope 分流。
+		if !tctx.Enabled {
 			return ""
 		}
 		// 命中原料：三级并集（障碍1）。查询抖动按「该级为空」降级，绝不因旁路
 		// 查询报错把整段注入打掉。
 		match := s.insightMatchKeys(ctx, pg, tctx, taskID)
 		var projectList []db.Insight
+		// 项目洞察：ListInsights 内部走单表 scope='project'（U2）。
 		if tctx.ObserverOn {
 			list, err := pg.ListInsights(ctx, tctx.ProjectID, match, insightInjectMax)
 			if err != nil {
@@ -130,6 +136,7 @@ func (s *Server) projectInsightResolverFor() func(taskID int64) string {
 			projectList = list
 		}
 		var crossKept []db.GlobalInsight
+		// 跨项目洞察：ListCrossProjectInsights 内部走单表 scope='cross'（U2）。
 		if tctx.ReaderOn && len(match) > 0 {
 			cross, err := pg.ListCrossProjectInsights(ctx, match, insightCrossScanMax)
 			if err != nil {

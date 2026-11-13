@@ -92,11 +92,14 @@ func (d *DB) CreateProject(in CreateProjectInput) (*Project, error) {
 	if in.ReportTemplateID != nil && *in.ReportTemplateID > 0 {
 		tmpl = *in.ReportTemplateID
 	}
+	// V6-U4 统一阅读者：observer_enabled 是主开关、reader_enabled 是兼容别名，
+	// 两列镜像写同值（任一入参为 true 即开，兼容只传 reader 的旧调用路径）。
+	enabled := in.ObserverEnabled || in.ReaderEnabled
 	return scanProject(d.QueryRow(`
 INSERT INTO projects(name, description, owner, concurrency, observer_enabled, report_template_id, auto_report, reader_enabled)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING `+projectCols, name, strings.TrimSpace(in.Description), strings.TrimSpace(in.Owner),
-		normalizeProjectConcurrency(concurrency), in.ObserverEnabled, tmpl, in.AutoReport, in.ReaderEnabled))
+		normalizeProjectConcurrency(concurrency), enabled, tmpl, in.AutoReport, enabled))
 }
 
 // GetProject 返回单个项目；不存在时返回 ErrProjectNotFound。
@@ -220,6 +223,20 @@ type UpdateProjectPatch struct {
 // UpdateProject 应用局部更新并返回新行。status 非法值返回错误（DDL 有 CHECK，
 // 提前在 server 侧挡掉好过让 PG 抛 23514）。
 func (d *DB) UpdateProject(id int64, patch UpdateProjectPatch) (*Project, error) {
+	// V6-U4 统一阅读者：PATCH 只要动了任一开关字段，就把两列镜像写成同值
+	// （observer 主开关 + reader 兼容别名）。放在数据层而非 HTTP 层，保证所有
+	// 调用路径两列恒等，API 仍接受两个字段名、RETURNING 返回两字段同值。
+	if patch.ObserverEnabled != nil || patch.ReaderEnabled != nil {
+		enabled := false
+		if patch.ObserverEnabled != nil {
+			enabled = *patch.ObserverEnabled
+		}
+		if patch.ReaderEnabled != nil {
+			enabled = enabled || *patch.ReaderEnabled
+		}
+		patch.ObserverEnabled = &enabled
+		patch.ReaderEnabled = &enabled
+	}
 	if patch.Status != nil {
 		switch *patch.Status {
 		case "active", "archived":

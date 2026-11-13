@@ -669,11 +669,14 @@ func (d *DB) TaskAssetIDs(ctx context.Context, taskID int64) ([]int64, error) {
 type TaskInsightContext struct {
 	ExplorationID int64
 	ProjectID     int64 // 0=未挂项目
-	ObserverOn    bool  // projects.observer_enabled（项目不存在/未挂=false）
-	// ReaderOn 是 projects.reader_enabled（V5-A）：跨项目洞察注入的开关。与写出侧
-	// readerVisibleProjects 同源——没 opt-in 的项目既不参与 reader 聚合，也不该
-	// 收到读回来的跨项目条目（否则等于绕过 opt-in）。
+	ObserverOn    bool  // projects.observer_enabled（主开关；项目不存在/未挂=false）
+	// ReaderOn 是 projects.reader_enabled（V6-U4 起兼容别名）：由 U1 迁移与
+	// U4 镜像写保证与 ObserverOn 同值。跨项目洞察注入仍按它单独判断，保留
+	// 「直接改单列关跨项目」的既有语义（readerVisibleProjects 同 opt-in 口径）。
 	ReaderOn bool
+	// Enabled 是统一阅读者的【单一开关】= 主开关 ObserverOn。V6-U4 注入侧
+	// 总闸门只读它；两个子查询仍按 ObserverOn/ReaderOn 分流（镜像后恒等）。
+	Enabled bool
 	// TaskName/TaskGoal 供 resolver 在锚定资产为空时从目标文本轻量提取 host:port。
 	TaskName string
 	TaskGoal string
@@ -694,6 +697,7 @@ WHERE t.id=$1 AND t.deleted_at IS NULL`, taskID).
 	c.ProjectID = pid.Int64
 	c.ObserverOn = on.Bool
 	c.ReaderOn = readerOn.Bool
+	c.Enabled = c.ObserverOn // 统一阅读者单一开关取主开关（两列镜像同值）
 	return &c, nil
 }
 
