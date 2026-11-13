@@ -288,6 +288,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.downgradeRmRecursiveToAsk(); err != nil {
 		return fmt.Errorf("downgrade rm -rf rule to ask: %w", err)
 	}
+	if err := d.shortenRmRecursiveAskTimeout(); err != nil {
+		return fmt.Errorf("shorten rm -rf ask timeout: %w", err)
+	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
 	}
@@ -378,9 +381,13 @@ func (d *DB) seedDefaultInterceptRules() error {
 		// timeout 只在 action=ask 时才有意义：v1 这批规则原本全是 deny，
 		// 审批超时字段一律 false（deny 用不上）。规则 #1 降为 ask 后必须显式
 		// 打开，否则 HandleAsk 走「无超时」分支无限等待人工——判官未启用或
-		// 判官故障回落时，一条 rm -rf 能把整个 task 挂死。true = 60s 无人
-		// 处理即按 timeout_action=deny 收敛（fail-closed）。
+		// 判官故障回落时，一条 rm -rf 能把整个 task 挂死。true = 15s 无人
+		// 处理即按 timeout_action=deny 收敛（fail-closed）。15s 而非 60s：
+		// 判官给出 ask 时 V6-AUTO 已按 timeout_action 立即落定，这 15s 只在
+		// 判官故障时使用，缩短以减少空等。
 		timeout bool
+		// timeoutSecs 仅在 timeout=true 时有意义；0 → 沿用 60s 出厂值。
+		timeoutSecs int
 	}
 	rules := []rule{
 		// ── 系统破坏性命令 (priority 100) ──────────────────────────────────
@@ -399,6 +406,9 @@ func (d *DB) seedDefaultInterceptRules() error {
 			message:  "递归强制删除（rm -rf / rm --recursive）需按作用对象确认：删除生产文件或系统路径将被拒绝，清理本次测试产物可放行",
 			priority: 100,
 			timeout:  true,
+			// V6-AUTO：60 → 15。判官给 ask 时按 timeout_action 立即落定，
+			// 15s 只在判官故障回落人工时生效。
+			timeoutSecs: 15,
 		},
 		{
 			name:     "[内置] 删除系统关键目录",
@@ -552,11 +562,15 @@ func (d *DB) seedDefaultInterceptRules() error {
 		},
 	}
 	for _, r := range rules {
+		timeoutSecs := r.timeoutSecs
+		if timeoutSecs <= 0 {
+			timeoutSecs = 60
+		}
 		if _, err := d.Exec(`
 INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-VALUES ($1, true, $2, $3, $4, $5, $6, $7, $8, 60, 'deny')
+VALUES ($1, true, $2, $3, $4, $5, $6, $7, $8, $9, 'deny')
 ON CONFLICT DO NOTHING`,
-			r.name, r.priority, r.target, r.typ, r.pattern, r.action, r.message, r.timeout,
+			r.name, r.priority, r.target, r.typ, r.pattern, r.action, r.message, r.timeout, timeoutSecs,
 		); err != nil {
 			return fmt.Errorf("rule %q: %w", r.name, err)
 		}
@@ -750,7 +764,7 @@ WHERE priority = 90 AND name IN (
 // （删目标生产文件）同样命中——实测 24 条对照里唯一误伤就是前者。目标归属
 // 无法用正则判定，交判官按「可逆性 × 作用对象」两根轴裁决（见
 // intercept/prompt.go 的 D4 / A2）；判官未启用时 ask 仍走人工审批
-// （HandleAsk，规则自带 60s 超时 → deny），fail-closed 语义不变。
+// （HandleAsk，规则自带超时 → deny），fail-closed 语义不变。
 //
 // 守卫：只改仍是出厂形态的行——action='deny'（尚未降级）、pattern 为出厂
 // 原值、且审批超时还是 v1 的 false/deny。用户改过正则或改过超时配置的规则
@@ -761,11 +775,30 @@ func (d *DB) downgradeRmRecursiveToAsk() error {
 	// action 降 ask 必须同时打开审批超时：v1 这批规则是 deny，timeout_enabled
 	// 一律 false，而 HandleAsk 的无超时分支是「等到用户决定或任务被取消」——
 	// 判官未启用、或判官故障回落人工时，一条 rm -rf 会把 task 无限挂住。
-	// 打开后 = 60s 无人处理按 timeout_action=deny 收敛，fail-closed 不变。
+	// 打开后 = 无人处理按 timeout_action=deny 收敛，fail-closed 不变。
 	_, err := d.Exec(`UPDATE intercept_rules
 SET action = 'ask', timeout_enabled = true
 WHERE name = $1 AND pattern = $2
   AND action = 'deny' AND timeout_enabled = false AND timeout_action = 'deny'`,
+		rmRecursiveRuleName, rmRecursivePattern)
+	return err
+}
+
+// shortenRmRecursiveAskTimeout 把规则 #1 的审批超时从 60s 收紧到 15s（V6-AUTO）。
+//
+// 为什么收紧：判官给出 ask 时已按规则 timeout_action 立即落定（不进 pending），
+// 这 15s 只在判官故障/超时回落人工时使用。60s 的空等对自主任务没有收益。
+//
+// 守卫与 downgradeRmRecursiveToAsk 同款：只动仍是出厂形态的行——name/pattern
+// 为出厂原值、action='ask'、timeout_enabled=true、timeout_action='deny' 且
+// timeout_seconds 恰为旧出厂值 60。用户改过超时值（例如调成 30/120）视为
+// 自定义配置，不覆盖。每次启动幂等执行，新库种出来就是 15s，本条命中 0 行。
+func (d *DB) shortenRmRecursiveAskTimeout() error {
+	_, err := d.Exec(`UPDATE intercept_rules
+SET timeout_seconds = 15
+WHERE name = $1 AND pattern = $2
+  AND action = 'ask' AND timeout_enabled = true
+  AND timeout_action = 'deny' AND timeout_seconds = 60`,
 		rmRecursiveRuleName, rmRecursivePattern)
 	return err
 }

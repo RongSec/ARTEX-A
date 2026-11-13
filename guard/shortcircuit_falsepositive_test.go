@@ -87,11 +87,13 @@ func TestV6FPDesignedAllowUnchanged(t *testing.T) {
 	}
 }
 
-// 探针里剩余两档（ask / allow）也保持不变。
+// 探针里剩余两档（allow / deny）按 V6-AUTO 的默认值保持：平台配置类工具
+// 显式放行，删除业务资产硬拦。
 func TestV6FPOtherVerdictsUnchanged(t *testing.T) {
 	cases := []struct{ desc, tool, in, want string }{
-		{"平台工具需审批", "create_custom_tool", `{"name":"probe"}`, "ask"},
+		{"平台配置工具自主放行", "create_custom_tool", `{"name":"probe"}`, "allow"},
 		{"低危面显式放行", "create_skill", `{"name":"probe"}`, "allow"},
+		{"删除业务资产硬拦", "delete_assets_by_host", `{"host":"probe"}`, "deny"},
 	}
 	for _, c := range cases {
 		dec := PreviewShortCircuit(c.tool, []byte(c.in))

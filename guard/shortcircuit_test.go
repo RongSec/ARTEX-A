@@ -2,24 +2,31 @@ package guard
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
-func TestShortCircuitPlatformToolsAsk(t *testing.T) {
+// V6-AUTO：平台配置/新建能力类工具一律显式 allow（自主优先，不再有 ask）。
+// 这些工具不直接破坏业务数据；其后果由动作层护栏兜住。
+func TestShortCircuitPlatformConfigToolsAllow(t *testing.T) {
 	for _, tool := range []string{
-		"create_custom_tool", "update_custom_tool",
-		"update_skill_file", "delete_assets_by_host",
+		"create_skill", "create_custom_tool",
+		"update_custom_tool", "update_skill_file",
 	} {
-		dec := shortCircuit(tool, []byte(`{"command":"http://127.0.0.1"}`))
+		dec := shortCircuit(tool, []byte(`{"name":"probe"}`))
 		if dec == nil {
-			t.Fatalf("%s 应命中短路表", tool)
+			t.Fatalf("%s 应命中短路表（显式 allow），不应落回漏判", tool)
 		}
-		if dec.Action != "ask" {
-			t.Fatalf("%s 应为 ask，得到 %s", tool, dec.Action)
+		if dec.Action != "allow" {
+			t.Fatalf("%s 应为 allow，得到 %s", tool, dec.Action)
 		}
-		if !dec.TimeoutEnabled || dec.TimeoutSeconds != 60 || dec.TimeoutAction != "deny" {
-			t.Fatalf("%s 的 ask 超时须为 60s/deny，得到 %+v", tool, dec)
+		if dec.TimeoutEnabled {
+			t.Fatalf("%s 为 allow 档，不应带审批超时语义，得到 %+v", tool, dec)
 		}
+	}
+	// 内置默认 ask 名单必须为空：自主任务里 ask 只是把 deny 延后，没意义。
+	if got := Defaults().Tools.Ask; len(got) != 0 {
+		t.Fatalf("内置默认不应再有 ask 工具，得到 %v", got)
 	}
 }
 
@@ -35,6 +42,20 @@ func TestShortCircuitLowRiskToolExplicitAllow(t *testing.T) {
 	}
 	if dec.RuleName == "" {
 		t.Fatal("allow 档也必须带 RuleName：审计链靠它区分来源")
+	}
+}
+
+// 破坏业务数据 → 硬 deny，与 MCP 同档。特别断言没有 ask 超时字段。
+func TestShortCircuitDeleteAssetsDeny(t *testing.T) {
+	dec := shortCircuit("delete_assets_by_host", []byte(`{"host":"target.example"}`))
+	if dec == nil || dec.Action != "deny" {
+		t.Fatalf("delete_assets_by_host 应硬拦，得到 %+v", dec)
+	}
+	if dec.TimeoutEnabled || dec.TimeoutSeconds != 0 {
+		t.Fatalf("deny 档不应带 ask 超时语义，得到 %+v", dec)
+	}
+	if !strings.Contains(dec.Message, "业务资产") {
+		t.Fatalf("文案应说明是业务资产破坏，得到 %q", dec.Message)
 	}
 }
 

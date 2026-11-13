@@ -61,16 +61,15 @@ func disableFlagFromEnv() (bool, string) {
 // platformDenyTools 比 ask 更严的一档。MCP 注册是凭据汇：stdio 传输会以容器 root
 // 拉起任意二进制，http/sse 传输则把 env 字段当 HTTP header 回放。所以「新建 MCP」
 // 等价于「让平台对任意地址带任意 header 发请求」，不该由 agent 在测评中途自行开通。
+// 批量删除业务资产（delete_assets_by_host）同档：直接销毁测评成果、不可逆。
 // 默认名单见 shortcircuit_config.go 的 Defaults().Tools.Deny（V6-CFG 起可由
 // <dataDir>/shortcircuit_rules.json 覆盖，仍需重启生效）。
 var platformDenyTools map[string]bool
 
-// platformAskTools 是 G-01① 的对象：改平台配置的工具一律 ask，不直接 deny —— 建自定义
-// 工具 / skill 是 auto agent 的合法日常操作，拦死会废掉平台运维能力。MCP 见上。
-//
-// create_skill 不在此表：新建技能文件不覆盖既有行为，其后果由动作层护栏兜住
-// （护栏拦行为不拦内容，故写进 skill 的内容无法绕过工具层策略），日常操作不该
-// 被人工审批打断。它落在 platformAllowTools —— 显式判定放行，不是漏判。
+// platformAskTools 是【可配置保留档】：代码默认已清空（V6-AUTO 起平台工具
+// 不再有 ask —— 自主任务里人不在线，ask 只是把 deny 延后 15s）。仅当管理员
+// 在 shortcircuit_rules.json 里显式写入 tools.ask 时才生效，此时仍走人工
+// 审批（15s 超时 → deny）。
 var platformAskTools map[string]bool
 
 // platformAllowTools 是低危面：代码常量【显式判定放行】。
@@ -81,6 +80,8 @@ var platformAskTools map[string]bool
 //
 // 收录标准：① 不覆盖既有行为（新建不同于改写）；② 其后果由动作层护栏兜住
 // （护栏拦行为不拦内容，故写进 skill 的内容无法绕过工具层策略）。
+// V6-AUTO 起新增 create_custom_tool / update_custom_tool / update_skill_file：
+// 均属平台配置类，不直接破坏业务数据，且改完的配置仍受动作层约束。
 var platformAllowTools map[string]bool
 
 // platformCredentialRe 是 G-02①-a 的对象：只拦 ARTEX 平台自身的凭据。
@@ -869,12 +870,19 @@ func platformExecutionText(toolName string, input []byte) []byte {
 	return out
 }
 
+// deleteAssetsTool 是批量删除业务资产的工具名：与 MCP 同属 deny 档，但
+// 文案必须是「业务破坏」而不是「凭据汇」，故在 deny 分支单独识别。
+const deleteAssetsTool = "delete_assets_by_host"
+
 const (
 	msgPlatformAsk = "该工具用于修改平台自身配置（建/改自定义工具、skill、资产库）。" +
 		"已转人工确认，确认后即可执行。"
 	msgMCPDeny = "MCP 注册属于凭据汇：stdio 会以容器 root 拉起任意二进制，" +
 		"http/sse 会把 env 当 HTTP header 对任意地址回放。agent 不得自行开通，" +
 		"需要时请由 owner 在管理界面配置。"
+	// msgDeleteAssetsDeny 与 MCP 档分开措辞：这是业务数据破坏，不是凭据面。
+	msgDeleteAssetsDeny = "批量删除业务资产会直接销毁测评成果且不可逆，" +
+		"属于破坏业务数据的高危操作，平台硬禁止。需要清理时请由 owner 在资产页面操作。"
 	msgSensitiveDeny = "该路径指向 ARTEX 平台自身的签名密钥或进程环境" +
 		"（含 LLM API Key / 数据库口令），属于控制面，不是渗透目标资产。已禁止读取。"
 	// msgHostCredentialDeny 与平台凭据档分开措辞：agent 需要知道这是
@@ -891,9 +899,9 @@ const (
 //
 // 动作语义：
 //
-//	deny —— 硬拦，无人工放行路径（平台自身凭据、MCP 注册）
-//	ask  —— 转人工审批（改写既有行为/可执行面、删证据库）
-//	allow —— 代码常量显式判定放行（低危面，如新建技能文件）
+//	deny —— 硬拦，无人工放行路径（平台自身凭据、MCP 注册、删除业务资产）
+//	ask  —— 转人工审批（仅管理员在配置文件里显式配置时命中；15s 超时 deny）
+//	allow —— 代码常量显式判定放行（低危面：新建能力/平台配置类工具）
 //
 // RuleName 一律带 "[代码常量]" 前缀：db.interceptSource 靠它把记录归为
 // shortcircuit 来源（跨包约定，见 guard/shortcircuit_source_test.go）。
@@ -910,33 +918,39 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 	if !ShortCircuitEnabled {
 		return nil
 	}
-	// 必须独立求值而非并入 platformAskTools：deny 无人工放行路径，ask 有 60s 超时兜底，合并即丢一档语义。
+	// 必须独立求值而非并入 platformAskTools：deny 无人工放行路径，ask 有超时兜底，合并即丢一档语义。
 	if platformDenyTools[toolName] {
+		ruleName, msg := "[代码常量] MCP 注册属凭据汇", msgMCPDeny
+		if toolName == deleteAssetsTool {
+			ruleName, msg = "[代码常量] 删除业务资产属破坏性操作", msgDeleteAssetsDeny
+		}
 		return &intercept.Decision{
 			Action:   "deny",
-			RuleName: "[代码常量] MCP 注册属凭据汇",
-			Message:  msgMCPDeny,
+			RuleName: ruleName,
+			Message:  msg,
 		}
 	}
-	// G-01①：平台工具一律 ask
+	// 可配置的 ask 档：代码默认已清空（V6-AUTO 自主优先），仅在管理员显式
+	// 配置 tools.ask 时命中。
 	if platformAskTools[toolName] {
 		return &intercept.Decision{
 			Action:   "ask",
 			RuleName: "[代码常量] 平台工具需人工确认",
 			Message:  msgPlatformAsk,
 			// ask 类规则默认启用超时（种子规则 timeout_enabled=false
-			// 照抄即无限等待）。60s 超时 → deny。
+			// 照抄即无限等待）。15s 超时 → deny（V6-AUTO：缩短空等）。
 			TimeoutEnabled: true,
-			TimeoutSeconds: 60,
+			TimeoutSeconds: 15,
 			TimeoutAction:  "deny",
 		}
 	}
-	// 低危面：显式放行（仍是代码常量判定，不是漏判）
+	// 低危面：显式放行（仍是代码常量判定，不是漏判）。V6-AUTO 起包括
+	// 新建/更新自定义工具与 skill 文件：平台配置类操作，不直接破坏业务数据。
 	if platformAllowTools[toolName] {
 		return &intercept.Decision{
 			Action:   "allow",
 			RuleName: "[代码常量] 平台低危工具放行",
-			Message:  "新建技能文件不改变既有行为，按平台策略放行。",
+			Message:  "平台配置/新建能力类工具不直接破坏业务数据，按自主策略放行。",
 		}
 	}
 	// G-02①-a：平台凭据/进程环境 deny + host 系统凭据档 deny（缺陷1/缺陷2）。

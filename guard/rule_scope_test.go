@@ -36,10 +36,13 @@ type fakeEngine struct {
 
 	judgeCalls int
 	askCalls   int
-	judgeDec   intercept.Decision
-	judgeOK    bool
-	askDec     intercept.Decision
-	askOK      bool
+	// handleAskCalls 统计真正进入人工审批的次数（V6-AUTO：判官 ask 自主
+	// 落定后必须为 0）。
+	handleAskCalls int
+	judgeDec       intercept.Decision
+	judgeOK        bool
+	askDec         intercept.Decision
+	askOK          bool
 }
 
 func (f *fakeEngine) IsToolEnabled(name string) bool { return f.enabled[name] }
@@ -49,6 +52,7 @@ func (f *fakeEngine) IsToolExternal(string) bool     { return true }
 func (f *fakeEngine) AskBurstExceeded(context.Context, string) bool { return false }
 
 func (f *fakeEngine) HandleAsk(context.Context, int64, intercept.Decision, string, []byte) bool {
+	f.handleAskCalls++
 	return false
 }
 
@@ -229,6 +233,9 @@ func TestMCPToolAskRuleGoesToJudgeVerdict(t *testing.T) {
 		if f.judgeCalls != 0 {
 			t.Fatalf("ask 规则命中不应再走无规则判官路径，实际 %d 次", f.judgeCalls)
 		}
+		if f.handleAskCalls != 0 {
+			t.Fatalf("判官给 allow 后不得再进人工审批，实际 %d 次", f.handleAskCalls)
+		}
 	})
 
 	t.Run("判官 deny 拦截", func(t *testing.T) {
@@ -249,6 +256,36 @@ func TestMCPToolAskRuleGoesToJudgeVerdict(t *testing.T) {
 		}
 		if f.askCalls != 1 {
 			t.Fatalf("ask 规则命中应交裁 1 次，实际 %d", f.askCalls)
+		}
+		if f.handleAskCalls != 0 {
+			t.Fatalf("判官给 deny 后不得再进人工审批，实际 %d 次", f.handleAskCalls)
+		}
+	})
+
+	// V6-AUTO：判官自己拿不准时按规则超时策略合成的终局（[自主]）走同一条
+	// applyDecision 路径，不得再进 HandleAsk / pending。
+	t.Run("判官不确定 → 自主落定不进人工", func(t *testing.T) {
+		f := &fakeEngine{
+			enabled:  map[string]bool{"Bash": true},
+			rules:    []fakeRule{rule},
+			judgeAll: true,
+			askDec: intercept.Decision{
+				Action:   "deny",
+				RuleName: rule.name + "·判官不确定",
+				Message:  "[自主] 判官无法确定该操作，按规则的超时策略「拦截」直接执行",
+			},
+			askOK: true,
+		}
+		g := newFakeGuard(f)
+		blocked, msg, _ := g.Hooks().PreToolUse(context.Background(), "mcp__fs__write", ev)
+		if !blocked {
+			t.Fatal("自主落定的 deny 必须拦截")
+		}
+		if !strings.Contains(msg, "[自主]") {
+			t.Fatalf("拦截消息应保留 [自主] 留痕，得到 %q", msg)
+		}
+		if f.handleAskCalls != 0 {
+			t.Fatalf("自主落定不得进人工审批，实际 %d 次", f.handleAskCalls)
 		}
 	})
 }

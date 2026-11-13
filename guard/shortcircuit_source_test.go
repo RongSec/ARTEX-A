@@ -19,7 +19,7 @@ func TestShortCircuitRuleNamesCarrySourcePrefix(t *testing.T) {
 		in   string
 	}{
 		{"MCP 注册", "create_mcp", `{"name":"x","transport":"http","url":"http://169.254.169.254/"}`},
-		{"平台工具需审批", "create_custom_tool", `{"command":"http://127.0.0.1"}`},
+		{"平台配置工具放行", "create_custom_tool", `{"command":"http://127.0.0.1"}`},
 		{"平台凭据", "Bash", `{"command":"cat /app/jwt.key"}`},
 		{"进程环境块", "Bash", `{"command":"cat /proc/1/environ"}`},
 		{"host 系统凭据（缺陷1 新增档）", "Bash", `{"command":"cat /etc/shadow"}`},

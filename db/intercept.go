@@ -250,11 +250,14 @@ const approvalRowSelectWithAudit = `SELECT ` + approvalRowColumns + `, ip.audit`
 // （shortcircuit）。短路表的判定没有 rule_id（它不是一条 DB 规则），
 // 靠 audit 里的 RuleName 前缀识别 —— 前缀是代码常量短路表的约定标记
 // （见 guard/shortcircuit.go）。
+//
+// [自主] 与 [模型] 同归 model：前者是判官自己给不出结论后，按规则超时策略
+// 合成的终局（V6-AUTO），同样是模型参与后的判定，不是 DB 规则命中。
 func interceptSource(ruleID int64, reason string, audits []*InterceptAudit) string {
 	if ruleID != 0 {
 		return "rule"
 	}
-	if strings.HasPrefix(reason, "[模型]") {
+	if strings.HasPrefix(reason, "[模型]") || strings.HasPrefix(reason, "[自主]") {
 		return "model"
 	}
 	if len(audits) > 0 && audits[0] != nil && strings.HasPrefix(audits[0].RuleName, "[代码常量]") {

@@ -438,6 +438,13 @@ func (s *Server) interceptSetJudgeConfig(w http.ResponseWriter, r *http.Request)
 		writeErr(w, 400, "ask_timeout_action 必须是 allow 或 deny")
 		return
 	}
+	// 空值兼容尚未认识该字段的旧前端（SetJudgeConfig 会保留既有设置）。
+	switch req.AskPolicy {
+	case "", "auto", "human":
+	default:
+		writeErr(w, 400, "ask_policy 必须是 auto 或 human")
+		return
+	}
 	if err := s.m.interceptor.SetJudgeConfig(req); err != nil {
 		writeErr(w, 500, err.Error())
 		return

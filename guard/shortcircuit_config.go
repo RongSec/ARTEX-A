@@ -30,7 +30,9 @@ import (
 const ShortCircuitConfigFile = "shortcircuit_rules.json"
 
 // ShortCircuitTools 是三类工具名单。判定顺序 deny → ask → allow，与
-// shortCircuit 的既有语义一致（deny 无人工放行路径，ask 有 60s 超时兜底）。
+// shortCircuit 的既有语义一致（deny 无人工放行路径，ask 有 15s 超时兜底）。
+// V6-AUTO 起内置默认不再有 ask 工具：自主优先，破坏业务数据直接 deny，
+// 平台配置/新建能力直接 allow。
 type ShortCircuitTools struct {
 	Deny  []string `json:"deny"`
 	Ask   []string `json:"ask"`
@@ -58,13 +60,28 @@ func Defaults() ShortCircuitConfig {
 
 var defaultShortCircuitConfig = ShortCircuitConfig{
 	Version: 1,
+	// 工具名单分档原则（V6-AUTO：自主优先，不再有 ask）：
+	//   破坏业务数据 → deny（无人工放行路径，硬拦）；
+	//   平台配置/新建能力 → allow（显式判定放行，不打断自主任务）。
+	//
+	// create_mcp / update_mcp：MCP 注册是凭据汇（stdio 以容器 root 拉起任意
+	// 二进制、http/sse 把 env 当 header 回放），等价于让平台对任意地址带任意
+	// header 发请求，agent 不得自行开通。
+	// delete_assets_by_host：批量删除业务资产直接销毁测评成果，属不可逆的
+	// 业务破坏，与 MCP 同档硬拦 —— 以前放 ask，人不在线时会超时 deny，
+	// 语义上本就是 deny，只是多空等一轮，现改为直接 deny。
+	// create_custom_tool / update_custom_tool / update_skill_file：平台配置类，
+	// 不直接破坏业务数据；其后果仍由动作层护栏兜住（护栏拦行为不拦内容）。
+	// 注：update_skill_file 能改 agent prompt，但改完的 prompt 仍要在动作层
+	// 过 guard/规则/判官，故接受这一取舍 —— 自主任务的价值大于「prompt
+	// 可能被 agent 自己改」的风险。create_skill 同理，且新建不覆盖既有行为。
 	Tools: ShortCircuitTools{
-		Deny: []string{"create_mcp", "update_mcp"},
-		Ask: []string{
-			"create_custom_tool", "update_custom_tool",
-			"update_skill_file", "delete_assets_by_host",
+		Deny: []string{"create_mcp", "update_mcp", "delete_assets_by_host"},
+		Ask:  []string{},
+		Allow: []string{
+			"create_skill", "create_custom_tool",
+			"update_custom_tool", "update_skill_file",
 		},
-		Allow: []string{"create_skill"},
 	},
 	PlatformPaths: []string{
 		// 平台签名密钥（现行 + 旧版遗留两处位置）

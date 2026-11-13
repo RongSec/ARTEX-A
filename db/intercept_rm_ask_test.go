@@ -64,7 +64,7 @@ VALUES ($1, true, 100, 'tool_input', 'regex', $2, 'deny', 'v5e test')`,
 		return action, pattern, timeout
 	}
 
-	t.Run("旧 deny 且仍是出厂 pattern → 改 ask 并打开 60s 超时", func(t *testing.T) {
+	t.Run("旧 deny 且仍是出厂 pattern → 改 ask 并打开审批超时", func(t *testing.T) {
 		set(t, "deny", rmRecursivePattern, false)
 		if err := d.downgradeRmRecursiveToAsk(); err != nil {
 			t.Fatal(err)
@@ -76,7 +76,7 @@ VALUES ($1, true, 100, 'tool_input', 'regex', $2, 'deny', 'v5e test')`,
 		// 超时必须同时打开：否则 HandleAsk 无超时分支会无限等人工，判官没开时
 		// 一条 rm -rf 能把 task 挂死。
 		if !timeout {
-			t.Fatal("降 ask 必须打开审批超时（60s 无人处理 → deny）")
+			t.Fatal("降 ask 必须打开审批超时（无人处理 → deny）")
 		}
 	})
 
@@ -99,6 +99,100 @@ VALUES ($1, true, 100, 'tool_input', 'regex', $2, 'deny', 'v5e test')`,
 		action, pattern, timeout := state(t)
 		if action != "deny" || pattern != custom || timeout {
 			t.Fatalf("用户改过的规则不该被迁移, got action=%q pattern=%q timeout=%t", action, pattern, timeout)
+		}
+	})
+}
+
+// V6-AUTO：规则 #1 的审批超时从 60s 收紧到 15s（判官 ask 已自主落定，
+// 15s 只在判官故障回落人工时生效）。迁移守卫与降 ask 同款：只动仍是出厂
+// 形态的行，用户改过超时/正则的不覆盖。
+func TestShortenRmRecursiveAskTimeout(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	t.Cleanup(func() { d.Close() })
+
+	var origAction, origPattern string
+	var origEnabled bool
+	var origSecs int
+	err = d.QueryRow(`SELECT action, pattern, timeout_enabled, timeout_seconds FROM intercept_rules WHERE name=$1 ORDER BY id LIMIT 1`,
+		rmRecursiveRuleName).Scan(&origAction, &origPattern, &origEnabled, &origSecs)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := d.Exec(`
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+VALUES ($1, true, 100, 'tool_input', 'regex', $2, 'ask', 'v6auto test', true, 60, 'deny')`,
+			rmRecursiveRuleName, rmRecursivePattern); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = d.Exec(`DELETE FROM intercept_rules WHERE name=$1 AND message='v6auto test'`, rmRecursiveRuleName)
+		})
+	case err != nil:
+		t.Fatal(err)
+	default:
+		t.Cleanup(func() {
+			_, _ = d.Exec(`UPDATE intercept_rules SET action=$1, pattern=$2, timeout_enabled=$3, timeout_seconds=$4 WHERE name=$5`,
+				origAction, origPattern, origEnabled, origSecs, rmRecursiveRuleName)
+		})
+	}
+
+	set := func(t *testing.T, action, pattern string, enabled bool, secs int) {
+		t.Helper()
+		if _, err := d.Exec(`UPDATE intercept_rules SET action=$1, pattern=$2, timeout_enabled=$3, timeout_seconds=$4, timeout_action='deny' WHERE name=$5`,
+			action, pattern, enabled, secs, rmRecursiveRuleName); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secs := func(t *testing.T) int {
+		t.Helper()
+		var n int
+		if err := d.QueryRow(`SELECT timeout_seconds FROM intercept_rules WHERE name=$1 ORDER BY id LIMIT 1`,
+			rmRecursiveRuleName).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	t.Run("出厂 ask+60s → 15s", func(t *testing.T) {
+		set(t, "ask", rmRecursivePattern, true, 60)
+		if err := d.shortenRmRecursiveAskTimeout(); err != nil {
+			t.Fatal(err)
+		}
+		if got := secs(t); got != 15 {
+			t.Fatalf("want timeout_seconds=15, got %d", got)
+		}
+	})
+
+	t.Run("用户改过超时值 → 不动", func(t *testing.T) {
+		set(t, "ask", rmRecursivePattern, true, 30)
+		if err := d.shortenRmRecursiveAskTimeout(); err != nil {
+			t.Fatal(err)
+		}
+		if got := secs(t); got != 30 {
+			t.Fatalf("用户配置不应被覆盖，want 30, got %d", got)
+		}
+	})
+
+	t.Run("action 非 ask → 不动", func(t *testing.T) {
+		set(t, "deny", rmRecursivePattern, false, 60)
+		if err := d.shortenRmRecursiveAskTimeout(); err != nil {
+			t.Fatal(err)
+		}
+		if got := secs(t); got != 60 {
+			t.Fatalf("非 ask 行不应被迁移，want 60, got %d", got)
+		}
+	})
+
+	t.Run("pattern 被用户改过 → 不动", func(t *testing.T) {
+		const custom = `(?i)\brm\b\s+-rf\s+/var/www\b`
+		set(t, "ask", custom, true, 60)
+		if err := d.shortenRmRecursiveAskTimeout(); err != nil {
+			t.Fatal(err)
+		}
+		if got := secs(t); got != 60 {
+			t.Fatalf("用户改过的正则不应被迁移，want 60, got %d", got)
 		}
 	})
 }

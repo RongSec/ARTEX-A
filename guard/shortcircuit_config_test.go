@@ -119,8 +119,8 @@ func TestShortCircuitConfigMissingUsesDefaultsNoWrite(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("缺失文件不应被自动创建，stat err=%v", err)
 	}
-	if got := EffectiveShortCircuitConfig(); len(got.Tools.Deny) != 2 {
-		t.Fatalf("缺文件应使用默认 deny，得到 %+v", got.Tools.Deny)
+	if got := EffectiveShortCircuitConfig(); len(got.Tools.Deny) != 3 {
+		t.Fatalf("缺文件应使用默认 deny（含 delete_assets_by_host），得到 %+v", got.Tools.Deny)
 	}
 	if dec := shortCircuit("create_mcp", []byte(`{}`)); dec == nil || dec.Action != "deny" {
 		t.Fatalf("默认规则未生效: %+v", dec)

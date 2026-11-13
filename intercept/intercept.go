@@ -339,6 +339,7 @@ const (
 	settingJudgeFailAction       = "llm_judge_fail_action"
 	settingJudgeAskTimeoutSecs   = "llm_judge_ask_timeout_seconds"
 	settingJudgeAskTimeoutAction = "llm_judge_ask_timeout_action"
+	settingJudgeAskPolicy        = "intercept_judge_ask_policy"
 )
 
 // SettingJudgeAllTools 是「白名单外工具也送判官」的开关键（默认 true）。
@@ -370,6 +371,30 @@ type JudgeConfig struct {
 	FailAction        string `json:"fail_action"` // allow|ask|deny
 	AskTimeoutSeconds int    `json:"ask_timeout_seconds"`
 	AskTimeoutAction  string `json:"ask_timeout_action"` // allow|deny
+	// AskPolicy 决定判官自己给出 ask 时的收敛方式（V6-AUTO）：
+	//   auto（默认）—— 立即按规则自带的 timeout_action 落定终局，不进人工；
+	//   human       —— 保留旧行为，回落人工审批。
+	AskPolicy string `json:"ask_policy"` // auto|human
+}
+
+// 判官 ask 的收敛策略值。
+//
+// auto 是默认：纯自主任务里人常常不在线，回落人工等于「无人处理 →
+// 超时 deny」，大量本可放行的成果会被拦掉。判官拿不准时按规则自己的
+// 超时动作收敛，既保持规则语义（rm -rf 类规则超时即拒），又不空等。
+// human 留给确实需要人拍板的部署，显式切换后才生效。
+const (
+	judgeAskPolicyAuto  = "auto"
+	judgeAskPolicyHuman = "human"
+)
+
+// judgeAskPolicyOf 归一化策略值：缺失/非法一律按 auto（fail-open 到自主）。
+// 无库注入配置（测试、嵌入场景）里 AskPolicy 为空时同样落到 auto。
+func judgeAskPolicyOf(v string) string {
+	if strings.ToLower(strings.TrimSpace(v)) == judgeAskPolicyHuman {
+		return judgeAskPolicyHuman
+	}
+	return judgeAskPolicyAuto
 }
 
 // judgeFailAction 解析 llm_judge_fail_action：缺失或非法值回落到
@@ -397,6 +422,7 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 		FailAction:        judgeFailAction(failStored),
 		AskTimeoutSeconds: i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs),
 		AskTimeoutAction:  i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
+		AskPolicy:         i.getSettingChoice(settingJudgeAskPolicy, judgeAskPolicyAuto, judgeAskPolicyAuto, judgeAskPolicyHuman),
 	}
 	// Prompt: stored value if non-empty, else the built-in template.
 	if v, ok, _ := i.db.GetSetting(settingJudgePrompt); ok && strings.TrimSpace(v) != "" {
@@ -471,6 +497,16 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 		return err
 	}
 	if err := i.db.SetSetting(settingJudgeAskTimeoutAction, c.AskTimeoutAction); err != nil {
+		return err
+	}
+	// 空值来自尚未认识该字段的旧前端：保留既有设置，不要静默重置成 auto。
+	policy := judgeAskPolicyOf(c.AskPolicy)
+	if strings.TrimSpace(c.AskPolicy) == "" {
+		if v, ok, _ := i.db.GetSetting(settingJudgeAskPolicy); ok {
+			policy = judgeAskPolicyOf(v)
+		}
+	}
+	if err := i.db.SetSetting(settingJudgeAskPolicy, policy); err != nil {
 		return err
 	}
 	return nil
@@ -554,15 +590,16 @@ func (i *Interceptor) judgeWithConfig(ctx context.Context, cfg JudgeConfig, tool
 // judgeAskOverridesHuman 纯函数：判官对 ask 规则交裁的 verdict 是否能直接终结
 // 审批（true），还是必须回落人工审批（false）。
 //
-// 只有【模型真实给出的】allow/deny 才终结；以下三种一律回落人工：
+// 只有【模型真实给出的】allow/deny 才在这里终结；以下三种不终结：
 //   - judged=false：判官未开启或 reviewer 未接线；
 //   - ModelFallback=true：判官报错/超时/输出不可解析。失败时不走 FailAction
 //     而交人工，是因为这里的上下文与无规则命中路径不同 —— ask 规则命中说明
 //     人工通道必然可用，回落 deny 会白白晾着能拍板的人，回落 allow 等于
 //     「让判官失效就必然放行」，交人工是唯一既不被绕过也不被卡死的语义。
-//     fail-closed 不因此改变：人工通道自身仍是 pending+超时 60s→deny。
-//   - 模型给出 ask verdict：用户配 ask 的本意就是人来看一眼，模型再转一次
-//     人工没有理由用判官的 300s 超时替换规则自带的审批超时。
+//     fail-closed 不因此改变：人工通道自身仍是 pending+超时→deny。
+//   - 模型给出 ask verdict：本函数返回 false；是否仍回落人工由 askVerdictWithConfig
+//     按 intercept_judge_ask_policy 决定（V6-AUTO 起默认按规则超时动作自主落定，
+//     不再空等人工）。
 func judgeAskOverridesHuman(d Decision, judged bool) bool {
 	return judged && !d.ModelFallback && (d.Action == "allow" || d.Action == "deny")
 }
@@ -571,12 +608,16 @@ func judgeAskOverridesHuman(d Decision, judged bool) bool {
 // 此前 Judge() 只在【无任何规则命中】时运行，用户显式配置 action=ask 的规则
 // 命中后直接进人工等待（实测 60s 超时即 deny）——判官开着时这不是预期语义。
 //
-// 返回 (verdict, true) 仅当判官开启、已接线且给出终局 allow/deny；返回
-// (Decision{}, false) 时调用方保持现 ask 语义转人工审批。rule 传入的是
-// Match() 命中的规则 Decision，用于把规则名带回审计留痕。
+// 返回 (verdict, true) 当判官开启、已接线且给出终局裁决。终局有两类：
+//   - 模型真实给出 allow/deny —— [模型] 留痕；
+//   - 模型给出 ask 且 intercept_judge_ask_policy=auto（默认）—— 按规则
+//     timeout_action 立即合成 allow/deny —— [自主] 留痕，不进 pending。
 //
-// RuleID 保持 Judge() 置的 0 → DB 行 decision_source 按 reason 的 [模型] 前缀
-// 归为 model（见 db.interceptSource），规则归属仍记在 audit.RuleName 里。
+// 返回 (Decision{}, false) 时调用方保持现 ask 语义转人工审批，仅剩两种情形：
+// 判官未开启/未接线，或策略显式设为 human。
+//
+// RuleID 保持 Judge() 置的 0 → DB 行 decision_source 按 reason 的 [模型]/[自主]
+// 前缀归为 model（见 db.interceptSource），规则归属仍记在 audit.RuleName 里。
 func (i *Interceptor) JudgeAskVerdict(ctx context.Context, rule Decision, tool string, arguments json.RawMessage) (Decision, bool) {
 	return i.askVerdictWithConfig(ctx, i.judgeConfig(), rule, tool, arguments)
 }
@@ -585,12 +626,49 @@ func (i *Interceptor) JudgeAskVerdict(ctx context.Context, rule Decision, tool s
 // judgeWithConfig 同款抽法：设置读取留在外层，路由与留痕语义可脱离 DB 测。
 func (i *Interceptor) askVerdictWithConfig(ctx context.Context, cfg JudgeConfig, rule Decision, tool string, arguments json.RawMessage) (Decision, bool) {
 	d, judged := i.judgeWithConfig(ctx, cfg, tool, arguments)
-	if !judgeAskOverridesHuman(d, judged) {
-		return Decision{}, false
+	if judgeAskOverridesHuman(d, judged) {
+		d.RuleName = rule.RuleName
+		d.Message = "[模型] ask 规则[" + rule.RuleName + "]交模型裁决：" + strings.TrimPrefix(d.Message, "[模型] ")
+		return d, true
 	}
-	d.RuleName = rule.RuleName
-	d.Message = "[模型] ask 规则[" + rule.RuleName + "]交模型裁决：" + strings.TrimPrefix(d.Message, "[模型] ")
-	return d, true
+	// 判官自己也没有结论（真实给出 ask）且策略为 auto：立即按规则超时动作
+	// 落定终局。这里【不】进 pending —— 自主任务里人不在线，回落人工只会
+	// 等到超时再按同一个 timeout_action 拒掉，白耗一轮。
+	// 判官故障（ModelFallback）不在此列：仍回落人工，见函数注释。
+	if judged && !d.ModelFallback && d.Action == "ask" && judgeAskPolicyOf(cfg.AskPolicy) == judgeAskPolicyAuto {
+		return autonomousJudgeAskDecision(rule, d), true
+	}
+	return Decision{}, false
+}
+
+// autonomousJudgeAskDecision 把「判官不确定」合成为终局决策（V6-AUTO）。
+//
+// action 取规则自己的 timeout_action（空/非法按 deny）：判官拿不准不等于
+// 放宽，规则的收敛意图仍然生效。RuleID 保持 0、reason 带 [自主] 前缀，
+// db.interceptSource 据此归为 model；规则归属只留在 RuleName 上。
+func autonomousJudgeAskDecision(rule, judged Decision) Decision {
+	action := rule.TimeoutAction
+	if action != "allow" && action != "deny" {
+		action = "deny"
+	}
+	label := "拦截"
+	if action == "allow" {
+		label = "放行"
+	}
+	reason := strings.TrimSpace(strings.TrimPrefix(judged.Message, "[模型] "))
+	if reason == "" {
+		reason = "判官未给出理由"
+	}
+	return Decision{
+		ModelInput:       judged.ModelInput,
+		ModelInputDigest: judged.ModelInputDigest,
+		ConfigDigest:     judged.ConfigDigest,
+		ProfileID:        judged.ProfileID,
+		Action:           action,
+		RuleName:         rule.RuleName + "·判官不确定",
+		Message: "[自主] 判官无法确定该操作，按规则的超时策略「" + label +
+			"」直接执行（原判官理由：" + reason + "）",
+	}
 }
 
 func judgeActionLabel(action string) string {

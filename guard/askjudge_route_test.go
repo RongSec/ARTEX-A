@@ -3,7 +3,10 @@ package guard
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
@@ -109,6 +112,50 @@ func TestRouteAskRuleJudgeAllowPassesWithAudit(t *testing.T) {
 	}
 }
 
+// V6-AUTO：判官自己给 ask + policy=auto → 按规则 timeout_action 立即 deny，
+// 【不进 pending】。回归点：旧行为会回落人工等 60s，人不在线就按 deny 拦掉。
+func TestRouteAskRuleJudgeAskAutoPolicyNoPending(t *testing.T) {
+	d := openRouteTestDB(t)
+	defer d.Close()
+	ic := routeFixture(t, d, "路由测试·ask自主", "ask", "RouteAskAutoProbe", true)
+	// 显式钉住 auto，避免同库其它用例留下的设置影响本用例。
+	cfg := ic.GetJudgeConfig()
+	cfg.AskPolicy = "auto"
+	if err := ic.SetJudgeConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	ic.SetReviewer(func(context.Context, int64, string, intercept.ReviewInput) (intercept.Decision, error) {
+		return intercept.Decision{Action: "ask", Message: "拿不准是否影响业务"}, nil
+	})
+	g := NewWithInterceptor(ic)
+	// taskID 带纳秒后缀：route 测试用 defer d.Close()，t.Cleanup 的删除在
+	// 关库后执行会静默失败；唯一 ID 让本用例在持久库上重复跑也不串行。
+	taskID := fmt.Sprintf("route-ask-auto-%d", time.Now().UnixNano())
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM intercept_pending WHERE task_id=$1`, taskID) })
+	ctx := intercept.WithTaskContext(context.Background(), taskID, "route-agent", nil)
+	blocked, msg, _ := g.Hooks().PreToolUse(ctx, "RouteAskAutoProbe", json.RawMessage(`{"probe":1}`))
+	if !blocked {
+		t.Fatal("规则 timeout_action=deny 时，判官 ask 应自主 deny")
+	}
+	if !strings.Contains(msg, "[自主]") {
+		t.Fatalf("拦截消息应带 [自主] 留痕，得到 %q", msg)
+	}
+	var pending int
+	if err := d.QueryRow(`SELECT count(*) FROM intercept_pending WHERE task_id=$1 AND status='pending'`, taskID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Fatalf("自主落定不得创建 pending 记录，实际 %d 条", pending)
+	}
+	rows, err := d.ListTaskIntercepts(taskID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("应恰好一条审计留痕（denied/model），rows=%d err=%v", len(rows), err)
+	}
+	if rows[0].Status != "denied" || rows[0].DecisionSource != "model" {
+		t.Fatalf("留痕应为 denied/model，得到 %+v", rows[0])
+	}
+}
+
 // 基线不变：ask 规则命中 + 判官关闭 → 不送判官、照常进人工 pending，
 // 人工放行后通过（emit 回调里 Decide，同 capture_approval_test 范式）。
 func TestRouteAskRuleJudgeOffGoesToHuman(t *testing.T) {
@@ -170,8 +217,9 @@ func TestRouteRmRecursiveBuiltinRuleIsAskRouted(t *testing.T) {
 	const ruleName = "[内置] 递归强制删除 rm -rf"
 	var action string
 	var timeout bool
-	if err := d.QueryRow(`SELECT action, timeout_enabled FROM intercept_rules WHERE name=$1`,
-		ruleName).Scan(&action, &timeout); err != nil {
+	var timeoutSecs int
+	if err := d.QueryRow(`SELECT action, timeout_enabled, timeout_seconds FROM intercept_rules WHERE name=$1`,
+		ruleName).Scan(&action, &timeout, &timeoutSecs); err != nil {
 		t.Fatalf("库中应有种子规则 %q: %v", ruleName, err)
 	}
 	if action != "ask" {
@@ -179,8 +227,12 @@ func TestRouteRmRecursiveBuiltinRuleIsAskRouted(t *testing.T) {
 	}
 	// ask 落地人工时必须有时限：v1 出厂是 deny+timeout_enabled=false，漏了这一步
 	// 判官未启用/故障回落时 HandleAsk 会无限等人工，一条 rm -rf 挂死整个 task。
+	// V6-AUTO：超时收紧到 15s（判官 ask 已自主落定，只有故障时才用这 15s）。
 	if !timeout {
-		t.Fatalf("种子规则 %q 的审批超时必须是打开的（60s→deny）", ruleName)
+		t.Fatalf("种子规则 %q 的审批超时必须是打开的（15s→deny）", ruleName)
+	}
+	if timeoutSecs != 15 {
+		t.Fatalf("种子规则 %q 的审批超时应为 15s（V6-AUTO），得到 %d", ruleName, timeoutSecs)
 	}
 
 	ic := intercept.New(d)

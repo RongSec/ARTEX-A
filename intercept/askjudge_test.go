@@ -83,9 +83,9 @@ func TestJudgeAskVerdictModelDenyBlocks(t *testing.T) {
 }
 
 // 测例3：ask 命中 + 判官报错/超时/不可解析 → 回落人工审批（返回 false）。
-// fail-closed 不变：回落由调用方走 HandleAsk（pending + 规则超时 60s→deny）。
-// 三种故障形态逐一钉住：reviewer error、输出不可解析（非法 Action）、判官
-// 本身转人工（模型给 ask）。
+// fail-closed 不变：回落由调用方走 HandleAsk（pending + 规则超时→deny）。
+// 注意「判官自己给 ask」不在此列：那是判官的真实结论，V6-AUTO 起按策略
+// 自主落定（见下方 TestJudgeAskVerdictAutoPolicy*）。
 func TestJudgeAskVerdictFaultFallsBackToHuman(t *testing.T) {
 	ctx := context.Background()
 	ask := askRuleDecision()
@@ -95,7 +95,6 @@ func TestJudgeAskVerdictFaultFallsBackToHuman(t *testing.T) {
 	}{
 		{"判官报错", fakeReviewer(Decision{}, errors.New("provider unavailable"))},
 		{"输出不可解析", fakeReviewer(Decision{Action: "maybe"}, nil)},
-		{"判官自己也转人工", fakeReviewer(Decision{Action: "ask", Message: "拿不准"}, nil)},
 	}
 	for _, c := range cases {
 		i := newNoDBJudgeInterceptor(t, c.rv)
@@ -173,5 +172,105 @@ func TestJudgeAskVerdictDecisionSourceContract(t *testing.T) {
 	}
 	if d.RuleName != rule.RuleName {
 		t.Fatalf("规则归属必须留在 audit.RuleName（%q），得到 %q", rule.RuleName, d.RuleName)
+	}
+}
+
+// ============================================================================
+// V6-AUTO：判官自己给出 ask 时的自主落定（intercept_judge_ask_policy）。
+//
+// 背景：纯自主任务里人常常不在线。旧行为「判官 ask → 回落人工 → 60s 超时
+// deny」等于「无人即拦掉成果」，与用户要的自主推进相反。默认策略改为
+// 立即按规则自带的 timeout_action 落定终局，不进 pending。
+// ============================================================================
+
+// 判官 ask + policy=auto（缺省即 auto）+ rule.timeout_action=deny → 立即 deny。
+func TestJudgeAskVerdictAutoPolicyDeny(t *testing.T) {
+	i := newNoDBJudgeInterceptor(t, fakeReviewer(Decision{Action: "ask", Message: "拿不准是否影响业务"}, nil))
+	rule := askRuleDecision() // TimeoutAction=deny
+	d, ok := i.askVerdictWithConfig(context.Background(), JudgeConfig{Enabled: true}, rule, "Bash", json.RawMessage(`{"command":"rm -rf /tmp/x"}`))
+	if !ok {
+		t.Fatal("policy=auto 时判官 ask 必须立即落定（ok=true），不得回落人工")
+	}
+	if d.Action != "deny" {
+		t.Fatalf("规则 timeout_action=deny → 应 deny，得到 %q", d.Action)
+	}
+	if d.RuleID != 0 {
+		t.Fatalf("[自主] 终局必须 RuleID=0（decision_source 归 model），得到 %d", d.RuleID)
+	}
+	if !strings.HasPrefix(d.Message, "[自主]") {
+		t.Fatalf("reason 必须以 [自主] 开头，得到 %q", d.Message)
+	}
+	if !strings.Contains(d.Message, "「拦截」") {
+		t.Fatalf("reason 必须写明按超时策略拦截，得到 %q", d.Message)
+	}
+	if !strings.Contains(d.Message, "拿不准是否影响业务") {
+		t.Fatalf("reason 必须保留原判官理由，得到 %q", d.Message)
+	}
+	wantRule := rule.RuleName + "·判官不确定"
+	if d.RuleName != wantRule {
+		t.Fatalf("RuleName 应为 %q，得到 %q", wantRule, d.RuleName)
+	}
+	if d.TimeoutEnabled {
+		t.Fatalf("已落定的终局不应再带审批超时语义，得到 %+v", d)
+	}
+}
+
+// 判官 ask + policy=auto + rule.timeout_action=allow → 立即 allow。
+func TestJudgeAskVerdictAutoPolicyAllow(t *testing.T) {
+	i := newNoDBJudgeInterceptor(t, fakeReviewer(Decision{Action: "ask", Message: "不确定"}, nil))
+	rule := askRuleDecision()
+	rule.TimeoutAction = "allow"
+	d, ok := i.askVerdictWithConfig(context.Background(), JudgeConfig{Enabled: true, AskPolicy: judgeAskPolicyAuto}, rule, "Bash", json.RawMessage(`{"command":"ls"}`))
+	if !ok || d.Action != "allow" {
+		t.Fatalf("timeout_action=allow 应自主放行，得到 %+v ok=%v", d, ok)
+	}
+	if !strings.Contains(d.Message, "「放行」") {
+		t.Fatalf("reason 必须写明按超时策略放行，得到 %q", d.Message)
+	}
+}
+
+// timeout_action 为空/非法时按 deny 收敛（fail-closed，不放宽）。
+func TestJudgeAskVerdictAutoPolicyEmptyTimeoutActionDenies(t *testing.T) {
+	i := newNoDBJudgeInterceptor(t, fakeReviewer(Decision{Action: "ask", Message: "不确定"}, nil))
+	rule := askRuleDecision()
+	rule.TimeoutAction = ""
+	d, ok := i.askVerdictWithConfig(context.Background(), JudgeConfig{Enabled: true}, rule, "Bash", json.RawMessage(`{"command":"ls"}`))
+	if !ok || d.Action != "deny" {
+		t.Fatalf("timeout_action 缺失应按 deny 收敛，得到 %+v ok=%v", d, ok)
+	}
+}
+
+// 判官 ask + policy=human → 保持原行为：回落人工（ok=false）。
+func TestJudgeAskVerdictHumanPolicyFallsBack(t *testing.T) {
+	i := newNoDBJudgeInterceptor(t, fakeReviewer(Decision{Action: "ask", Message: "请人确认"}, nil))
+	if d, ok := i.askVerdictWithConfig(context.Background(),
+		JudgeConfig{Enabled: true, AskPolicy: judgeAskPolicyHuman}, askRuleDecision(), "Bash", json.RawMessage(`{"command":"ls"}`)); ok || d.Action != "" {
+		t.Fatalf("policy=human 应回落人工，得到 %+v ok=%v", d, ok)
+	}
+}
+
+// 判官故障（ModelFallback=true）不同于判官给 ask：即使 FailAction=ask 且
+// policy=auto 也必须回落人工（fail-closed，不替人拍板）。
+func TestJudgeAskVerdictModelFallbackStillHumanUnderAuto(t *testing.T) {
+	i := newNoDBJudgeInterceptor(t, fakeReviewer(Decision{}, errors.New("timeout")))
+	if d, ok := i.askVerdictWithConfig(context.Background(),
+		JudgeConfig{Enabled: true, FailAction: "ask", AskPolicy: judgeAskPolicyAuto}, askRuleDecision(), "Bash", json.RawMessage(`{"command":"ls"}`)); ok || d.Action != "" {
+		t.Fatalf("判官故障应回落人工（规则 ask → pending 15s），得到 %+v ok=%v", d, ok)
+	}
+}
+
+// 策略值归一化：空与非法值都按 auto（fail-open 到自主）；human 原样保留。
+func TestJudgeAskPolicyOf(t *testing.T) {
+	cases := map[string]string{
+		"":        judgeAskPolicyAuto,
+		"auto":    judgeAskPolicyAuto,
+		"human":   judgeAskPolicyHuman,
+		" HUMAN ": judgeAskPolicyHuman,
+		"bogus":   judgeAskPolicyAuto,
+	}
+	for in, want := range cases {
+		if got := judgeAskPolicyOf(in); got != want {
+			t.Fatalf("judgeAskPolicyOf(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
