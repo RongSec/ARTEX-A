@@ -112,6 +112,39 @@ func TestReviewInputBoundsAndInvalidContext(t *testing.T) {
 	}
 }
 
+// Background is intent/authorization context only: keep it small so judge
+// latency stays bounded, and mark it truncated instead of silently rewriting.
+func TestReviewInputClipsLongBackground(t *testing.T) {
+	args := json.RawMessage(`{"command":"rm -rf /tmp/v5e_check"}`)
+	ctx := WithReviewContext(t.Context(), "", ReviewBackground{Source: BackgroundUserMessage, Text: strings.Repeat("a", 1000)})
+	in, err := BuildReviewInput(ctx, "Bash", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Background == nil || !in.Background.Truncated || len(in.Background.Text) != reviewTextLimit {
+		t.Fatalf("background not clipped to limit: %+v", in.Background)
+	}
+	if string(in.Arguments) != string(args) {
+		t.Fatal("clipping background changed current arguments")
+	}
+
+	// Exactly at the limit is not truncation.
+	ctx = WithReviewContext(t.Context(), "", ReviewBackground{Source: BackgroundUserMessage, Text: strings.Repeat("a", reviewTextLimit)})
+	in, err = BuildReviewInput(ctx, "Bash", args)
+	if err != nil || in.Background == nil || in.Background.Truncated || len(in.Background.Text) != reviewTextLimit {
+		t.Fatalf("limit-sized background misreported: %+v %v", in.Background, err)
+	}
+
+	// Empty or whitespace-only background is omitted, not sent as "".
+	for _, text := range []string{"", "   \n\t"} {
+		ctx = WithReviewContext(t.Context(), "", ReviewBackground{Source: BackgroundUserMessage, Text: text})
+		in, err = BuildReviewInput(ctx, "Bash", args)
+		if err != nil || in.Background != nil {
+			t.Fatalf("empty background kept: %+v %v", in.Background, err)
+		}
+	}
+}
+
 func TestReviewInputAuditRetention(t *testing.T) {
 	for _, input := range []json.RawMessage{
 		json.RawMessage(`{"version":1,"history":[],"turn_input":"old input","tool_name":"Read","arguments":{}}`),

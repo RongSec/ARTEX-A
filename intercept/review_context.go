@@ -7,7 +7,14 @@ import (
 	"strings"
 )
 
-const reviewTextLimit = 4000
+// reviewTextLimit caps the human background sent to the LLM judge. Background
+// only explains intent/authorization context, so ~900 bytes carries the actual
+// user request; feeding longer text (later exploration state, plan/history prose)
+// inflates the prompt and measurably raises judge latency and token cost without
+// changing the verdict. The current tool arguments are never truncated, and
+// truncated=true is documented in JudgeContextBoundary so the judge knows the
+// background was cut.
+const reviewTextLimit = 900
 
 const BackgroundUserMessage = "user_message"
 
