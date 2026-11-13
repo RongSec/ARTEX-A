@@ -19,22 +19,37 @@ import (
 // reviewer（后者要过 judgeConfig 的 DB 读，故在 intercept 侧测）。
 // ============================================================================
 
-// 总闸三分支：关掉 → 不判；工具名为空 → 不判；开启且有工具名 → 判。
+// 总闸四分支：关掉 → 不判；内置工具 → 不判；工具名为空 → 不判；
+// 开启、外部工具且有工具名 → 判。
 func TestShouldJudgeBeyondWhitelistThreeBranches(t *testing.T) {
 	cases := []struct {
-		desc    string
-		enabled bool
-		tool    string
-		want    bool
+		desc     string
+		enabled  bool
+		external bool
+		tool     string
+		want     bool
 	}{
-		{"开关关闭退回旧行为", false, "mcp__fs__read_file", false},
-		{"开启但事件无工具名", true, "", false},
-		{"开启且有工具名", true, "mcp__fs__read_file", true},
+		{"开关关闭退回旧行为", false, true, "mcp__fs__read_file", false},
+		{"内置平台工具不送判", true, false, "record_fact", false},
+		{"开启但事件无工具名", true, true, "", false},
+		{"开启且为外部工具", true, true, "mcp__fs__read_file", true},
 	}
 	for _, c := range cases {
-		if got := shouldJudgeBeyondWhitelist(c.enabled, c.tool); got != c.want {
+		external := func() bool { return c.external }
+		if got := shouldJudgeBeyondWhitelist(c.enabled, c.tool, external); got != c.want {
 			t.Fatalf("%s：want %t got %t", c.desc, c.want, got)
 		}
+	}
+}
+
+// 开关关闭 / 无工具名时不得触碰分类器（分类器意味着一次查库）。
+func TestShouldJudgeBeyondWhitelistSkipsProbe(t *testing.T) {
+	probed := false
+	probe := func() bool { probed = true; return true }
+	shouldJudgeBeyondWhitelist(false, "mcp__foo__bar", probe)
+	shouldJudgeBeyondWhitelist(true, "", probe)
+	if probed {
+		t.Fatal("总闸已短路时不应调用分类器")
 	}
 }
 

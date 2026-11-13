@@ -30,12 +30,13 @@ type AuditEntry struct {
 
 // Guard enforces the side-effect policy via agent-core hooks.
 type Guard struct {
-	mu          sync.Mutex
-	audit       []AuditEntry
-	attrib      map[string]int // failure attribution counts (Observer / G5)
-	reg         *hook.Registry
-	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
-	judgeCache  *judgeVerdictCache     // 白名单外工具的判官结论缓存（见 judge_all.go）
+	mu            sync.Mutex
+	audit         []AuditEntry
+	attrib        map[string]int // failure attribution counts (Observer / G5)
+	reg           *hook.Registry
+	interceptor   *intercept.Interceptor // optional; nil disables user-configured rules
+	judgeCache    *judgeVerdictCache     // 白名单外工具的判官结论缓存（见 judge_all.go）
+	externalProbe func(string) bool      // 测试注入的工具外部性分类器；nil 走 interceptor
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -140,9 +141,13 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 		return hook.Result{}
 	}
 	if !g.interceptor.IsToolEnabled(ev.ToolName) {
-		// 白名单外（MCP / 自定义工具）：规则只覆盖 intercept_enabled_tools 里的
-		// 面，这里不跑 Match，但必须过判官 —— 改动前这一行直接放行，于是这些
-		// 工具既不跑规则、也不过模型，两道防线全绕开。开关见 intercept_judge_all_tools。
+		// 白名单外：
+		//   - 内置平台工具（kind=builtin，record_fact / graph_overview 等）不送
+		//     判官 —— 它们不执行代码也不触外部系统，判官没有可拦的面，送判只
+		//     是每轮多烧 2-3k token + 1-3s（V5-B2）。
+		//   - MCP / 自定义（command|script|http）/ 未知工具名仍必送：这些才是
+		//     V5-B 要覆盖的面（见 intercept.IsToolExternal）。
+		//   - intercept_judge_all_tools=false 时整体退回旧行为，全部放行。
 		return g.judgeOutsideWhitelist(ctx, ev, g.interceptor.JudgeAllToolsEnabled(), g.interceptor.Judge)
 	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
@@ -176,6 +181,10 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 // [模型] 前缀 + RuleID=0 归类），ask 走人工审批（判官 ask verdict 自带超时）。
 // 判官未开启/未接线时 Judge 返回 judged=false，保持改动前的放行语义。
 //
+// 「白名单外」不等于「都送判」：平台内置工具（kind=builtin）在这里被
+// toolIsExternal 挡掉（V5-B2）；只有 MCP、自定义（command|script|http）与
+// 未知工具名才真正落到判官。
+//
 // 缓存：同一次会话内 (tool, sha256(input)) 相同的调用复用结论（TTL 5 分钟、
 // 上限 500、LRU），命中时不重复调模型，但每次都落库留痕（applyDecision 里
 // 的 Log），审计链不缺条目。
@@ -183,7 +192,7 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 // enabled/judge 由调用方传入，是为了让这条路由能在没有数据库的环境里用假
 // 判官测（见 judge_all_test.go）。
 func (g *Guard) judgeOutsideWhitelist(ctx context.Context, ev hook.Event, enabled bool, judge judgeFunc) hook.Result {
-	if !shouldJudgeBeyondWhitelist(enabled, ev.ToolName) {
+	if !shouldJudgeBeyondWhitelist(enabled, ev.ToolName, func() bool { return g.toolIsExternal(ev.ToolName) }) {
 		return hook.Result{}
 	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)

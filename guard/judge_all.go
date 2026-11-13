@@ -25,14 +25,34 @@ const (
 // shouldJudgeBeyondWhitelist 是白名单外分支的总闸（纯函数，无库可测）。
 //
 //   - enabled=false：管理员关了 intercept_judge_all_tools，退回改动前的语义
-//     ——白名单外直接放行（省 token 的唯一开关）。
+//     ——白名单外直接放行（省 token 的唯一开关）。此分支不查分类器。
 //   - tool==""：事件不带工具名，判官无从审查，不送（避免一串空名判官调用）。
+//   - external()==false：工具是平台内置（kind=builtin），既不执行代码也不触
+//     外部系统，判官没有可拦的面 —— 送判纯属成本（V5-B2）。
 //   - 其余：送判官。
-func shouldJudgeBeyondWhitelist(enabled bool, tool string) bool {
-	if !enabled {
+//
+// external 传函数而不是布尔值，是为了在前两个分支短路时完全不查库。
+func shouldJudgeBeyondWhitelist(enabled bool, tool string, external func() bool) bool {
+	if !enabled || tool == "" {
 		return false
 	}
-	return tool != ""
+	return external()
+}
+
+// toolIsExternal 报告某个工具是否必须送判官。
+//
+// 生产接线是 interceptor.IsToolExternal（查 tools 表按 kind 分类）；probe 字段
+// 只用于让「内置不判 / MCP 判 / 未知判 / 自定义判」这组路由矩阵能在无库环境里
+// 用假分类器钉住（见 judge_scope_test.go）。无 interceptor 时按外部处理：
+// 没有分类信息就 fail-safe 送判。
+func (g *Guard) toolIsExternal(name string) bool {
+	if g.externalProbe != nil {
+		return g.externalProbe(name)
+	}
+	if g.interceptor == nil {
+		return true
+	}
+	return g.interceptor.IsToolExternal(name)
 }
 
 // cacheableJudgeVerdict 只缓存模型给出的确定性 allow/deny。

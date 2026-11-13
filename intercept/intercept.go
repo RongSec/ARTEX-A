@@ -140,12 +140,13 @@ type Reviewer func(ctx context.Context, profileID int64, prompt string, input Re
 // Interceptor loads intercept rules from the database and evaluates them on
 // tool calls. It is safe for concurrent use.
 type Interceptor struct {
-	db           *db.DB
-	mu           sync.RWMutex
-	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
-	enabledTools map[string]bool // nil means not loaded yet
-	pending      *pendingManager
-	reviewer     Reviewer // nil = LLM fallback judge not wired
+	db            *db.DB
+	mu            sync.RWMutex
+	cached        []compiledRule  // sorted by priority DESC; nil means not loaded yet
+	enabledTools  map[string]bool // nil means not loaded yet
+	pending       *pendingManager
+	reviewer      Reviewer                       // nil = LLM fallback judge not wired
+	externalTools map[string]externalToolVerdict // 工具是否必须送判官（TTL 60s，见 tool_external.go）
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
@@ -176,6 +177,7 @@ func (i *Interceptor) Invalidate() {
 	i.mu.Lock()
 	i.cached = nil
 	i.enabledTools = nil
+	i.externalTools = nil
 	i.mu.Unlock()
 }
 
