@@ -692,34 +692,90 @@ var recordOnlyTools = map[string]bool{
 // 故本档天然覆盖转义绕过，无需再单独解码。
 var hostScanFields = []string{"command", "text", "file_path", "path", "args"}
 
-// hostScanText 提取 host 档的校验文本：JSON 对象走字段抽取（顺带完成 JSON
-// 转义解码，堵 \u002f 形态），非 JSON 对象退回整体字节串。
+// hostScanFieldsSet 是 hostScanFields 的 set 形式，供递归遍历 O(1) 判定键名。
+var hostScanFieldsSet = func() map[string]bool {
+	m := make(map[string]bool, len(hostScanFields))
+	for _, k := range hostScanFields {
+		m[k] = true
+	}
+	return m
+}()
+
+// hostSkipFields 是描述性/搜索模式字段（正文、正则、摘要、记录文本），
+// 不是执行面。既有语义里 host 档只认 hostScanFields，这些字段一律不碰；
+// 改为递归遍历后显式整支跳过，防止「战果记录里引用 cat /etc/shadow」或
+// Grep 的 pattern 被误判成本机读取（宁漏不误伤）。
+var hostSkipFields = map[string]bool{
+	"pattern": true, "content": true, "note": true, "notes": true,
+	"description": true, "summary": true, "detail": true, "message": true,
+}
+
+const (
+	hostScanMaxDepth = 64    // 递归层数上限，防恶意深嵌套打爆栈
+	hostScanMaxNodes = 10000 // 遍历节点数上限，防超大结构拖死 CPU
+)
+
+type hostScanState struct {
+	b     strings.Builder
+	nodes int
+}
+
+// hostWalk 深度遍历已 JSON 解码的节点，收集【执行面】字符串。
+//   - collect=true：当前节点是某个白名单字段的值（如 args 数组、command
+//     对象），其内部所有字符串都属于执行面，直接收集。
+//   - collect=false：只有命中 hostScanFieldsSet 的键才转为 collect 下钻；
+//     hostSkipFields 键整支跳过；其余容器键（params/arguments/input/
+//     payload/tool_name 等）递归下去但不因键名收值——这正是 MCP 嵌套形态能
+//     取到 params.command 的关键。
+//
+// 数组元素继承当前 collect 态：来自 args/command 的数组里的裸字符串会收，
+// 普通容器数组里的裸字符串不收。depth/nodes 双上限保证恶意深嵌套既不
+// panic 也不死循环。
+func hostWalk(v any, collect bool, depth int, st *hostScanState) {
+	if depth > hostScanMaxDepth || st.nodes > hostScanMaxNodes {
+		return
+	}
+	switch t := v.(type) {
+	case string:
+		if collect {
+			st.b.WriteString(t)
+			st.b.WriteByte('\n')
+		}
+	case []any:
+		for _, e := range t {
+			st.nodes++
+			hostWalk(e, collect, depth+1, st)
+		}
+	case map[string]any:
+		for k, e := range t {
+			st.nodes++
+			if hostSkipFields[k] {
+				continue
+			}
+			hostWalk(e, collect || hostScanFieldsSet[k], depth+1, st)
+		}
+	}
+}
+
+// hostScanText 提取 host 档的校验文本：JSON 对象走【字段感知的递归抽取】
+// （顺带由 json.Unmarshal 完成 JSON 转义解码），非 JSON 对象退回整体字节串。
+//
+// 相对旧实现（只取顶层 hostScanFields）的修复：stdio MCP 的调用在 hook 里
+// 表现为 tool_name=ExecuteExtraTool，真实命令藏在 params.command 等嵌套
+// 容器里，顶层没有白名单字段 → 旧实现返回空串 → host 档恒不命中 → 红线
+// 漏判。改为深度遍历后，任意层级的白名单字段都能取到；容器键只递归、
+// 不因键名收值，描述性字段整支跳过，字段白名单语义保持不变。
 func hostScanText(input []byte) string {
 	if len(input) == 0 || input[0] != '{' {
 		return string(input)
 	}
-	var m map[string]any
-	if err := json.Unmarshal(input, &m); err != nil {
+	var v any
+	if err := json.Unmarshal(input, &v); err != nil {
 		return string(input)
 	}
-	var b strings.Builder
-	for _, k := range hostScanFields {
-		v, ok := m[k]
-		if !ok {
-			continue
-		}
-		switch t := v.(type) {
-		case string:
-			b.WriteString(t)
-			b.WriteByte('\n')
-		default:
-			if enc, err := json.Marshal(v); err == nil {
-				b.Write(enc)
-				b.WriteByte('\n')
-			}
-		}
-	}
-	return b.String()
+	st := &hostScanState{}
+	hostWalk(v, false, 0, st)
+	return st.b.String()
 }
 
 // hostSystemCredentialHit 判定一次入参文本是否构成"裸读本机系统凭据"：
