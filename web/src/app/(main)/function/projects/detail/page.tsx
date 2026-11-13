@@ -168,12 +168,7 @@ function ProjectDetailInner() {
             </Badge>
             {p.observer_enabled && (
               <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400">
-                观察者开
-              </Badge>
-            )}
-            {p.reader_enabled && (
-              <Badge variant="outline" className="text-blue-600 dark:text-blue-400">
-                阅读者开
+                统一阅读者开
               </Badge>
             )}
             {p.auto_report && (
@@ -385,11 +380,10 @@ function OverviewTab({ detail, templates }: { detail: ProjectDetail; templates: 
         <p className="text-muted-foreground">
           创建时间：{new Date(detail.project.created_at).toLocaleString("zh-CN")} · 更新时间：
           {new Date(detail.project.updated_at).toLocaleString("zh-CN")} · 并发额度：{detail.project.concurrency} ·
-          观察者：{detail.project.observer_enabled ? "开" : "关（将在观察者版本启用）"}
+          统一阅读者：{detail.project.observer_enabled ? "开（项目内观察 + 跨项目串联）" : "关"}
         </p>
         <p className="text-muted-foreground mt-2">
-          阅读者：{p.reader_enabled ? "开（跨项目 reader 可聚合本项目洞察）" : "关"} · 自动写报告：
-          {p.auto_report ? "开（全部任务收官后按下方模板生成）" : "关"}
+          自动写报告：{p.auto_report ? "开（全部任务收官后按下方模板生成）" : "关"}
         </p>
       </div>
       <div className="flex items-center justify-between gap-4 rounded-xl border p-4 text-sm">
@@ -444,8 +438,7 @@ function EditProjectDialog({
   const [description, setDescription] = React.useState(project.description);
   const [owner, setOwner] = React.useState(project.owner);
   const [concurrency, setConcurrency] = React.useState(String(project.concurrency));
-  const [observer, setObserver] = React.useState(project.observer_enabled);
-  const [reader, setReader] = React.useState(project.reader_enabled);
+  const [unified, setUnified] = React.useState(project.observer_enabled); // V6 统一阅读者单开关
   const [autoReport, setAutoReport] = React.useState(project.auto_report);
   const [templateId, setTemplateId] = React.useState<string>(project.report_template_id ? String(project.report_template_id) : "");
   const [saving, setSaving] = React.useState(false);
@@ -456,8 +449,7 @@ function EditProjectDialog({
       setDescription(project.description);
       setOwner(project.owner);
       setConcurrency(String(project.concurrency));
-      setObserver(project.observer_enabled);
-      setReader(project.reader_enabled);
+      setUnified(project.observer_enabled);
       setAutoReport(project.auto_report);
       setTemplateId(project.report_template_id ? String(project.report_template_id) : "");
     }
@@ -480,8 +472,8 @@ function EditProjectDialog({
         description: description.trim(),
         owner: owner.trim(),
         concurrency: conc,
-        observer_enabled: observer,
-        reader_enabled: reader,
+        observer_enabled: unified,
+        reader_enabled: unified, // 兼容别名：与主开关同值
         auto_report: autoReport,
         // "" = 默认链（显式 null 清除绑定）；数字 = 绑定该模板。
         report_template_id: templateId ? Number(templateId) : null,
@@ -536,18 +528,14 @@ function EditProjectDialog({
           </div>
           <div className="grid gap-3 rounded-lg border p-3">
             <label className="flex items-center justify-between gap-3 text-sm">
-              <span>跨任务观察者</span>
-              <Switch checked={observer} onCheckedChange={setObserver} />
-            </label>
-            <label className="flex items-center justify-between gap-3 text-sm">
-              <span>跨项目阅读者</span>
-              <Switch checked={reader} onCheckedChange={setReader} />
+              <span>统一阅读者</span>
+              <Switch checked={unified} onCheckedChange={setUnified} />
             </label>
             <label className="flex items-center justify-between gap-3 text-sm">
               <span>自动写报告</span>
               <Switch checked={autoReport} onCheckedChange={setAutoReport} />
             </label>
-            <p className="text-muted-foreground text-xs">观察者=项目级索引+观察 agent 触发+洞察注入；阅读者=允许跨项目 reader 聚合本项目；自动报告=全部任务收官后按上方模板生成项目报告。均默认关。</p>
+            <p className="text-muted-foreground text-xs">统一阅读者=项目内观察(图变更触发)+跨项目串联(定时触发)，共用一个开关；自动报告=全部任务收官后按上方模板生成项目报告。均默认关。</p>
           </div>
         </div>
         <DialogFooter>

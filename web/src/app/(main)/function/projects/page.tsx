@@ -134,17 +134,12 @@ export default function ProjectsPage() {
                           {p.name}
                         </span>
                       </Link>
-                      {/* T19 状态徽章：开关开启才显示，配色与详情页/现有一致。 */}
-                      {(p.observer_enabled || p.reader_enabled || p.auto_report) && (
+                      {/* V6 统一阅读者徽章：两开关镜像同值，只显示一个。 */}
+                      {(p.observer_enabled || p.auto_report) && (
                         <div className="flex flex-wrap items-center gap-1">
                           {p.observer_enabled && (
                             <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400">
-                              观察者
-                            </Badge>
-                          )}
-                          {p.reader_enabled && (
-                            <Badge variant="outline" className="text-blue-600 dark:text-blue-400">
-                              阅读者
+                              统一阅读者
                             </Badge>
                           )}
                           {p.auto_report && (
@@ -209,9 +204,9 @@ export default function ProjectsPage() {
 }
 
 // CreateProjectDialog 新建项目：名称必填，描述/负责人/并发数可选。
-// T19 新增四设置控件：观察者 / 阅读者 / 自动写报告（三 Switch，默认关）+
-// 报告模板（下拉，可留空=默认链）。后端 create 字段集已与 PATCH 对齐（方案 A），
-// 四控件值直接进 POST body。
+// V6 统一阅读者：观察者/阅读者合并为「统一阅读者」一个 Switch + 自动写报告
+// + 报告模板（下拉，可留空=默认链）。提交时 observer_enabled(主开关) 与
+// reader_enabled(兼容别名) 两字段都传同值，后端镜像写两列。
 function CreateProjectDialog({
   open,
   onOpenChange,
@@ -225,8 +220,7 @@ function CreateProjectDialog({
   const [description, setDescription] = React.useState("");
   const [owner, setOwner] = React.useState("");
   const [concurrency, setConcurrency] = React.useState("2");
-  const [observer, setObserver] = React.useState(false);
-  const [reader, setReader] = React.useState(false);
+  const [unified, setUnified] = React.useState(false); // V6 统一阅读者单开关
   const [autoReport, setAutoReport] = React.useState(false);
   const [templateId, setTemplateId] = React.useState<string>(""); // "" = 默认链
   const [templates, setTemplates] = React.useState<{ id: number; name: string; is_default: boolean }[]>([]);
@@ -238,8 +232,7 @@ function CreateProjectDialog({
       setDescription("");
       setOwner("");
       setConcurrency("2");
-      setObserver(false);
-      setReader(false);
+      setUnified(false);
       setAutoReport(false);
       setTemplateId("");
       api
@@ -266,10 +259,10 @@ function CreateProjectDialog({
         description: description.trim(),
         owner: owner.trim(),
         concurrency: conc,
-        observer_enabled: observer,
+        observer_enabled: unified,
         report_template_id: templateId ? Number(templateId) : null,
         auto_report: autoReport,
-        reader_enabled: reader,
+        reader_enabled: unified, // 兼容别名：与主开关同值
       });
       toast.success(`项目已创建：${p.name}`);
       onCreated();
@@ -321,18 +314,14 @@ function CreateProjectDialog({
           </div>
           <div className="grid gap-3 rounded-lg border p-3">
             <label className="flex items-center justify-between gap-3 text-sm">
-              <span>跨任务观察者</span>
-              <Switch checked={observer} onCheckedChange={setObserver} />
-            </label>
-            <label className="flex items-center justify-between gap-3 text-sm">
-              <span>跨项目阅读者</span>
-              <Switch checked={reader} onCheckedChange={setReader} />
+              <span>统一阅读者</span>
+              <Switch checked={unified} onCheckedChange={setUnified} />
             </label>
             <label className="flex items-center justify-between gap-3 text-sm">
               <span>自动写报告</span>
               <Switch checked={autoReport} onCheckedChange={setAutoReport} />
             </label>
-            <p className="text-muted-foreground text-xs">三项默认关闭；自动写报告在该项目全部任务收官后按所选模板生成一份项目报告。</p>
+            <p className="text-muted-foreground text-xs">统一阅读者=项目内观察(图变更触发)+跨项目串联(定时触发)，共用一个开关；自动写报告在该项目全部任务收官后按所选模板生成一份项目报告。均默认关。</p>
           </div>
         </div>
         <DialogFooter>

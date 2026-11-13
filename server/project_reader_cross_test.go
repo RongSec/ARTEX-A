@@ -25,6 +25,7 @@ func TestReaderPromptUpgradeFor(t *testing.T) {
 		{"空白 prompt", "  \n\t", readerPromptSeed},
 		{"旧默认", readerPromptV1, readerPromptReplace},
 		{"旧默认带尾随空白", readerPromptV1 + "\n\n", readerPromptReplace},
+		{"V4-E 资产优先旧默认", readerPrompt, readerPromptReplace}, // V6-U3 起也是旧默认，升到统一版
 		{"用户编辑过", readerPromptV1 + "\n补充：只看 443 端口。", readerPromptKeep},
 		{"用户全新正文", "自定义阅读者", readerPromptKeep},
 	}
