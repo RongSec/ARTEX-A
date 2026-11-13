@@ -28,15 +28,31 @@ type AuditEntry struct {
 	Command string `json:"command,omitempty"`
 }
 
+// interceptorAPI 是 guard 用到的 intercept 能力面。生产实现恒为
+// *intercept.Interceptor；抽成接口只为让「规则表 → 白名单 → 判官」的路由能在
+// 无数据库环境里用假实现钉死（与 externalProbe 同一种测试缝）。
+type interceptorAPI interface {
+	IsToolEnabled(string) bool
+	JudgeAllToolsEnabled() bool
+	IsToolExternal(string) bool
+	Match(string, []byte) (intercept.Decision, bool)
+	Judge(context.Context, string, json.RawMessage) (intercept.Decision, bool)
+	JudgeAskVerdict(context.Context, intercept.Decision, string, json.RawMessage) (intercept.Decision, bool)
+	AskBurstExceeded(context.Context, string) bool
+	HandleAsk(context.Context, int64, intercept.Decision, string, []byte) bool
+	Log(context.Context, int64, intercept.Decision, string, []byte, string)
+	AppendDecisionEvent(context.Context, intercept.Decision, string, []byte, string)
+}
+
 // Guard enforces the side-effect policy via agent-core hooks.
 type Guard struct {
 	mu            sync.Mutex
 	audit         []AuditEntry
 	attrib        map[string]int // failure attribution counts (Observer / G5)
 	reg           *hook.Registry
-	interceptor   *intercept.Interceptor // optional; nil disables user-configured rules
-	judgeCache    *judgeVerdictCache     // 白名单外工具的判官结论缓存（见 judge_all.go）
-	externalProbe func(string) bool      // 测试注入的工具外部性分类器；nil 走 interceptor
+	interceptor   interceptorAPI     // optional; nil disables user-configured rules
+	judgeCache    *judgeVerdictCache // 白名单外工具的判官结论缓存（见 judge_all.go）
+	externalProbe func(string) bool  // 测试注入的工具外部性分类器；nil 走 interceptor
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -48,9 +64,13 @@ func NewWithInterceptor(ic *intercept.Interceptor) *Guard { return newGuard(ic) 
 
 func newGuard(ic *intercept.Interceptor) *Guard {
 	g := &Guard{
-		attrib:      map[string]int{},
-		interceptor: ic,
-		judgeCache:  newJudgeVerdictCache(time.Now, judgeVerdictTTL, judgeVerdictCacheCap),
+		attrib:     map[string]int{},
+		judgeCache: newJudgeVerdictCache(time.Now, judgeVerdictTTL, judgeVerdictCacheCap),
+	}
+	// 逐值赋值：把 (*intercept.Interceptor)(nil) 塞进接口会得到非 nil 接口，
+	// 下面所有 `g.interceptor == nil` 的无规则快路径就全失效了。
+	if ic != nil {
+		g.interceptor = ic
 	}
 	g.reg = hook.NewRegistry().
 		On(hook.PreToolUse, g.preToolUse).
@@ -88,8 +108,7 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 // applyIntercept evaluates user-configured intercept rules against the tool call.
 // Both rules and the fallback judge receive the complete tool input.
 func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
-	// 短路表须先于 IsToolEnabled 求值：不在 intercept_enabled_tools 名单内的工具
-	// 会在下一行直接放行，表排其后即失效。代码常量，不受 settings 覆盖。
+	// 短路表须先于规则匹配求值：它是代码常量红线，对全部工具生效，命中即终局。
 	if dec := shortCircuit(ev.ToolName, ev.Input); dec != nil {
 		switch dec.Action {
 		case "allow":
@@ -140,21 +159,26 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	if g.interceptor == nil {
 		return hook.Result{}
 	}
-	if !g.interceptor.IsToolEnabled(ev.ToolName) {
-		// 白名单外：
+	// 规则表对【全部】工具生效：Match 本身按规则的 MatchTarget（tool_name /
+	// tool_input）比对，与白名单无关。此前先判 IsToolEnabled 再 Match，白名单
+	// 外的 MCP / 自定义工具根本不过规则表 —— 一条 tool_input=deny 的规则（如
+	// 内置 rm -rf、凭据读写）对它们永不生效，用户在 UI 里给 mcp__xxx__run 建的
+	// tool_name 规则同样形同虚设。白名单现在只决定「无规则命中后送不送判官」。
+	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
+	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
+	if !matched {
+		// 无规则命中。白名单外：
 		//   - 内置平台工具（kind=builtin，record_fact / graph_overview 等）不送
 		//     判官 —— 它们不执行代码也不触外部系统，判官没有可拦的面，送判只
 		//     是每轮多烧 2-3k token + 1-3s（V5-B2）。
 		//   - MCP / 自定义（command|script|http）/ 未知工具名仍必送：这些才是
 		//     V5-B 要覆盖的面（见 intercept.IsToolExternal）。
 		//   - intercept_judge_all_tools=false 时整体退回旧行为，全部放行。
-		return g.judgeOutsideWhitelist(ctx, ev, g.interceptor.JudgeAllToolsEnabled(), g.interceptor.Judge)
-	}
-	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
-	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
-	if !matched {
-		// No rule matched. Ask the LLM fallback judge (if enabled); when it is off
-		// or unwired, keep current behavior and allow.
+		if !g.interceptor.IsToolEnabled(ev.ToolName) {
+			return g.judgeOutsideWhitelist(ctx, ev, g.interceptor.JudgeAllToolsEnabled(), g.interceptor.Judge)
+		}
+		// 白名单内无规则命中：Ask the LLM fallback judge (if enabled); when it is
+		// off or unwired, keep current behavior and allow.
 		d, judged := g.interceptor.Judge(ctx, ev.ToolName, ev.Input)
 		if !judged {
 			return hook.Result{}
@@ -174,12 +198,17 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	return g.applyDecision(ctx, ev, dec)
 }
 
-// judgeOutsideWhitelist 给白名单外的工具调用补上判官这一道（V5-B）。
+// judgeOutsideWhitelist 给白名单外、且【规则表未命中】的工具调用补判官（V5-B）。
 //
-// 规则匹配跳过（规则的匹配面是白名单内的工具），但判官仍然是全覆盖的安全
-// 兜底：模型 allow/deny 照常执行并落库（decision_source=model，由 reason 的
-// [模型] 前缀 + RuleID=0 归类），ask 走人工审批（判官 ask verdict 自带超时）。
-// 判官未开启/未接线时 Judge 返回 judged=false，保持改动前的放行语义。
+// 调用方只在 Match 返回未命中后才走到这里：规则表对全部工具生效（含 MCP /
+// 自定义工具），所以到这里意味着确实没有规则可依，只剩模型这一道兜底。反过来，
+// 规则命中 deny/allow 时它是权威结论，不再额外送判（省 token，也不让模型推翻
+// 硬规则）；命中 ask 才走 JudgeAskVerdict 交模型裁决。
+//
+// 判官仍然是全覆盖的安全兜底：模型 allow/deny 照常执行并落库
+// （decision_source=model，由 reason 的 [模型] 前缀 + RuleID=0 归类），ask 走
+// 人工审批（判官 ask verdict 自带超时）。判官未开启/未接线时 Judge 返回
+// judged=false，保持改动前的放行语义。
 //
 // 「白名单外」不等于「都送判」：平台内置工具（kind=builtin）在这里被
 // toolIsExternal 挡掉（V5-B2）；只有 MCP、自定义（command|script|http）与
