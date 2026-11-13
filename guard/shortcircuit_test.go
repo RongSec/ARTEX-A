@@ -204,9 +204,10 @@ func TestShortCircuitBarePlatformConfigDeny(t *testing.T) {
 		{"head 首参", `{"command":"head .jwt"}`},
 		{"strings 首参", `{"command":"strings jwt.key"}`},
 		{"管道后置", `{"command":"cat config.json | grep dsn"}`},
-		// V6-FP：前置边界类去掉 `'` 后，`bash -c 'cat config.json'` 里读命令
-		// 紧贴引号、不再是命令位边界，按「宁漏不误伤」取舍漏判（返回 nil）。
-		// 依任务书写进注释，不作失败用例；详见 shortcircuit_falsepositive_test.go。
+		// V6-FP2：恢复前置边界类里的引号后，bash -c 内联形态重新命中 deny。
+		// V6-FP 曾按「宁漏不误伤」把它改成注释不作失败用例，属平台凭据裸读
+		// 保护的真实绕过，本笔已收窄修复（见 maskWriteCommandQuoteArgs）。
+		{"bash -c 内联", `{"command":"bash -c 'cat config.json'"}`},
 		{"转义解码后", `{"command":"cat \u0063onfig.json"}`},
 	}
 	for _, c := range deny {

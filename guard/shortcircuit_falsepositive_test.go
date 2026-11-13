@@ -1,6 +1,9 @@
 package guard
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // ============================================================================
 // V6-FP：短路表把「正常渗透动作」误判为 deny 的三条实测缺陷回归钉。
@@ -13,7 +16,9 @@ import "testing"
 //	#12  ls -la /root/.ssh/                      —— 列目录是只读侦察
 //	#19  docker exec dvwa-a cat /etc/shadow      —— 读的是目标容器内 shadow
 //
-// 修复全部落在 shortcircuit.go 的三处正则，架构未动。
+// V6-FP 的修复落在 shortcircuit.go 的三处正则；V6-FP2 又恢复 #09 那处
+// 正则的前置引号边界并新增写命令豁免纯函数（maskWriteCommandQuoteArgs），
+// 逐条回归见本文件末尾的 V6-FP2 测试组。
 //
 // Bash 入参用 shortcircuit_test.go 定义的 bashCommand 构造，即
 // json.Marshal(map[string]string{"command": cmd})，与线上 hook 同形
@@ -109,10 +114,92 @@ func TestV6FPBoundaryVerdicts(t *testing.T) {
 		}
 	}
 
-	// 【已知漏判，按取舍接受，不作失败用例】
-	// `bash -c 'cat config.json'` / `bash -c "cat config.json"`：#09 把前置
-	// 边界类里的引号去掉后，读命令紧贴引号不再处于命令位，platformConfig
-	// BareReadRe 不命中 → 返回 nil。按「宁漏不误伤」接受，闭合需 shell AST
-	// 或 realpath 级执行前校验；与 shortcircuit_test.go 同名取舍注释呼应。
-	// 这里刻意不断言（既不断言 deny 也不断言 nil），避免把取舍钉成回归契约。
+	// V6-FP2：上面「bash -c 内联漏判按取舍接受」的裁决已被推翻——它是平台
+	// 凭据裸读保护的真实绕过，不能留。恢复引号边界后内联形态重新 deny；这里
+	// 从「刻意不断言」改为逐条断言，与 shortcircuit_test.go 同名用例呼应。
+	inlineDeny := []struct{ desc, cmd string }{
+		{"bash -c 单引号内联", `bash -c 'cat config.json'`},
+		{"bash -c 双引号内联", `bash -c "cat config.json"`},
+	}
+	for _, c := range inlineDeny {
+		if dec := PreviewShortCircuit("Bash", bashCommand(c.cmd)); dec == nil || dec.Action != "deny" {
+			t.Errorf("%s：V6-FP2 应恢复 deny，得到 %+v", c.desc, dec)
+		}
+	}
+}
+
+// ============================================================================
+// V6-FP2：#09 修复收窄回归钉。
+//
+// 上一笔为修 echo 写命令误伤，把 platformConfigBareReadRe 前置边界类里的
+// 双/单引号去掉，副作用是 bash -c / sh -c / eval 内联「读命令紧贴引号」的
+// 平台凭据裸读被放行——这是真实绕过。本笔恢复引号边界堵住绕过，并只对
+// echo/printf/tee 的引号参数（数据）做豁免，逐条钉死下列判定。
+// ============================================================================
+
+// 上表 7 条逐条断言：写命令豁免不误伤、解释器内联恢复 deny、裸读既有行为不变。
+func TestV6FP2QuoteBoundaryAndWriteExemption(t *testing.T) {
+	cases := []struct {
+		desc, cmd string
+		wantDeny  bool
+	}{
+		{"#1 echo 写命令引号内是数据", `echo "cat config.json" > /tmp/notes.txt`, false},
+		{"#2 printf 写命令引号内是数据", `printf 'cat config.json' > /tmp/notes.txt`, false},
+		{"#3 bash -c 内联恢复 deny", `bash -c 'cat config.json'`, true},
+		{"#4 sh -c 内联恢复 deny", `sh -c "cat config.json"`, true},
+		{"#5 eval 内联恢复 deny", `eval 'cat config.json'`, true},
+		{"#6 文件名带引号的裸读仍拦", `cat "config.json"`, true},
+		{"#7a 裸读仍拦", `cat config.json`, true},
+		{"#7b 带路径的同名文件放过", `cat /tmp/x/config.json`, false},
+		{"#7c 粘连文件名放过", `cat my_config.json`, false},
+		// 实现约束：复合命令里有真实读，不得因首段是写命令而整体豁免该档。
+		{"复合命令有真实读仍 deny", `echo x && cat config.json`, true},
+		{"写命令引号数据后接真实读仍 deny", `echo "cat config.json" && cat jwt.key`, true},
+	}
+	for _, c := range cases {
+		dec := PreviewShortCircuit("Bash", bashCommand(c.cmd))
+		if c.wantDeny {
+			if dec == nil || dec.Action != "deny" {
+				t.Errorf("%s：应 deny，得到 %+v", c.desc, dec)
+			}
+		} else if dec != nil {
+			t.Errorf("%s：应放行(nil)，得到 action=%s rule=%q", c.desc, dec.Action, dec.RuleName)
+		}
+	}
+}
+
+// 纯函数层：只屏蔽 echo/printf/tee 段的引号参数，等长替换；引号外骨架与
+// 非写命令段（bash -c / eval / cat）原样保留。
+func TestMaskWriteCommandQuoteArgs(t *testing.T) {
+	cases := []struct {
+		desc, in  string
+		bareAfter bool // 屏蔽后 platformConfigBareReadRe 是否应命中
+		unchanged bool // 输出应与输入逐字节相同
+	}{
+		{"echo 双引号数据", `echo "cat config.json" > /tmp/notes.txt`, false, false},
+		{"printf 单引号数据", `printf 'cat config.json' > /tmp/notes.txt`, false, false},
+		{"tee 单引号数据", `tee 'cat config.json' < f`, false, false},
+		{"bash -c 内联原样", `bash -c 'cat config.json'`, true, true},
+		{"sh -c 内联原样", `sh -c "cat config.json"`, true, true},
+		{"eval 内联原样", `eval 'cat config.json'`, true, true},
+		{"cat 带引号裸读原样", `cat "config.json"`, true, true},
+		{"复合命令真实读不被屏蔽", `echo x && cat config.json`, true, true},
+		{"echo 引号数据后接独立读只屏蔽前者", `echo "cat config.json" && cat jwt.key`, true, false},
+		{"无引号文本原样", `cat config.json`, true, true},
+	}
+	for _, c := range cases {
+		got := maskWriteCommandQuoteArgs(c.in)
+		if len(got) != len(c.in) {
+			t.Errorf("%s：屏蔽必须等长，%d -> %d（%q）", c.desc, len(c.in), len(got), got)
+		}
+		if c.unchanged && got != c.in {
+			t.Errorf("%s：非写命令段应原样保留，得到 %q", c.desc, got)
+		}
+		if hit := platformConfigBareReadRe.MatchString(got); hit != c.bareAfter {
+			t.Errorf("%s：屏蔽后裸名档命中应为 %v，得到 %v（文本 %q）", c.desc, c.bareAfter, hit, got)
+		}
+		if !c.unchanged && strings.Contains(got, "cat config.json") {
+			t.Errorf("%s：写命令引号数据应被屏蔽，输出仍含明文：%q", c.desc, got)
+		}
+	}
 }

@@ -153,13 +153,15 @@ var platformCredentialLooseRe = regexp.MustCompile(
 //     参数位）不拦——按字面执行收窄，宁漏不误伤：worker 工作目录里注入的
 //     配置也可能同名，且打靶取证常引用同名靶机文件（/tmp/x/config.json、
 //     my_config.json 一律放过，见负向用例）。
-//   - 裸名【前】必须是命令边界（行首/空白/`;&|(`/反引号），前接 `/` 或
-//     字母数字不命中：`cat /tmp/foo/config.json`、`cat my_config.json` 放过。
-//     V6-FP：边界类【不再含】 `"`/`'` —— `echo "cat config.json" >
-//     /tmp/notes.txt` 里引号内只是被写入的数据，旧类会把它当成读命令起点
-//     误伤。代价是 `bash -c "cat config.json"` / `bash -c 'cat config.json'`
-//     这类读命令紧贴引号的形态会漏判，按「宁漏不误伤」接受（字符串预筛
-//     固有上限，闭合需 shell AST / realpath 级执行前校验）。
+//   - 裸名【前】必须是命令边界（行首/空白/引号/`;&|(`/反引号），前接 `/`
+//     或字母数字不命中：`cat /tmp/foo/config.json`、`cat my_config.json` 放过。
+//     V6-FP2：边界类【恢复含】 `"`/`'`。V6-FP 曾为修 `echo "cat config.json"
+//     > /tmp/notes.txt` 误伤把引号移出边界类，副作用是 `bash -c 'cat
+//     config.json'` / `eval 'cat config.json'` 这类「读命令紧贴引号」的平台
+//     凭据裸读被放行——这是真实绕过，不能留。现恢复引号边界堵住绕过，另在
+//     shortCircuit 计算 bareReadHit 前用 maskWriteCommandQuoteArgs 把
+//     echo/printf/tee 引号参数里的「数据」屏蔽，仅豁免裸相对名档（详见该函数
+//     注释与 shortcircuit_falsepositive_test.go 的 V6-FP2 回归）。
 //   - 裸名【后】是词尾边界（行尾/空白/引号/管道重定向等），`cat config.json.bak`
 //     放过（`.` 不在尾类里，RE2 无环视故用消费式；这也意味着
 //     `cat config.json.orig` 这类备份名不拦——备份文件不是活动凭据，接受）。
@@ -172,7 +174,7 @@ var platformCredentialLooseRe = regexp.MustCompile(
 // 调用侧维持不变。已知残留漏判面：shell 变量展开（f=config.json; cat $f）、
 // 引号内换行首置等需 realpath 级执行前校验才闭合（V2 G-02①-b 范畴）。
 var platformConfigBareReadRe = regexp.MustCompile(
-	`(?i)(?:^|[\s` + "`" + `;&|(])` +
+	`(?i)(?:^|[\s"'` + "`" + `;&|(])` +
 		`(?:cat|head|tail|less|more|cp|mv|sed|awk|strings)[\s"'` + "`" + `]+` +
 		`["']?(?:config\.json|\.jwt|jwt\.key)(?:$|[\s"'` + "`" + `;|&)<>{[=,)])`)
 
@@ -407,6 +409,127 @@ func jsonStringValuesText(input []byte) (string, bool) {
 		b.WriteByte('\n')
 	}
 	return b.String(), true
+}
+
+// ============================================================================
+// V6-FP2：写命令引号参数豁免（收窄 #09 的修复，堵住 bash -c 内联绕过）
+//
+// 背景：V6-FP 为修 echo 把疑似裸读文本写进 /tmp/notes.txt 的误伤，把
+// platformConfigBareReadRe 前置边界类里的双/单引号去掉了。副作用是
+// bash -c / sh -c / eval 这类把引号内容当命令执行的形态，其平台凭据裸读
+// 被放行——引号里是【要被执行的命令】，不是数据，这是真实绕过，不能留。
+// V6-FP2 恢复引号边界（见正则定义处注释），并在此对 echo/printf/tee 的
+// 引号参数做屏蔽，使写命令误伤与解释器绕过同时得到正确处理。
+//
+// 判据（纯函数，无运行时推断）：把待匹配文本按 shell 命令边界切成段，
+// 只有【第一个动词】是 echo/printf/tee 的段才把其引号参数视为数据屏蔽；
+// bash/sh/eval 等解释器段、以及 cat/head 等读命令段一律不屏蔽。
+//
+// 刻意只屏蔽【引号参数】，不动命令骨架：重定向目标、&&/; 后的后续命令
+// 原样保留，因此 echo x && cat config.json 里的真实读仍会被拦。若改成
+// 「整条文本首个动词是写命令就整体跳过该档」，复合命令里的真实读会被
+// 一并放过，故取屏蔽而非整体跳过。
+//
+// 作用面：仅 platformConfigBareReadRe 一档（bareReadHit）。platformCredential
+// Re / Loose 与 host 系统凭据档仍按原文匹配，不吃本豁免；stripHeredocBodies
+// 与 decodedInputText 两条既有路径同样保持不变（本函数叠加在其后）。
+// ============================================================================
+
+// writeCommandVerbs 是「把引号参数当数据输出/写入、不执行」的命令动词。
+// 只有这些命令引号里的疑似裸读文本才是被写入的数据，不构成裸读。
+var writeCommandVerbs = map[string]bool{
+	"echo": true, "printf": true, "tee": true,
+}
+
+// maskWriteCommandQuoteArgs 把 text 中 echo/printf/tee 命令段内【引号包裹的
+// 参数】替换为等长空白（保留字节数与换行，便于定位与正则边界判定），返回
+// 供 platformConfigBareReadRe 匹配的文本。
+//
+// 引号外的骨架（命令动词、重定向目标、&&/; 连接的后续命令）原样保留；
+// 非写命令段（含 bash -c / sh -c / eval / cat 等）整段不屏蔽。
+func maskWriteCommandQuoteArgs(text string) string {
+	out := []byte(text)
+	inSingle, inDouble := false, false
+	verbSeen := false // 当前段是否已读到第一个动词
+	isWriter := false // 当前段动词是否为 echo/printf/tee
+	quoteStart := 0
+
+	maskRange := func(a, b int) {
+		for i := a; i < b && i < len(out); i++ {
+			if out[i] != '\n' && out[i] != '\r' {
+				out[i] = ' '
+			}
+		}
+	}
+	endSegment := func(segEnd int) {
+		// 未闭合引号：写命令段里把已见的引号内容屏蔽到段末，避免留下半个
+		// 疑似裸读文本参与匹配。
+		if isWriter && (inSingle || inDouble) {
+			maskRange(quoteStart, segEnd)
+		}
+		inSingle, inDouble = false, false
+		verbSeen, isWriter = false, false
+	}
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if inSingle || inDouble {
+			if inDouble && c == '\\' { // 双引号内反斜杠转义下一个字符
+				if isWriter {
+					maskRange(i, i+2)
+				}
+				i++
+				continue
+			}
+			closing := (inSingle && c == '\'') || (inDouble && c == '"')
+			if isWriter {
+				maskRange(i, i+1)
+			}
+			if closing {
+				inSingle, inDouble = false, false
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			if c == '\'' {
+				inSingle = true
+			} else {
+				inDouble = true
+			}
+			quoteStart = i
+			if isWriter {
+				out[i] = ' ' // 开引号也一并屏蔽
+			}
+		case ';', '&', '|', '\n', '(', ')', '`':
+			endSegment(i)
+		default:
+			if !verbSeen {
+				if c == ' ' || c == '\t' {
+					continue
+				}
+				// 取本段第一个动词 token（到空白/分隔符/引号为止），按
+				// basename 判定，兼容 /usr/bin/echo 这类带路径写法。
+				j := i
+				for j < len(text) {
+					d := text[j]
+					if d == ' ' || d == '\t' || d == ';' || d == '&' || d == '|' ||
+						d == '\n' || d == '(' || d == ')' || d == '`' || d == '\'' || d == '"' {
+						break
+					}
+					j++
+				}
+				verb := text[i:j]
+				if k := strings.LastIndexByte(verb, '/'); k >= 0 {
+					verb = verb[k+1:]
+				}
+				isWriter = writeCommandVerbs[strings.ToLower(verb)]
+				verbSeen = true
+				i = j - 1
+			}
+		}
+	}
+	endSegment(len(text))
+	return string(out)
 }
 
 // ============================================================================
@@ -738,8 +861,13 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 		if t, ok := jsonStringValuesText(input); ok {
 			readText = t
 		}
-		bareReadHit := platformConfigBareReadRe.MatchString(stripHeredocBodies(readText)) ||
-			(decoded != "" && platformConfigBareReadRe.MatchString(stripHeredocBodies(decoded)))
+		// V6-FP2：裸相对名档先剥离 heredoc 正文、再屏蔽 echo/printf/tee 引号
+		// 参数（写命令数据），最后才匹配。豁免只叠加在这一档；platformCredential
+		// Re/Loose 与 host 档仍按原文匹配（见 maskWriteCommandQuoteArgs 注释）。
+		bareScan := func(t string) bool {
+			return platformConfigBareReadRe.MatchString(maskWriteCommandQuoteArgs(stripHeredocBodies(t)))
+		}
+		bareReadHit := bareScan(readText) || (decoded != "" && bareScan(decoded))
 		if platformCredentialRe.Match(input) || platformCredentialLooseRe.Match(input) || bareReadHit ||
 			(decoded != "" && (platformCredentialRe.MatchString(decoded) || platformCredentialLooseRe.MatchString(decoded))) {
 			return &intercept.Decision{
