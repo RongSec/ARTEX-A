@@ -50,6 +50,13 @@ type ShortCircuitConfig struct {
 	SSHHostKeyPatterns    []string          `json:"ssh_host_key_patterns"`
 	RemoteExemptPatterns  []string          `json:"remote_exempt_patterns"`
 	RecordOnlyTools       []string          `json:"record_only_tools"`
+	ControlPlanePatterns  []string          `json:"control_plane_patterns"`
+	// PlatformAbsDir 是 V6-CP 的运行时字段：启动时由 EffectiveShortCircuitConfig
+	// 填入 dataDir 的绝对路径，供 UI 只读展示；【不落盘、不参与解析】。
+	// 选择「新增字段」而不是「追加到 platform_paths」的理由：追加会随 UI 保存
+	// 把机器相关的绝对路径写死进配置文件（换部署路径后旧前缀继续生效、
+	// 新前缀失效），且无法区分「用户手写模式」与「运行时生成模式」。
+	PlatformAbsDir string `json:"platform_abs_dir"`
 }
 
 // Defaults 返回代码内置的默认配置。API 的「恢复默认」和文件缺字段的兜底都用它。
@@ -126,6 +133,19 @@ var defaultShortCircuitConfig = ShortCircuitConfig{
 		"goal_met", "set_goals", "set_constraints", "insert_assets",
 		"bind_finding_traffic",
 	},
+	// V6-CP：平台控制面 API。威胁模型是 agent 自己（而非持 JWT 的人）：
+	// 先读绝对路径的 jwt.key 拿到 token，再调 /api/intercept/**、/api/settings
+	// 关规则——热加载规则被自主绕过。这里按「平台自身监听地址 + 管理路径」
+	// 拦死；实际 -addr 的 host/port 由启动时追加生成的同形模式覆盖（见
+	// control_plane.go 的 controlPlaneAddrAlt）。
+	//
+	// 只列平台管理面：/api/health、/api/facts、/function/facts 是只读业务面，
+	// 刻意不拦（agent 自查健康是合法动作）。
+	ControlPlanePatterns: []string{
+		`(?:https?://)?(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):(?:8801|8787)/api/(?:intercept|settings|system|agents|mcp|tools)(?:[/?#\s"'` + "`" + `;&|)>},.]|$)`,
+		`(?:https?://)?(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):(?:8801|8787)/api/tasks/[^/\s"'` + "`" + `;&|]+/control(?:[/?#\s"'` + "`" + `;&|)>},.]|$)`,
+		`(?:https?://)?(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):(?:8801|8787)/api/tasks/control(?:/batch)?(?:[/?#\s"'` + "`" + `;&|)>},.]|$)`,
+	},
 }
 
 // shortCircuitConfigJSON 用指针字段区分「缺省」与「显式空数组」。
@@ -143,6 +163,9 @@ type shortCircuitConfigJSON struct {
 	SSHHostKeyPatterns    *[]string `json:"ssh_host_key_patterns"`
 	RemoteExemptPatterns  *[]string `json:"remote_exempt_patterns"`
 	RecordOnlyTools       *[]string `json:"record_only_tools"`
+	ControlPlanePatterns  *[]string `json:"control_plane_patterns"`
+	// platform_abs_dir 刻意不在此结构里：它是运行时派生值，PUT 传回来也
+	// 必须忽略（否则前端原样回传会把旧机器的绝对路径固化进配置）。
 }
 
 // ParseShortCircuitConfig 把 JSON 字节解析成配置：缺省字段填默认值，再做校验。
@@ -188,6 +211,9 @@ func ParseShortCircuitConfig(raw []byte) (ShortCircuitConfig, error) {
 	if in.RecordOnlyTools != nil {
 		cfg.RecordOnlyTools = *in.RecordOnlyTools
 	}
+	if in.ControlPlanePatterns != nil {
+		cfg.ControlPlanePatterns = *in.ControlPlanePatterns
+	}
 	cfg = normalizeShortCircuitConfig(cfg)
 	if err := ValidateShortCircuitConfig(cfg); err != nil {
 		return ShortCircuitConfig{}, err
@@ -212,13 +238,14 @@ func ValidateShortCircuitConfig(cfg ShortCircuitConfig) error {
 		{"host_paths", cfg.HostPaths},
 		{"ssh_host_key_patterns", cfg.SSHHostKeyPatterns},
 		{"remote_exempt_patterns", cfg.RemoteExemptPatterns},
+		{"control_plane_patterns", cfg.ControlPlanePatterns},
 	}
 	for _, c := range critical {
 		if len(c.list) == 0 {
 			return fmt.Errorf("%s 不能为空（空列表会让整档防线失效）", c.field)
 		}
 	}
-	if _, err := compileShortCircuitRegexes(cfg); err != nil {
+	if _, err := compileShortCircuitRegexes(cfg, ""); err != nil {
 		return err
 	}
 	return nil
@@ -237,9 +264,14 @@ type compiledShortCircuit struct {
 	sshHostKey    *regexp.Regexp
 	remote        *regexp.Regexp
 	recordOnly    map[string]bool
+	// V6-CP：平台 dataDir 绝对路径（按运行时 dataDir 生成）与控制面 API。
+	platformAbs  *regexp.Regexp
+	controlPlane controlPlaneMatcher
 }
 
-func compileShortCircuitRegexes(cfg ShortCircuitConfig) (compiledShortCircuit, error) {
+// compileShortCircuitRegexes 编译配置。dataDir 用于生成平台绝对路径档；
+// 传空串表示不生成（校验/无 dataDir 的嵌入场景），其余档不受影响。
+func compileShortCircuitRegexes(cfg ShortCircuitConfig, dataDir string) (compiledShortCircuit, error) {
 	var out compiledShortCircuit
 	var err error
 
@@ -260,6 +292,12 @@ func compileShortCircuitRegexes(cfg ShortCircuitConfig) (compiledShortCircuit, e
 	}
 	if out.remote, err = compileAlternation("remote_exempt_patterns", cfg.RemoteExemptPatterns, "", ""); err != nil {
 		return out, err
+	}
+	if out.controlPlane, err = buildControlPlaneMatcher(cfg.ControlPlanePatterns); err != nil {
+		return out, err
+	}
+	if out.platformAbs, err = buildPlatformAbsRegexp(dataDir); err != nil {
+		return out, fmt.Errorf("platform_abs_dir %q 生成失败: %w", dataDir, err)
 	}
 	out.platformDeny = toNameSet("tools.deny", cfg.Tools.Deny)
 	out.platformAsk = toNameSet("tools.ask", cfg.Tools.Ask)
@@ -353,6 +391,7 @@ func normalizeShortCircuitConfig(cfg ShortCircuitConfig) ShortCircuitConfig {
 	cfg.SSHHostKeyPatterns = trim(cfg.SSHHostKeyPatterns)
 	cfg.RemoteExemptPatterns = trim(cfg.RemoteExemptPatterns)
 	cfg.RecordOnlyTools = trim(cfg.RecordOnlyTools)
+	cfg.ControlPlanePatterns = trim(cfg.ControlPlanePatterns)
 	return cfg
 }
 
@@ -375,6 +414,7 @@ func cloneShortCircuitConfig(cfg ShortCircuitConfig) ShortCircuitConfig {
 	cfg.SSHHostKeyPatterns = cp(cfg.SSHHostKeyPatterns)
 	cfg.RemoteExemptPatterns = cp(cfg.RemoteExemptPatterns)
 	cfg.RecordOnlyTools = cp(cfg.RecordOnlyTools)
+	cfg.ControlPlanePatterns = cp(cfg.ControlPlanePatterns)
 	return cfg
 }
 
@@ -386,6 +426,10 @@ var (
 	shortCircuitPath    string
 	shortCircuitLoaded  time.Time
 	shortCircuitLoadErr error
+	// shortCircuitLoadedDir 是生效配置对应的 dataDir。platform_abs_dir 的
+	// 展示值必须与短路表实际编译时用的目录一致（Reload 的入参），不能读
+	// 包级 guardDataDir——试判/测试会用临时 dataDir 重载。
+	shortCircuitLoadedDir string
 )
 
 // 求值依据是 shortcircuit.go 中声明的包级变量（map / *regexp.Regexp）；
@@ -414,11 +458,12 @@ func ShortCircuitConfigPath(dataDir string) string {
 
 func init() {
 	// 先装入代码默认，保证任何测试/调用在 Init 之前也得到完整规则。
-	if err := applyShortCircuitConfig(Defaults()); err != nil {
+	if err := applyShortCircuitConfig(Defaults(), guardDataDir); err != nil {
 		panic("guard: 内置短路默认配置非法: " + err.Error())
 	}
 	shortCircuitPath = ShortCircuitConfigPath(guardDataDir)
 	shortCircuitLoaded = time.Now()
+	shortCircuitLoadedDir = guardDataDir
 }
 
 var shortCircuitInitOnce sync.Once
@@ -440,13 +485,14 @@ func ReloadShortCircuit(dataDir string) error {
 	if err != nil {
 		return err
 	}
-	if err := applyShortCircuitConfig(cfg); err != nil {
+	if err := applyShortCircuitConfig(cfg, dataDir); err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 	shortCircuitStateMu.Lock()
 	shortCircuitActive = cfg
 	shortCircuitPath = path
 	shortCircuitLoaded = time.Now()
+	shortCircuitLoadedDir = dataDir
 	shortCircuitLoadErr = nil
 	shortCircuitStateMu.Unlock()
 	return nil
@@ -467,8 +513,8 @@ func readShortCircuitConfig(path string) (ShortCircuitConfig, error) {
 	return cfg, nil
 }
 
-func applyShortCircuitConfig(cfg ShortCircuitConfig) error {
-	c, err := compileShortCircuitRegexes(cfg)
+func applyShortCircuitConfig(cfg ShortCircuitConfig, dataDir string) error {
+	c, err := compileShortCircuitRegexes(cfg, dataDir)
 	if err != nil {
 		return err
 	}
@@ -482,14 +528,28 @@ func applyShortCircuitConfig(cfg ShortCircuitConfig) error {
 	hostSystemCredentialRe = c.host
 	sshHostKeyRe = c.sshHostKey
 	remoteRefRe = c.remote
+	platformAbsRe = c.platformAbs
+	controlPlaneDetector = c.controlPlane
 	return nil
 }
 
-// EffectiveShortCircuitConfig 返回当前生效配置的深拷贝。
+// EffectiveShortCircuitConfig 返回当前生效配置的深拷贝。PlatformAbsDir 在此
+// 填入运行时 dataDir 的绝对路径——只用于 UI 只读展示，不写入配置文件
+// （写盘走 Parse/Defaults 的结果，见 PlatformAbsDir 字段注释）。
 func EffectiveShortCircuitConfig() ShortCircuitConfig {
 	shortCircuitStateMu.RLock()
-	defer shortCircuitStateMu.RUnlock()
-	return cloneShortCircuitConfig(shortCircuitActive)
+	cfg := cloneShortCircuitConfig(shortCircuitActive)
+	dataDir := shortCircuitLoadedDir
+	shortCircuitStateMu.RUnlock()
+	if dataDir == "" {
+		dataDir = guardDataDir
+	}
+	abs, err := filepath.Abs(dataDir)
+	if err != nil {
+		abs = dataDir
+	}
+	cfg.PlatformAbsDir = filepath.ToSlash(filepath.Clean(abs))
+	return cfg
 }
 
 // ShortCircuitLoadedAt 返回当前生效配置的装入时间。

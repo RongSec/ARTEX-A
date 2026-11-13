@@ -100,6 +100,9 @@ func run() int {
 	// 文件非法（正则编译失败/关键列表为空）必须拒绝启动——静默退化成空规则等于
 	// 把「不能热改的红线」降级为「没有红线」。
 	guard.SetShortCircuitDataDir(*dataDir)
+	// V6-CP：控制面判定需要平台实际监听地址（127.0.0.1/localhost:<port>）。
+	// 必须在 InitShortCircuit 之前注入——短路表启动时编译一次，运行期不热改。
+	guard.SetShortCircuitListenAddr(*addr)
 	if err := guard.InitShortCircuit(); err != nil {
 		log.Fatalf("[guard] 短路规则配置非法，拒绝启动: %v", err)
 	}

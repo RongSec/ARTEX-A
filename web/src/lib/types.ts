@@ -928,6 +928,9 @@ export interface ShortCircuitConfig {
   ssh_host_key_patterns: string[];
   remote_exempt_patterns: string[];
   record_only_tools: string[];
+  control_plane_patterns: string[];
+  // 运行时派生：启动时由 dataDir 绝对路径填充，只读展示（不参与保存）。
+  platform_abs_dir: string;
 }
 
 export interface ShortCircuitState {

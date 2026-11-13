@@ -583,6 +583,31 @@ var hostSystemCredentialRe *regexp.Regexp
 // hostSystemCredentialHit 里用代码检查尾缀过滤。
 var sshHostKeyRe *regexp.Regexp
 
+// ============================================================================
+// V6-CP：平台自身绝对路径 + 控制面 API（威胁模型 = agent 自主绕过）
+//
+// 实测（线上 8801，命令均可由 agent 的 Bash 直接执行）：
+//
+//	cat /root/Desktop/sec/artex-hs/data/jwt.key   → 曾 allow/judge（绝对路径漏）
+//	curl -H "Authorization: Bearer $(cat ...)" …/api/intercept/rules
+//	                                              → 曾 allow/judge
+//	curl -X POST …/api/intercept/rules/1/toggle   → 曾 allow/judge
+//
+// 既有 platformCredentialRe 只认 /app/... 与 ../../jwt.key，不认识运行时
+// dataDir 的绝对路径；控制面 API 更是完全没判。这两条必须由短路表自己闭合
+// （DB 规则/settings 都能被持 JWT 者热改，正是本表要防的事）。
+//
+// platformAbsRe 按运行时 dataDir 生成（见 control_plane.go），只拦解析到
+// 平台 dataDir 的路径，不按 basename 兜底——靶机上的同名 jwt.key 属战果。
+// 求值位置：平台凭据档内（同 deny 语义），在 controlPlane 之前。
+// ============================================================================
+var platformAbsRe *regexp.Regexp
+
+// controlPlaneDetector 是平台控制面 API 判定（本机监听地址 + 管理路径；
+// 第二道 Authorization: Bearer + 本机平台端口）。判定在平台凭据档之后、
+// host 档之前，RuleName 带 "[代码常量]" 前缀（db 层归类为 shortcircuit）。
+var controlPlaneDetector controlPlaneMatcher
+
 // remoteRefRe 是"远程目标指代"语境判据：命令串里【任意位置】出现任一形态，
 // 即认为读取指令与远端靶机有关，host 系统凭据档整体豁免。
 //
@@ -885,6 +910,11 @@ const (
 		"属于破坏业务数据的高危操作，平台硬禁止。需要清理时请由 owner 在资产页面操作。"
 	msgSensitiveDeny = "该路径指向 ARTEX 平台自身的签名密钥或进程环境" +
 		"（含 LLM API Key / 数据库口令），属于控制面，不是渗透目标资产。已禁止读取。"
+	// msgControlPlaneDeny 与平台凭据档分开措辞：agent 需要知道被拦的是
+	// 「调平台自己的管理接口」，而不是打靶 HTTP 请求——打靶不受影响。
+	msgControlPlaneDeny = "该请求指向 ARTEX 平台自身的控制面管理接口" +
+		"（拦截规则 / 系统设置 / 任务控制等）。agent 不得通过管理 API 改动拦截" +
+		"或平台设置——需要调整时请由 owner 在管理界面操作。已禁止调用。"
 	// msgHostCredentialDeny 与平台凭据档分开措辞：agent 需要知道这是
 	// "读本机"被拦而不是"读靶机"被拦——靶机战果照拿不误，把 ssh/scp 等
 	// 远程指代加进命令即可放行（见 hostSystemCredentialHit）。
@@ -991,12 +1021,29 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 			return platformConfigBareReadRe.MatchString(maskWriteCommandQuoteArgs(stripHeredocBodies(t)))
 		}
 		bareReadHit := bareScan(readText) || (decoded != "" && bareScan(decoded))
+		// V6-CP：平台 dataDir 的绝对路径（按运行时生成，含 jwt.key/.jwt/.env/
+		// 短路配置文件/MITM CA）。与既有 /app 档同属平台凭据，合并进同一
+		// deny 分支——同一档防线，不额外拆 RuleName。匹配前对文本做等价形态
+		// （反斜杠→正斜杠、折叠 ./ 与 x/../）归一，见 pathTextVariants。
+		credText := string(execInput)
+		absHit := platformAbsHit(platformAbsRe, credText) ||
+			(decoded != "" && platformAbsHit(platformAbsRe, decoded))
 		if platformCredentialRe.Match(execInput) || platformCredentialLooseRe.Match(execInput) || bareReadHit ||
+			absHit ||
 			(decoded != "" && (platformCredentialRe.MatchString(decoded) || platformCredentialLooseRe.MatchString(decoded))) {
 			return &intercept.Decision{
 				Action:   "deny",
 				RuleName: "[代码常量] 平台凭据/进程环境",
 				Message:  msgSensitiveDeny,
+			}
+		}
+		// V6-CP：平台控制面 API（本机监听地址 + 管理路径；第二道 Bearer +
+		// 本机平台端口）。位置在平台凭据档之后、host 档之前。
+		if controlPlaneDetector.hit(credText) || (decoded != "" && controlPlaneDetector.hit(decoded)) {
+			return &intercept.Decision{
+				Action:   "deny",
+				RuleName: "[代码常量] 平台控制面 API",
+				Message:  msgControlPlaneDeny,
 			}
 		}
 		// host 系统凭据档：只扫执行面字段（command/file_path 等），远程

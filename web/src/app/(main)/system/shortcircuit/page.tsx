@@ -26,7 +26,8 @@ type TextField =
   | "host_paths"
   | "ssh_host_key_patterns"
   | "remote_exempt_patterns"
-  | "record_only_tools";
+  | "record_only_tools"
+  | "control_plane_patterns";
 
 const TEXT_FIELDS: Array<{ key: TextField; title: string; hint: string; mono?: boolean }> = [
   {
@@ -69,6 +70,12 @@ const TEXT_FIELDS: Array<{ key: TextField; title: string; hint: string; mono?: b
     key: "record_only_tools",
     title: "纯记录类工具豁免名单",
     hint: "这些工具只写 DB，不落盘/不执行；其文本里引用凭据路径不算读取。一行一个工具名。",
+  },
+  {
+    key: "control_plane_patterns",
+    title: "平台控制面 API 正则",
+    hint: "对平台自身监听地址（127.0.0.1/localhost:<端口>）的管理接口请求（/api/intercept|settings|system|agents|mcp|tools、/api/tasks/<id>/control）命中即 deny；实际 -addr 的 host/端口由启动时自动追加，/api/health 等只读面不拦。",
+    mono: true,
   },
 ];
 
@@ -157,6 +164,7 @@ export default function ShortCircuitPage() {
     ssh_host_key_patterns: "",
     remote_exempt_patterns: "",
     record_only_tools: "",
+    control_plane_patterns: "",
   });
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
@@ -178,6 +186,7 @@ export default function ShortCircuitPage() {
       ssh_host_key_patterns: arrayToLines(cfg.ssh_host_key_patterns),
       remote_exempt_patterns: arrayToLines(cfg.remote_exempt_patterns),
       record_only_tools: arrayToLines(cfg.record_only_tools),
+      control_plane_patterns: arrayToLines(cfg.control_plane_patterns),
     });
   }, []);
 
@@ -204,6 +213,9 @@ export default function ShortCircuitPage() {
     ssh_host_key_patterns: linesToArray(texts.ssh_host_key_patterns),
     remote_exempt_patterns: linesToArray(texts.remote_exempt_patterns),
     record_only_tools: linesToArray(texts.record_only_tools),
+    control_plane_patterns: linesToArray(texts.control_plane_patterns),
+    // 运行时派生值：服务端会忽略（按启动时的 dataDir 重新生成），仅为类型完整回传。
+    platform_abs_dir: active?.config.platform_abs_dir ?? "",
   });
 
   const save = () => {
@@ -318,6 +330,10 @@ export default function ShortCircuitPage() {
               )}
             </span>
             <span className="font-mono break-all">文件：{active?.file_path ?? "—"}</span>
+            <span className="font-mono break-all">
+              平台 dataDir：{active?.config.platform_abs_dir || "—"}
+              <span className="ml-1 opacity-70">（运行时生成，绝对值写入平台凭据档，不可编辑）</span>
+            </span>
             <span>生效配置装入于：{active?.loaded_at ? new Date(active.loaded_at).toLocaleString() : "—"}</span>
           </div>
         </div>
