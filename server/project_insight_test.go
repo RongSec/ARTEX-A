@@ -178,3 +178,85 @@ func idsOfGlobal(list []db.GlobalInsight) []int64 {
 	}
 	return out
 }
+
+// TestExtractHostKeys 守 V5-C 障碍1 第三级来源：从任务名称/目标文本里轻量提取
+// host:port 与 host（父键），并挡掉 "login.php" 这类把路径当域名的误命中。
+func TestExtractHostKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want []string
+	}{
+		{
+			name: "URL 里的 host:port",
+			text: "对 http://127.0.0.1:9081/login.php 做未授权测试",
+			want: []string{"127.0.0.1:9081", "127.0.0.1"},
+		},
+		{
+			name: "裸域名与 host:port",
+			text: "打 demo.example.com:8443 与 api.example.com 两个面",
+			want: []string{"demo.example.com:8443", "demo.example.com", "api.example.com"},
+		},
+		{
+			name: "端口越界只留 host",
+			text: "example.com:99999 不是合法端口",
+			want: []string{"example.com"},
+		},
+		{
+			name: "路径片段不当域名",
+			text: "登录页是 login.php，接口是 api.json",
+			want: nil,
+		},
+		{
+			name: "无资产线索",
+			text: "把后台打穿",
+			want: nil,
+		},
+	}
+	for _, c := range cases {
+		got := extractHostKeys(c.text)
+		if len(got) == 0 && len(c.want) == 0 {
+			continue
+		}
+		if len(got) != len(c.want) {
+			t.Errorf("%s: extractHostKeys()=%v want %v", c.name, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%s: extractHostKeys()[%d]=%q want %q (all %v)", c.name, i, got[i], c.want[i], got)
+			}
+		}
+	}
+}
+
+// TestInsightQuota 守 V5-C 障碍3 的配额：存在跨项目行时项目洞察压到 2、至少留
+// 1 位给跨项目；无跨项目时项目可占满 3；总数永不超过 3、跨项目永不超过 2。
+func TestInsightQuota(t *testing.T) {
+	cases := []struct {
+		name                     string
+		projectAvail, crossAvail int
+		wantProject, wantCross   int
+	}{
+		{"项目占满且跨项目存在 → 2+1", 18, 5, 2, 1},
+		{"项目只有 1 条 → 1+2", 1, 5, 1, 2},
+		{"项目 0 条 → 跨项目最多 2", 0, 5, 0, 2},
+		{"无跨项目 → 项目可用满 3", 18, 0, 3, 0},
+		{"都很少", 1, 1, 1, 1},
+		{"都空", 0, 0, 0, 0},
+		{"负值按 0", -1, -1, 0, 0},
+	}
+	for _, c := range cases {
+		p, x := insightQuota(c.projectAvail, c.crossAvail)
+		if p != c.wantProject || x != c.wantCross {
+			t.Errorf("%s: insightQuota(%d,%d)=(%d,%d) want (%d,%d)",
+				c.name, c.projectAvail, c.crossAvail, p, x, c.wantProject, c.wantCross)
+		}
+		if p+x > insightInjectMax {
+			t.Errorf("%s: total %d exceeds %d", c.name, p+x, insightInjectMax)
+		}
+		if x > insightCrossMax {
+			t.Errorf("%s: cross %d exceeds %d", c.name, x, insightCrossMax)
+		}
+	}
+}

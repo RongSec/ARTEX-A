@@ -207,3 +207,201 @@ func TestProjectInsightResolverInjectsCrossProject(t *testing.T) {
 		t.Errorf("关掉 reader_enabled 不该影响 observer 洞察: %q", got)
 	}
 }
+
+// createV5CInsightFixture 造「项目 + 任务」并注册清理；返回 project id 与数字
+// taskID。V5-C 的三个障碍测试共用（名称/主机都带纳秒后缀，避免与库里既有行
+// 串味，尤其是 asset_keys 交集与 global_insights 的同资产覆盖逻辑）。
+func createV5CInsightFixture(t *testing.T, s *Server, pg *db.DB, label, goal string) (int64, int64) {
+	t.Helper()
+	n := time.Now().UnixNano()
+	p, err := pg.CreateProject(db.CreateProjectInput{
+		Name: fmt.Sprintf("%s-%d", label, n%1000000), ObserverEnabled: true, ReaderEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := p.ID
+	task, err := s.m.CreateTaskWithOptions(label, goal, db.TaskCreateOptions{ProjectID: &pid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := strconv.ParseInt(task.ID, 10, 64)
+	if err != nil {
+		t.Fatalf("task id %q 不是数字: %v", task.ID, err)
+	}
+	t.Cleanup(func() {
+		pg.Exec(`DELETE FROM tasks WHERE id=$1`, taskID)            //nolint:errcheck
+		pg.Exec(`DELETE FROM explorations WHERE id=$1`, task.ExpID) //nolint:errcheck
+		pg.Exec(`DELETE FROM projects WHERE id=$1`, pid)            //nolint:errcheck // project_insights 级联删
+	})
+	return pid, taskID
+}
+
+// insertV5CEndpoint 插一个 endpoint 资产并挂到 task_ids（V5-C 命中键来源）。
+func insertV5CEndpoint(t *testing.T, pg *db.DB, host string, port int, path string, taskID int64) int64 {
+	t.Helper()
+	var id int64
+	err := pg.QueryRow(`INSERT INTO assets(type, url, method, domain, port, task_ids)
+VALUES ('endpoint', $1, 'GET', $2, $3, ARRAY[$4]::bigint[]) RETURNING id`,
+		fmt.Sprintf("http://%s:%d%s", host, port, path), host, port, taskID).Scan(&id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pg.Exec(`DELETE FROM assets WHERE id=$1`, id) }) //nolint:errcheck
+	return id
+}
+
+// TestInsightMatchKeysThreeLevels 守 V5-C 障碍1：命中键三级并集且「任一级非空
+// 即停止」——目标文本 → 任务资产 → 意图锚定（含 running）。
+func TestInsightMatchKeysThreeLevels(t *testing.T) {
+	s, pg := newInsightTestPG(t)
+	ctx := context.Background()
+	n := time.Now().UnixNano()
+	goalHost := fmt.Sprintf("v5c-goal-%d.example.com", n%100000000)
+	assetHost := fmt.Sprintf("v5c-asset-%d.example.com", n%100000000)
+	anchorHost := fmt.Sprintf("v5c-anchor-%d.example.com", n%100000000)
+
+	_, taskID := createV5CInsightFixture(t, s, pg, "v5c-levels",
+		"对 http://"+goalHost+":9443/login.php 做未授权测试")
+	tctx, err := pg.TaskInsightContext(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// c 级：意图锚定与任务资产都为空，只能从目标文本提取。
+	keys := s.insightMatchKeys(ctx, pg, tctx, taskID)
+	if !containsKey(keys, goalHost+":9443") {
+		t.Errorf("目标文本应提取出 %s:9443，got %v", goalHost, keys)
+	}
+
+	// b 级：任务资产非空后停止，不再走目标文本提取。
+	insertV5CEndpoint(t, pg, assetHost, 8081, "/x.php", taskID)
+	keys = s.insightMatchKeys(ctx, pg, tctx, taskID)
+	if !containsKey(keys, assetHost+":8081") || !containsKey(keys, assetHost+":8081/x.php") {
+		t.Errorf("任务资产应产出父子两级键，got %v", keys)
+	}
+	if containsKey(keys, goalHost+":9443") {
+		t.Errorf("b 级非空时应停止，不该再含目标文本键: %v", keys)
+	}
+
+	// a 级：锚定意图（running——真实时序下 worker 已认领）优先于任务资产。
+	anchorAsset := insertV5CEndpoint(t, pg, anchorHost, 8082, "/admin/login.php", 0)
+	task, ok := s.m.Task(strconv.FormatInt(taskID, 10))
+	if !ok {
+		t.Fatal("任务不在内存表")
+	}
+	nodeID, err := task.Store.AddIntent(map[string]any{"summary": "打这个资产"}, 1, []int64{anchorAsset}, "planner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := task.Store.SetNodeState(nodeID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	keys = s.insightMatchKeys(ctx, pg, tctx, taskID)
+	if !containsKey(keys, anchorHost+":8082") {
+		t.Errorf("running 意图的锚定资产应产出命中键（障碍1），got %v", keys)
+	}
+	if containsKey(keys, assetHost+":8081") {
+		t.Errorf("a 级非空时不该再回落到任务资产: %v", keys)
+	}
+}
+
+// TestCrossLevelKeyHitEndToEnd 守 V5-C 障碍2：站点级键（host:port）与页面级
+// endpoint 锚定必须能互相命中——项目洞察 keywords 与跨项目 asset_keys 都写
+// 站点级，任务锚定的是页面级 endpoint。
+func TestCrossLevelKeyHitEndToEnd(t *testing.T) {
+	s, pg := newInsightTestPG(t)
+	ctx := context.Background()
+	n := time.Now().UnixNano()
+	host := fmt.Sprintf("v5c-cross-%d.example.com", n%100000000)
+
+	pid, taskID := createV5CInsightFixture(t, s, pg, "v5c-cross", "打 "+host)
+	assetID := insertV5CEndpoint(t, pg, host, 8081, "/admin/login.php", taskID)
+	task, ok := s.m.Task(strconv.FormatInt(taskID, 10))
+	if !ok {
+		t.Fatal("任务不在内存表")
+	}
+	if _, err := task.Store.AddIntent(map[string]any{"summary": "打登录页"}, 1, []int64{assetID}, "planner"); err != nil {
+		t.Fatal(err)
+	}
+
+	siteKey := fmt.Sprintf("%s:8081", host)
+	if _, err := pg.WriteInsight(ctx, pid, "项目经验：该站点后台可未授权进入", 0, []string{siteKey}); err != nil {
+		t.Fatal(err)
+	}
+	cross, err := pg.WriteGlobalInsight(ctx, "跨项目经验：同站点同端口在别的项目已打通", []int64{pid, 999}, []string{siteKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pg.Exec(`DELETE FROM global_insights WHERE id=$1`, cross.ID) }) //nolint:errcheck
+
+	got := s.projectInsightResolverFor()(taskID)
+	if !strings.Contains(got, "项目经验：该站点后台可未授权进入") {
+		t.Errorf("站点级 keywords 应命中页面级锚定（障碍2）: %q", got)
+	}
+	if !strings.Contains(got, "【跨项目】") || !strings.Contains(got, "跨项目经验：同站点同端口在别的项目已打通") {
+		t.Errorf("站点级 asset_keys 应命中页面级锚定（障碍2）: %q", got)
+	}
+}
+
+// TestCrossProjectQuotaReservesSlot 守 V5-C 障碍3：项目洞察塞满时项目侧压到
+// 2 条，至少给跨项目留 1 个名额（旧实现跨项目永远拿不到位置）。
+func TestCrossProjectQuotaReservesSlot(t *testing.T) {
+	s, pg := newInsightTestPG(t)
+	ctx := context.Background()
+	n := time.Now().UnixNano()
+	host := fmt.Sprintf("v5c-quota-%d.example.com", n%100000000)
+
+	pid, taskID := createV5CInsightFixture(t, s, pg, "v5c-quota", "打 "+host)
+	assetID := insertV5CEndpoint(t, pg, host, 8082, "/p.php", taskID)
+	task, ok := s.m.Task(strconv.FormatInt(taskID, 10))
+	if !ok {
+		t.Fatal("任务不在内存表")
+	}
+	if _, err := task.Store.AddIntent(map[string]any{"summary": "打"}, 1, []int64{assetID}, "planner"); err != nil {
+		t.Fatal(err)
+	}
+
+	siteKey := fmt.Sprintf("%s:8082", host)
+	for i := 0; i < 5; i++ {
+		if _, err := pg.WriteInsight(ctx, pid, fmt.Sprintf("项目经验-%d", i), 0, []string{siteKey}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cross, err := pg.WriteGlobalInsight(ctx, "跨项目经验：配额保位", []int64{pid, 999}, []string{siteKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pg.Exec(`DELETE FROM global_insights WHERE id=$1`, cross.ID) }) //nolint:errcheck
+
+	got := s.projectInsightResolverFor()(taskID)
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want 3 lines (2 项目 + 1 跨项目), got %d: %q", len(lines), got)
+	}
+	projectLines, crossLines := 0, 0
+	for _, ln := range lines {
+		switch {
+		case strings.HasPrefix(ln, "- 【跨项目】"):
+			crossLines++
+		case strings.HasPrefix(ln, "- 来源任务#") || strings.HasPrefix(ln, "- 项目经验"):
+			projectLines++
+		}
+	}
+	if projectLines != 2 || crossLines != 1 {
+		t.Errorf("配额应为 2+1，got 项目=%d 跨项目=%d: %q", projectLines, crossLines, got)
+	}
+	if !strings.HasPrefix(lines[len(lines)-1], "- 【跨项目】") {
+		t.Errorf("跨项目条目应渲染在项目洞察之后: %q", got)
+	}
+}
+
+// containsKey 是测试用的键集合判定（大小写不敏感，键口径与生产一致）。
+func containsKey(keys []string, want string) bool {
+	for _, k := range keys {
+		if strings.EqualFold(strings.TrimSpace(k), want) {
+			return true
+		}
+	}
+	return false
+}

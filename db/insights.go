@@ -315,7 +315,8 @@ WHERE id=$1 AND status<>'rejected' RETURNING id`, id, utf8Clean(reason)).Scan(&g
 }
 
 // AssetKeysForProjects 返回这些项目下【出现过的资产】的归一化键集合
-// （assetKeyFor 同款：URL > 域名 > root_domain > IP）。关联链以真实 schema 为准：
+// （V5-C 起为父子两级：host、host:port、host:port/path，见 assetKeyLevels；
+// 另含历史完整 URL/域名/IP 键保兼容）。关联链以真实 schema 为准：
 // assets.task_ids（BIGINT[]）∩ 项目下未删任务的 id。
 //
 // 用途：reader 写 global_insight 时没给 asset_keys，就从正文里匹配这些已知键
@@ -326,7 +327,8 @@ func (d *DB) AssetKeysForProjects(ctx context.Context, projectIDs []int64) ([]st
 		return nil, nil
 	}
 	rows, err := d.QueryContext(ctx, `
-SELECT DISTINCT COALESCE(a.domain,''), COALESCE(a.root_domain,''), COALESCE(a.ip,''), COALESCE(a.url,'')
+SELECT DISTINCT COALESCE(a.type,''), COALESCE(a.domain,''), COALESCE(a.root_domain,''), COALESCE(a.ip,''),
+       COALESCE(a.port,0), COALESCE(a.url,'')
 FROM assets a
 WHERE a.task_ids && ARRAY(
     SELECT t.id FROM tasks t
@@ -339,14 +341,12 @@ WHERE a.task_ids && ARRAY(
 	seen := map[string]bool{}
 	var out []string
 	for rows.Next() {
-		var domain, root, ip, u string
-		if err := rows.Scan(&domain, &root, &ip, &u); err != nil {
+		var typ, domain, root, ip, u string
+		var port int
+		if err := rows.Scan(&typ, &domain, &root, &ip, &port, &u); err != nil {
 			return nil, err
 		}
-		if k := assetKeyFor(domain, root, ip, u); k != "" && !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
+		out = appendAssetKeys(out, seen, assetKeyLevels(typ, domain, root, ip, port, u))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

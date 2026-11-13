@@ -10,6 +10,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -75,6 +78,9 @@ func marshalTextArray(items []string) string {
 // 域名走 DomainKey 归一化（小写/去尾点），与写入侧一致，保证跨任务同资产
 // 产出的键逐字节相同——这是 asset_keys 能做交集命中的前提。
 // 纯函数，单测覆盖。
+//
+// V5-C 起它是「历史单键」口径：注入侧已改用 assetKeyLevels 的父子两级键，
+// assetKeyFor 仍保留为兼容旧行者理解键形态的基准（完整 URL 形态与历史行一致）。
 func assetKeyFor(domain, rootDomain, ip, url string) string {
 	if u := strings.TrimSpace(url); u != "" {
 		return u
@@ -88,28 +94,146 @@ func assetKeyFor(domain, rootDomain, ip, url string) string {
 	return IPKey(ip)
 }
 
+// assetKeyLevels 把一行 assets 展开成父子两级归一化资产键（纯函数，单测覆盖）。
+//
+// V5-C 障碍2：注入命中靠 asset_keys 数组交集（`&&`），而旧实现每个资产只产
+// 一个「最具体」的键——endpoint/service 只产完整 URL、domain 只产域名。于是
+// 站点级键（127.0.0.1:9081）与页面级键（http://127.0.0.1:9081/login.php）永远
+// 不相等，交集恒空。现在同时产父键与子键，`&&` 天然支持父子互含：
+//
+//   - endpoint: host:port、host:port/path（path 为空或 "/" 时省子键）
+//   - service : host:port
+//   - 其它（root_domain/subdomain/ip/app）: host；已知端口时再产 host:port
+//
+// 新键一律小写、不带 scheme（与 DeriveAssetKeys 的写入侧小写口径一致）。
+// 末尾额外补历史键 assetKeyFor 的原样形态（完整 URL/域名/IP）——存量
+// global_insights.asset_keys 与 project_insights.keywords 只可能是这一种形态，
+// 不补就永远匹配不上旧行。去重保序：具体键 → 泛化键 → 历史键。
+// host 推导不出时返回 nil。
+func assetKeyLevels(typ, domain, rootDomain, ip string, port int, rawURL string) []string {
+	legacy := strings.TrimSpace(rawURL)
+	var uhost, upath string
+	uport := 0
+	if legacy != "" {
+		if u, err := url.Parse(legacy); err == nil && u.Host != "" {
+			uhost = DomainKey(u.Hostname())
+			upath = u.EscapedPath()
+			uport = defaultPort(strings.ToLower(u.Scheme), u.Port())
+		}
+	}
+	host := uhost
+	if host == "" {
+		host = DomainKey(domain)
+	}
+	if host == "" {
+		host = DomainKey(rootDomain)
+	}
+	if host == "" {
+		host = IPKey(ip)
+	}
+	if host == "" {
+		return nil
+	}
+
+	hostPort := ""
+	switch {
+	case uport > 0:
+		hostPort = net.JoinHostPort(host, strconv.Itoa(uport))
+	case port > 0 && port <= 65535:
+		hostPort = net.JoinHostPort(host, strconv.Itoa(port))
+	}
+	// IPv6 字面量走 JoinHostPort 的方括号形式；与正文里裸写的 ::1:9081 不同形，
+	// 但至少保持与既有 SiteKey 拆分口径（host/port 分离）可重建、无歧义。
+
+	var out []string
+	seen := make(map[string]bool, 4)
+	add := func(k string) {
+		if k == "" || seen[k] {
+			return
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+
+	switch typ {
+	case "endpoint":
+		if hostPort != "" {
+			add(hostPort)
+			if p := cleanAssetPath(upath); p != "" {
+				add(hostPort + p)
+			}
+		} else {
+			add(host) // 无端口信息时退回主机键，至少保留 host 级命中
+		}
+	case "service":
+		if hostPort != "" {
+			add(hostPort)
+		} else {
+			add(host)
+		}
+	default:
+		add(host)
+		if hostPort != "" {
+			add(hostPort)
+		}
+	}
+	// 历史形态：不改写大小写（存量 keywords 可能是大小写混杂的原文），
+	// 再补一条小写变体对齐 DeriveAssetKeys 的小写候选口径。
+	if legacy != "" {
+		add(legacy)
+		add(strings.ToLower(legacy))
+	}
+	return out
+}
+
+// cleanAssetPath 规整 URL 路径成子键后缀：空路径与根路径不产子键
+// （否则 endpoint 会多出一条与 host:port 等价的 "host:port/"）。
+func cleanAssetPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" || p == "/" {
+		return ""
+	}
+	return p
+}
+
+// appendAssetKeys 把一批键并入 out（去重，保序），返回扩充后的切片。
+// 多个资产/多个键之间可能有交集（同一主机不同页面），去重防 asset_keys 膨胀。
+func appendAssetKeys(out []string, seen map[string]bool, keys []string) []string {
+	for _, k := range keys {
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+	return out
+}
+
 // AssetKeysForIDs 把资产 id 解析成归一化资产键列表（project_index.asset_keys
-// 的写入原料）。不存在的 id 静默跳过（投影是尽力而为的旁路，不该因单个脏
-// 锚定失败）。返回顺序与入参无关（SQL 聚合），调用方不依赖顺序。
+// 与洞察命中的写入原料）。每个资产产父子两级键（assetKeyLevels），V5-C 起
+// 同时覆盖 host:port 与 host:port/path，让站点级/页面级锚定能互含命中。
+// 不存在的 id 静默跳过（投影是尽力而为的旁路，不该因单个脏锚定失败）。
+// 返回顺序与入参无关（SQL 聚合），调用方不依赖顺序。
 func (d *DB) AssetKeysForIDs(ids []int64) ([]string, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	rows, err := d.Query(`SELECT COALESCE(domain,''), COALESCE(root_domain,''), COALESCE(ip,''), COALESCE(url,'')
+	rows, err := d.Query(`SELECT COALESCE(type,''), COALESCE(domain,''), COALESCE(root_domain,''), COALESCE(ip,''),
+       COALESCE(port,0), COALESCE(url,'')
 FROM assets WHERE id = ANY($1::bigint[])`, marshalInt64Array(ids))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	seen := map[string]bool{}
 	var out []string
 	for rows.Next() {
-		var domain, root, ip, u string
-		if err := rows.Scan(&domain, &root, &ip, &u); err != nil {
+		var typ, domain, root, ip, u string
+		var port int
+		if err := rows.Scan(&typ, &domain, &root, &ip, &port, &u); err != nil {
 			return nil, err
 		}
-		if k := assetKeyFor(domain, root, ip, u); k != "" {
-			out = append(out, k)
-		}
+		out = appendAssetKeys(out, seen, assetKeyLevels(typ, domain, root, ip, port, u))
 	}
 	return out, rows.Err()
 }
@@ -486,15 +610,43 @@ FROM project_graph_events WHERE project_id=$1 AND id > $2 ORDER BY id LIMIT $3`,
 	return out, rows.Err()
 }
 
-// OpenIntentAnchorAssetIDs 返回某探索图里所有 open 意图锚定的资产 id（去重）。
-// T12 insight 注入的命中原料：这些资产的归一化键与 project_insights.keywords
-// 求交集，命中的洞察排前（ListInsights 的 matchKeywords 排序）。
-func (d *DB) OpenIntentAnchorAssetIDs(ctx context.Context, expID int64) ([]int64, error) {
+// IntentAnchorAssetIDs 返回某探索图里【open 或 running】意图锚定的资产 id
+// （去重）。T12 insight 注入的命中原料：这些资产的归一化键与洞察的关键词/
+// asset_keys 求交集，命中的洞察排前。
+//
+// V5-C 障碍1：口径从 state='open' 扩到 open+running。带锚定的种子意图一生成
+// 就被 worker 认领成 running，而 planner 轮往往既看不到 open 意图、新锚定也
+// 还没产生——旧口径在这个时序下恒空，跨项目命中键整段丢失。
+func (d *DB) IntentAnchorAssetIDs(ctx context.Context, expID int64) ([]int64, error) {
 	rows, err := d.QueryContext(ctx, `
 SELECT DISTINCT ea.asset_id
 FROM exploration_anchors ea
 JOIN exploration_nodes en ON en.id = ea.node_id
-WHERE en.exploration_id=$1 AND en.kind='intent' AND en.state='open' AND ea.asset_id IS NOT NULL`, expID)
+WHERE en.exploration_id=$1 AND en.kind='intent' AND en.state IN ('open','running') AND ea.asset_id IS NOT NULL`, expID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// TaskAssetIDs 返回 task_ids 命中该任务的资产 id（新在前，上限 500）。
+// V5-C 障碍1 的第二级命中键来源：即使意图锚定为空，本任务打过/挂过的资产
+// 仍能代表「正在打的资产」，不该因为意图状态流转而丢掉注入依据。
+// 上限防单任务上万资产把匹配数组撑爆（500 已远超正常探测面）。
+func (d *DB) TaskAssetIDs(ctx context.Context, taskID int64) ([]int64, error) {
+	if taskID <= 0 {
+		return nil, nil
+	}
+	rows, err := d.QueryContext(ctx, `SELECT id FROM assets WHERE $1 = ANY(task_ids) ORDER BY id DESC LIMIT 500`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -511,7 +663,8 @@ WHERE en.exploration_id=$1 AND en.kind='intent' AND en.state='open' AND ea.asset
 }
 
 // TaskInsightContext 一次查回 insight 注入决策所需的全部字段：任务的
-// exploration 归属 + 项目观察者开关（LEFT JOIN——未挂项目时 enabled=false）。
+// exploration 归属 + 项目观察者开关（LEFT JOIN——未挂项目时 enabled=false）+
+// 任务名称/目标（V5-C 障碍1 的第三级命中键来源：目标文本里的 host:port）。
 // 单行查询、每 planner 轮一次，无缓存=挂/摘与开关翻转即时生效。
 type TaskInsightContext struct {
 	ExplorationID int64
@@ -521,6 +674,9 @@ type TaskInsightContext struct {
 	// readerVisibleProjects 同源——没 opt-in 的项目既不参与 reader 聚合，也不该
 	// 收到读回来的跨项目条目（否则等于绕过 opt-in）。
 	ReaderOn bool
+	// TaskName/TaskGoal 供 resolver 在锚定资产为空时从目标文本轻量提取 host:port。
+	TaskName string
+	TaskGoal string
 }
 
 func (d *DB) TaskInsightContext(ctx context.Context, taskID int64) (*TaskInsightContext, error) {
@@ -528,9 +684,10 @@ func (d *DB) TaskInsightContext(ctx context.Context, taskID int64) (*TaskInsight
 	var pid sql.NullInt64
 	var on, readerOn sql.NullBool
 	err := d.QueryRowContext(ctx, `
-SELECT t.exploration_id, t.project_id, p.observer_enabled, p.reader_enabled
+SELECT t.exploration_id, t.project_id, p.observer_enabled, p.reader_enabled, t.name, t.goal
 FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
-WHERE t.id=$1 AND t.deleted_at IS NULL`, taskID).Scan(&c.ExplorationID, &pid, &on, &readerOn)
+WHERE t.id=$1 AND t.deleted_at IS NULL`, taskID).
+		Scan(&c.ExplorationID, &pid, &on, &readerOn, &c.TaskName, &c.TaskGoal)
 	if err != nil {
 		return nil, err // ErrNoRows=任务不存在/已删，调用方按空处理
 	}

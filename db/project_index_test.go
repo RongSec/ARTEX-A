@@ -64,6 +64,69 @@ func TestAssetKeyFor(t *testing.T) {
 	}
 }
 
+// TestAssetKeyLevels 守 V5-C 障碍2 的父子两级键口径：endpoint 产
+// host:port + host:port/path，service 产 host:port，domain 产 domain
+// （已知端口时再加 host:port）；历史完整 URL 键必须保留（存量行只有它）。
+func TestAssetKeyLevels(t *testing.T) {
+	cases := []struct {
+		name                       string
+		typ, domain, root, ip, url string
+		port                       int
+		want                       []string
+	}{
+		{
+			name: "endpoint 双键（站点级+页面级）",
+			typ:  "endpoint", domain: "Example.COM", port: 8080,
+			url:  "http://example.com:8080/login.php",
+			want: []string{"example.com:8080", "example.com:8080/login.php", "http://example.com:8080/login.php"},
+		},
+		{
+			name: "endpoint 根路径不产子键",
+			typ:  "endpoint", domain: "example.com", port: 443,
+			url:  "https://example.com",
+			want: []string{"example.com:443", "https://example.com"},
+		},
+		{
+			name: "service 单键 host:port（+历史 URL）",
+			typ:  "service", domain: "example.com", port: 443,
+			url:  "https://example.com",
+			want: []string{"example.com:443", "https://example.com"},
+		},
+		{
+			name: "domain 无端口只产域名",
+			typ:  "root_domain", domain: "Example.COM.",
+			want: []string{"example.com"},
+		},
+		{
+			name: "domain 带 URL 时补 host:port",
+			typ:  "subdomain", domain: "a.example.com",
+			url:  "https://a.example.com/path",
+			want: []string{"a.example.com", "a.example.com:443", "https://a.example.com/path"},
+		},
+		{
+			name: "IP + 端口",
+			typ:  "service", ip: "10.0.0.8", port: 8080,
+			want: []string{"10.0.0.8:8080"},
+		},
+		{
+			name: "全空",
+			typ:  "endpoint",
+			want: nil,
+		},
+		{
+			name: "重复字段去重",
+			typ:  "subdomain", domain: "dup.example.com", root: "dup.example.com",
+			want: []string{"dup.example.com"},
+		},
+	}
+	for _, c := range cases {
+		got := assetKeyLevels(c.typ, c.domain, c.root, c.ip, c.port, c.url)
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: assetKeyLevels()=%v want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestBuildProjectIndexWhere(t *testing.T) {
 	// 空过滤：只剩 project_id。
 	where, args := buildProjectIndexWhere(42, ProjectIndexFilter{})
