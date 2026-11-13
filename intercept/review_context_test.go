@@ -3,6 +3,7 @@ package intercept
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -98,6 +99,100 @@ func TestReviewInputExplicitBackgroundOnly(t *testing.T) {
 	in, err := BuildReviewInput(WithCall(ctx, "Read", args), "Read", args)
 	if err != nil || in.Background != nil {
 		t.Fatal("missing environment must not infer user input")
+	}
+}
+
+// The judge must be able to settle "is this target a test artifact?" from the
+// call itself, so absolute paths are classified by position.
+func TestClassifyReviewPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    string
+		workDir string
+		temp    []string
+		other   []string
+	}{
+		{name: "temp cleanup", args: `{"command":"rm -rf /tmp/v5e_check"}`, temp: []string{"/tmp/v5e_check"}},
+		{name: "production target", args: `{"command":"rm -rf /var/www/html"}`, other: []string{"/var/www/html"}},
+		{name: "copy out of tmp", args: `{"command":"cp /tmp/a /var/www/html/"}`, temp: []string{"/tmp/a"}, other: []string{"/var/www/html"}},
+		{name: "var tmp and shm", args: `{"command":"rm -rf /var/tmp/x /dev/shm/y"}`, temp: []string{"/var/tmp/x", "/dev/shm/y"}},
+		{name: "bare temp roots are not artifacts", args: `{"command":"rm -rf /tmp /var/tmp /dev/shm"}`, other: []string{"/tmp", "/var/tmp", "/dev/shm"}},
+		{name: "workdir target", args: `{"command":"rm -rf ` + "/w/tasks/1/i2/out" + `"}`, workDir: "/w/tasks/1/i2", temp: []string{"/w/tasks/1/i2/out"}},
+		{name: "relative paths ignored", args: `{"command":"rm -rf ./build ../cache out"}`, workDir: "/w/tasks/1/i2"},
+		{name: "url is not a path", args: `{"command":"curl -s http://t/logo.png"}`, other: nil, temp: nil},
+		{name: "flag value counts", args: `{"command":"tar -czf /tmp/b.tgz /etc/passwd"}`, temp: []string{"/tmp/b.tgz"}, other: []string{"/etc/passwd"}},
+		{name: "no absolute path", args: `{"command":"$HOME/x ~/y"}`, workDir: "/w"},
+		{name: "root kept", args: `{"command":"rm -rf /"}`, other: []string{"/"}},
+		{name: "traversal out of tmp", args: `{"command":"rm -rf /tmp/../etc/passwd"}`, other: []string{"/etc/passwd"}},
+		{name: "dot segments cleaned", args: `{"command":"rm -rf /tmp/./a/"}`, temp: []string{"/tmp/a"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := classifyReviewPaths(json.RawMessage(tc.args), tc.workDir)
+			if tc.temp == nil && tc.other == nil {
+				if pc != nil {
+					t.Fatalf("unexpected path_context: %+v", pc)
+				}
+				return
+			}
+			if pc == nil || !equalStrings(pc.Temporary, tc.temp) || !equalStrings(pc.Other, tc.other) {
+				t.Fatalf("got %+v, want temporary=%v other=%v", pc, tc.temp, tc.other)
+			}
+		})
+	}
+
+	// Order is preserved, duplicates collapse, and each list is capped.
+	var many strings.Builder
+	for i := 0; i < 14; i++ {
+		many.WriteString(" /tmp/p" + strconv.Itoa(i))
+	}
+	many.WriteString(" /tmp/p0 /var/www/a /var/www/a")
+	pc := classifyReviewPaths(json.RawMessage(`{"command":"rm -rf`+many.String()+`"}`), "")
+	if len(pc.Temporary) != pathContextLimit || len(pc.Other) != 1 {
+		t.Fatalf("wrong caps: %+v", pc)
+	}
+	if pc.Temporary[0] != "/tmp/p0" || pc.Temporary[1] != "/tmp/p1" || pc.Other[0] != "/var/www/a" {
+		t.Fatalf("order or dedupe lost: %+v", pc)
+	}
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// path_context is only sent when the arguments actually contain absolute paths:
+// an empty field would collide with the existing "no unknown keys" assertions.
+func TestReviewInputCarriesPathContext(t *testing.T) {
+	ctx := WithReviewContext(t.Context(), "/w/run", ReviewBackground{})
+	args := json.RawMessage(`{"command":"rm -rf /w/run/out /var/www/html"}`)
+	in, err := BuildReviewInput(ctx, "Bash", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.PathContext == nil || !equalStrings(in.PathContext.Temporary, []string{"/w/run/out"}) || !equalStrings(in.PathContext.Other, []string{"/var/www/html"}) {
+		t.Fatalf("wrong path_context: %+v", in.PathContext)
+	}
+	raw, err := json.Marshal(in)
+	if err != nil || !strings.Contains(string(raw), `"path_context"`) {
+		t.Fatalf("path_context missing from input: %s %v", raw, err)
+	}
+
+	for _, args := range []json.RawMessage{json.RawMessage(`{"command":"ls ."}`), json.RawMessage(`{"command":"pwd"}`), json.RawMessage(`{}`)} {
+		in, err := BuildReviewInput(ctx, "Bash", args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(in)
+		if in.PathContext != nil || strings.Contains(string(raw), "path_context") {
+			t.Fatalf("empty path_context leaked into input: %s", raw)
+		}
 	}
 }
 

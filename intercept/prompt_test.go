@@ -6,6 +6,29 @@ import (
 	"testing"
 )
 
+// The A2 path anchor is a deterministic rule, not a hint: if only the ALLOW half
+// survived an edit, every absolute path would read as a test artifact.
+func TestDefaultJudgePromptAnchorsPathContext(t *testing.T) {
+	for _, want := range []string{
+		"path_context.temporary 非空且 path_context.other 为空",
+		"删除、覆盖、清理一律 ALLOW,不得以「归属不明」判 ASK",
+		"path_context.other 非空",
+		"仍需按 D1–D6 判定",
+	} {
+		if !strings.Contains(DefaultJudgePrompt, want) {
+			t.Errorf("prompt lost the A2 path anchor clause %q", want)
+		}
+	}
+	// The boundary must describe the field, otherwise the judge reads an
+	// undocumented key and falls back to guessing.
+	if !strings.Contains(JudgeContextBoundary, "path_context 由程序从本次完整参数中机械提取") {
+		t.Fatal("judge boundary does not explain path_context")
+	}
+	if strings.Contains(JudgeContextBoundary, "不得因 /tmp、test、fixture 就断言") {
+		t.Fatal("boundary still forbids the /tmp inference the A2 anchor relies on")
+	}
+}
+
 func TestParseVerdict(t *testing.T) {
 	for _, action := range []string{"allow", "ask", "deny"} {
 		t.Run(action, func(t *testing.T) {
