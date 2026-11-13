@@ -37,6 +37,18 @@ import (
 // 里 shortCircuit 一旦返回非 nil 就直接 return，DB 规则与判官都不会再跑。
 // 试判要回答的是"线上这条命令会被怎么处理"，因此照抄终局语义，而不是
 // 按"前两层都没 deny"的字面意思继续跑（那会给出线上并不存在的判定）。
+//
+// 【测量模式：skip_short_circuit / skip_rules】
+// 两个可选布尔只用于能力测量（如评估"删掉短路表后判官能否独挡"），默认
+// false 时与上面的线上语义逐字段一致：
+//
+//   - skip_short_circuit=true：跳过短路表，从 DB 规则开始；规则仍可 deny/ask；
+//   - skip_rules=true：跳过 DB 规则匹配，直接进判官；
+//   - 两者都 true：纯判官判定（前提 use_judge=true）。
+//
+// 跳过本身会改变结论，不加标记极易被误读成线上真实行为，所以返回体带
+// bypassed（本次跳过了哪几层），且最终由判官定论时 message 加
+// 「[仅判官·已跳过前两层]」前缀。这些参数不改变"不执行、不写审计"的约束。
 // ============================================================================
 
 // 试判限流：同一 token 每分钟 30 次。判官调用要烧 token，若无上限，一个
@@ -58,6 +70,10 @@ type judgeTestRequest struct {
 	Tool     string          `json:"tool"`
 	Input    json.RawMessage `json:"input"`
 	UseJudge *bool           `json:"use_judge"` // 缺省 true；false 时跳过判官（省钱）
+
+	// 测量用开关：默认 false，生产语义不变。见文件头「测量模式」。
+	SkipShortCircuit bool `json:"skip_short_circuit"`
+	SkipRules        bool `json:"skip_rules"`
 }
 
 // judgeTestLayer 是短路表/规则两层的观测结果。hit=false 时其余字段省略。
@@ -91,12 +107,29 @@ type judgeTestFinal struct {
 }
 
 // judgeTestResponse 是试判返回体。
+//
+// Bypassed 只在测量模式（skip_*）下出现：[]string{"shortcircuit","rules"} 的
+// 子集，明示本次哪些层根本没参与判定。默认参数下省略，返回体与上线语义版
+// 逐字段一致，避免把测量结果误读成线上真实行为。
 type judgeTestResponse struct {
 	ShortCircuit  judgeTestLayer `json:"short_circuit"`
 	Rule          judgeTestLayer `json:"rule"`
 	Judge         judgeTestJudge `json:"judge"`
 	Final         judgeTestFinal `json:"final"`
 	JudgeCostHint string         `json:"judge_cost_hint,omitempty"`
+	Bypassed      []string       `json:"bypassed,omitempty"`
+}
+
+// judgeTestSkipPrefix 标记"跳过前两层后由判官单独定论"的结果。
+const judgeTestSkipPrefix = "[仅判官·已跳过前两层] "
+
+// judgeTestJudgeMessage 给测量模式下判官定论的 message 加前缀，防止把
+// "删掉前两层后的结论"当成线上行为。
+func judgeTestJudgeMessage(msg string, bypassed []string) string {
+	if len(bypassed) == 0 {
+		return msg
+	}
+	return judgeTestSkipPrefix + msg
 }
 
 // judgeTestDeps 把三层判定以函数注入，使试判编排可以脱离 DB/模型测试。
@@ -114,9 +147,16 @@ func evaluateJudgeTest(ctx context.Context, req judgeTestRequest, deps judgeTest
 	tool := strings.TrimSpace(req.Tool)
 	useJudge := req.UseJudge == nil || *req.UseJudge
 	var resp judgeTestResponse
+	// 测量模式：记录本次主动跳过了哪几层（默认两个 false → 空，返回体省略）。
+	if req.SkipShortCircuit {
+		resp.Bypassed = append(resp.Bypassed, "shortcircuit")
+	}
+	if req.SkipRules {
+		resp.Bypassed = append(resp.Bypassed, "rules")
+	}
 
 	// 第一层：短路表（代码常量，不受 settings/DB 热改影响）。
-	if deps.shortCircuit != nil {
+	if !req.SkipShortCircuit && deps.shortCircuit != nil {
 		if sc := deps.shortCircuit(tool, req.Input); sc != nil {
 			resp.ShortCircuit = judgeTestLayer{
 				Hit: true, Action: sc.Action, RuleName: sc.RuleName, Message: sc.Message,
@@ -129,7 +169,7 @@ func evaluateJudgeTest(ctx context.Context, req judgeTestRequest, deps judgeTest
 	// 第二层：DB 规则（priority DESC，首条命中）。
 	var ruleDec intercept.Decision
 	ruleMatched := false
-	if deps.match != nil {
+	if !req.SkipRules && deps.match != nil {
 		ruleDec, ruleMatched = deps.match(tool, req.Input)
 	}
 	if ruleMatched {
@@ -148,10 +188,11 @@ func evaluateJudgeTest(ctx context.Context, req judgeTestRequest, deps judgeTest
 	// 第三层：判官（仅在前两层未给终局、且调用方请求时）。
 	if !useJudge {
 		resp.Judge = judgeTestJudge{Called: false, Reason: "未请求判官（use_judge=false）"}
-		resp.Final = judgeTestFinal{
-			Action: "allow", Layer: "none",
-			Message: "未命中短路表与拦截规则，且未请求判官，按放行处理",
+		noneMsg := "未命中短路表与拦截规则，且未请求判官，按放行处理"
+		if len(resp.Bypassed) > 0 {
+			noneMsg = "前两层已按 skip 参数跳过，且未请求判官，按放行处理"
 		}
+		resp.Final = judgeTestFinal{Action: "allow", Layer: "none", Message: noneMsg}
 		if ruleMatched {
 			// ask 规则命中但没请求判官：真实路径进人工审批。
 			resp.Final = judgeTestFinal{Action: "ask", Layer: "rule", Message: ruleDec.Message}
@@ -166,10 +207,11 @@ func evaluateJudgeTest(ctx context.Context, req judgeTestRequest, deps judgeTest
 	}
 	if !judged {
 		resp.Judge = judgeTestJudge{Called: false, Reason: "判官未启用"}
-		resp.Final = judgeTestFinal{
-			Action: "allow", Layer: "none",
-			Message: "未命中短路表与拦截规则，判官未启用，按放行处理",
+		noneMsg := "未命中短路表与拦截规则，判官未启用，按放行处理"
+		if len(resp.Bypassed) > 0 {
+			noneMsg = "前两层已按 skip 参数跳过，判官未启用，按放行处理"
 		}
+		resp.Final = judgeTestFinal{Action: "allow", Layer: "none", Message: noneMsg}
 		if ruleMatched {
 			resp.Final = judgeTestFinal{Action: "ask", Layer: "rule", Message: ruleDec.Message}
 		}
@@ -187,14 +229,20 @@ func evaluateJudgeTest(ctx context.Context, req judgeTestRequest, deps judgeTest
 		// intercept.judgeAskOverridesHuman 同语义）；模型失败或给 ask 时
 		// 回落规则自带的 ask 语义。
 		if !judgeDec.ModelFallback && (judgeDec.Action == "allow" || judgeDec.Action == "deny") {
-			resp.Final = judgeTestFinal{Action: judgeDec.Action, Layer: "judge", Message: judgeDec.Message}
+			resp.Final = judgeTestFinal{
+				Action: judgeDec.Action, Layer: "judge",
+				Message: judgeTestJudgeMessage(judgeDec.Message, resp.Bypassed),
+			}
 		} else {
 			resp.Final = judgeTestFinal{Action: "ask", Layer: "rule", Message: ruleDec.Message}
 		}
 		return resp
 	}
 
-	resp.Final = judgeTestFinal{Action: judgeDec.Action, Layer: "judge", Message: judgeDec.Message}
+	resp.Final = judgeTestFinal{
+		Action: judgeDec.Action, Layer: "judge",
+		Message: judgeTestJudgeMessage(judgeDec.Message, resp.Bypassed),
+	}
 	return resp
 }
 
