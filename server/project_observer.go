@@ -13,6 +13,10 @@ package server
 // projectReaderTools() 保持原样（装配单测按数量断言），统一绑定用
 // unifiedReaderToolKeys（六件全绑到 reader）。
 //
+// V7-LINK 追加两件 reader 工具（read_task_intel / link_tasks），由
+// taskIntelReaderTools() 单独 seed 绑定，不进 unifiedReaderToolKeys——那条
+// 列表的「六件」语义与历史绑定收敛逻辑保持不动。
+//
 // 工具经 SeedTool 入库 + AddAgentToToolBinding 绑定到 reader；触发运行策略
 // serial+merge=all（整波合并）；tool_base='none'（只读红线，两 key 都保留）。
 // 两个尺度各自独立开关（V6-DUAL）：projects.observer_enabled 管跨任务/项目内
@@ -421,11 +425,10 @@ func unifiedReaderTrigger() *db.AgentTrigger {
 	}
 }
 
-// readerUnifiedPrompt 是统一阅读者（单 agent/单 trigger）的默认正文：把 observer
-// 五步与 reader 跨项目三步合成一份，用触发消息前缀判别本轮作用域。
-// 旧默认 readerPromptV1（V4-E 之前）与 readerPrompt（V4-E 资产优先版）保留作
-// upgradeReaderPrompt 的「逐字节比对旧默认才升级」基准——用户手改的一律不覆盖。
-const readerUnifiedPrompt = "你是【统一阅读者】：只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
+// readerUnifiedPromptV6 是统一阅读者上线时的默认正文（V6-U3）。V7-LINK 起
+// 只是 upgradeReaderPrompt 的「旧默认」比对基准：存量库未编辑过的正文升级到
+// 带情报表勾连段的版本，用户手改过的一律保留。
+const readerUnifiedPromptV6 = "你是【统一阅读者】：只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
 	"触发时机：项目探索图变更（图变更触发）或定时兜底（每 30 分钟一轮）；一条触发器同时挂这两个条件。\n" +
 	"【先看触发消息前缀判别本轮作用域】\n" +
 	"· 【scope=project】（项目图变更，消息里还带本批变更清单）：做项目内跨任务观察——\n" +
@@ -439,6 +442,17 @@ const readerUnifiedPrompt = "你是【统一阅读者】：只读与总结，禁
 	"  2) cross_project_assets 非空时围绕这些行写全局洞察，点名是哪个资产、涉及哪几个项目、同一资产上的同类漏洞面该搬到哪；\n" +
 	"  3) 确有串联价值才 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
 	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。"
+
+// readerPromptLinkSection 是 V7-LINK 追加的固定段：图变更信号后读增量情报表，
+// 发现可勾连任务就用结构化 link_tasks，而不是写自由文本洞察代替链接。
+const readerPromptLinkSection = "\n情报表勾连（V7-LINK）：收到图变更信号后，先用 read_task_intel 读增量情报表（新接口/凭据/组件；since_id 传上一轮返回的 next_since_id）；" +
+	"发现同一 kind/key 出现在多个任务、可以互相比对时，用 link_tasks 把两个任务标成候选关联（reason 写清命中项）；" +
+	"不要用自由文本洞察代替结构化链接——规划者需要的是可下钻的候选任务。"
+
+// readerUnifiedPrompt 是统一阅读者的当前默认正文：V6 统一版 + V7-LINK 勾连段。
+// 旧默认（readerPromptV1 / readerPrompt / readerUnifiedPromptV6）保留作
+// upgradeReaderPrompt 的逐字节比对基准——用户手改的一律不覆盖。
+const readerUnifiedPrompt = readerUnifiedPromptV6 + readerPromptLinkSection
 
 // seedObserverAgent 是 V6 之前的「跨任务观察者」seed（回退路径保留）。
 // V6-U3 起 observer 退化为只读别名：收敛完成后（reader_unified_v1 置位）
@@ -606,7 +620,7 @@ func (s *Server) unifyReaderAgent() {
 	log.Printf("[reader-unify] 已收敛为 reader 单 agent / 单条双条件触发器")
 }
 
-// seedProjectTools 把六工具 SeedTool 入库（首插生效），并跑统一阅读者的
+// seedProjectTools 把项目工具 SeedTool 入库（首插生效），并跑统一阅读者的
 // seed/收敛/升级。由 seedOrchestrationTools 末尾调用——agent 绑定要求工具行
 // 先存在（reporter 同款顺序依赖）。绑定不给 auto/planner：跨任务读图+写 hint
 // 是阅读者特权，最小暴露面。tool_base='none' 两 key 都保留（只读安全红线）。
@@ -628,6 +642,33 @@ func (s *Server) seedProjectTools() {
 		log.Printf("[project-tools] seed %s agents: %v", rt.Name(), err)
 	} else if err := s.m.PG().SeedTool(rt.Name(), rt.Description(), schema, agents); err != nil {
 		log.Printf("[project-tools] seed %s: %v", rt.Name(), err)
+	}
+	// V7-LINK：情报表勾连工具。planner 三件（request_reader_links /
+	// adopt_related_task / dismiss_related_task）首插即只绑 planner；reader
+	// 两件（read_task_intel / link_tasks）只绑 reader——与 reject_insight 同款
+	// 「首插生效」：用户日后在工具页取消绑定不会被重启复活。
+	for _, spec := range []struct {
+		tools  []actool.CoreTool
+		agents []string
+	}{
+		{s.taskIntelPlannerTools(), []string{"planner"}},
+		{s.taskIntelReaderTools(), []string{"reader"}},
+	} {
+		agents, err := json.Marshal(spec.agents)
+		if err != nil {
+			log.Printf("[project-tools] seed %v agents: %v", spec.agents, err)
+			continue
+		}
+		for _, t := range spec.tools {
+			schema, err := json.Marshal(t.InputSchema())
+			if err != nil {
+				log.Printf("[project-tools] seed %s schema: %v", t.Name(), err)
+				continue
+			}
+			if err := s.m.PG().SeedTool(t.Name(), t.Description(), schema, agents); err != nil {
+				log.Printf("[project-tools] seed %s: %v", t.Name(), err)
+			}
+		}
 	}
 	// V6-U3 顺序：先建 reader（全新库）→ 再收敛存量库双链（置 reader_unified_v1）
 	// → observer 见 flag 早退 → 最后升级 prompt。
@@ -654,12 +695,11 @@ func (s *Server) seedProjectTools() {
 	}
 }
 
-// readerPromptUpgradeFlag 是「统一阅读者默认正文已收编」的一次性标记
-// （V6-U3 新 flag，替代 reader_prompt_asset_first_v4e——旧 flag 对已升级过
-// V4-E 的存量库会早退，拿不到统一版正文）。与 seedReaderAgent 的 flag 不同：
-// 这条只在真的处理过（播种/升级/确认已编辑）后置位，agent 尚不存在时留空，
-// 下次启动再试。
-const readerPromptUpgradeFlag = "reader_prompt_unified_v6"
+// readerPromptUpgradeFlag 是「统一阅读者默认正文已收编」的一次性标记。
+// V7-LINK 起改用新 flag：旧 flag（reader_prompt_unified_v6）在存量库已置位，
+// 继续用它会让新增的情报表勾连段永远到不了 reader；换 flag 即再执行一次
+// 「逐字节比对旧默认才升级」的幂等收编。
+const readerPromptUpgradeFlag = "reader_prompt_link_v7"
 
 // readerPromptUpgrade 是 upgradeReaderPrompt 的纯判定结果（无库可单测）。
 type readerPromptUpgrade int
@@ -673,15 +713,15 @@ const (
 	readerPromptReplace
 )
 
-// readerPromptUpgradeFor 是「能不能升级」的纯判定（V6-U3）：旧默认有两个
-// ——readerPromptV1（V4-E 之前）与 readerPrompt（V4-E 资产优先版）。当前与
-// 任一逐字节相同＝用户没编辑过，升到 readerUnifiedPrompt；已是统一版或用户
-// 手改的正文一律 Keep，不覆盖。
+// readerPromptUpgradeFor 是「能不能升级」的纯判定：旧默认有三个——readerPromptV1
+// （V4-E 之前）、readerPrompt（V4-E 资产优先版）与 readerUnifiedPromptV6（V6 统一
+// 版）。当前与任一逐字节相同＝用户没编辑过，升到带情报表勾连段的 readerUnifiedPrompt；
+// 已是当前版本或用户手改的正文一律 Keep，不覆盖。
 func readerPromptUpgradeFor(cur string) readerPromptUpgrade {
 	switch strings.TrimSpace(cur) {
 	case "":
 		return readerPromptSeed
-	case readerPromptV1, readerPrompt:
+	case readerPromptV1, readerPrompt, readerUnifiedPromptV6:
 		return readerPromptReplace
 	default:
 		return readerPromptKeep

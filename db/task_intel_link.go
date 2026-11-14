@@ -1,0 +1,175 @@
+package db
+
+// 任务情报勾连的查询面（V7-LINK）：planner 按「新攻击面」抽出的 (kind,key)
+// 反查情报表里命中的任务；reader 的 link_tasks 写候选关联。
+//
+// 与 db/task_intel.go 的落库读写分开，避免那个文件继续膨胀；本文件只做
+// 「按 (kind,key) 命中 + 任务价值统计」和「candidate 写保护」两件事。
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+// IntelKeyRef 是一次攻击面抽出的候选键（kind 已在抽取侧归一化）。
+type IntelKeyRef struct {
+	Kind string `json:"kind"`
+	Key  string `json:"key"`
+}
+
+// IntelTaskMatch 是命中行 + 任务侧价值统计（planner 判断候选值不值得下钻）。
+type IntelTaskMatch struct {
+	TaskIntel
+	TaskName     string `json:"task_name"`
+	FindingCount int    `json:"finding_count"`
+	IntentCount  int    `json:"intent_count"`
+}
+
+// MatchTaskIntel 按 (kind,key) 命中 task_intel，排除当前任务。
+//
+// scope 语义：
+//   - cross=false（项目内）：只查 projectID 这一个项目；
+//   - cross=true（跨项目）：只查【其他项目】，且目标项目必须
+//     reader_enabled=true 且 status='active'（跨项目尺度开关，与
+//     observer_enabled 无关）。
+//
+// 命中键按调用方给的顺序拼 OR（键数很少，索引 idx_tintel_match 可用）；
+// 已删档任务不参与（情报表仍留档，但 planner 无法 adopt 一个不存在的任务）。
+// 返回按 task_id/kind/key 稳定排序，聚合排序在 server 层做。
+func (d *DB) MatchTaskIntel(ctx context.Context, projectID int64, keys []IntelKeyRef, excludeTaskID int64, cross bool) ([]IntelTaskMatch, error) {
+	if projectID <= 0 || len(keys) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(keys)*2+2)
+	conds := make([]string, 0, len(keys))
+	for _, k := range keys {
+		kind := strings.ToLower(strings.TrimSpace(k.Kind))
+		key := strings.TrimSpace(k.Key)
+		if kind == "" || key == "" {
+			continue
+		}
+		args = append(args, kind, key)
+		conds = append(conds, fmt.Sprintf("(ti.kind=$%d AND ti.key=$%d)", len(args)-1, len(args)))
+	}
+	if len(conds) == 0 {
+		return nil, nil
+	}
+	args = append(args, projectID)
+	pidPos := len(args)
+	var scope string
+	if cross {
+		scope = fmt.Sprintf(`ti.project_id <> $%d AND ti.project_id IN (
+SELECT id FROM projects WHERE reader_enabled = TRUE AND status = 'active')`, pidPos)
+	} else {
+		scope = fmt.Sprintf("ti.project_id = $%d", pidPos)
+	}
+	args = append(args, excludeTaskID)
+	excludePos := len(args)
+
+	q := `SELECT ti.id, ti.project_id, ti.task_id, ti.kind, ti.key, ti.value, ti.detail,
+       ti.source, ti.source_id, ti.created_at, ti.updated_at,
+       COALESCE(t.name, ''),
+       (SELECT COUNT(*) FROM findings f WHERE f.task_id = ti.task_id),
+       (SELECT COUNT(*) FROM exploration_nodes en
+          WHERE en.exploration_id = t.exploration_id AND en.kind = 'intent')
+FROM task_intel ti
+JOIN tasks t ON t.id = ti.task_id AND t.deleted_at IS NULL
+WHERE ti.task_id <> $` + fmt.Sprint(excludePos) + ` AND ` + scope + `
+  AND (` + strings.Join(conds, " OR ") + `)
+ORDER BY ti.task_id, ti.kind, ti.key`
+
+	rows, err := d.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []IntelTaskMatch
+	for rows.Next() {
+		var m IntelTaskMatch
+		var detail []byte
+		var sourceID sql.NullInt64
+		if err := rows.Scan(&m.ID, &m.ProjectID, &m.TaskID, &m.Kind, &m.Key, &m.Value, &detail,
+			&m.Source, &sourceID, &m.CreatedAt, &m.UpdatedAt,
+			&m.TaskName, &m.FindingCount, &m.IntentCount); err != nil {
+			return nil, err
+		}
+		if len(detail) == 0 {
+			detail = []byte(`{}`)
+		}
+		m.Detail = json.RawMessage(detail)
+		if sourceID.Valid {
+			v := sourceID.Int64
+			m.SourceID = &v
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// TaskIntelLinkFor 读一条 (task_id, related_task_id) 的现有决策；无行返回
+// (nil, nil)（重复 adopt 的幂等判定用）。
+func (d *DB) TaskIntelLinkFor(ctx context.Context, taskID, relatedTaskID int64) (*TaskIntelLink, error) {
+	if taskID <= 0 || relatedTaskID <= 0 {
+		return nil, nil
+	}
+	var l TaskIntelLink
+	var matched []byte
+	err := d.QueryRowContext(ctx, `
+SELECT id, project_id, task_id, related_task_id, decision, reason, matched, created_at
+FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, taskID, relatedTaskID).
+		Scan(&l.ID, &l.ProjectID, &l.TaskID, &l.RelatedTaskID, &l.Decision, &l.Reason, &matched, &l.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(matched) == 0 {
+		matched = []byte(`[]`)
+	}
+	l.Matched = json.RawMessage(matched)
+	return &l, nil
+}
+
+// SaveCandidateIntelLink 写 reader 的候选关联：幂等 upsert，但【不覆盖】已有
+// adopted/dismissed —— 阅读者的机器判断永远不能推翻规划者下钻后的人工决策。
+// 返回行 id 与是否真的写入（被保护时 applied=false，返回 existing id）。
+func (d *DB) SaveCandidateIntelLink(ctx context.Context, l TaskIntelLink) (id int64, applied bool, err error) {
+	if l.ProjectID <= 0 || l.TaskID <= 0 || l.RelatedTaskID <= 0 {
+		return 0, false, fmt.Errorf("intel link: project/task/related task id required")
+	}
+	matched := l.Matched
+	if len(matched) == 0 || !json.Valid(matched) {
+		matched = json.RawMessage(`[]`)
+	}
+	err = d.QueryRowContext(ctx, `
+INSERT INTO task_intel_links(project_id, task_id, related_task_id, decision, reason, matched)
+VALUES ($1,$2,$3,'candidate',$4,$5)
+ON CONFLICT (task_id, related_task_id) DO UPDATE
+SET decision = 'candidate',
+    reason = EXCLUDED.reason,
+    matched = EXCLUDED.matched
+WHERE task_intel_links.decision NOT IN ('adopted','dismissed')
+RETURNING id`,
+		l.ProjectID, l.TaskID, l.RelatedTaskID,
+		truncateRunes(utf8Clean(l.Reason), 1000), string(matched)).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		// 已有 adopted/dismissed：保护生效，回读现有行 id 供调用方回报。
+		cur, qerr := d.TaskIntelLinkFor(ctx, l.TaskID, l.RelatedTaskID)
+		if qerr != nil {
+			return 0, false, qerr
+		}
+		if cur != nil {
+			return cur.ID, false, nil
+		}
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}

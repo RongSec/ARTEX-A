@@ -44,6 +44,11 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools = append(tools, s.platformTools()...)        // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
 	tools = append(tools, s.projectObserverTools()...) // observer 四工具(读投影/下钻图/写洞察/推 hint)
 	tools = append(tools, s.projectReaderTools()...)   // reader 两工具(读全项目洞察/写全局洞察)
+	// V7-LINK：情报表勾连工具。planner 三件（申请候选/采纳/舍弃）只绑 planner，
+	// reader 两件（增量读情报/标候选关联）只绑 reader；绑定在 seed 时写入工具表，
+	// 装配层对其他 agent 会按 agents 过滤丢弃。
+	tools = append(tools, s.taskIntelPlannerTools()...)
+	tools = append(tools, s.taskIntelReaderTools()...)
 	// V5-A：planner 的洞察否决工具（host 工具，需 pg；tools 表 seed 时只绑 planner，
 	// 故装配层对其他 agent 会按绑定丢弃——worker/mainagent 看不到）。
 	tools = append(tools, s.toolRejectInsight())

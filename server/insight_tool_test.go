@@ -54,7 +54,7 @@ func TestRejectInsightTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pg.Exec(`DELETE FROM global_insights WHERE id=$1`, g.ID) //nolint:errcheck
+	defer pg.Exec(`DELETE FROM project_insights WHERE id=$1`, g.ID) //nolint:errcheck
 
 	if l, err := pg.ListCrossProjectInsights(ctx, []string{key}, 5); err != nil || len(l) != 1 {
 		t.Fatalf("前置条件：洞察应可注入，got %d err=%v", len(l), err)
@@ -94,7 +94,7 @@ func TestRejectInsightTool(t *testing.T) {
 		t.Errorf("否决后不该再被注入，got %d err=%v", len(l), err)
 	}
 	var status, reason string
-	if err := pg.QueryRow(`SELECT status, rejected_reason FROM global_insights WHERE id=$1`, g.ID).
+	if err := pg.QueryRow(`SELECT status, rejected_reason FROM project_insights WHERE id=$1`, g.ID).
 		Scan(&status, &reason); err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestRejectInsightTool(t *testing.T) {
 	if isErr || !strings.Contains(msg, "无需重复否决") {
 		t.Errorf("重复否决应幂等: isErr=%v msg=%q", isErr, msg)
 	}
-	if err := pg.QueryRow(`SELECT rejected_reason FROM global_insights WHERE id=$1`, g.ID).Scan(&reason); err != nil {
+	if err := pg.QueryRow(`SELECT rejected_reason FROM project_insights WHERE id=$1`, g.ID).Scan(&reason); err != nil {
 		t.Fatal(err)
 	}
 	if reason != "该资产已被修复" {
@@ -121,11 +121,11 @@ func TestRejectInsightTool(t *testing.T) {
 	}
 }
 
-// TestProjectInsightResolverInjectsCrossProject 是 A1 的端到端验收：同一项目
-// 里（observer 洞察 + 跨项目洞察）都按「本任务 open 意图锚定资产键」命中，
-// resolver 输出项目洞察在前、跨项目条目在后并带不确定性标注；把
-// projects.reader_enabled 关掉后跨项目条目消失（项目洞察保留）。
-func TestProjectInsightResolverInjectsCrossProject(t *testing.T) {
+// TestProjectInsightResolverInjectsProjectOnly 是 S1 的端到端验收（V7-LINK
+// 口径）：项目内观察者洞察照旧按「本任务 open 意图锚定资产键」命中注入；
+// 即使存在同资产的跨项目洞察、且 reader_enabled=true，也**不再自动注入**
+// 【跨项目】——跨项目情报改由 planner 主动 request_reader_links 拉取（S2 移除）。
+func TestProjectInsightResolverInjectsProjectOnly(t *testing.T) {
 	s, pg := newInsightTestPG(t)
 	ctx := context.Background()
 
@@ -150,8 +150,7 @@ func TestProjectInsightResolverInjectsCrossProject(t *testing.T) {
 	if _, err := task.Store.AddIntent(map[string]any{"summary": "打这个资产"}, 1, []int64{assetID}, "planner"); err != nil {
 		t.Fatal(err)
 	}
-	projIns, err := pg.WriteInsight(ctx, pid, "项目经验：该主机历史上有未认证后台", 0, []string{key})
-	if err != nil {
+	if _, err := pg.WriteInsight(ctx, pid, "项目经验：该主机历史上有未认证后台", 0, []string{key}); err != nil {
 		t.Fatal(err)
 	}
 	crossIns, err := pg.WriteGlobalInsight(ctx, "跨项目经验：同资产在另一项目已打通该入口", []int64{pid, 999}, []string{key})
@@ -163,61 +162,30 @@ func TestProjectInsightResolverInjectsCrossProject(t *testing.T) {
 		t.Fatalf("task id %q 不是数字: %v", task.ID, err)
 	}
 	t.Cleanup(func() {
-		pg.Exec(`DELETE FROM global_insights WHERE id=$1`, crossIns.ID) //nolint:errcheck
-		pg.Exec(`DELETE FROM tasks WHERE id=$1`, taskID)                //nolint:errcheck
-		pg.Exec(`DELETE FROM explorations WHERE id=$1`, task.ExpID)     //nolint:errcheck
-		pg.Exec(`DELETE FROM assets WHERE id=$1`, assetID)              //nolint:errcheck
-		pg.Exec(`DELETE FROM projects WHERE id=$1`, pid)                //nolint:errcheck // project_insights 级联删
+		pg.Exec(`DELETE FROM project_insights WHERE id=$1`, crossIns.ID) //nolint:errcheck
+		pg.Exec(`DELETE FROM tasks WHERE id=$1`, taskID)                 //nolint:errcheck
+		pg.Exec(`DELETE FROM explorations WHERE id=$1`, task.ExpID)      //nolint:errcheck
+		pg.Exec(`DELETE FROM assets WHERE id=$1`, assetID)               //nolint:errcheck
+		pg.Exec(`DELETE FROM projects WHERE id=$1`, pid)                 //nolint:errcheck // project_insights 级联删
 	})
-	_ = projIns
 
 	got := s.projectInsightResolverFor()(taskID)
 	if !strings.Contains(got, "项目经验：该主机历史上有未认证后台") {
 		t.Errorf("项目洞察缺失: %q", got)
 	}
-	if !strings.Contains(got, "【跨项目】") || !strings.Contains(got, "跨项目经验：同资产在另一项目已打通该入口") {
-		t.Errorf("跨项目条目缺失: %q", got)
+	if strings.Contains(got, "【跨项目") || strings.Contains(got, "跨项目经验：同资产在另一项目已打通该入口") {
+		t.Errorf("V7-LINK：跨项目条目不得再自动注入: %q", got)
 	}
-	if !strings.Contains(got, "来自其他项目，仅作假设，须在本目标验证）") {
-		t.Errorf("跨项目条目缺不确定性标注: %q", got)
-	}
-	if !strings.Contains(got, fmt.Sprintf("洞察#%d", crossIns.ID)) {
-		t.Errorf("跨项目条目应带洞察 id（reject_insight 的句柄）: %q", got)
-	}
-	lines := strings.Split(strings.TrimSpace(got), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("want 2 lines (项目在前/跨项目在后), got %d: %q", len(lines), got)
-	}
-	if !strings.HasPrefix(lines[0], "- 来源任务#") && !strings.HasPrefix(lines[0], "- 项目经验") {
-		t.Errorf("line0 应是项目洞察: %q", lines[0])
-	}
-	if !strings.HasPrefix(lines[1], "- 【跨项目】") {
-		t.Errorf("line1 应是跨项目条目（项目洞察优先占位）: %q", lines[1])
+	if strings.Contains(got, "洞察#"+strconv.FormatInt(crossIns.ID, 10)) {
+		t.Errorf("跨项目洞察 id 不该出现在注入正文: %q", got)
 	}
 
-	// reader_enabled=false → 跨项目条目不注入（opt-in 门控），项目洞察不受影响。
-	if _, err := pg.Exec(`UPDATE projects SET reader_enabled=false WHERE id=$1`, pid); err != nil {
-		t.Fatal(err)
-	}
-	got = s.projectInsightResolverFor()(taskID)
-	if strings.Contains(got, "【跨项目】") {
-		t.Errorf("reader_enabled=false 时不应注入跨项目条目: %q", got)
-	}
-	if !strings.Contains(got, "项目经验：该主机历史上有未认证后台") {
-		t.Errorf("关掉 reader_enabled 不该影响 observer 洞察: %q", got)
-	}
-
-	// V6-DUAL 反向：observer_enabled=false / reader_enabled=true → 只剩跨项目
-	// 段（两个尺度各自开关，不是同一把闸）。
+	// observer_enabled=false → 项目洞察也不注入（reader_enabled 不再补位）。
 	if _, err := pg.Exec(`UPDATE projects SET observer_enabled=false, reader_enabled=true WHERE id=$1`, pid); err != nil {
 		t.Fatal(err)
 	}
-	got = s.projectInsightResolverFor()(taskID)
-	if strings.Contains(got, "项目经验：该主机历史上有未认证后台") {
-		t.Errorf("observer_enabled=false 时不该注入项目洞察: %q", got)
-	}
-	if !strings.Contains(got, "【跨项目】") || !strings.Contains(got, "跨项目经验：同资产在另一项目已打通该入口") {
-		t.Errorf("reader_enabled=true 时跨项目条目应仍在: %q", got)
+	if got := s.projectInsightResolverFor()(taskID); got != "" {
+		t.Errorf("observer 关 / reader 开时也应为零注入，got %q", got)
 	}
 }
 
@@ -319,9 +287,9 @@ func TestInsightMatchKeysThreeLevels(t *testing.T) {
 	}
 }
 
-// TestCrossLevelKeyHitEndToEnd 守 V5-C 障碍2：站点级键（host:port）与页面级
-// endpoint 锚定必须能互相命中——项目洞察 keywords 与跨项目 asset_keys 都写
-// 站点级，任务锚定的是页面级 endpoint。
+// TestCrossLevelKeyHitEndToEnd 守 V5-C 障碍2（项目内）：站点级键（host:port）
+// 与页面级 endpoint 锚定必须能互相命中——项目洞察 keywords 写站点级，任务
+// 锚定的是页面级 endpoint；同资产的跨项目洞察不再自动注入（V7-LINK）。
 func TestCrossLevelKeyHitEndToEnd(t *testing.T) {
 	s, pg := newInsightTestPG(t)
 	ctx := context.Background()
@@ -346,20 +314,20 @@ func TestCrossLevelKeyHitEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { pg.Exec(`DELETE FROM global_insights WHERE id=$1`, cross.ID) }) //nolint:errcheck
+	t.Cleanup(func() { pg.Exec(`DELETE FROM project_insights WHERE id=$1`, cross.ID) }) //nolint:errcheck
 
 	got := s.projectInsightResolverFor()(taskID)
 	if !strings.Contains(got, "项目经验：该站点后台可未授权进入") {
 		t.Errorf("站点级 keywords 应命中页面级锚定（障碍2）: %q", got)
 	}
-	if !strings.Contains(got, "【跨项目】") || !strings.Contains(got, "跨项目经验：同站点同端口在别的项目已打通") {
-		t.Errorf("站点级 asset_keys 应命中页面级锚定（障碍2）: %q", got)
+	if strings.Contains(got, "【跨项目") || strings.Contains(got, "跨项目经验：同站点同端口在别的项目已打通") {
+		t.Errorf("V7-LINK：跨项目条目不得自动注入（即便站点级键命中）: %q", got)
 	}
 }
 
-// TestCrossProjectQuotaReservesSlot 守 V5-C 障碍3：项目洞察塞满时项目侧压到
-// 2 条，至少给跨项目留 1 个名额（旧实现跨项目永远拿不到位置）。
-func TestCrossProjectQuotaReservesSlot(t *testing.T) {
+// TestProjectInsightQuotaNoCross 守 V7-LINK 的预算口径：项目洞察最多 3 条，
+// 不再为跨项目条目让位（跨项目交集查询已从 resolver 移除）。
+func TestProjectInsightQuotaNoCross(t *testing.T) {
 	s, pg := newInsightTestPG(t)
 	ctx := context.Background()
 	n := time.Now().UnixNano()
@@ -381,31 +349,21 @@ func TestCrossProjectQuotaReservesSlot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cross, err := pg.WriteGlobalInsight(ctx, "跨项目经验：配额保位", []int64{pid, 999}, []string{siteKey})
+	cross, err := pg.WriteGlobalInsight(ctx, "跨项目经验：不再自动注入", []int64{pid, 999}, []string{siteKey})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { pg.Exec(`DELETE FROM global_insights WHERE id=$1`, cross.ID) }) //nolint:errcheck
+	t.Cleanup(func() { pg.Exec(`DELETE FROM project_insights WHERE id=$1`, cross.ID) }) //nolint:errcheck
 
 	got := s.projectInsightResolverFor()(taskID)
 	lines := strings.Split(strings.TrimSpace(got), "\n")
-	if len(lines) != 3 {
-		t.Fatalf("want 3 lines (2 项目 + 1 跨项目), got %d: %q", len(lines), got)
+	if len(lines) != insightInjectMax {
+		t.Fatalf("项目洞察应占满 %d 条（不再给跨项目留位），got %d: %q", insightInjectMax, len(lines), got)
 	}
-	projectLines, crossLines := 0, 0
 	for _, ln := range lines {
-		switch {
-		case strings.HasPrefix(ln, "- 【跨项目】"):
-			crossLines++
-		case strings.HasPrefix(ln, "- 来源任务#") || strings.HasPrefix(ln, "- 项目经验"):
-			projectLines++
+		if strings.HasPrefix(ln, "- 【跨项目") {
+			t.Errorf("不得出现跨项目条目: %q", got)
 		}
-	}
-	if projectLines != 2 || crossLines != 1 {
-		t.Errorf("配额应为 2+1，got 项目=%d 跨项目=%d: %q", projectLines, crossLines, got)
-	}
-	if !strings.HasPrefix(lines[len(lines)-1], "- 【跨项目】") {
-		t.Errorf("跨项目条目应渲染在项目洞察之后: %q", got)
 	}
 }
 

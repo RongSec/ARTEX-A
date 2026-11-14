@@ -69,52 +69,6 @@ func TestRenderProjectInsights(t *testing.T) {
 	}
 }
 
-// TestRenderCrossProjectInsight 守 V5-A 跨项目条目的渲染口径：前缀、来源项目
-// 引用、不确定性标注、rune 截断（与项目洞察共用同一截断实现）。
-func TestRenderCrossProjectInsight(t *testing.T) {
-	list := []db.GlobalInsight{
-		{ID: 12, Content: "canal v1.1.5 未认证RCE在 #1 已打通，同版本组件可复用", SourceProjects: []int64{2, 3}},
-		{ID: 9, Content: "10.0.0.8:8080 的弱口令面与 #7 一致", SourceProjects: []int64{7}},
-	}
-	got := renderCrossProjectInsight(list)
-	lines := strings.Split(got, "\n")
-	if len(lines) != 2 {
-		t.Fatalf("want 2 lines, got %d: %q", len(lines), got)
-	}
-	if !strings.HasPrefix(lines[0], "- 【跨项目】来源项目#2/#3：") {
-		t.Errorf("line0 prefix wrong: %q", lines[0])
-	}
-	if !strings.HasSuffix(lines[0], "（洞察#12，来自其他项目，仅作假设，须在本目标验证）") {
-		t.Errorf("line0 must carry insight id + uncertainty marker: %q", lines[0])
-	}
-	if !strings.Contains(lines[1], "来源项目#7：") || !strings.Contains(lines[1], "洞察#9") {
-		t.Errorf("single source ref / id wrong: %q", lines[1])
-	}
-
-	// 无来源项目（历史/异常行）：省来源段，但保留【跨项目】与标注。
-	noSrc := renderCrossProjectInsight([]db.GlobalInsight{{Content: "同组件指纹"}})
-	if !strings.HasPrefix(noSrc, "- 【跨项目】同组件指纹（来自其他项目") {
-		t.Errorf("no-source render wrong: %q", noSrc)
-	}
-
-	// 截断：正文按 rune 截 200 + 省略号，标注仍完整跟在后面。
-	long := strings.Repeat("验", insightInjectMaxRunes+5)
-	out := renderCrossProjectInsight([]db.GlobalInsight{{Content: long, SourceProjects: []int64{1}}})
-	body := strings.TrimPrefix(out, "- 【跨项目】来源项目#1：")
-	body = strings.TrimSuffix(body, "（来自其他项目，仅作假设，须在本目标验证）")
-	if !strings.HasSuffix(body, "…") {
-		t.Fatalf("truncated body must end with ellipsis: tail %q", body[len(body)-6:])
-	}
-	if n := utf8.RuneCountInString(strings.TrimSuffix(body, "…")); n != insightInjectMaxRunes {
-		t.Errorf("truncated body rune count = %d want %d", n, insightInjectMaxRunes)
-	}
-
-	// 空列表 → 空串（resolver 靠它决定整段不出现）。
-	if g := renderCrossProjectInsight(nil); g != "" {
-		t.Errorf("nil must render empty, got %q", g)
-	}
-}
-
 // TestRenderInsightCarriesID 守「注入行带洞察 id」——reject_insight 只能靠它
 // 定位；「来源任务#N」是任务 id，不是洞察 id（历史格式里两者混用易误判）。
 func TestRenderInsightCarriesID(t *testing.T) {
@@ -122,61 +76,6 @@ func TestRenderInsightCarriesID(t *testing.T) {
 	if proj != "- 来源任务#7：经验（洞察#31）" {
 		t.Errorf("project line with id = %q", proj)
 	}
-	cross := renderCrossProjectInsight([]db.GlobalInsight{{ID: 42, Content: "经验", SourceProjects: []int64{2}}})
-	if cross != "- 【跨项目】来源项目#2：经验（洞察#42，来自其他项目，仅作假设，须在本目标验证）" {
-		t.Errorf("cross line with id = %q", cross)
-	}
-}
-
-// TestFilterInjectableCross 守跨项目注入的筛选语义（纯函数，无库）：
-// reader_enabled=false 全空、status≠active 剔除、asset_keys 不交为空、
-// 剩余名额截断。
-func TestFilterInjectableCross(t *testing.T) {
-	match := []string{"Canal.Example.com", "10.0.0.8"}
-	rows := []db.GlobalInsight{
-		{ID: 1, Content: "命中且 active", AssetKeys: []string{"canal.example.com"}, Status: db.InsightStatusActive},
-		{ID: 2, Content: "命中但被否决", AssetKeys: []string{"canal.example.com"}, Status: db.InsightStatusRejected},
-		{ID: 3, Content: "命中但被覆盖", AssetKeys: []string{"canal.example.com"}, Status: db.InsightStatusSuperseded},
-		{ID: 4, Content: "不交", AssetKeys: []string{"other.example.com"}, Status: db.InsightStatusActive},
-		{ID: 5, Content: "无键", AssetKeys: nil, Status: db.InsightStatusActive},
-		{ID: 6, Content: "零值 status 按 active", AssetKeys: []string{"10.0.0.8"}},
-	}
-
-	// reader_enabled=false → 一条都不注入（与写出侧 opt-in 同阈）。
-	if got := filterInjectableCross(rows, match, false, 3); len(got) != 0 {
-		t.Fatalf("reader off must inject nothing, got %d 条", len(got))
-	}
-	// 本任务无锚定键 → 跨项目经验无据可验，不注入。
-	if got := filterInjectableCross(rows, nil, true, 3); len(got) != 0 {
-		t.Fatalf("empty match must inject nothing, got %d 条", len(got))
-	}
-	if got := filterInjectableCross(rows, []string{"  "}, true, 3); len(got) != 0 {
-		t.Fatalf("blank match must inject nothing, got %d 条", len(got))
-	}
-
-	got := filterInjectableCross(rows, match, true, insightInjectMax)
-	if len(got) != 2 || got[0].ID != 1 || got[1].ID != 6 {
-		t.Fatalf("active+intersect rows only, got %+v", idsOfGlobal(got))
-	}
-	// 大小写不敏感（归一化键本应小写，防御脏数据）。
-	if got := filterInjectableCross(rows, []string{"CANAL.example.COM"}, true, 3); len(got) != 1 || got[0].ID != 1 {
-		t.Errorf("match must be case-insensitive, got %+v", idsOfGlobal(got))
-	}
-	// 剩余名额截断（项目洞察优先占位的另一半）。
-	if got := filterInjectableCross(rows, match, true, 1); len(got) != 1 || got[0].ID != 1 {
-		t.Errorf("limit must cut to 1, got %+v", idsOfGlobal(got))
-	}
-	if got := filterInjectableCross(rows, match, true, 0); len(got) != 0 {
-		t.Errorf("zero remaining quota must inject nothing, got %d", len(got))
-	}
-}
-
-func idsOfGlobal(list []db.GlobalInsight) []int64 {
-	out := make([]int64, 0, len(list))
-	for _, g := range list {
-		out = append(out, g.ID)
-	}
-	return out
 }
 
 // TestExtractHostKeys 守 V5-C 障碍1 第三级来源：从任务名称/目标文本里轻量提取
@@ -230,85 +129,33 @@ func TestExtractHostKeys(t *testing.T) {
 	}
 }
 
-// TestInsightQuota 守 V5-C 障碍3 的配额：存在跨项目行时项目洞察压到 2、至少留
-// 1 位给跨项目；无跨项目时项目可占满 3；总数永不超过 3、跨项目永不超过 2。
-func TestInsightQuota(t *testing.T) {
+// TestBuildInsightBodyProjectOnly 守 V7-LINK：注入正文只剩项目洞察——
+// observer_enabled 关时零注入；reader_enabled 与跨项目候选不再参与渲染
+// （跨项目情报改由 planner 主动 request_reader_links 拉取）。
+func TestBuildInsightBodyProjectOnly(t *testing.T) {
+	projectRows := []db.Insight{
+		{Content: "项目经验：同项目内可复用", SourceTaskID: 1},
+		{Content: "项目经验-2", SourceTaskID: 2},
+	}
 	cases := []struct {
-		name                     string
-		projectAvail, crossAvail int
-		wantProject, wantCross   int
+		name       string
+		observerOn bool
+		want       bool
 	}{
-		{"项目占满且跨项目存在 → 2+1", 18, 5, 2, 1},
-		{"项目只有 1 条 → 1+2", 1, 5, 1, 2},
-		{"项目 0 条 → 跨项目最多 2", 0, 5, 0, 2},
-		{"无跨项目 → 项目可用满 3", 18, 0, 3, 0},
-		{"都很少", 1, 1, 1, 1},
-		{"都空", 0, 0, 0, 0},
-		{"负值按 0", -1, -1, 0, 0},
+		{"observer 开 → 只注入项目段", true, true},
+		{"observer 关 → 零注入", false, false},
 	}
 	for _, c := range cases {
-		p, x := insightQuota(c.projectAvail, c.crossAvail)
-		if p != c.wantProject || x != c.wantCross {
-			t.Errorf("%s: insightQuota(%d,%d)=(%d,%d) want (%d,%d)",
-				c.name, c.projectAvail, c.crossAvail, p, x, c.wantProject, c.wantCross)
+		tctx := &db.TaskInsightContext{ProjectID: 1, ObserverOn: c.observerOn, ReaderOn: true}
+		body := buildInsightBody(tctx, projectRows)
+		if got := body != ""; got != c.want {
+			t.Errorf("%s: body=%q want non-empty=%v", c.name, body, c.want)
 		}
-		if p+x > insightInjectMax {
-			t.Errorf("%s: total %d exceeds %d", c.name, p+x, insightInjectMax)
-		}
-		if x > insightCrossMax {
-			t.Errorf("%s: cross %d exceeds %d", c.name, x, insightCrossMax)
+		if strings.Contains(body, "【跨项目") {
+			t.Errorf("%s: 不得再自动注入跨项目条目: %q", c.name, body)
 		}
 	}
-}
-
-// TestBuildInsightBodyDualSwitch 守 V6-DUAL：跨任务（项目内）与跨项目是两个
-// 独立尺度、两道独立闸门，绝不归一回一个开关（纯函数，无库）。
-//   - observer=true/reader=false → 只有项目段，无【跨项目】；
-//   - observer=false/reader=true → 只有跨项目段；
-//   - 两者都 false → 空（三停之「注入停」）；
-//   - 两者都 true → 两段都有（项目段在前、跨项目段在后）。
-func TestBuildInsightBodyDualSwitch(t *testing.T) {
-	projectRows := []db.Insight{{Content: "项目经验：同项目内可复用", SourceTaskID: 1}}
-	crossRows := []db.GlobalInsight{{
-		ID: 9, Content: "跨项目经验：别处已打通", Status: db.InsightStatusActive,
-		AssetKeys: []string{"canal.example.com:8080"},
-	}}
-	m := insightMatch{Anchors: []string{"canal.example.com:8080"}}
-
-	cases := []struct {
-		name                   string
-		observerOn, readerOn   bool
-		wantProject, wantCross bool
-	}{
-		{"跨任务开/跨项目关", true, false, true, false},
-		{"跨任务关/跨项目开", false, true, false, true},
-		{"两者都关", false, false, false, false},
-		{"两者都开", true, true, true, true},
-	}
-	for _, c := range cases {
-		tctx := &db.TaskInsightContext{ProjectID: 1, ObserverOn: c.observerOn, ReaderOn: c.readerOn}
-		body, scope, crossN := buildInsightBody(tctx, m, projectRows, crossRows, nil)
-		gotProject := strings.Contains(body, "项目经验：同项目内可复用")
-		gotCross := strings.Contains(body, "【跨项目】")
-		if gotProject != c.wantProject || gotCross != c.wantCross {
-			t.Errorf("%s: project=%v cross=%v want project=%v cross=%v body=%q",
-				c.name, gotProject, gotCross, c.wantProject, c.wantCross, body)
-		}
-		if c.wantCross {
-			if scope != insightCrossScopeAnchored || crossN != 1 {
-				t.Errorf("%s: scope=%q crossN=%d want anchored/1", c.name, scope, crossN)
-			}
-		} else if scope != "" || crossN != 0 {
-			t.Errorf("%s: 跨项目关时应无档位注入，got scope=%q crossN=%d", c.name, scope, crossN)
-		}
-		if !c.wantProject && !c.wantCross && body != "" {
-			t.Errorf("%s: 两闸全关应零注入，got %q", c.name, body)
-		}
-		if c.wantProject && c.wantCross {
-			lines := strings.Split(strings.TrimSpace(body), "\n")
-			if len(lines) != 2 || !strings.HasPrefix(lines[0], "- 来源任务#") || !strings.HasPrefix(lines[1], "- 【跨项目】") {
-				t.Errorf("%s: 应为项目段在前、跨项目段在后，got %q", c.name, body)
-			}
-		}
+	if body := buildInsightBody(nil, projectRows); body != "" {
+		t.Errorf("nil tctx 必须零注入，got %q", body)
 	}
 }

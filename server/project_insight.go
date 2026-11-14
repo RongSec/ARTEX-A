@@ -2,34 +2,22 @@ package server
 
 // T12 项目洞察 → planner 注入（架构 §2.4，裁决1 后的定稿语义）。
 //
-// 门控链（每 planner 轮现查，零缓存——两个开关翻转与洞察增删即时生效，
-// 与 SetConstraintInject 同款「闭包每轮读」范式）：
-//   任务存在 → 挂了项目 →（两段各自一道闸）→ 才可能注入。
-//   - 项目段（scope='project'，跨任务/项目内尺度）看 observer_enabled；
-//   - 跨项目段（scope='cross'，跨项目尺度）看 reader_enabled。
-// 两列**互相独立**（V6-DUAL），任一为 true 就按对应段注入；两者全关才整体
-// 返回 ""（planner 侧 projectInsightsRendered 见空串即整段不出现，prompt 与
-// 原版逐字节一致 = 三停收编后的"注入停"）。
-// 项目/跨项目两次查询保留为两个适配函数，内部都走 project_insights 单表、
-// 按 scope='project' / scope='cross' 分流。
+// 门控链（每 planner 轮现查，零缓存——开关翻转与洞察增删即时生效，与
+// SetConstraintInject 同款「闭包每轮读」范式）：
+//   任务存在 → 挂了项目 → 项目段（scope='project'）看 observer_enabled。
+//
+// V7-LINK：跨项目自动注入已拆除。reader_enabled 不再决定「往 planner prompt
+// 里塞什么」，只作为 request_reader_links(scope=cross) 的闸门——跨项目情报改由
+// planner 主动申请、自己下钻判断（详见 server/task_intel_link.go）。本文件只
+// 保留项目内洞察注入，planner 侧 projectInsightsRendered 见空串即整段不出现，
+// prompt 与原版逐字节一致 = 三停收编后的"注入停"。
 //
 // 限量与命中：ListInsights(matchKeywords=当前任务 open 意图锚定资产的归一化
 // 键) 让「与本任务正在打的资产相交」的洞察排最前，取 ≤3 条、每条正文截
 // 200 rune、带「（来源任务#N）」回链。keywords 交集为空时退化为按时间新在
 // 前补位——观察者攒的经验值得被看见，但绝不挤过直接命中的。
 //
-// V5-A 跨项目回流：同一预算（≤3 条）里项目洞察与跨项目条目按配额分配
-// （V5-C 障碍3：项目洞察最多 2 条；存在可注入跨项目行时项目洞察压到 2，
-// 至少给跨项目留 1 位；跨项目最多 2 条）。project_insights 中 scope='cross'
-// 且 status='active' 的条目注入，分两档（V6-XPROJ）：
-//   - anchored：asset_keys 与本任务锚定资产键相交（精确命中优先）；
-//   - global：本任务没有任何锚定资产键（或只有名称/描述分词这类弱键）时，
-//     退化为「最近 insightCrossMax 条 active 的 scope='cross'」全局参照。
-// 两档都由该项目 reader_enabled 闸门控制（与写出侧 readerVisibleProjects 同一
-// opt-in 口径；与 observer_enabled 无关——两个尺度各自开关）。跨项目条目额外
-// 带「仅作假设」标注；global 档标签为【跨项目·全局参照】以区别于同资产命中。
-//
-// V5-C 命中键来源（障碍1，三级并集，任一级非空即停）；V6-XPROJ 追加两级：
+// 命中键来源（障碍1，三级并集，任一级非空即停）：
 //   a. 本探索图 state IN ('open','running') 的意图锚定资产（running 也很常见：
 //      带锚定的种子意图一生成就被 worker 认领）；
 //   b. assets.task_ids 命中本任务的资产；
@@ -46,7 +34,6 @@ import (
 	"log"
 	"net"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -61,14 +48,6 @@ import (
 const (
 	insightInjectMax      = 3   // 每轮最多注入条数（token 预算：3×200 字有上限）
 	insightInjectMaxRunes = 200 // 单条正文截断
-	// V5-C 障碍3 配额：项目洞察/跨项目洞察各自的上限。跨项目存在时项目洞察
-	// 压到 insightProjectMax，保证跨项目至少 1 位（旧实现项目洞察先占满 3，
-	// 项目 3 有 18 条洞察时跨项目永远拿不到名额）。
-	insightProjectMax = 2
-	insightCrossMax   = 2
-	// insightCrossScanMax 是跨项目条目的扫描上限：SQL limit 之后还要按
-	// asset_keys 交集数在 Go 侧排序（交集多的优先），扫 2 条会漏掉后面的强命中。
-	insightCrossScanMax = 50
 	// insightWarnEvery 是洞察链路 DB 错误的告警限频（照 project_indexer 的
 	// maybeWarnDrop 30s 范式）。OBS-1：resolver 出错→静默返回 "" 会让「四个
 	// planner 轮无注入」这类故障完全无线索，必须留一条 warn；但每轮一条会
@@ -107,14 +86,8 @@ var insightWarner insightErrWarner
 //
 // 命中键（五级，见 insightMatchSources）分两档：Anchors（资产键，可与
 // asset_keys 精确求交）与 Weak（名称/描述分词，只参与项目洞察 keywords 打分）。
-// 跨项目查询据此分两档（V6-XPROJ）：
-//   - 有 Anchors → scope=anchored，走 ListCrossProjectInsights 的 asset_keys
-//     交集精确匹配（语义不变，命中优先）；
-//   - 无 Anchors（含只有 Weak 的情况）→ scope=global，走「最近 N 条 active
-//     scope='cross'」的全局参照，N=insightCrossMax（=2）。观察者经验的价值不
-//     止于同资产：相似接口/同类组件/同类打法在本任务尚未锚定资产时同样有参照
-//     意义，故不再因无锚定键整段不注入。两种档位都受 reader_enabled 闸门约束，
-//     都计入 insightCrossMax 配额，且不得挤掉项目段（insightQuota 规则不变）。
+// V7-LINK 起只注入项目内洞察：跨项目情报由 planner 调 request_reader_links
+// 主动申请，不在 prompt 里自动出现。
 func (s *Server) projectInsightResolverFor() func(taskID int64) string {
 	pg := s.m.pg
 	return func(taskID int64) string {
@@ -132,67 +105,23 @@ func (s *Server) projectInsightResolverFor() func(taskID int64) string {
 		if tctx.ProjectID <= 0 {
 			return "" // 未挂项目
 		}
-		// V6-DUAL：两个尺度各自一道闸——项目段看 observer_enabled（跨任务/
-		// 项目内），跨项目段看 reader_enabled（写段与查询档位由
-		// insightCrossPlan 判）。两列互相独立，两者全关才零注入（三停之一
-		// "注入停"，原版逐字节一致）。
-		if !tctx.ObserverOn && !tctx.ReaderOn {
+		// 项目内洞察只看 observer_enabled（跨任务/项目内尺度）。reader_enabled
+		// 从 V7-LINK 起不再决定 prompt 注入。
+		if !tctx.ObserverOn {
 			return ""
 		}
 		// 命中原料：五级并集，查询抖动按「该级为空」降级，绝不因旁路查询报错
 		// 把整段注入打掉。
 		match := s.insightMatchSources(ctx, pg, tctx, taskID)
-		var projectList []db.Insight
 		// 项目洞察：ListInsights 内部走单表 scope='project'（U2）。
-		if tctx.ObserverOn {
-			list, err := pg.ListInsights(ctx, tctx.ProjectID, match.keys(), insightInjectMax)
-			if err != nil {
-				insightWarner.warn("ListInsights", taskID, err)
-				return ""
-			}
-			projectList = list
+		list, err := pg.ListInsights(ctx, tctx.ProjectID, match.keys(), insightInjectMax)
+		if err != nil {
+			insightWarner.warn("ListInsights", taskID, err)
+			return ""
 		}
-		var anchoredCross, globalCross []db.GlobalInsight
-		scope, wantCross := insightCrossPlan(tctx, match)
-		var crossErr error
-		if wantCross {
-			if scope == insightCrossScopeAnchored {
-				anchoredCross, crossErr = pg.ListCrossProjectInsights(ctx, match.Anchors, insightCrossScanMax)
-			} else {
-				// 退化档只取 insightCrossMax 条：配额顶层上限就是 2，多取无益。
-				globalCross, crossErr = pg.ListRecentCrossProjectInsights(ctx, insightCrossMax)
-			}
-			if crossErr != nil {
-				insightWarner.warn("ListCrossProjectInsights", taskID, crossErr)
-			}
-		}
-		body, renderedScope, crossN := buildInsightBody(tctx, match, projectList, anchoredCross, globalCross)
-		if wantCross {
-			// OBS-2：线上核对「为什么这轮 0 条跨项目」。scope 区分精确命中还是全局
-			// 参照，match_keys 是本次取到的键总数（含弱键），injected 是配额后实际
-			// 注入条数。
-			reason := "no_cross_rows"
-			switch {
-			case crossErr != nil:
-				reason = "query_error"
-			case renderedScope == insightCrossScopeAnchored && crossN > 0:
-				reason = "asset_hit"
-			case renderedScope == insightCrossScopeAnchored:
-				reason = "no_asset_hit"
-			case crossN > 0:
-				reason = "global_fallback"
-			}
-			log.Printf("[insight] cross scope=%s match_keys=%d injected=%d reason=%s", renderedScope, len(match.keys()), crossN, reason)
-		}
-		return body
+		return buildInsightBody(tctx, list)
 	}
 }
-
-// insightCrossScope 的两个档位（也用于日志取值）。
-const (
-	insightCrossScopeAnchored = "anchored"
-	insightCrossScopeGlobal   = "global"
-)
 
 // insightMatch 是命中原料的两档：
 //   - Anchors：资产键（意图锚定 / 任务资产 / finding 资产 / 目标文本 host），
@@ -208,68 +137,19 @@ type insightMatch struct {
 // keys 返回两档并集（小写去重、保序），供 ListInsights 的 keywords 打分。
 func (m insightMatch) keys() []string { return mergeInsightKeys(m.Anchors, m.Weak) }
 
-// insightCrossPlan 是纯函数：决定本轮跨项目查询档位。
-//   - reader_enabled 关 → ok=false（双开关语义：跨项目注入必须 opt-in）；
-//   - 有锚定资产键 → anchored（精确交集优先）；
-//   - 只有弱键或全空 → global（最近 N 条 active 的全局参照）。
-func insightCrossPlan(tctx *db.TaskInsightContext, m insightMatch) (scope string, ok bool) {
-	if tctx == nil || !tctx.ReaderOn {
-		return "", false
-	}
-	if len(m.Anchors) > 0 {
-		return insightCrossScopeAnchored, true
-	}
-	return insightCrossScopeGlobal, true
-}
-
-// buildInsightBody 是纯函数：resolver 的 SQL 之后全部逻辑（两段闸门、档位
-// 选择、候选裁剪、配额分配、渲染）都在这里，测试可直构 tctx 与候选行、无需
-// 数据库。返回注入正文、实际跨项目档位与跨项目注入条数（后两者供日志）。
+// buildInsightBody 是纯函数：resolver 的 SQL 之后全部逻辑（observer 闸门 +
+// 渲染）都在这里，测试可直构 tctx 与候选行、无需数据库。
 //
-// 两段闸门都在这里再判一次（与 resolver 的提前返回同意义，单源可测）：
-// 项目段看 observer_enabled，跨项目段看 reader_enabled。
-func buildInsightBody(tctx *db.TaskInsightContext, m insightMatch, projectList []db.Insight, anchoredCross, globalCross []db.GlobalInsight) (body, scope string, crossN int) {
-	if tctx == nil {
-		return "", "", 0
+// V7-LINK：跨项目段已移除，body 只可能是项目洞察（或空串）。
+func buildInsightBody(tctx *db.TaskInsightContext, projectList []db.Insight) string {
+	if tctx == nil || !tctx.ObserverOn {
+		return ""
 	}
-	if !tctx.ObserverOn {
-		projectList = nil // 跨任务/项目内开关关：项目洞察一律不注入
-	}
-	scope, ok := insightCrossPlan(tctx, m)
-	var crossKept []db.GlobalInsight
-	if ok {
-		switch scope {
-		case insightCrossScopeAnchored:
-			// 精确档：交集命中 + 交集数排序 + insightCrossMax 截断（语义不变）。
-			crossKept = filterInjectableCross(anchoredCross, m.Anchors, tctx.ReaderOn, insightCrossMax)
-		case insightCrossScopeGlobal:
-			// 退化档：最近 N 条 active（不再要求交集），仍受 reader 闸门约束。
-			crossKept = filterRecentCross(globalCross, tctx.ReaderOn, insightCrossMax)
-		}
-	}
-	projectN, crossKeep := insightQuota(len(projectList), len(crossKept))
-	var parts []string
-	if projectN > 0 {
-		if rendered := renderProjectInsights(projectList[:projectN]); rendered != "" {
-			parts = append(parts, rendered)
-		}
-	}
-	if crossKeep > 0 {
-		var rendered string
-		if scope == insightCrossScopeGlobal {
-			rendered = renderCrossProjectGlobalInsight(crossKept[:crossKeep])
-		} else {
-			rendered = renderCrossProjectInsight(crossKept[:crossKeep])
-		}
-		if rendered != "" {
-			parts = append(parts, rendered)
-		}
-	}
-	return strings.Join(parts, "\n"), scope, crossKeep
+	return renderProjectInsights(projectList)
 }
 
-// insightMatchSources 是命中原料的五级并集（V6-XPROJ 起，前三级任一级非空即
-// 停止，后两级只在无资产键时补弱键）：
+// insightMatchSources 是命中原料的五级并集（前三级任一级非空即停止，后两级
+// 只在无资产键时补弱键）：
 //
 //	a. 探索图里 state IN ('open','running') 的意图锚定资产；
 //	b. assets.task_ids 命中本任务的资产；
@@ -308,8 +188,8 @@ func (s *Server) insightMatchSources(ctx context.Context, pg *db.DB, tctx *db.Ta
 	return collectInsightMatch(anchorIDs, taskIDs, findingIDs, resolve, text)
 }
 
-// insightMatchKeys 保留旧签名（既有测试与调用方）：返回两档并集。跨项目精确
-// 匹配请直接用 insightMatchSources 的 Anchors，别拿 Weak 当资产键。
+// insightMatchKeys 保留旧签名（既有测试与调用方）：返回两档并集。需要区分
+// 强/弱键时直接用 insightMatchSources 的 Anchors，别拿 Weak 当资产键。
 func (s *Server) insightMatchKeys(ctx context.Context, pg *db.DB, tctx *db.TaskInsightContext, taskID int64) []string {
 	return s.insightMatchSources(ctx, pg, tctx, taskID).keys()
 }
@@ -458,38 +338,6 @@ func tokenizeInsightKeywords(text string) []string {
 	return out
 }
 
-// insightQuota 是纯函数：按「项目洞察/跨项目洞察」的可用条数分配总预算
-// （≤insightInjectMax）。规则：
-//   - 无跨项目可注入行 → 项目洞察可用满 3；
-//   - 有跨项目行 → 项目洞察压到 2，至少给跨项目留 1 位；
-//   - 跨项目最多 2 条，总数绝不超过 3（项目 0 条时跨项目也只能拿 2）。
-func insightQuota(projectAvailable, crossAvailable int) (projectN, crossN int) {
-	if projectAvailable < 0 {
-		projectAvailable = 0
-	}
-	if crossAvailable < 0 {
-		crossAvailable = 0
-	}
-	projectN = projectAvailable
-	if projectN > insightInjectMax {
-		projectN = insightInjectMax
-	}
-	if crossAvailable == 0 {
-		return projectN, 0
-	}
-	if projectN > insightProjectMax {
-		projectN = insightProjectMax
-	}
-	crossN = insightInjectMax - projectN
-	if crossN > insightCrossMax {
-		crossN = insightCrossMax
-	}
-	if crossN > crossAvailable {
-		crossN = crossAvailable
-	}
-	return projectN, crossN
-}
-
 var (
 	// reGoalHostPort 匹配 [host:port]：host 是带点的域名或 IPv4 字面量。
 	// 只用于从任务目标文本里做轻量提取（障碍1 第三级），命不中最多退化为
@@ -592,158 +440,4 @@ func renderProjectInsights(list []db.Insight) string {
 		}
 	}
 	return b.String()
-}
-
-// renderCrossProjectInsight 纯函数：有锚定命中的跨项目洞察 → 注入正文。每条一行：
-//
-//   - 【跨项目】来源项目#2/#3：正文（洞察#12，来自其他项目，仅作假设，须在本目标验证）
-//
-// 与项目洞察刻意不同：①【跨项目】提示来源层级；② 末尾钉死不确定性标注——
-// 跨项目经验是「别的目标上成立」的假设，直接照搬会误导本任务（尤其资产相同
-// 但版本/权限模型不同时）。SourceProjects 为空时省来源段。截断与项目洞察共用
-// truncateInsightContent（同一 token 预算口径）。空列表返回 ""。
-func renderCrossProjectInsight(list []db.GlobalInsight) string {
-	return renderCrossProjectTagged(list, "【跨项目】")
-}
-
-// renderCrossProjectGlobalInsight 纯函数：无锚定命中的退化档渲染。与精确命中
-// 唯一的差别是标签为【跨项目·全局参照】——本任务还没锚定资产，这些条目只是
-// 「别处同类打法的全局参照」，比同资产命中更需要被质疑。不确定性标注原样保留。
-func renderCrossProjectGlobalInsight(list []db.GlobalInsight) string {
-	return renderCrossProjectTagged(list, "【跨项目·全局参照】")
-}
-
-// renderCrossProjectTagged 是两条跨项目渲染路径的共同实现（标签不同、其余
-// 逐字节一致）。
-func renderCrossProjectTagged(list []db.GlobalInsight, tag string) string {
-	if len(list) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	for i, g := range list {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
-		b.WriteString("- ")
-		b.WriteString(tag)
-		if refs := crossProjectSourceRefs(g.SourceProjects); refs != "" {
-			b.WriteString("来源项目#")
-			b.WriteString(refs)
-			b.WriteString("：")
-		}
-		b.WriteString(truncateInsightContent(g.Content))
-		b.WriteString("（")
-		if g.ID > 0 {
-			b.WriteString("洞察#")
-			b.WriteString(strconv.FormatInt(g.ID, 10))
-			b.WriteString("，")
-		}
-		b.WriteString("来自其他项目，仅作假设，须在本目标验证）")
-	}
-	return b.String()
-}
-
-// crossProjectSourceRefs 把来源项目 id 列表渲染成 "2/#3" 风格的引用串
-// （调用方在其前拼「来源项目#」，最终成「来源项目#2/#3」）。去重、保持入参
-// 顺序、非正值丢弃。空=不写来源段。
-func crossProjectSourceRefs(ids []int64) string {
-	seen := make(map[int64]bool, len(ids))
-	parts := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if id <= 0 || seen[id] {
-			continue
-		}
-		seen[id] = true
-		ref := strconv.FormatInt(id, 10)
-		if len(parts) > 0 {
-			ref = "#" + ref
-		}
-		parts = append(parts, ref)
-	}
-	return strings.Join(parts, "/")
-}
-
-// filterInjectableCross 是纯函数：把 ListCrossProjectInsights 的结果再按注入
-// 规则裁一遍（SQL 已过滤 active/交集，这里做防御 + 可无库单测的语义单源）：
-//   - readerOn=false（projects.reader_enabled 关）→ 全空，绝不注入；
-//   - match 为空（本任务无锚定资产键）→ 全空（无据可验的跨项目经验只会有害）；
-//   - status≠active（含 superseded/rejected，以及未显式赋值的零值按 active）→ 剔除；
-//   - asset_keys 与 match 无交集 → 剔除；
-//   - 按「交集键数降序 → 时间降序（入参序，SQL 已按时间排）」稳定排序，
-//     最后按 limit 截断（跨项目配额，障碍3）。
-func filterInjectableCross(list []db.GlobalInsight, match []string, readerOn bool, limit int) []db.GlobalInsight {
-	if !readerOn || len(match) == 0 || limit <= 0 {
-		return nil
-	}
-	want := make(map[string]bool, len(match))
-	for _, m := range match {
-		if k := strings.ToLower(strings.TrimSpace(m)); k != "" {
-			want[k] = true
-		}
-	}
-	if len(want) == 0 {
-		return nil
-	}
-	type hitRow struct {
-		insight db.GlobalInsight
-		hits    int
-	}
-	rows := make([]hitRow, 0, len(list))
-	for _, g := range list {
-		// 零值（测试/历史构造）按 active 处理；只有显式非 active 才剔除。
-		if g.Status != "" && g.Status != db.InsightStatusActive {
-			continue
-		}
-		hits := 0
-		for _, k := range g.AssetKeys {
-			if want[strings.ToLower(strings.TrimSpace(k))] {
-				hits++
-			}
-		}
-		if hits == 0 {
-			continue
-		}
-		rows = append(rows, hitRow{insight: g, hits: hits})
-	}
-	// 稳定排序：交集多的优先；交集数相同保留入参序（SQL 的 created_at DESC），
-	// 双保险再比一次时间，避免调用方传入乱序时结果不稳定。
-	sort.SliceStable(rows, func(i, j int) bool {
-		if rows[i].hits != rows[j].hits {
-			return rows[i].hits > rows[j].hits
-		}
-		return rows[i].insight.CreatedAt.After(rows[j].insight.CreatedAt)
-	})
-	if len(rows) > limit {
-		rows = rows[:limit]
-	}
-	out := make([]db.GlobalInsight, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.insight)
-	}
-	return out
-}
-
-// filterRecentCross 是纯函数：无锚定命中（global 档）的候选裁剪。
-//   - readerOn=false → 全空（双开关语义，与精确档同一道闸门）；
-//   - status≠active（含 superseded/rejected，零值按 active）→ 剔除；
-//   - 不做资产交集——「全局参照」的语义就是不要求与本任务资产相交；
-//   - 保持入参序（SQL 已 created_at DESC），截到 limit 条。
-func filterRecentCross(list []db.GlobalInsight, readerOn bool, limit int) []db.GlobalInsight {
-	if !readerOn || limit <= 0 {
-		return nil
-	}
-	out := make([]db.GlobalInsight, 0, len(list))
-	for _, g := range list {
-		if g.Status != "" && g.Status != db.InsightStatusActive {
-			continue
-		}
-		out = append(out, g)
-		if len(out) >= limit {
-			break
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
