@@ -406,6 +406,19 @@ func aggregateReaderLinkCandidates(matches []db.IntelTaskMatch, limit int) []rea
 	}
 	out := make([]readerLinkCandidate, 0, len(byTask))
 	for _, c := range byTask {
+		// V8-SIG：只有组件（软件版本）撞上的候选不算"相关任务"——实测 task#51
+		// 就是仅命中 mariadb@10.1 被当成候选，规划者要花一轮去排除。强信号
+		// 只认接口/漏洞/凭据/资产；组件只作为"附带的旁证"随强信号一起返回。
+		strong := false
+		for _, h := range c.Hits {
+			if h.Kind != db.IntelKindComponent {
+				strong = true
+				break
+			}
+		}
+		if !strong {
+			continue
+		}
 		c.HitCount = len(c.Hits)
 		out = append(out, *c)
 	}

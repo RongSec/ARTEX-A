@@ -617,3 +617,19 @@ func TestReaderLinkScopeSwitches(t *testing.T) {
 		t.Fatalf("reader_enabled=true 时应可读该项目，got total=%d skipped=%+v", readOut.Total, readOut.Skipped)
 	}
 }
+
+// TestReaderLinkWeakComponentOnlyDropped 守 V8-SIG：只有组件命中的候选必须被丢弃。
+func TestReaderLinkWeakComponentOnlyDropped(t *testing.T) {
+	matches := []db.IntelTaskMatch{
+		{TaskIntel: db.TaskIntel{TaskID: 1, Kind: db.IntelKindComponent, Key: "mariadb@10.1", MatchKey: "mariadb", Value: "MariaDB 10.1"}},
+		{TaskIntel: db.TaskIntel{TaskID: 2, Kind: db.IntelKindComponent, Key: "dvwa@1.10", MatchKey: "dvwa", Value: "DVWA 1.10"}},
+		{TaskIntel: db.TaskIntel{TaskID: 2, Kind: db.IntelKindEndpoint, Key: "post /vulnerabilities/sqli/", MatchKey: "/vulnerabilities/sqli/", Value: "http://t/x"}},
+	}
+	out := aggregateReaderLinkCandidates(matches, 10)
+	if len(out) != 1 || out[0].TaskID != 2 {
+		t.Fatalf("只应有接口命中的任务 2，得到 %+v", out)
+	}
+	if out[0].HitCount != 2 {
+		t.Errorf("强信号候选应保留全部命中（含组件旁证），got %d", out[0].HitCount)
+	}
+}
