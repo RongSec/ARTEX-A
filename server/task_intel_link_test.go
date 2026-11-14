@@ -531,3 +531,89 @@ func TestReadTaskIntelTool(t *testing.T) {
 		t.Errorf("水位之后应为 0 条，got %d", out2.Total)
 	}
 }
+
+// TestReaderLinkScopeSwitches 守「同一类、两个视角、各自开关」（V6-DUAL）：
+//   - 跨任务（scope=project）受本项目 observer_enabled 控制，关了就 0 候选并说明原因；
+//   - 跨项目（scope=cross）受目标项目 reader_enabled 控制（既有用例已覆盖）；
+//   - reader 的 read_task_intel 显式指定项目时，两把开关都关才 skipped。
+func TestReaderLinkScopeSwitches(t *testing.T) {
+	s, pg := newInsightTestPG(t)
+	ctx := context.Background()
+
+	pid := intelLinkProject(t, pg, "scope-p", false) // observer=true, reader=false
+	_, idA := intelLinkTask(t, s, pg, pid, "scope-a")
+	_, idB := intelLinkTask(t, s, pg, pid, "scope-b")
+
+	if _, err := pg.UpsertTaskIntel(ctx, pid, idA, []db.TaskIntel{
+		{Kind: db.IntelKindEndpoint, Key: "post /vulnerabilities/sqli/", Value: "http://t/vulnerabilities/sqli/", Source: "finding"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	link := s.toolRequestReaderLinks()
+	bCtx := agent.WithRunInfo(ctx, agent.RunInfo{TaskID: idB})
+	callLink := func(c context.Context, raw json.RawMessage) (string, bool) {
+		r, err := link.Call(c, raw, nil)
+		if err != nil {
+			t.Fatalf("tool call: %v", err)
+		}
+		return r.Flatten(), r.IsError
+	}
+	type linkOut struct {
+		Candidates []readerLinkCandidate `json:"candidates"`
+		Note       string                `json:"note"`
+	}
+
+	// 1) observer 开 → 跨任务视角可用。
+	var out linkOut
+	callToolJSON(t, "request_reader_links", callLink, bCtx, map[string]any{
+		"surface": "POST /vulnerabilities/sqli/",
+	}, &out)
+	if len(out.Candidates) != 1 || out.Candidates[0].TaskID != idA {
+		t.Fatalf("observer_enabled=true 时应命中任务 A，got %+v", out.Candidates)
+	}
+
+	// 2) 关掉 observer_enabled → 跨任务候选必须消失，且说明是开关原因。
+	if _, err := pg.Exec(`UPDATE projects SET observer_enabled=false WHERE id=$1`, pid); err != nil {
+		t.Fatal(err)
+	}
+	out.Candidates = nil
+	out.Note = ""
+	callToolJSON(t, "request_reader_links", callLink, bCtx, map[string]any{
+		"surface": "POST /vulnerabilities/sqli/",
+	}, &out)
+	if len(out.Candidates) != 0 {
+		t.Fatalf("observer_enabled=false 时不应有跨任务候选，got %+v", out.Candidates)
+	}
+	if !strings.Contains(out.Note, "observer_enabled") || !strings.Contains(out.Note, "跨任务") {
+		t.Errorf("0 候选时必须说明是跨任务视角未开启，got %q", out.Note)
+	}
+
+	// 3) 两把开关全关 → read_task_intel 显式指定项目进 skipped。
+	read := s.toolReadTaskIntel()
+	callRead := func(c context.Context, raw json.RawMessage) (string, bool) {
+		r, err := read.Call(c, raw, nil)
+		if err != nil {
+			t.Fatalf("tool call: %v", err)
+		}
+		return r.Flatten(), r.IsError
+	}
+	var readOut struct {
+		Total   int              `json:"total"`
+		Skipped []map[string]any `json:"skipped"`
+	}
+	callToolJSON(t, "read_task_intel", callRead, ctx, map[string]any{"project_id": pid}, &readOut)
+	if readOut.Total != 0 || len(readOut.Skipped) != 1 {
+		t.Fatalf("两把开关全关应 skipped 且 0 条，got total=%d skipped=%+v", readOut.Total, readOut.Skipped)
+	}
+
+	// 4) 只开 reader_enabled（跨项目视角）→ 显式读该项目即可用。
+	if _, err := pg.Exec(`UPDATE projects SET reader_enabled=true WHERE id=$1`, pid); err != nil {
+		t.Fatal(err)
+	}
+	readOut.Total, readOut.Skipped = 0, nil // 复位，避免上一步的 skipped 残留
+	callToolJSON(t, "read_task_intel", callRead, ctx, map[string]any{"project_id": pid}, &readOut)
+	if len(readOut.Skipped) != 0 || readOut.Total == 0 {
+		t.Fatalf("reader_enabled=true 时应可读该项目，got total=%d skipped=%+v", readOut.Total, readOut.Skipped)
+	}
+}

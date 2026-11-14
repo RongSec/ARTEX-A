@@ -278,7 +278,8 @@ func (s *Server) toolRequestReaderLinks() actool.CoreTool {
 	return roTool("request_reader_links",
 		"当你形成新的攻击面（准备产出意图）时调用：把这段攻击面描述（URL/裸路径/host:port/组件版本，可混合自由文本）交给情报表，找出命中同一接口/凭据/组件的其它任务。"+
 			"返回候选任务的 task_id、名称、命中明细与该任务的 finding/意图数量；这只是候选，须由你下钻判断相关性，有关的用 adopt_related_task 保留、无关的用 dismiss_related_task 舍弃。"+
-			"scope=project 只看同项目（默认），scope=cross 看已开启 reader_enabled 的其它项目。",
+			"scope=project 是【跨任务】视角，只看同项目，需本项目 observer_enabled=true；"+
+			"scope=cross 是【跨项目】视角，只看其它项目，需目标项目 reader_enabled=true。",
 		objSchema(map[string]any{
 			"surface": strParam("新攻击面描述（可含 URL、/api/... 路径、host:port、产品/版本，或一段自然语言）"),
 			"scope":   map[string]any{"type": "string", "enum": []any{"project", "cross"}, "description": "检索范围：project=同项目(默认) / cross=已开启 reader_enabled 的其它项目"},
@@ -304,6 +305,22 @@ func (s *Server) toolRequestReaderLinks() actool.CoreTool {
 			}
 			if scope != "project" && scope != "cross" {
 				return actool.Errorf("scope 必须是 project 或 cross"), nil
+			}
+			// V7-SCOPE：两个视角各自一把开关（V6-DUAL 语义），拉取侧同样要过闸。
+			//   scope=project（跨任务/项目内）→ 当前项目 observer_enabled
+			//   scope=cross （跨项目）        → 目标项目 reader_enabled（在 SQL 内过滤）
+			// 不过闸的后果是「关了开关仍能拿到候选」，等于开关只关了旧注入路径。
+			if scope == "project" {
+				if proj, perr := s.m.pg.GetProject(tctx.ProjectID); perr == nil && proj != nil && !proj.ObserverEnabled {
+					return jsonResult(map[string]any{
+						"surface":    a.Surface,
+						"scope":      scope,
+						"keys":       []db.IntelKeyRef{},
+						"candidates": []readerLinkCandidate{},
+						"debug":      map[string]any{"missing_switch": "observer_enabled", "queried_project_id": tctx.ProjectID},
+						"note":       "本项目未开启【跨任务】视角（observer_enabled=false），项目内任务情报不可勾连。" + readerLinkCandidateNote,
+					})
+				}
 			}
 			limit := a.Limit
 			if limit <= 0 {
@@ -600,8 +617,8 @@ type intelSummaryGroup struct {
 func (s *Server) toolReadTaskIntel() actool.CoreTool {
 	return roTool("read_task_intel",
 		"按水位增量读任务情报表（每个任务终态生成的接口/凭据/组件/资产/漏洞表），用于判断「哪些任务可以互相比对」。"+
-			"since_id 传上一轮返回的 next_since_id（首轮 0）；project_id 缺省=全部已开启 reader_enabled 的项目。"+
-			"返回按 kind 分组的条目与任务归属，以及 next_since_id（下次传回）。",
+			"since_id 传上一轮返回的 next_since_id（首轮 0）；project_id 缺省=全部已开启 reader_enabled 的项目（跨项目视野）。"+
+			"显式指定 project_id 时，该项目需 observer_enabled 或 reader_enabled 至少一项开启，否则进 skipped。返回按 kind 分组的条目与任务归属，以及 next_since_id（下次传回）。",
 		objSchema(map[string]any{
 			"project_id": map[string]any{"type": "integer", "description": "可选：只读某个项目；缺省=全部开启 reader_enabled 的项目"},
 			"since_id":   map[string]any{"type": "integer", "description": "可选：上次读到的最大 id（首轮 0）"},
@@ -618,8 +635,19 @@ func (s *Server) toolReadTaskIntel() actool.CoreTool {
 			since := parseProfileID(a.SinceID)
 			pid := parseProfileID(a.ProjectID)
 			var pids []int64
+			skipped := []map[string]any{}
 			if pid > 0 {
-				pids = []int64{pid}
+				// V7-SCOPE：显式指定项目也要过视角开关——任一视角开着就可读：
+				// 跨任务看 observer_enabled，跨项目看 reader_enabled。
+				if proj, perr := s.m.pg.GetProject(pid); perr != nil || proj == nil ||
+					(!proj.ObserverEnabled && !proj.ReaderEnabled) {
+					skipped = append(skipped, map[string]any{
+						"project_id": pid,
+						"reason":     "该项目未开启任何阅读视角（observer_enabled=false 且 reader_enabled=false）",
+					})
+				} else {
+					pids = []int64{pid}
+				}
 			} else {
 				visible, _, err := s.readerVisibleProjects(nil)
 				if err != nil {
@@ -654,6 +682,9 @@ func (s *Server) toolReadTaskIntel() actool.CoreTool {
 				"next_since_id": next,
 				"total":         total,
 				"projects":      projects,
+			}
+			if len(skipped) > 0 {
+				out["skipped"] = skipped
 			}
 			if total == 0 {
 				out["note"] = "自该水位后没有新增情报，本轮无需勾连。"
