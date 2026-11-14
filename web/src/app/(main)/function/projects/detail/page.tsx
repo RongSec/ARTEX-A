@@ -168,12 +168,12 @@ function ProjectDetailInner() {
             </Badge>
             {p.observer_enabled && (
               <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400">
-                跨任务阅读开
+                跨任务阅读者开
               </Badge>
             )}
             {p.reader_enabled && (
               <Badge variant="outline" className="text-blue-600 dark:text-blue-400">
-                跨项目阅读开
+                跨项目阅读者开
               </Badge>
             )}
             {p.auto_report && (
@@ -385,7 +385,7 @@ function OverviewTab({ detail, templates }: { detail: ProjectDetail; templates: 
         <p className="text-muted-foreground">
           创建时间：{new Date(detail.project.created_at).toLocaleString("zh-CN")} · 更新时间：
           {new Date(detail.project.updated_at).toLocaleString("zh-CN")} · 并发额度：{detail.project.concurrency} ·
-          跨任务阅读：{detail.project.observer_enabled ? "开（项目内观察 + 洞察注入）" : "关"} · 跨项目阅读：
+          跨任务阅读者：{detail.project.observer_enabled ? "开（项目内跨任务经验 + 洞察注入）" : "关"} · 跨项目阅读者：
           {p.reader_enabled ? "开（跨项目串联）" : "关"}
         </p>
         <p className="text-muted-foreground mt-2">
@@ -424,7 +424,7 @@ function OverviewTab({ detail, templates }: { detail: ProjectDetail; templates: 
 }
 
 // EditProjectDialog PATCH 项目名/描述/负责人/并发 + 四设置开关
-//（观察者/阅读者/自动报告 + 报告模板绑定，T19 与建项目对话框同构）。
+//（跨任务阅读者/跨项目阅读者/自动报告 + 报告模板绑定，T19 与建项目对话框同构）。
 // report_template_id 三态：保持原值不动时不传键；选「默认模板」传 null=清绑定；
 // 选具体模板传数字=绑定（后端 *int64+Set 语义）。
 function EditProjectDialog({
@@ -536,18 +536,18 @@ function EditProjectDialog({
           </div>
           <div className="grid gap-3 rounded-lg border p-3">
             <label className="flex items-center justify-between gap-3 text-sm">
-              <span>跨任务阅读（项目内）</span>
+              <span>跨任务阅读者（项目内）</span>
               <Switch checked={observer} onCheckedChange={setObserver} />
             </label>
             <p className="text-muted-foreground text-xs">
-              本项目内任务之间共享经验：任务图变更触发阅读、项目洞察注入 planner。与跨项目无关。
+              本项目内任务之间共享经验：任务图变更触发跨任务阅读者、项目洞察注入 planner。与跨项目无关。
             </p>
             <label className="flex items-center justify-between gap-3 text-sm">
-              <span>跨项目阅读</span>
+              <span>跨项目阅读者</span>
               <Switch checked={reader} onCheckedChange={setReader} />
             </label>
             <p className="text-muted-foreground text-xs">
-              本项目参与跨项目串联：允许 reader 聚合本项目洞察、接受别的项目读回来的跨项目经验。与项目无关的项目可以关掉，省配额。
+              本项目参与跨项目串联：允许跨项目阅读者聚合本项目洞察、接受别的项目读回来的跨项目经验。与项目无关的项目可以关掉，省配额。
             </p>
             <label className="flex items-center justify-between gap-3 text-sm">
               <span>自动写报告</span>

@@ -36,7 +36,7 @@ type Planner struct {
 	webSearch         WebSearchOpts                          // web_search tool backend selection (off by default)
 	workDir           string                                 // shared work dir (surfaced in prompt as artifact-output target)
 	injectConstraints func() bool                            // resolver: inject task operation constraints into system prompt? (nil = yes)
-	projectInsights   func(taskID int64) string              // artex-hs T12: 项目观察者洞察注入段渲染（见 SetProjectInsightResolver；nil/空串=零注入）
+	projectInsights   func(taskID int64) string              // artex-hs T12: 项目洞察注入段渲染（跨任务阅读者视角，见 SetProjectInsightResolver；nil/空串=零注入）
 	nonStreamingFn    func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn      func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
@@ -121,7 +121,7 @@ func (p *Planner) projectInsightsRendered(taskID int64) string {
 	if body == "" {
 		return ""
 	}
-	return "\n\n## 项目经验（观察者）\n" + body
+	return "\n\n## 项目经验（跨任务阅读者）\n" + body
 }
 
 // wantConstraints reports whether constraint injection is enabled (default yes).
@@ -369,7 +369,7 @@ func plannerSystem(goal, dataDir, workDir string) string {
 }
 
 // plannerLinkGuidance 是 V7-LINK 的固定指引（代码所有，不可在 prompt 页编辑）：
-// 新攻击面必须先申请阅读者勾连候选，再自己下钻做保留/舍弃决策。跨项目情报
+// 新攻击面必须先申请跨任务/跨项目阅读者勾连候选，再自己下钻做保留/舍弃决策。跨项目情报
 // 不再由 resolver 自动注入（见 server/project_insight.go），这条指引是唯一入口。
 const plannerLinkGuidance = "\n\n**攻击面勾连（形成新攻击面时先做）**：当你形成新的攻击面（准备产出意图）时，先调用 request_reader_links 查询相关任务；对返回的候选逐条下钻，有关的用 adopt_related_task 保留，无关的用 dismiss_related_task 舍弃。"
 

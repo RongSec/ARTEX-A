@@ -1,6 +1,6 @@
 package db
 
-// 统一阅读者洞察（V6-U2）：observer（项目内）与 reader（跨项目）两条链合成
+// 统一阅读者洞察（V6-U2）：observer（项目内=跨任务阅读者）与 reader（跨项目=跨项目阅读者）两条链合成
 // 一套表 project_insights，用 scope 列区分：scope='project' 项目洞察
 // （project_id 指向所属项目）、scope='cross' 跨项目洞察（project_id=NULL）。
 // planner 侧按「open 意图锚定 asset_keys ∩ keywords/asset_keys 交集命中优先、
@@ -282,7 +282,7 @@ ORDER BY created_at DESC, id DESC LIMIT $2`, marshalTextArray(matchKeys), limit)
 }
 
 // ListRecentCrossProjectInsights 返回最近 limit 条【active】的跨项目洞察（新在
-// 前）。V6-XPROJ：本任务没有任何锚定资产键时的退化注入来源——观察者经验在
+// 前）。V6-XPROJ：本任务没有任何锚定资产键时的退化注入来源——跨任务阅读者经验在
 // 「本任务尚未锚定资产」时仍有全局参照价值，故不再因交集为空整段不注入；
 // 调用方（server/project_insight.go）只取 insightCrossMax 条并要求 reader 闸门
 // 打开。limit<=0 默认 50。

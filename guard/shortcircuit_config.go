@@ -132,7 +132,7 @@ var defaultShortCircuitConfig = ShortCircuitConfig{
 		"add_hint", "add_task_hint", "add_intent", "prove_goal",
 		"goal_met", "set_goals", "set_constraints", "insert_assets",
 		"bind_finding_traffic",
-		// V6-CP2：观察者/阅读者的落库工具。它们只写 DB，不执行、不读盘；
+		// V6-CP2：跨任务阅读者/跨项目阅读者的落库工具（内部 key=observer/reader）。它们只写 DB，不执行、不读盘；
 		// 洞察正文如实引用「曾尝试 cat /root/.../data/jwt.key」是审计刚需，
 		// 不能因为正文里出现平台路径就把整条洞察拒掉（任务 #49 实测 153/154 被误拒）。
 		"write_project_insight", "write_global_insight", "push_task_hint",

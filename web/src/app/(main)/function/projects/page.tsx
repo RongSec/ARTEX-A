@@ -139,12 +139,12 @@ export default function ProjectsPage() {
                         <div className="flex flex-wrap items-center gap-1">
                           {p.observer_enabled && (
                             <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400">
-                              跨任务阅读
+                              跨任务阅读者
                             </Badge>
                           )}
                           {p.reader_enabled && (
                             <Badge variant="outline" className="text-blue-600 dark:text-blue-400">
-                              跨项目阅读
+                              跨项目阅读者
                             </Badge>
                           )}
                           {p.auto_report && (
@@ -323,18 +323,18 @@ function CreateProjectDialog({
           </div>
           <div className="grid gap-3 rounded-lg border p-3">
             <label className="flex items-center justify-between gap-3 text-sm">
-              <span>跨任务阅读（项目内）</span>
+              <span>跨任务阅读者（项目内）</span>
               <Switch checked={observer} onCheckedChange={setObserver} />
             </label>
             <p className="text-muted-foreground text-xs">
-              本项目内任务之间共享经验：任务图变更触发阅读、项目洞察注入 planner。与跨项目无关。
+              本项目内任务之间共享经验：任务图变更触发跨任务阅读者、项目洞察注入 planner。与跨项目无关。
             </p>
             <label className="flex items-center justify-between gap-3 text-sm">
-              <span>跨项目阅读</span>
+              <span>跨项目阅读者</span>
               <Switch checked={reader} onCheckedChange={setReader} />
             </label>
             <p className="text-muted-foreground text-xs">
-              本项目参与跨项目串联：允许 reader 聚合本项目洞察、接受别的项目读回来的跨项目经验。与项目无关的项目可以关掉，省配额。
+              本项目参与跨项目串联：允许跨项目阅读者聚合本项目洞察、接受别的项目读回来的跨项目经验。与项目无关的项目可以关掉，省配额。
             </p>
             <label className="flex items-center justify-between gap-3 text-sm">
               <span>自动写报告</span>

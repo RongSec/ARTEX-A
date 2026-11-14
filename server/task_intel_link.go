@@ -278,8 +278,8 @@ func (s *Server) toolRequestReaderLinks() actool.CoreTool {
 	return roTool("request_reader_links",
 		"当你形成新的攻击面（准备产出意图）时调用：把这段攻击面描述（URL/裸路径/host:port/组件版本，可混合自由文本）交给情报表，找出命中同一接口/凭据/组件的其它任务。"+
 			"返回候选任务的 task_id、名称、命中明细与该任务的 finding/意图数量；这只是候选，须由你下钻判断相关性，有关的用 adopt_related_task 保留、无关的用 dismiss_related_task 舍弃。"+
-			"scope=project 是【跨任务】视角，只看同项目，需本项目 observer_enabled=true；"+
-			"scope=cross 是【跨项目】视角，只看其它项目，需目标项目 reader_enabled=true。",
+			"scope=project 是【跨任务阅读者】视角，只看同项目，需本项目 observer_enabled=true；"+
+			"scope=cross 是【跨项目阅读者】视角，只看其它项目，需目标项目 reader_enabled=true。",
 		objSchema(map[string]any{
 			"surface": strParam("新攻击面描述（可含 URL、/api/... 路径、host:port、产品/版本，或一段自然语言）"),
 			"scope":   map[string]any{"type": "string", "enum": []any{"project", "cross"}, "description": "检索范围：project=同项目(默认) / cross=已开启 reader_enabled 的其它项目"},
@@ -558,7 +558,7 @@ func (s *Server) writeAdoptHint(taskID, relatedID int64, taskName, reason string
 // planner 直接引用；上限 readerLinkHintMaxHits 条）。
 func renderAdoptHint(relatedID int64, taskName, reason string, hits []readerLinkHit) string {
 	var b strings.Builder
-	b.WriteString("【阅读者勾连·采纳】任务#")
+	b.WriteString("【跨任务/跨项目阅读者勾连·采纳】任务#")
 	b.WriteString(strconv.FormatInt(relatedID, 10))
 	if n := strings.TrimSpace(taskName); n != "" {
 		b.WriteString("「")

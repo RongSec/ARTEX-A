@@ -33,7 +33,7 @@ import (
 //   - kind 只认 project/global，其他值明确报错（防模型瞎填把两类表混淆）。
 func (s *Server) toolRejectInsight() actool.CoreTool {
 	return wrTool("reject_insight",
-		"否决一条洞察（后续注入不再包含它）。kind=project(本项目观察者洞察)/global(跨项目阅读者洞察)，id 用洞察的 id，"+
+		"否决一条洞察（后续注入不再包含它）。kind=project(本项目跨任务阅读者洞察)/global(跨项目阅读者洞察)，id 用洞察的 id，"+
 			"reason 写一句为什么在本目标不成立（如「版本不同/该入口已修复/资产非同一实例」）。"+
 			"仅当洞察的结论与本任务已确认的事实冲突、或明显不适用时用；不要用它表达「还没试」。"+
 			"id 不存在会返回未找到（不算失败），重复否决是幂等的。",

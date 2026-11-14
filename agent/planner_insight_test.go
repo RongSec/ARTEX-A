@@ -32,7 +32,7 @@ func TestProjectInsightsRendered(t *testing.T) {
 		return "- canal v1.1.5 RCE 可借鉴（来源任务#12）"
 	})
 	got := p.projectInsightsRendered(7)
-	if !strings.HasPrefix(got, "\n\n## 项目经验（观察者）\n") {
+	if !strings.HasPrefix(got, "\n\n## 项目经验（跨任务阅读者）\n") {
 		t.Errorf("missing heading prefix: %q", got)
 	}
 	if !strings.HasSuffix(got, "（来源任务#12）") {

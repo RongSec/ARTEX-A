@@ -246,7 +246,7 @@ export default function FactsPage() {
       <Card className="shrink-0">
         <CardContent className="flex flex-wrap items-center gap-3 p-3">
           <div className="flex items-center gap-1.5 text-sm font-medium">
-            <BookOpenTextIcon className="size-4" /> 事实台账
+            <BookOpenTextIcon className="size-4" /> 任务小结
           </div>
           <Select value={projectFilter} onValueChange={setProjectFilter}>
             <SelectTrigger size="sm" className="w-40">

@@ -8,7 +8,7 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-// 跨任务观察者/阅读者的六个专用工具名（口径与 project_observer.go 的 seed
+// 跨任务阅读者/跨项目阅读者的六个专用工具名（口径与 project_observer.go 的 seed
 // 绑定列表一致）。
 //
 // 回归背景（2026-11-11 实跑发现）：六工具在 DB 侧已 SeedTool 入库并经

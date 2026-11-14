@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // IntelKeyRef 是一次攻击面抽出的候选键（kind 已在抽取侧归一化）。
@@ -142,6 +143,65 @@ FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, taskID, relatedT
 	}
 	l.Matched = json.RawMessage(matched)
 	return &l, nil
+}
+
+// TaskIntelLinkTrace 是一条「任务视角」的勾连记录：既覆盖本任务勾连别人
+// （direction=out），也覆盖别人勾连本任务（direction=in）。Related* 是对端
+// 任务与它所属项目；相关项目可能为空（任务未挂项目）。
+type TaskIntelLinkTrace struct {
+	ID                 int64
+	ProjectID          int64
+	TaskID             int64
+	RelatedTaskID      int64
+	Decision           string
+	Reason             string
+	Matched            json.RawMessage
+	CreatedAt          time.Time
+	Direction          string // out=本任务发起，in=对端勾连本任务
+	RelatedTaskName    string
+	RelatedProjectID   sql.NullInt64
+	RelatedProjectName sql.NullString
+}
+
+// ListTaskIntelLinkTraces 返回与本任务相关的全部勾连记录（双向），按时间倒序。
+// 只连未删除的对端任务（已删档任务仍留在 links 表，但审计面展示无意义）。
+func (d *DB) ListTaskIntelLinkTraces(ctx context.Context, taskID int64) ([]TaskIntelLinkTrace, error) {
+	if taskID <= 0 {
+		return nil, nil
+	}
+	rows, err := d.QueryContext(ctx, `
+SELECT l.id, l.project_id, l.task_id,
+       CASE WHEN l.task_id = $1 THEN l.related_task_id ELSE l.task_id END,
+       l.decision, l.reason, l.matched, l.created_at,
+       CASE WHEN l.task_id = $1 THEN 'out' ELSE 'in' END,
+       COALESCE(rt.name, ''),
+       rt.project_id,
+       rp.name
+FROM task_intel_links l
+JOIN tasks rt ON rt.id = CASE WHEN l.task_id = $1 THEN l.related_task_id ELSE l.task_id END
+             AND rt.deleted_at IS NULL
+LEFT JOIN projects rp ON rp.id = rt.project_id
+WHERE l.task_id = $1 OR l.related_task_id = $1
+ORDER BY l.created_at DESC, l.id DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TaskIntelLinkTrace
+	for rows.Next() {
+		var t TaskIntelLinkTrace
+		var matched []byte
+		if err := rows.Scan(&t.ID, &t.ProjectID, &t.TaskID, &t.RelatedTaskID, &t.Decision, &t.Reason, &matched,
+			&t.CreatedAt, &t.Direction, &t.RelatedTaskName, &t.RelatedProjectID, &t.RelatedProjectName); err != nil {
+			return nil, err
+		}
+		if len(matched) == 0 {
+			matched = []byte(`[]`)
+		}
+		t.Matched = json.RawMessage(matched)
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // SaveCandidateIntelLink 写 reader 的候选关联：幂等 upsert，但【不覆盖】已有

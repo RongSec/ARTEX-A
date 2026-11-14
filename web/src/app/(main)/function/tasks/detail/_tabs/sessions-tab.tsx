@@ -2,6 +2,7 @@
 
 import * as React from "react";
 
+import Link from "next/link";
 import {
   ArrowUpIcon,
   BrainIcon,
@@ -10,6 +11,7 @@ import {
   CircleSlashIcon,
   CircleXIcon,
   ClockIcon,
+  GlobeIcon,
   HistoryIcon,
   Loader2Icon,
   PaperclipIcon,
@@ -21,6 +23,7 @@ import {
   SquareIcon,
   Trash2Icon,
   UserIcon,
+  WaypointsIcon,
   WifiOffIcon,
   XIcon,
   ZapOffIcon,
@@ -60,6 +63,8 @@ import type {
   ChatAttachment,
   IntentAsset,
   InterceptApprovalRow,
+  ReaderTraceItem,
+  ReaderTraces,
   Session,
   SessionStatus,
   SessionTokenUsage,
@@ -238,6 +243,7 @@ const roleMeta = {
   planner: { label: "规划 Planner", icon: BrainIcon },
   worker: { label: "Workers", icon: RadioIcon },
   system: { label: "系统审计", icon: HistoryIcon },
+  reader: { label: "阅读者审计", icon: WaypointsIcon },
 } as const;
 
 // The main-agent session is the interactive entry point of this tab and has no
@@ -288,11 +294,34 @@ const SYSTEM_SESSION: Session = {
   last_activity: "",
 };
 
+// 两个阅读者视角的固定会话（V8-NAME）：内容来自 GET /api/tasks/{id}/reader-traces，
+// 不是活动流，因此没有 SSE / 分页。内部 key 仍是 observer（项目内）/reader（跨项目）。
+const READER_TASK_ID = "s-reader-task";
+const READER_TASK_SESSION: Session = {
+  id: READER_TASK_ID,
+  role: "reader_task",
+  title: "跨任务阅读者",
+  status: "done",
+  live: false,
+  last_activity: "",
+};
+const READER_PROJECT_ID = "s-reader-project";
+const READER_PROJECT_SESSION: Session = {
+  id: READER_PROJECT_ID,
+  role: "reader_project",
+  title: "跨项目阅读者",
+  status: "done",
+  live: false,
+  last_activity: "",
+};
+
 // keyForSession maps a UI Session → its stable store key (main:<seg> | plan | intent:<id>).
 function keyForSession(s: Session): string {
   if (s.role === "mainagent") return `main:${s.seg ?? 0}`;
   if (s.role === "planner") return "plan";
   if (s.role === "system") return "system";
+  if (s.role === "reader_task") return "reader-task";
+  if (s.role === "reader_project") return "reader-project";
   return `intent:${s.intent_id}`;
 }
 
@@ -342,6 +371,7 @@ function SessionItem({
   displayTitle,
   hasPending,
   unread,
+  count,
   onClick,
   onCancel,
   controlling,
@@ -352,6 +382,7 @@ function SessionItem({
   displayTitle: string;
   hasPending?: boolean;
   unread?: number;
+  count?: number;
   onClick: () => void;
   onCancel?: () => void;
   controlling?: boolean;
@@ -361,6 +392,10 @@ function SessionItem({
     <Trash2Icon className="size-3.5 text-destructive" />
   ) : s.role === "worker" ? (
     statusIcon(s.status)
+  ) : s.role === "reader_task" ? (
+    <WaypointsIcon className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+  ) : s.role === "reader_project" ? (
+    <GlobeIcon className="size-3.5 text-blue-600 dark:text-blue-400" />
   ) : s.live ? (
     <Loader2Icon className="size-3.5 animate-spin text-blue-500" />
   ) : null;
@@ -403,6 +438,11 @@ function SessionItem({
           <Badge variant="outline" className="shrink-0 border-destructive/40 text-destructive">
             已删除
           </Badge>
+        )}
+        {count !== undefined && (
+          <span className="inline-flex min-w-4 shrink-0 items-center justify-center rounded-full bg-muted px-1 text-[10px] font-medium tabular-nums text-muted-foreground">
+            {count > 99 ? "99+" : count}
+          </span>
         )}
         {hasPending && <ShieldAlertIcon className="size-3.5 shrink-0 text-amber-500" />}
         {!active && unread ? (
@@ -478,6 +518,157 @@ function WorkerAssetBadge({ assets }: { assets: IntentAsset[] }) {
   );
 }
 
+const readerDecisionMeta: Record<string, { label: string; cls: string }> = {
+  adopted: { label: "保留", cls: "text-emerald-600 border-emerald-500/40 dark:text-emerald-400" },
+  dismissed: { label: "舍弃", cls: "text-muted-foreground" },
+  candidate: { label: "候选", cls: "text-amber-600 border-amber-500/40 dark:text-amber-400" },
+};
+
+function fmtReaderTraceTime(ts: string): string {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return ts;
+  return d.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+// ReaderTraceCard 一条勾连记录：对端任务 / 方向 / 决策 / 理由 / 命中明细。
+function ReaderTraceCard({ item }: { item: ReaderTraceItem }) {
+  const decision = readerDecisionMeta[item.decision] ?? { label: item.decision, cls: "" };
+  const out = item.direction === "out";
+  return (
+    <div className="rounded-lg border p-3 text-xs">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Link
+          href={`/function/tasks/detail?id=${encodeURIComponent(String(item.related_task_id))}`}
+          className="text-sm font-medium hover:underline"
+        >
+          {item.related_task_name || `任务 #${item.related_task_id}`}
+        </Link>
+        <span className="text-muted-foreground font-mono text-[10px] tabular-nums">#{item.related_task_id}</span>
+        {item.related_project_name && (
+          <Badge variant="outline" className="font-normal">
+            {item.related_project_name}
+          </Badge>
+        )}
+        <Badge
+          variant="outline"
+          className={out ? "border-emerald-500/40 font-normal" : "border-blue-500/40 font-normal"}
+        >
+          {out ? "本任务勾连" : "对方勾连本任务"}
+        </Badge>
+        <Badge variant="outline" className={"font-normal " + decision.cls}>
+          {decision.label}
+        </Badge>
+        <span className="text-muted-foreground ml-auto tabular-nums">{fmtReaderTraceTime(item.created_at)}</span>
+      </div>
+      {item.reason && <p className="mt-2 leading-relaxed break-words">{item.reason}</p>}
+      {item.matched.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1">
+          {item.matched.map((m, index) => (
+            <span
+              key={`${m.kind}-${m.key}-${index}`}
+              title={m.value}
+              className="bg-muted text-muted-foreground inline-flex max-w-full items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10px]"
+            >
+              <span className="shrink-0 opacity-70">{m.kind}</span>
+              <span className="truncate">{m.key}</span>
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ReaderTracePanel 是任务详情里两个阅读者会话的内容面：关系列表 + 阅读者运行记录。
+function ReaderTracePanel({
+  scope,
+  traces,
+  loading,
+  error,
+  onRetry,
+}: {
+  scope: "cross_task" | "cross_project";
+  traces?: ReaderTraces;
+  loading: boolean;
+  error: string;
+  onRetry: () => void;
+}) {
+  const isTask = scope === "cross_task";
+  const list = (isTask ? traces?.cross_task : traces?.cross_project) ?? [];
+  const runs = traces?.runs ?? [];
+
+  if (loading && !traces) {
+    return (
+      <div className="text-muted-foreground flex items-center gap-2 text-xs">
+        <Loader2Icon className="size-3.5 animate-spin" />
+        加载勾连记录…
+      </div>
+    );
+  }
+  if (error && !traces) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-red-500">
+        <CircleXIcon className="size-3.5" />
+        加载失败：{error}
+        <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={onRetry}>
+          重试
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-muted-foreground text-xs">
+          {isTask
+            ? "本项目内与本任务存在勾连关系的任务记录（同项目任务小结比对）。"
+            : "其它项目中与本任务存在勾连关系的任务记录（跨项目任务小结比对）。"}
+        </p>
+        <Button size="sm" variant="ghost" className="h-6 shrink-0 px-2 text-xs" onClick={onRetry} disabled={loading}>
+          {loading ? <Loader2Icon className="size-3 animate-spin" /> : <RotateCwIcon className="size-3" />}
+          刷新
+        </Button>
+      </div>
+      {list.length === 0 ? (
+        <div className="rounded-lg border border-dashed p-8 text-center">
+          <p className="text-sm font-medium">{isTask ? "暂无跨任务勾连记录" : "暂无跨项目勾连记录"}</p>
+          <p className="text-muted-foreground mt-1 text-xs">
+            {isTask
+              ? "同项目任务完成并生成小结表后，勾连记录会出现在这里"
+              : "相关项目任务完成并生成小结表后，勾连记录会出现在这里"}
+          </p>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {list.map((item) => (
+            <ReaderTraceCard key={`${item.direction}-${item.related_task_id}`} item={item} />
+          ))}
+        </div>
+      )}
+      {runs.length > 0 && (
+        <section className="flex flex-col gap-2">
+          <h3 className="text-sm font-medium">阅读者运行记录</h3>
+          <div className="flex flex-col gap-1.5">
+            {runs.map((run) => (
+              <div key={run.id} className="rounded-lg border p-2.5 text-xs">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Badge variant="outline" className="font-normal">
+                    {run.worker === "observer" ? "跨任务阅读者" : "跨项目阅读者"}
+                  </Badge>
+                  <span className="text-muted-foreground tabular-nums">{fmtReaderTraceTime(run.ts)}</span>
+                  <span className="text-muted-foreground font-mono text-[10px] tabular-nums">#{run.id}</span>
+                </div>
+                {run.summary && <p className="mt-1.5 leading-relaxed break-words">{run.summary}</p>}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
 export function SessionsTab({ taskId }: { taskId: string }) {
   const approvalFocus = useApprovalFocus({ taskId });
   const [selectedSessionId, setActiveId] = React.useState(MAIN_ID);
@@ -515,6 +706,25 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const [currentSeg, setCurrentSeg] = React.useState(0);
   const [creatingMain, setCreatingMain] = React.useState(false);
   const [confirmNewMain, setConfirmNewMain] = React.useState(false);
+  // 阅读者勾连审计（跨任务/跨项目两组 + 运行记录）。固定会话不是活动流，
+  // 不走 SSE/分页，任务切换时拉一次、点刷新再拉。
+  const [readerTraces, setReaderTraces] = React.useState<ReaderTraces>();
+  const [readerTracesLoading, setReaderTracesLoading] = React.useState(false);
+  const [readerTracesError, setReaderTracesError] = React.useState("");
+  const loadReaderTraces = React.useCallback(() => {
+    setReaderTracesLoading(true);
+    api
+      .taskReaderTraces(taskId)
+      .then((data) => {
+        setReaderTraces(data);
+        setReaderTracesError("");
+      })
+      .catch((e) => setReaderTracesError((e as Error).message || "请稍后重试"))
+      .finally(() => setReaderTracesLoading(false));
+  }, [taskId]);
+  React.useEffect(() => {
+    loadReaderTraces();
+  }, [loadReaderTraces]);
   // 手机端（<lg）会话列表默认折叠：屏幕高度本就紧张，列表若固定占掉 10~15rem，
   // 下方的会话记录会被挤到只剩标题与输入框。折叠后记录区拿到几乎全部高度，
   // 点标题栏可展开选会话，选完自动收起。桌面端不受影响（lg 起始终展开）。
@@ -1245,7 +1455,14 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   );
 
   const sessions = React.useMemo(() => {
-    const items = [...mainSessions, { ...PLANNER_SESSION, live: plannerLive }, ...workerSessions, SYSTEM_SESSION];
+    const items = [
+      ...mainSessions,
+      { ...PLANNER_SESSION, live: plannerLive },
+      ...workerSessions,
+      SYSTEM_SESSION,
+      READER_TASK_SESSION,
+      READER_PROJECT_SESSION,
+    ];
     const located = focusSession ?? retainedSession;
     if (located && !items.some((s) => s.id === located.id)) items.push(located);
     return items;
@@ -1256,6 +1473,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     planner: sessions.filter((s) => s.role === "planner"),
     worker: sessions.filter((s) => s.role === "worker"),
     system: sessions.filter((s) => s.role === "system"),
+    reader: sessions.filter((s) => s.role === "reader_task" || s.role === "reader_project"),
   };
 
   const active = sessions.find((s) => s.id === activeId) ?? MAIN_SESSION;
@@ -1269,6 +1487,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const isMain = active.role === "mainagent";
   const isPlanner = active.role === "planner";
   const isSystem = active.role === "system";
+  const isReader = active.role === "reader_task" || active.role === "reader_project";
   const activeKey = keyForSession(active);
   const activeState = store[activeKey];
   // A main turn is serialized per task (chat lock), so "busy" is task-wide: while any
@@ -1293,6 +1512,8 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   // biome-ignore lint/correctness/useExhaustiveDependencies: cache updates must not reactivate the current session.
   React.useEffect(() => {
     activeKeyRef.current = activeKey;
+    // 阅读者会话的数据来自 reader-traces，不是活动流：跳过活动分页/标已读。
+    if (activeKey === "reader-task" || activeKey === "reader-project") return;
     const st = store[activeKey];
     if (!st || (!st.loaded && !st.loading)) {
       loadSession(activeKey);
@@ -1337,7 +1558,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     // same SSE stream (worker="mainagent") as every agent step — no client-side
     // optimistic echo, hence no fabricated seq that could collide with real DB ids.
     if (isMain) return items;
-    if (isPlanner || isSystem) return items;
+    if (isPlanner || isSystem || isReader) return items;
     // Worker session: the intent leads the transcript as a right-aligned "user"-style
     // message (the task handed to this worker), followed by its execution steps.
     const intentTitle = sessionMeta.get(active.id)?.title ?? active.title;
@@ -1355,6 +1576,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     isMain,
     isPlanner,
     isSystem,
+    isReader,
     activeState,
     active.id,
     active.title,
@@ -1550,9 +1772,16 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   // 发送键位由系统设置决定（localStorage），默认 Enter 发送。
   const sendMode = useChatSendMode();
   // What the transcript pane should show for the active session.
-  const showLoader = !activeState || (activeState.loading && !activeState.loaded);
+  const showLoader = !isReader && (!activeState || (activeState.loading && !activeState.loaded));
   const resolutionForSession = (session: Session): TaskLLMResolution | undefined => {
-    if (!llmResolutions || session.inherited || session.role === "system") return undefined;
+    if (
+      !llmResolutions ||
+      session.inherited ||
+      session.role === "system" ||
+      session.role === "reader_task" ||
+      session.role === "reader_project"
+    )
+      return undefined;
     if (session.role === "mainagent") return llmResolutions.mainagent;
     if (session.role === "planner") return llmResolutions.planner;
     return llmResolutions.worker;
@@ -1653,7 +1882,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
             )}
           >
             <div className="flex w-full flex-col gap-3 p-2">
-              {(["mainagent", "planner", "system", "worker"] as const).map((role) => {
+              {(["mainagent", "planner", "system", "worker", "reader"] as const).map((role) => {
                 const items = grouped[role];
                 if (!items.length) return null;
                 const Meta = roleMeta[role];
@@ -1690,6 +1919,13 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                           displayTitle={meta?.title ?? s.title}
                           hasPending={hasPendingForSession(s)}
                           unread={store[keyForSession(s)]?.unread}
+                          count={
+                            s.role === "reader_task"
+                              ? readerTraces?.cross_task.length
+                              : s.role === "reader_project"
+                                ? readerTraces?.cross_project.length
+                                : undefined
+                          }
                           onClick={() => {
                             approvalFocus.close();
                             setActiveId(s.id);
@@ -1875,7 +2111,15 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                     加载更早历史…
                   </div>
                 )}
-                {showLoader ? (
+                {isReader ? (
+                  <ReaderTracePanel
+                    scope={active.role === "reader_task" ? "cross_task" : "cross_project"}
+                    traces={readerTraces}
+                    loading={readerTracesLoading}
+                    error={readerTracesError}
+                    onRetry={loadReaderTraces}
+                  />
+                ) : showLoader ? (
                   <div className="flex items-center gap-2 pl-9 text-xs text-muted-foreground">
                     <Loader2Icon className="size-3.5 animate-spin" />
                     加载活动流…

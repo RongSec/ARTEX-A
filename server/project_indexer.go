@@ -10,7 +10,7 @@ package server
 //
 // [已核实 T12 定稿] 投影常开：消费路径只按 exploration→project 归属过滤
 // （pid<=0 丢弃=原版任务），**不过 observer_enabled**——project_index 是
-// 大图 tab 的数据源，关闭观察者的项目也要能看。observer_enabled 只管
+// 大图 tab 的数据源，关闭跨任务阅读者的项目也要能看。observer_enabled 只管
 // fireProjectGraph 触发与 insight 注入两处（各自侧过滤）。绑定侧的对应
 // 红线见 bindGraphHook：原版（未挂项目）任务完全不回调、零额外查询。
 
@@ -152,7 +152,7 @@ func (ix *ProjectIndexer) InvalidateTaskMapping(expID int64) {
 // 丢弃（原版任务恒此路径）。
 //
 // [已核实 T12 定稿] 这里**不再过 observer_enabled**：project_index 是大图 tab
-// 的数据源，关闭观察者的项目也要能看大图——投影常开。observer_enabled 的语义
+// 的数据源，关闭跨任务阅读者的项目也要能看大图——投影常开。observer_enabled 的语义
 // 收窄为只管 ① fireProjectGraph 产不产触发（scheduler 侧 JOIN projects 过滤）
 // ② T12 的 insight 注入。二者都不在本消费路径。
 func filterAdmitted(batch []indexedEvent,

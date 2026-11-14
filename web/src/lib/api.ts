@@ -90,6 +90,7 @@ import type {
   ProjectWithStats,
   PromptVar,
   PromptVersion,
+  ReaderTraces,
   SessionTokenUsage,
   Settings,
   Severity,
@@ -469,6 +470,8 @@ export const api = {
     }>(`/tasks/${id}/coverage`),
   // 资产覆盖图：范围内全部资产 + 连接用的根域名/公司节点，含 tested/in_scope。
   taskCoverageGraph: (id: string) => get<CoverageGraphData>(`/tasks/${id}/coverage-graph`),
+  // 任务视角的阅读者勾连审计：跨任务（同项目）与跨项目两组记录 + 阅读者运行记录。
+  taskReaderTraces: (id: string) => get<ReaderTraces>(`/tasks/${id}/reader-traces`),
   // 全局 llm_usage 聚合（仪表盘新版 token 视图）：按 profile 总量 + 按天分桶。
   usageStats: (days = 365) => get<UsageStats>(`/tokens/usage?days=${days}`),
   // ---- 目标管理（总览）----

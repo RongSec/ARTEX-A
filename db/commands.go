@@ -1,8 +1,11 @@
 package db
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -343,6 +346,74 @@ func (d *DB) GetLLMRecord(id int64) (*LLMRecord, error) {
 	r.RawRequest = rawReq.String
 	r.RawResponse = rawResp.String
 	return &r, nil
+}
+
+// ReaderLLMRun 是一条「阅读者」LLM 运行的摘要（GET /api/tasks/{id}/reader-traces）。
+// worker 只会是 reader/observer 两个内部 key。
+type ReaderLLMRun struct {
+	ID      int64     `json:"id"`
+	Worker  string    `json:"worker"`
+	Ts      time.Time `json:"ts"`
+	Summary string    `json:"summary"`
+}
+
+// ListReaderRunsForTask 取某任务命中的阅读者 LLM 运行（worker IN reader/observer），
+// 按时间倒序。没有记录返回空切片而不是 nil——接口契约是「空数组、不报错」。
+// summary 从 response_body.text 的首行压缩而来（llm_records 没有 summary 列）。
+func (d *DB) ListReaderRunsForTask(ctx context.Context, taskID string, limit int) ([]ReaderLLMRun, error) {
+	if strings.TrimSpace(taskID) == "" {
+		return []ReaderLLMRun{}, nil
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := d.QueryContext(ctx, `
+SELECT id, COALESCE(worker,''), COALESCE(ts, now()), COALESCE(response_body,'')
+FROM llm_records
+WHERE COALESCE(task_id,'') = $1 AND worker IN ('reader','observer')
+ORDER BY id DESC LIMIT $2`, taskID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ReaderLLMRun{}
+	for rows.Next() {
+		var r ReaderLLMRun
+		var body string
+		if err := rows.Scan(&r.ID, &r.Worker, &r.Ts, &body); err != nil {
+			return nil, err
+		}
+		r.Summary = llmRunSummary(body)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// llmRunSummary 从规范化响应体（{"text":...}）取首行，截断 200 字。
+// 解析失败/无正文返回空串，绝不因为展示层摘要影响接口可用性。
+func llmRunSummary(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+	var payload struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return ""
+	}
+	s := strings.TrimSpace(payload.Text)
+	if s == "" {
+		return ""
+	}
+	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	runes := []rune(s)
+	if len(runes) > 200 {
+		return string(runes[:200]) + "…"
+	}
+	return string(runes)
 }
 
 func nullIfEmpty(s string) any {

@@ -1,6 +1,7 @@
 package server
 
-// 统一阅读者的宿主工具与一次性 seed（artex-hs T11 / V6-U3）。
+// 跨任务阅读者 / 跨项目阅读者的宿主工具与一次性 seed（artex-hs T11 / V6-U3）。
+// 内部 agent key 仍是 observer（跨任务视角）与 reader（跨项目视角），只改展示称谓。
 //
 // V6-U3 把 observer（项目内跨任务观察）与 reader（跨项目串联）两条独立链合成
 // 一套：一个 agent（主 key=reader，收官 nudge 硬编码）、一条 trigger
@@ -182,8 +183,8 @@ func (s *Server) toolReadAllProjectInsights() actool.CoreTool {
 	return roTool("read_all_project_insights",
 		"读跨项目阅读输入，两段：① cross_project_assets＝同一资产出现在 ≥2 个项目里的聚合行"+
 			"(资产标签/类型/涉及项目[id+名称]/发现数/最近出现，按项目数降序，最多 20 行)——跨项目信号先看这段；"+
-			"② projects＝各项目的项目洞察(project_insights，observer 产出)。"+
-			"仅覆盖【开启阅读者开关(reader_enabled)】的 active 项目；project_ids 空=读全部已开启项目。"+
+			"② projects＝各项目的项目洞察(project_insights，跨任务阅读者产出)。"+
+			"仅覆盖【开启跨项目阅读者开关(reader_enabled)】的 active 项目；project_ids 空=读全部已开启项目。"+
 			"cross_project_assets 为空即无跨项目信号，不必再逐条翻 insights。",
 		objSchema(map[string]any{
 			"project_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：限定项目 id；空=全部已开启项目"},
@@ -359,7 +360,7 @@ func (s *Server) projectReaderTools() []actool.CoreTool {
 	}
 }
 
-// unifiedReaderToolKeys 是统一阅读者 agent（key=reader）绑定的全部六工具
+// unifiedReaderToolKeys 是阅读者 agent（key=reader，现名「跨项目阅读者」）绑定的全部六工具
 // （V6-U3）：observer 四件 + reader 两件，工具名一律不变。两个聚合出口
 // projectObserverTools()/projectReaderTools() 仍需按原数量分别服务装配链，
 // 故合并只发生在「绑定集合」这一层，不动那两个函数。
@@ -370,9 +371,10 @@ var unifiedReaderToolKeys = []string{
 
 // ---------- seed（照 reporter 样板 orchestration.go:735） ----------
 
-// observerPrompt 是观察者 system prompt 的默认正文（SeedPromptIfEmpty 播种，
-// DB 里可编辑；要点全部保留：只读红线、五步工作流、insight 格式与克制）。
-const observerPrompt = "你是本项目的【跨任务观察者】：只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
+// observerPrompt 是【跨任务阅读者】system prompt 的默认正文（SeedPromptIfEmpty
+// 播种，DB 里可编辑；要点全部保留：只读红线、五步工作流、insight 格式与克制）。
+// 内部 key 仍是 observer（历史标识不改），对用户/模型统一称「跨任务阅读者」。
+const observerPrompt = "你是本项目的【跨任务阅读者】：只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
 	"触发时机：本项目的探索图发生变更，触发消息里带本批变更清单（kind/摘要/task_id）。\n" +
 	"工作步骤：\n" +
 	"1) query_project_index 总览全项目投影（可按 kinds/severities/asset_keys 过滤），建立「这个项目里各任务都在做什么、发现了什么」的全貌；\n" +
@@ -380,7 +382,7 @@ const observerPrompt = "你是本项目的【跨任务观察者】：只读与�
 	"3) 与其他任务的投影比对——同一 CMS/同组件同版本/同服务指纹/同类漏洞入口都是高价值借鉴信号（A 任务已验证的打法/入口/PoC 对 B 任务是现成的路）；\n" +
 	"4) 确有可借鉴处用 write_project_insight 落库：短、事实性、可执行，格式如「N任务 canal v1.1.5 未认证RCE已验证，可借鉴至 M任务 10.x:8080」，keywords 必须带组件名/版本/IP/域名等命中键；\n" +
 	"5) 仅当某目标任务【当下正需要】该信息时才 push_task_hint 直接提醒（每轮最多 2 条，宁少勿滥；hint 会唤醒对方 planner，滥用等于污染）。\n" +
-	"没有真发现就直接结束本轮，绝不写空洞 insight 或客套 hint。跨项目的事不归你管（那是 reader）。"
+	"没有真发现就直接结束本轮，绝不写空洞 insight 或客套 hint。跨项目的事不归你管（那是跨项目阅读者）。"
 
 // readerPromptV1 是上线时的默认正文（V4-E 之前）。存量库里未编辑过的 prompt
 // 与它逐字节相同——upgradeReaderPrompt 据此判断「可以安全升级」，用户改过的
@@ -407,7 +409,7 @@ const readerPrompt = "你是【跨项目阅读者】：只读与总结，禁止�
 // unifiedGraphMessage；本常量保留给 observer 别名 seed 的回退路径。
 const observerGraphMessage = "项目探索图发生了新变更，请依职责观察。"
 
-// V6-U3 统一阅读者：单 trigger 双条件的两个消息前缀。图变更触发带
+// V6-U3 统一阅读者（现名跨项目阅读者）：单 trigger 双条件的两个消息前缀。图变更触发带
 // 【scope=project】，定时触发带【scope=cross】——readerUnifiedPrompt 据此判别
 // 本轮做「项目内观察」还是「跨项目串联」。一条 trigger 同时开两条件，
 // scheduler 的 fireProjectGraph/fireIntervals 各认 OnProjectGraph/IntervalSec
@@ -415,7 +417,7 @@ const observerGraphMessage = "项目探索图发生了新变更，请依职责�
 const unifiedGraphMessage = "【scope=project】项目探索图发生了新变更，请依职责观察。"
 const unifiedIntervalMessage = "【scope=cross】定时跨项目阅读：读各项目洞察，串联跨项目相似面。"
 
-// unifiedReaderTrigger 构造统一阅读者的【唯一】触发器行：双条件 + enabled=true。
+// unifiedReaderTrigger 构造阅读者的【唯一】触发器行：双条件 + enabled=true。
 // seedReaderAgent（全新库建行）与 unifyReaderAgent（存量库收敛）共用，口径单源。
 func unifiedReaderTrigger() *db.AgentTrigger {
 	return &db.AgentTrigger{
@@ -449,10 +451,29 @@ const readerPromptLinkSection = "\n情报表勾连（V7-LINK）：收到图变�
 	"发现同一 kind/key 出现在多个任务、可以互相比对时，用 link_tasks 把两个任务标成候选关联（reason 写清命中项）；" +
 	"不要用自由文本洞察代替结构化链接——规划者需要的是可下钻的候选任务。"
 
-// readerUnifiedPrompt 是统一阅读者的当前默认正文：V6 统一版 + V7-LINK 勾连段。
-// 旧默认（readerPromptV1 / readerPrompt / readerUnifiedPromptV6）保留作
-// upgradeReaderPrompt 的逐字节比对基准——用户手改的一律不覆盖。
+// readerUnifiedPrompt 是 V7-LINK 的默认正文：V6 统一版 + 勾连段。V8-NAME 起
+// 保留为逐字节比对基准——存量库未编辑过的正文据此升级到 readerUnifiedPromptNames。
+// 内部 agent key 仍是 reader（历史标识不改）。
 const readerUnifiedPrompt = readerUnifiedPromptV6 + readerPromptLinkSection
+
+// readerUnifiedPromptNames 是 V8-NAME 起的当前默认正文：流程与 V7 完全一致，
+// 只把称谓改成按作用域区分的两个名字——项目内=【跨任务阅读者】、跨项目=
+// 【跨项目阅读者】。内部 key/触发器/工具名一个不动。
+const readerUnifiedPromptNames = "你同时承担两个只读视角：项目内【跨任务阅读者】（scope=project）、跨项目【跨项目阅读者】（scope=cross）。只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
+	"触发时机：项目探索图变更（图变更触发）或定时兜底（每 30 分钟一轮）；一条触发器同时挂这两个条件。\n" +
+	"【先看触发消息前缀判别本轮作用域】\n" +
+	"· 【scope=project】（项目图变更，消息里还带本批变更清单）：做项目内跨任务阅读（你是跨任务阅读者）——\n" +
+	"  1) query_project_index 总览全项目投影（可按 kinds/severities/asset_keys 过滤）；\n" +
+	"  2) 从变更清单里的 task_id/kind 定位变更点，必要时 get_task_graph_digest 下钻该任务完整探索图；\n" +
+	"  3) 与其他任务投影比对——同 CMS/同组件同版本/同类漏洞入口都是高价值借鉴信号；\n" +
+	"  4) 确有可借鉴处用 write_project_insight 落库（短、事实性、可执行，keywords 必带命中键）；\n" +
+	"  5) 仅当某目标任务【当下正需要】该信息才 push_task_hint 提醒（每轮最多 2 条，宁少勿滥）。\n" +
+	"· 【scope=cross】（定时触发）：做跨项目串联（你是跨项目阅读者）——\n" +
+	"  1) read_all_project_insights 拿本轮输入，【先看 cross_project_assets】——它已 join 好「同一资产/组件出现在 ≥2 个项目」；为空即无跨项目信号，直接空转结束；\n" +
+	"  2) cross_project_assets 非空时围绕这些行写全局洞察，点名是哪个资产、涉及哪几个项目、同一资产上的同类漏洞面该搬到哪；\n" +
+	"  3) 确有串联价值才 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
+	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。" +
+	readerPromptLinkSection
 
 // seedObserverAgent 是 V6 之前的「跨任务观察者」seed（回退路径保留）。
 // V6-U3 起 observer 退化为只读别名：收敛完成后（reader_unified_v1 置位）
@@ -471,8 +492,8 @@ func (s *Server) seedObserverAgent() {
 	if exist, _ := s.m.pg.GetAgentByKey("observer"); exist != nil {
 		return // key 已被占用（用户手建过）——不覆盖
 	}
-	a, err := s.m.pg.CreateAgent("observer", "跨任务观察者",
-		"项目级跨任务观察：项目探索图变更时自动触发，读全项目投影，把可借鉴处写成项目洞察、必要时提醒相关任务。默认惰性（项目未开观察者开关时不触发）。")
+	a, err := s.m.pg.CreateAgent("observer", "跨任务阅读者",
+		"跨任务阅读者（项目内）：项目探索图变更时自动触发，读全项目投影，把可借鉴处写成项目洞察、必要时提醒相关任务。默认惰性（项目未开跨任务阅读者开关时不触发）。")
 	if err != nil {
 		log.Printf("[observer] 创建 agent 失败: %v", err)
 		return
@@ -501,10 +522,10 @@ func (s *Server) seedObserverAgent() {
 	}); err != nil {
 		log.Printf("[observer] 创建触发器失败: %v", err)
 	}
-	log.Printf("[observer] 已预置「跨任务观察者」agent + 项目图变更触发器")
+	log.Printf("[observer] 已预置「跨任务阅读者」agent + 项目图变更触发器")
 }
 
-// seedReaderAgent 预置「统一阅读者」自定义 agent（V6-U3）：绑定六工具 +
+// seedReaderAgent 预置「跨项目阅读者」自定义 agent（V6-U3，历史名统一阅读者）：绑定六工具 +
 // 单条双条件触发器（OnProjectGraph + IntervalSec=1800 + enabled=true）。
 // 一次性 flag 保护；存量库的旧 reader（只绑两工具/触发器 enabled=false）
 // 由紧随其后的 unifyReaderAgent 收敛，本函数因自己的 flag 已置位会早退。
@@ -518,13 +539,13 @@ func (s *Server) seedReaderAgent() {
 	if exist, _ := s.m.pg.GetAgentByKey("reader"); exist != nil {
 		return
 	}
-	a, err := s.m.pg.CreateAgent("reader", "统一阅读者",
-		"统一阅读者：项目内观察(图变更触发)与跨项目串联(定时触发)共用一个 agent、一条双条件触发器。读全项目投影/单任务图、写项目洞察、必要时提醒任务；定时读跨项目资产信号、写跨项目洞察。")
+	a, err := s.m.pg.CreateAgent("reader", "跨项目阅读者",
+		"跨项目阅读者：项目内视角称「跨任务阅读者」（图变更触发），跨项目视角称「跨项目阅读者」（定时触发），共用一个 agent、一条双条件触发器。读全项目投影/单任务图、写项目洞察、必要时提醒任务；定时读跨项目资产信号、写跨项目洞察。")
 	if err != nil {
 		log.Printf("[reader] 创建 agent 失败: %v", err)
 		return
 	}
-	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPrompt); err != nil {
+	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptNames); err != nil {
 		log.Printf("[reader] seed prompt 失败: %v", err)
 	}
 	// serial+merge=all：整波图变更合并成一次会话（observer 原策略），max_parallel=2。
@@ -537,10 +558,10 @@ func (s *Server) seedReaderAgent() {
 	if _, err := s.m.pg.CreateTrigger(unifiedReaderTrigger()); err != nil {
 		log.Printf("[reader] 创建双条件触发器失败: %v", err)
 	}
-	log.Printf("[reader] 已预置「统一阅读者」agent + 单条双条件触发器(on_project_graph+interval, enabled)")
+	log.Printf("[reader] 已预置「跨项目阅读者」agent + 单条双条件触发器(on_project_graph+interval, enabled)")
 }
 
-// readerUnifiedFlag 是「统一阅读者收敛已完成」的一次性标记（settings 表）。
+// readerUnifiedFlag 是「阅读者收敛已完成」的一次性标记（settings 表）。
 // 双重用途：unifyReaderAgent 自己只跑一次；seedObserverAgent 见它即早退
 // （observer 不再新建 agent/触发器）。
 const readerUnifiedFlag = "reader_unified_v1"
@@ -620,7 +641,7 @@ func (s *Server) unifyReaderAgent() {
 	log.Printf("[reader-unify] 已收敛为 reader 单 agent / 单条双条件触发器")
 }
 
-// seedProjectTools 把项目工具 SeedTool 入库（首插生效），并跑统一阅读者的
+// seedProjectTools 把项目工具 SeedTool 入库（首插生效），并跑阅读者的
 // seed/收敛/升级。由 seedOrchestrationTools 末尾调用——agent 绑定要求工具行
 // 先存在（reporter 同款顺序依赖）。绑定不给 auto/planner：跨任务读图+写 hint
 // 是阅读者特权，最小暴露面。tool_base='none' 两 key 都保留（只读安全红线）。
@@ -675,8 +696,9 @@ func (s *Server) seedProjectTools() {
 	s.seedReaderAgent()
 	s.unifyReaderAgent()
 	s.seedObserverAgent()
+	s.reconcileReaderAgentNames()
 
-	// V6-U3：reader prompt 默认正文升级到统一阅读者版。seedReaderAgent 有
+	// V6-U3：reader prompt 默认正文升级到新版。seedReaderAgent 有
 	// 一次性 flag 早退，SeedPromptIfEmpty 又是「已有任一版本就 no-op」，所以
 	// 存量库里已建好的 reader 永远拿不到新正文——必须每次启动无条件收编
 	// （动作本身幂等：逐字节比对旧默认才升级，见 upgradeReaderPrompt）。
@@ -695,11 +717,50 @@ func (s *Server) seedProjectTools() {
 	}
 }
 
-// readerPromptUpgradeFlag 是「统一阅读者默认正文已收编」的一次性标记。
-// V7-LINK 起改用新 flag：旧 flag（reader_prompt_unified_v6）在存量库已置位，
-// 继续用它会让新增的情报表勾连段永远到不了 reader；换 flag 即再执行一次
+// reconcileReaderAgentNames 一次性把历史默认显示名改成 V8-NAME 称谓：observer
+// →「跨任务阅读者」、reader →「跨项目阅读者」。只改「名字仍等于旧默认」且
+// 「描述仍等于旧默认」的字段——用户在 Agent 页自定义过的名字/描述一律不动。
+// 内部 key 与绑定关系不变，改的只是展示层。
+func (s *Server) reconcileReaderAgentNames() {
+	pg := s.m.pg
+	if pg == nil {
+		return
+	}
+	const flag = "reader_agent_names_v8"
+	if v, _, _ := pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = pg.SetSetting(flag, "true") }()
+
+	const readerDesc = "跨项目阅读者：项目内视角称「跨任务阅读者」（图变更触发），跨项目视角称「跨项目阅读者」（定时触发），共用一个 agent、一条双条件触发器。读全项目投影/单任务图、写项目洞察、必要时提醒任务；定时读跨项目资产信号、写跨项目洞察。"
+	const observerDesc = "跨任务阅读者（项目内）：项目探索图变更时自动触发，读全项目投影，把可借鉴处写成项目洞察、必要时提醒相关任务。默认惰性（项目未开跨任务阅读者开关时不触发）。"
+	for _, r := range []struct {
+		key, oldName, newName, oldDesc, newDesc string
+	}{
+		{"observer", "跨任务观察者", "跨任务阅读者",
+			"项目级跨任务观察：项目探索图变更时自动触发，读全项目投影，把可借鉴处写成项目洞察、必要时提醒相关任务。默认惰性（项目未开观察者开关时不触发）。", observerDesc},
+		{"reader", "统一阅读者", "跨项目阅读者",
+			"统一阅读者：项目内观察(图变更触发)与跨项目串联(定时触发)共用一个 agent、一条双条件触发器。读全项目投影/单任务图、写项目洞察、必要时提醒任务；定时读跨项目资产信号、写跨项目洞察。", readerDesc},
+	} {
+		a, err := pg.GetAgentByKey(r.key)
+		if err != nil || a == nil || a.Name != r.oldName {
+			continue // 不存在或用户改过名字 → 不动
+		}
+		desc := a.Description
+		if desc == r.oldDesc {
+			desc = r.newDesc
+		}
+		if err := pg.UpdateAgentMeta(r.key, r.newName, desc); err != nil {
+			log.Printf("[project-tools] 重命名 %s 失败: %v", r.key, err)
+		}
+	}
+}
+
+// readerPromptUpgradeFlag 是「默认正文已切换到 V8-NAME 称谓」的一次性标记。
+// V7-LINK 的旧 flag（reader_prompt_link_v7）在存量库已置位，继续用它会让
+// 「跨任务阅读者/跨项目阅读者」称谓永远到不了 reader；换 flag 即再执行一次
 // 「逐字节比对旧默认才升级」的幂等收编。
-const readerPromptUpgradeFlag = "reader_prompt_link_v7"
+const readerPromptUpgradeFlag = "reader_prompt_names_v8"
 
 // readerPromptUpgrade 是 upgradeReaderPrompt 的纯判定结果（无库可单测）。
 type readerPromptUpgrade int
@@ -713,27 +774,29 @@ const (
 	readerPromptReplace
 )
 
-// readerPromptUpgradeFor 是「能不能升级」的纯判定：旧默认有三个——readerPromptV1
-// （V4-E 之前）、readerPrompt（V4-E 资产优先版）与 readerUnifiedPromptV6（V6 统一
-// 版）。当前与任一逐字节相同＝用户没编辑过，升到带情报表勾连段的 readerUnifiedPrompt；
-// 已是当前版本或用户手改的正文一律 Keep，不覆盖。
+// readerPromptUpgradeFor 是「能不能升级」的纯判定：旧默认有四个——readerPromptV1
+// （V4-E 之前）、readerPrompt（V4-E 资产优先版）、readerUnifiedPromptV6（V6 统一
+// 版）与 readerUnifiedPrompt（V7-LINK 勾连版）。当前与任一逐字节相同＝用户没
+// 编辑过，升到带新称谓的 readerUnifiedPromptNames；已是当前版本或用户手改的
+// 正文一律 Keep，不覆盖。
 func readerPromptUpgradeFor(cur string) readerPromptUpgrade {
 	switch strings.TrimSpace(cur) {
 	case "":
 		return readerPromptSeed
-	case readerPromptV1, readerPrompt, readerUnifiedPromptV6:
+	case readerPromptV1, readerPrompt, readerUnifiedPromptV6, readerUnifiedPrompt:
 		return readerPromptReplace
 	default:
 		return readerPromptKeep
 	}
 }
 
-// upgradeReaderPrompt 把存量库 reader 的 system prompt 升到统一阅读者版：
+// upgradeReaderPrompt 把存量库 reader 的 system prompt 升到 V8-NAME 称谓版：
 //
 //   - 当前 prompt 为空（seed 曾失败）→ 播种新默认；
-//   - 当前 prompt 与任一旧默认（readerPromptV1 / readerPrompt）逐字节相同
+//   - 当前 prompt 与任一旧默认（readerPromptV1 / readerPrompt /
+//     readerUnifiedPromptV6 / readerUnifiedPrompt）逐字节相同
 //     ＝用户没编辑过 → 追加一个新版本（SavePrompt 保留历史，可在 UI 回滚）；
-//   - 已是统一版或已被用户编辑 → 不覆盖，只记一行日志并置 flag。
+//   - 已是当前版本或已被用户编辑 → 不覆盖，只记一行日志并置 flag。
 //
 // 用「逐字节比对旧默认」而不是无条件 ResetPromptToDefault：后者会把用户手写
 // 的正文冲掉。这也是不能照搬 SetAgentToolBase「无脑写」的原因——tool_base 是
@@ -757,19 +820,19 @@ func (s *Server) upgradeReaderPrompt() {
 	}
 	switch readerPromptUpgradeFor(cur) {
 	case readerPromptSeed:
-		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPrompt); err != nil {
+		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptNames); err != nil {
 			log.Printf("[reader] 播种新默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已播种「统一阅读者」默认 prompt")
+		log.Printf("[reader] 已播种「跨项目阅读者」默认 prompt")
 	case readerPromptReplace:
-		if _, err := pg.SavePrompt(a.ID, readerUnifiedPrompt, "V6-U3 默认正文升级：统一阅读者单 agent/单 trigger", "system"); err != nil {
+		if _, err := pg.SavePrompt(a.ID, readerUnifiedPromptNames, "V8-NAME 默认正文升级：跨任务阅读者/跨项目阅读者称谓", "system"); err != nil {
 			log.Printf("[reader] 升级默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已把未编辑的默认 prompt 升级为「统一阅读者」版（历史版本保留）")
+		log.Printf("[reader] 已把未编辑的默认 prompt 升级为「跨任务阅读者/跨项目阅读者」版（历史版本保留）")
 	default:
-		log.Printf("[reader] 当前 prompt 已是统一版或被用户编辑，跳过默认正文升级（如需新流程请手动恢复内置默认）")
+		log.Printf("[reader] 当前 prompt 已是新版或被用户编辑，跳过默认正文升级（如需新流程请手动恢复内置默认）")
 	}
 	if err := pg.SetSetting(readerPromptUpgradeFlag, "true"); err != nil {
 		log.Printf("[reader] 写入 prompt 升级标记失败: %v", err)

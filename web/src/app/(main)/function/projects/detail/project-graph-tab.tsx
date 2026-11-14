@@ -128,7 +128,11 @@ export function ProjectGraphTab({ project, onChanged }: { project: Project; onCh
     setObserver(on); // 乐观翻转；失败回滚
     try {
       await api.updateProject(project.id, { observer_enabled: on });
-      toast.success(on ? "已开启跨任务阅读（项目内触发与洞察注入生效；投影本就常开）" : "已关闭跨任务阅读（停止项目内触发与注入；大图投影保留）");
+      toast.success(
+        on
+          ? "已开启跨任务阅读者（项目内触发与洞察注入生效；投影本就常开）"
+          : "已关闭跨任务阅读者（停止项目内触发与注入；大图投影保留）",
+      );
       onChanged();
     } catch (e) {
       setObserver(prev);
@@ -149,7 +153,7 @@ export function ProjectGraphTab({ project, onChanged }: { project: Project; onCh
           <Separator orientation="vertical" className="h-4" />
           <label className="flex items-center gap-2 text-xs" htmlFor="pg-observer">
             <Switch id="pg-observer" checked={observer} onCheckedChange={toggleObserver} />
-            跨任务阅读
+            跨任务阅读者
           </label>
           <span className="text-muted-foreground text-xs">并发 {project.concurrency}</span>
           <div className="ml-auto flex items-center gap-2">
@@ -242,7 +246,7 @@ function GraphTaskCard({ g }: { g: GraphTaskGroup }) {
   );
 }
 
-// InsightsPanel 观察者经验：列表 + keywords 徽章 + 来源任务回链 + 删除。
+// InsightsPanel 跨任务阅读者经验：列表 + keywords 徽章 + 来源任务回链 + 删除。
 function InsightsPanel({ projectID }: { projectID: number }) {
   const [list, setList] = React.useState<ProjectInsight[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -279,7 +283,7 @@ function InsightsPanel({ projectID }: { projectID: number }) {
   return (
     <Card size="sm" className="max-h-[calc(100vh-12rem)] self-start">
       <CardHeader>
-        <CardTitle className="text-sm">观察者洞察{list.length ? `（${list.length}）` : ""}</CardTitle>
+        <CardTitle className="text-sm">跨任务阅读者洞察{list.length ? `（${list.length}）` : ""}</CardTitle>
         <CardDescription className="text-xs">跨任务可借鉴经验（planner 按资产命中限量注入）</CardDescription>
         <CardAction>
           <Button variant="ghost" size="icon" onClick={() => load()} aria-label="刷新洞察">
@@ -290,7 +294,7 @@ function InsightsPanel({ projectID }: { projectID: number }) {
       <CardContent className="grid gap-2 overflow-y-auto">
         {!loading && list.length === 0 && (
           <p className="text-muted-foreground py-6 text-center text-xs">
-            还没有洞察。开启项目「观察者」后，观察 agent 会在图变更时自动沉淀可借鉴经验。
+            还没有洞察。开启项目「跨任务阅读者」后，跨任务阅读者会在图变更时自动沉淀可借鉴经验。
           </p>
         )}
         {list.map((it) => (

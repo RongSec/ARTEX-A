@@ -761,8 +761,43 @@ export interface LogLine {
   text: string;
 }
 
-export type SessionRole = "mainagent" | "planner" | "worker" | "system";
+export type SessionRole = "mainagent" | "planner" | "worker" | "system" | "reader_task" | "reader_project";
 export type SessionStatus = "running" | "paused" | "done" | "blocked" | "exhausted" | "pending" | "stopped" | "deleted";
+
+// ---- 任务视角的阅读者勾连审计（GET /api/tasks/{id}/reader-traces）----
+// 跨任务阅读者 = 原 observer（同项目、observer_enabled）；跨项目阅读者 = 原 reader
+// （reader_enabled）。内部 key 不变，只有展示名区分。
+export interface ReaderTraceMatch {
+  kind: string;
+  key: string;
+  value: string;
+}
+
+export interface ReaderTraceItem {
+  related_task_id: number;
+  related_task_name: string;
+  related_project_id: number;
+  related_project_name: string;
+  decision: "adopted" | "dismissed" | "candidate" | string;
+  reason: string;
+  matched: ReaderTraceMatch[];
+  created_at: string;
+  direction: "in" | "out" | string; // out=本任务勾连别人，in=别人勾连本任务
+}
+
+export interface ReaderTraceRun {
+  id: number;
+  worker: string;
+  ts: string;
+  summary: string;
+}
+
+export interface ReaderTraces {
+  task_id: number;
+  cross_task: ReaderTraceItem[];
+  cross_project: ReaderTraceItem[];
+  runs: ReaderTraceRun[];
+}
 
 // Daily token aggregate bucket (GET /api/tokens/daily).
 export interface DailyTokenBucket {
@@ -1710,7 +1745,7 @@ export interface ProjectGraphResp {
   hint?: string; // 空投影时的后端文案（单一出处）
 }
 
-// 项目观察者洞察（project_insights 行，GET /api/projects/{id}/insights）。
+// 项目洞察（project_insights 行，GET /api/projects/{id}/insights；跨任务阅读者产出）。
 export interface ProjectInsight {
   id: number;
   project_id: number;
@@ -1905,7 +1940,7 @@ export interface FindingEvidenceImage {
 
 // ---- 事实台账（V4-A）----
 
-// FactSource：来源三分法。worker=探索图机器写入；observer=项目观察者（预留）；
+// FactSource：来源三分法。worker=探索图机器写入；observer=跨任务阅读者（预留）；
 // human=主控/人工新增或人工编辑过。
 export type FactSource = "worker" | "observer" | "human";
 
