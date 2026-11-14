@@ -755,6 +755,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/coverage", s.taskCoverage)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage-graph", s.taskCoverageGraph)
 	mux.HandleFunc("GET /api/tasks/{id}/asset-refs", s.taskAssetRefs)
+	// V7-INTEL：任务情报表（收官时自动生成；GET 只读，rebuild 同步重建）。
+	mux.HandleFunc("GET /api/tasks/{id}/intel", s.taskIntelList)
+	mux.HandleFunc("POST /api/tasks/{id}/intel/rebuild", s.taskIntelRebuild)
 	mux.HandleFunc("POST /api/tasks/{id}/assets", s.attachTaskAssets)
 	mux.HandleFunc("DELETE /api/tasks/{id}/assets/{assetID}", s.detachTaskAsset)
 	mux.HandleFunc("GET /api/tasks/{id}/intent-assets", s.taskIntentAssets)

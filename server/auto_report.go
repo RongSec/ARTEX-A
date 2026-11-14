@@ -43,14 +43,19 @@ func projectSettled(all, terminal map[int64]bool) (settled bool, taskCount int) 
 }
 
 // installTerminalHooks 装配任务终态钩子（仅 server.New 的 PG 非空分支调用一次）。
-// 两段旁路按注册顺序串联，互不短路（自动报告失败不该挡住 reader 唤起，反之亦然）：
-//  1. onTaskTerminalAutoReport —— 整项目收官自动写报告（T18）
-//  2. onTaskTerminalReaderNudge —— 项目收官唤起一轮 reader（V4-E / E3）
+// 三段旁路按注册顺序串联，互不短路（任一段失败不该挡住其余，反之亦然）：
+//  1. onTaskTerminalBuildIntel —— 生成本任务情报表并发图变更信号（V7-INTEL）
+//  2. onTaskTerminalAutoReport —— 整项目收官自动写报告（T18）
+//  3. onTaskTerminalReaderNudge —— 项目收官唤起一轮 reader（V4-E / E3）
+//
+// 情报表放最前：它产出的 event 是 reader/observer 的输入，先写库再唤起下游，
+// 下游读到的就是「本任务已收官且情报已就位」的一致视图。
 func (s *Server) installTerminalHooks() {
 	if s.m == nil || s.m.pg == nil {
 		return
 	}
 	s.m.OnTaskTerminal = func(taskID int64, status string) {
+		s.onTaskTerminalBuildIntel(taskID, status)
 		s.onTaskTerminalAutoReport(taskID, status)
 		s.onTaskTerminalReaderNudge(taskID, status)
 	}

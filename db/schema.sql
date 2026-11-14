@@ -1749,3 +1749,55 @@ CREATE TABLE IF NOT EXISTS finding_evidence_images (
 CREATE INDEX IF NOT EXISTS idx_fei_finding ON finding_evidence_images(finding_id, step_index, sort_order, id);
 -- T22 报文自动截图：旧库补 source 列（CREATE 段已含，双写法同 projects 三列先例）。
 ALTER TABLE finding_evidence_images ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'upload';
+
+-- =====================================================================
+-- R. 任务情报表（artex-hs V7-INTEL）：每个任务一份可直接比对的情报
+-- =====================================================================
+-- 阅读者机制第一层。任务收官时把 findings / facts / 资产抽成结构化行——
+-- (kind, key) 就是跨任务比对键，value 保留人类可读原文，detail 存合并明细
+-- （出现次数、来源 finding id 列表、脱敏后的密文片段）。UNIQUE 让重复生成
+-- 幂等（upsert 覆盖，不会膨胀）。
+--
+-- 只有挂了项目的任务才落行（project_id NOT NULL + 外键级联）：无项目任务走
+-- 原版路径，情报表是项目内/跨项目勾连的底座，没有项目就没有比对的意义。
+CREATE TABLE IF NOT EXISTS task_intel (
+    id         BIGSERIAL PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_id    BIGINT NOT NULL,                            -- 无 FK：任务删档后情报表仍可作历史比对
+    kind       TEXT NOT NULL CHECK (kind IN ('endpoint','credential','component','asset','vuln')),
+    key        TEXT NOT NULL,                              -- 归一化后的可比对键（见 db/task_intel.go）
+    value      TEXT NOT NULL,                              -- 人类可读原文（凭据恒为脱敏描述，不含明文）
+    detail     JSONB NOT NULL DEFAULT '{}',                -- 合并明细：次数/来源 id/hosts/secret_masked…
+    source     TEXT NOT NULL,                              -- finding|fact|asset|manual
+    source_id  BIGINT,                                     -- 对应来源行 id（可空）
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (project_id, task_id, kind, key)
+);
+-- 存量库补列（CREATE 段已含，双写法同 §Q 先例）：v7 前不存在本表，这里纯保险。
+ALTER TABLE task_intel ADD COLUMN IF NOT EXISTS detail JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE task_intel ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE task_intel ADD COLUMN IF NOT EXISTS source_id BIGINT;
+ALTER TABLE task_intel ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- 索引必须写在补列之后（存量库补列失败时索引引用的列可能尚不存在）。
+CREATE INDEX IF NOT EXISTS idx_tintel_match ON task_intel(kind, key);          -- 跨任务勾连：同 kind 同 key
+CREATE INDEX IF NOT EXISTS idx_tintel_task  ON task_intel(task_id);            -- 单任务情报表
+CREATE INDEX IF NOT EXISTS idx_tintel_proj  ON task_intel(project_id, created_at DESC); -- 增量水位/项目面板
+
+-- 跨任务勾连结果（V7-INTEL 第二层，本单只建表 + 读写函数）。规划者申请阅读者
+-- 勾连后，对每个候选任务给一条决策：adopted=保留（下钻相关）/ dismissed=舍弃 /
+-- candidate=待判。matched 存命中明细 [{kind,key,value}]，供复盘"为什么关联"。
+CREATE TABLE IF NOT EXISTS task_intel_links (
+    id              BIGSERIAL PRIMARY KEY,
+    project_id      BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_id         BIGINT NOT NULL,                       -- 发起方（规划中的任务）
+    related_task_id BIGINT NOT NULL,                       -- 被勾连的任务
+    decision        TEXT NOT NULL CHECK (decision IN ('adopted','dismissed','candidate')),
+    reason          TEXT NOT NULL DEFAULT '',
+    matched         JSONB NOT NULL DEFAULT '[]',           -- 命中明细 [{kind,key,value}]
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, related_task_id)
+);
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS matched JSONB NOT NULL DEFAULT '[]';
+CREATE INDEX IF NOT EXISTS idx_tintel_link_task ON task_intel_links(task_id, decision);

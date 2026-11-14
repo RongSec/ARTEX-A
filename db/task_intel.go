@@ -1,0 +1,599 @@
+package db
+
+// 任务情报表（V7-INTEL 第一层）：每个任务一份可直接比对的表（接口/凭据/
+// 组件/资产/漏洞）。本文件负责三件事：
+//
+//  1. 归一化纯函数（NormalizeEndpoint / NormalizeComponent / NormalizeCredential）
+//     ——跨任务能"比对"的前提是 key 稳定：数字/UUID 段折叠、版本截到
+//     major.minor、query 只留参数名、凭据键小写定长。全部无副作用，单测直断言。
+//  2. 落库/读取（UpsertTaskIntel / TaskIntelForTask / IntelSince）+ 跨任务勾连
+//     结果表读写（SaveTaskIntelLink / ListTaskIntelLinks，供下一单）。
+//  3. 抽取原料查询（TaskFindingsForIntel / TaskFactsForIntel）——抽取规则本身
+//     在 server/task_intel_build.go（依赖 server 的拼装，db 不 import server）。
+//
+// 信号复用 project_graph_events（InsertGraphEvent），不新增事件表：本包只提供
+// IntelDeltaSummary 纯函数拼摘要，写事件的动作由调用方（server）在 upsert 后做。
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+)
+
+// TaskIntel 是 task_intel 的一行（任务情报表的可比对单元）。
+type TaskIntel struct {
+	ID        int64           `json:"id"`
+	ProjectID int64           `json:"project_id"`
+	TaskID    int64           `json:"task_id"`
+	Kind      string          `json:"kind"`
+	Key       string          `json:"key"`
+	Value     string          `json:"value"`
+	Detail    json.RawMessage `json:"detail"`
+	Source    string          `json:"source"`
+	SourceID  *int64          `json:"source_id,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+}
+
+// 情报 kind 枚举（与 schema 的 CHECK 一致）。
+const (
+	IntelKindEndpoint   = "endpoint"
+	IntelKindCredential = "credential"
+	IntelKindComponent  = "component"
+	IntelKindAsset      = "asset"
+	IntelKindVuln       = "vuln"
+)
+
+// IntelKindLabel 是 kind 的中文短名（事件摘要"新增接口情报 3 条"用）。
+func IntelKindLabel(kind string) string {
+	switch kind {
+	case IntelKindEndpoint:
+		return "接口情报"
+	case IntelKindCredential:
+		return "凭据"
+	case IntelKindComponent:
+		return "组件"
+	case IntelKindAsset:
+		return "资产"
+	case IntelKindVuln:
+		return "漏洞"
+	}
+	return kind
+}
+
+// IntelDeltaSummary 纯函数：拼一条图变更摘要，形如
+// `task#12 新增接口情报 3 条 / 凭据 1 条`。顺序固定（接口/凭据/组件/资产/
+// 漏洞），只列数量 >0 的 kind；全 0 返回 ""（调用方跳过发事件）。
+func IntelDeltaSummary(taskID int64, byKind map[string]int) string {
+	order := []string{IntelKindEndpoint, IntelKindCredential, IntelKindComponent, IntelKindAsset, IntelKindVuln}
+	parts := make([]string, 0, len(order))
+	for _, k := range order {
+		if n := byKind[k]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d 条", IntelKindLabel(k), n))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("task#%d 新增%s", taskID, strings.Join(parts, " / "))
+}
+
+// ---------------------------------------------------------------------------
+// 归一化纯函数
+// ---------------------------------------------------------------------------
+
+// reNumeric / reUUID 复用 db/nkey.go 的同名包级变量（TemplatePath 也用它）；
+// 本层把 UUID 也折叠成 {id}（而非 {uuid}）：跨任务比对只要"这是一个实例 id"，
+// 不区分数字还是 UUID。
+var reVersionLead = regexp.MustCompile(`^[vV]?(\d+)(?:\.(\d+))?`)
+
+// NormalizeEndpoint 归一化一个接口：key = 小写 method + 路径（数字/UUID 段
+// 折叠为 {id}，query 只保留参数名并按名字排序去值），value = 原始 URL。
+//
+// 例：POST https://h/api/user/123/profile?id=1&x=2
+//
+//	→ key "post /api/user/{id}/profile?id&x"，value 原串。
+//
+// 空 URL 返回空 key（调用方跳过）。method 为空按 GET 计。路径大小写保持原样
+// （HTTP 路径大小写敏感），只有 method 小写。query 参数名排序是为了让
+// "?a=1&b=2" 与 "?b=2&a=1" 视为同一接口——比对要的是接口形状，不是取值顺序。
+func NormalizeEndpoint(method, rawurl string) (key, value string) {
+	raw := strings.TrimSpace(rawurl)
+	if raw == "" {
+		return "", ""
+	}
+	m := strings.ToLower(strings.TrimSpace(method))
+	target := raw
+	u, err := url.Parse(target)
+	if err != nil || (u.Scheme == "" && u.Host == "" && strings.Contains(target, " ")) {
+		// 整行请求行（"POST /api/x HTTP/1.1"）或非法串：取 method + 目标两段重解析。
+		fields := strings.Fields(target)
+		if len(fields) >= 2 && isHTTPMethod(fields[0]) {
+			if m == "" {
+				m = strings.ToLower(fields[0])
+			}
+			target = fields[1]
+			u, err = url.Parse(target)
+		}
+		if err != nil {
+			u = &url.URL{Path: target}
+			err = nil
+		}
+	}
+	if m == "" {
+		m = "get"
+	}
+	// "example.com/api/x"（省略 scheme）：补 http:// 才能解析出 Path。
+	if u.Scheme == "" && u.Host == "" && !strings.HasPrefix(target, "/") && !strings.HasPrefix(target, "?") {
+		if pu, perr := url.Parse("http://" + target); perr == nil {
+			u = pu
+		}
+	}
+	p := u.Path
+	if p == "" {
+		p = "/"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	p = foldIDPathSegments(p)
+	if q := queryParamNames(u.Query()); q != "" {
+		return m + " " + p + "?" + q, raw
+	}
+	return m + " " + p, raw
+}
+
+func isHTTPMethod(s string) bool {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT":
+		return true
+	}
+	return false
+}
+
+// foldIDPathSegments 把纯数字段与 UUID 段折叠成 {id}：
+// /api/user/123/profile → /api/user/{id}/profile。
+func foldIDPathSegments(p string) string {
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		if reNumeric.MatchString(s) || reUUID.MatchString(s) {
+			segs[i] = "{id}"
+		}
+	}
+	return strings.Join(segs, "/")
+}
+
+// queryParamNames 只取参数名（去值），排序去重后用 "&" 连接：
+// ?id=1&x=2 → "id&x"。
+func queryParamNames(v url.Values) string {
+	if len(v) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(v))
+	for k := range v {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return strings.Join(names, "&")
+}
+
+// NormalizeComponent 归一化一个组件指纹：key = product@major.minor（product
+// 小写去空格，版本截到前两段；无版本 → product@*），value = 人类可读原文。
+//
+// product 可带版本（"nginx/1.18.0" / "PHP:7.4.33" / "Apache 2.4.49"），
+// version 参数为空时从 product 里拆。空输入返回空 key。
+func NormalizeComponent(product, version string) (key, value string) {
+	nameRaw := strings.TrimSpace(product)
+	verRaw := strings.TrimSpace(version)
+	if nameRaw == "" && verRaw == "" {
+		return "", ""
+	}
+	if nameRaw == "" {
+		nameRaw, verRaw = verRaw, ""
+	}
+	origProduct := nameRaw
+	if verRaw == "" {
+		if i := strings.IndexAny(nameRaw, "/:"); i > 0 {
+			nameRaw, verRaw = nameRaw[:i], nameRaw[i+1:]
+		}
+	}
+	name := strings.ToLower(strings.Join(strings.Fields(nameRaw), ""))
+	if name == "" {
+		return "", ""
+	}
+	mm := "*"
+	if m := reVersionLead.FindStringSubmatch(strings.TrimSpace(verRaw)); m != nil {
+		mm = m[1]
+		if m[2] != "" {
+			mm += "." + m[2]
+		}
+	}
+	// value 用调用方原文：内嵌版本（"nginx/1.18.0"）不重复拼一次版本。
+	value = origProduct
+	if v := strings.TrimSpace(version); v != "" {
+		value = strings.TrimSpace(origProduct + " " + v)
+	}
+	return name + "@" + mm, value
+}
+
+// 凭据 kind 白名单（与 schema/README 口径一致）。
+var intelCredentialKinds = map[string]bool{
+	"password": true, "hash": true, "token": true, "cookie": true, "key": true,
+}
+
+// ValidIntelCredentialKind 报告 kind 是否属于凭据枚举。
+func ValidIntelCredentialKind(kind string) bool {
+	return intelCredentialKinds[strings.ToLower(strings.TrimSpace(kind))]
+}
+
+// NormalizeCredential 归一化一条凭据：key = kind|username|service（全小写；
+// username/service 为空用 "-"）。value 是人类可读的**脱敏描述**（如
+// "password for admin@10.0.0.5"），绝不承载明文——明文只允许以
+// detail.secret_masked（前 2 后 2）出现，由抽取侧负责。
+//
+// 空 kind / 非法 kind / username 与 service 同时为空 → 空 key（调用方跳过）：
+// 一条没有任何归属的凭据无法参与"同账号同服务"的比对。
+func NormalizeCredential(kind, username, service string) (key, value string) {
+	k := strings.ToLower(strings.TrimSpace(kind))
+	if !intelCredentialKinds[k] {
+		return "", ""
+	}
+	uRaw := strings.TrimSpace(username)
+	sRaw := strings.TrimSpace(service)
+	if uRaw == "" && sRaw == "" {
+		return "", ""
+	}
+	u := strings.ToLower(uRaw)
+	if u == "" {
+		u = "-"
+	}
+	s := strings.ToLower(sRaw)
+	if s == "" {
+		s = "-"
+	}
+	switch {
+	case uRaw != "" && sRaw != "":
+		value = k + " for " + uRaw + "@" + sRaw
+	case uRaw != "":
+		value = k + " for " + uRaw
+	default:
+		value = k + " for " + sRaw
+	}
+	return k + "|" + u + "|" + s, value
+}
+
+// ---------------------------------------------------------------------------
+// 落库 / 读取
+// ---------------------------------------------------------------------------
+
+const taskIntelCols = `id, project_id, task_id, kind, key, value, detail, source, source_id, created_at, updated_at`
+
+// UpsertIntelResult 是一次批量写入的统计（信号摘要只报**新增**行数：重复生成
+// 不产生新攻击面，不该反复唤醒 reader）。
+type UpsertIntelResult struct {
+	Total    int            `json:"total"`
+	Inserted int            `json:"inserted"`
+	Updated  int            `json:"updated"`
+	ByKind   map[string]int `json:"by_kind"` // kind → 本次新增条数
+}
+
+// UpsertTaskIntel 批量落一个任务的情报行，按 UNIQUE(project_id,task_id,kind,key)
+// 幂等 upsert（value/detail/source 覆盖为最新计算值，created_at 保留首见时刻）。
+// 整批一个事务：中途失败不留半份情报表。projectID<=0 或空 rows 为 no-op。
+func (d *DB) UpsertTaskIntel(ctx context.Context, projectID, taskID int64, rows []TaskIntel) (UpsertIntelResult, error) {
+	res := UpsertIntelResult{ByKind: map[string]int{}}
+	if projectID <= 0 || taskID <= 0 || len(rows) == 0 {
+		return res, nil
+	}
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return res, err
+	}
+	defer tx.Rollback() //nolint:errcheck // 提交成功后是 no-op
+	for _, r := range rows {
+		detail := r.Detail
+		if len(detail) == 0 || !json.Valid(detail) {
+			detail = json.RawMessage(`{}`)
+		}
+		src := strings.TrimSpace(r.Source)
+		if src == "" {
+			src = "manual"
+		}
+		var inserted bool
+		err := tx.QueryRowContext(ctx, `
+INSERT INTO task_intel(project_id, task_id, kind, key, value, detail, source, source_id)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+ON CONFLICT (project_id, task_id, kind, key) DO UPDATE
+SET value = EXCLUDED.value,
+    detail = EXCLUDED.detail,
+    source = EXCLUDED.source,
+    source_id = EXCLUDED.source_id,
+    updated_at = now()
+RETURNING (xmax = 0)`,
+			projectID, taskID, r.Kind, truncateRunes(utf8Clean(r.Key), 500),
+			truncateRunes(utf8Clean(r.Value), 2000), string(detail),
+			truncateRunes(src, 32), r.SourceID).Scan(&inserted)
+		if err != nil {
+			return UpsertIntelResult{ByKind: map[string]int{}}, err
+		}
+		res.Total++
+		if inserted {
+			res.Inserted++
+			res.ByKind[r.Kind]++
+		} else {
+			res.Updated++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return UpsertIntelResult{ByKind: map[string]int{}}, err
+	}
+	return res, nil
+}
+
+// TaskIntelForTask 返回某任务的全部情报行（kind 升序、key 升序，稳定可断言）。
+func (d *DB) TaskIntelForTask(ctx context.Context, taskID int64) ([]TaskIntel, error) {
+	rows, err := d.QueryContext(ctx, `SELECT `+taskIntelCols+`
+FROM task_intel WHERE task_id=$1 ORDER BY kind, key`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTaskIntelRows(rows)
+}
+
+// IntelSince 按 id 水位增量读某项目的情报行（reader 侧用；本单只提供查询，
+// 不接 reader）。返回 (rows, watermark)：watermark = 本批最大 id（无行时等于
+// afterID），调用方下次传回即可；单批上限 500 行，循环调用直到 rows 为空。
+func (d *DB) IntelSince(ctx context.Context, projectID, afterID int64) ([]TaskIntel, int64, error) {
+	if projectID <= 0 {
+		return nil, afterID, nil
+	}
+	rows, err := d.QueryContext(ctx, `SELECT `+taskIntelCols+`
+FROM task_intel WHERE project_id=$1 AND id>$2 ORDER BY id LIMIT 500`, projectID, afterID)
+	if err != nil {
+		return nil, afterID, err
+	}
+	defer rows.Close()
+	list, err := scanTaskIntelRows(rows)
+	if err != nil {
+		return nil, afterID, err
+	}
+	watermark := afterID
+	for _, r := range list {
+		if r.ID > watermark {
+			watermark = r.ID
+		}
+	}
+	return list, watermark, nil
+}
+
+func scanTaskIntelRows(rows *sql.Rows) ([]TaskIntel, error) {
+	var out []TaskIntel
+	for rows.Next() {
+		var r TaskIntel
+		var detail []byte
+		var sourceID sql.NullInt64
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.TaskID, &r.Kind, &r.Key, &r.Value,
+			&detail, &r.Source, &sourceID, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if len(detail) == 0 {
+			detail = []byte(`{}`)
+		}
+		r.Detail = json.RawMessage(detail)
+		if sourceID.Valid {
+			v := sourceID.Int64
+			r.SourceID = &v
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// 跨任务勾连结果（下一单的读写面；本单只落表 + 函数）
+// ---------------------------------------------------------------------------
+
+// TaskIntelLink 是 task_intel_links 的一行：发起方任务对某个候选任务给出
+// 保留/舍弃决策，以及命中的情报明细。
+type TaskIntelLink struct {
+	ID            int64           `json:"id"`
+	ProjectID     int64           `json:"project_id"`
+	TaskID        int64           `json:"task_id"`
+	RelatedTaskID int64           `json:"related_task_id"`
+	Decision      string          `json:"decision"`
+	Reason        string          `json:"reason"`
+	Matched       json.RawMessage `json:"matched"`
+	CreatedAt     time.Time       `json:"created_at"`
+}
+
+// ValidIntelLinkDecision 报告决策是否属于 adopted|dismissed|candidate。
+func ValidIntelLinkDecision(d string) bool {
+	switch d {
+	case "adopted", "dismissed", "candidate":
+		return true
+	}
+	return false
+}
+
+// SaveTaskIntelLink 幂等写一条勾连决策（同 task_id+related_task_id 覆盖决策/
+// 理由/命中明细），返回行 id。
+func (d *DB) SaveTaskIntelLink(ctx context.Context, l TaskIntelLink) (int64, error) {
+	if l.ProjectID <= 0 || l.TaskID <= 0 || l.RelatedTaskID <= 0 {
+		return 0, fmt.Errorf("intel link: project/task/related task id required")
+	}
+	if !ValidIntelLinkDecision(l.Decision) {
+		return 0, fmt.Errorf("intel link: invalid decision %q", l.Decision)
+	}
+	matched := l.Matched
+	if len(matched) == 0 || !json.Valid(matched) {
+		matched = json.RawMessage(`[]`)
+	}
+	var id int64
+	err := d.QueryRowContext(ctx, `
+INSERT INTO task_intel_links(project_id, task_id, related_task_id, decision, reason, matched)
+VALUES ($1,$2,$3,$4,$5,$6)
+ON CONFLICT (task_id, related_task_id) DO UPDATE
+SET decision = EXCLUDED.decision,
+    reason = EXCLUDED.reason,
+    matched = EXCLUDED.matched
+RETURNING id`,
+		l.ProjectID, l.TaskID, l.RelatedTaskID, l.Decision,
+		truncateRunes(utf8Clean(l.Reason), 1000), string(matched)).Scan(&id)
+	return id, err
+}
+
+// ListTaskIntelLinks 返回某发起方任务的全部勾连决策（新在前）。
+func (d *DB) ListTaskIntelLinks(ctx context.Context, taskID int64) ([]TaskIntelLink, error) {
+	rows, err := d.QueryContext(ctx, `
+SELECT id, project_id, task_id, related_task_id, decision, reason, matched, created_at
+FROM task_intel_links WHERE task_id=$1 ORDER BY id DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TaskIntelLink
+	for rows.Next() {
+		var l TaskIntelLink
+		var matched []byte
+		if err := rows.Scan(&l.ID, &l.ProjectID, &l.TaskID, &l.RelatedTaskID,
+			&l.Decision, &l.Reason, &matched, &l.CreatedAt); err != nil {
+			return nil, err
+		}
+		if len(matched) == 0 {
+			matched = []byte(`[]`)
+		}
+		l.Matched = json.RawMessage(matched)
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// 抽取原料
+// ---------------------------------------------------------------------------
+
+// IntelFinding 是抽取用的 finding 最小投影（列表/详情字段混在一起太胖，
+// 情报表只要标题/严重度/正文/证据/关联资产）。
+type IntelFinding struct {
+	ID        int64
+	Name      string
+	VulnClass string
+	Severity  string
+	Summary   string
+	Evidence  string
+	AssetIDs  []int64
+}
+
+// TaskFindingsForIntel 取某任务的全部 findings（id 升序，保证重复生成稳定）。
+func (d *DB) TaskFindingsForIntel(ctx context.Context, taskID int64) ([]IntelFinding, error) {
+	rows, err := d.QueryContext(ctx, `
+SELECT id, COALESCE(name,''), COALESCE(vulnclass,''), COALESCE(severity,''),
+       COALESCE(summary,''), COALESCE(evidence,''), COALESCE(asset_ids, '{}')
+FROM findings WHERE task_id=$1 ORDER BY id`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []IntelFinding
+	for rows.Next() {
+		var f IntelFinding
+		var aids string
+		if err := rows.Scan(&f.ID, &f.Name, &f.VulnClass, &f.Severity, &f.Summary, &f.Evidence, &aids); err != nil {
+			return nil, err
+		}
+		f.AssetIDs = parsePGIntArray(aids)
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// IntelFact 是抽取用的 fact 投影。
+type IntelFact struct {
+	NodeID   int64
+	Summary  string
+	Detail   string
+	Evidence string
+}
+
+// TaskFactsForIntel 取某任务的 fact 节点（kind='fact'，排除已否决/已删的
+// dismissed/deleted 节点——被人工否掉的结论不该进情报面）。id 升序稳定。
+func (d *DB) TaskFactsForIntel(ctx context.Context, taskID int64) ([]IntelFact, error) {
+	rows, err := d.QueryContext(ctx, `
+SELECT en.id, en.payload
+FROM exploration_nodes en
+JOIN tasks t ON t.exploration_id = en.exploration_id
+WHERE t.id=$1 AND en.kind='fact' AND COALESCE(en.state,'') NOT IN ('dismissed','deleted')
+ORDER BY en.id`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []IntelFact
+	for rows.Next() {
+		var id int64
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
+		}
+		var m map[string]any
+		_ = json.Unmarshal(raw, &m)
+		out = append(out, IntelFact{
+			NodeID:   id,
+			Summary:  payloadText(m, "summary"),
+			Detail:   payloadText(m, "detail", "description"),
+			Evidence: payloadText(m, "evidence"),
+		})
+	}
+	return out, rows.Err()
+}
+
+// payloadText 取 payload 里第一个非空字符串字段（字段值也可能是对象/数组，
+// 统一 marshal 成文本，抽取侧只做正则扫描，不依赖结构）。
+func payloadText(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		v, ok := m[k]
+		if !ok || v == nil {
+			continue
+		}
+		switch s := v.(type) {
+		case string:
+			if strings.TrimSpace(s) != "" {
+				return s
+			}
+		default:
+			if b, err := json.Marshal(v); err == nil && len(b) > 2 {
+				return string(b)
+			}
+		}
+	}
+	return ""
+}
+
+// parsePGIntArray 解析 `{1,2,3}` 形式的 BIGINT[] 文本（NULL 元素跳过）。
+func parsePGIntArray(s string) []int64 {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "{")
+	s = strings.TrimSuffix(s, "}")
+	if s == "" {
+		return nil
+	}
+	var out []int64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" || part == "NULL" {
+			continue
+		}
+		var n int64
+		if _, err := fmt.Sscan(part, &n); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
