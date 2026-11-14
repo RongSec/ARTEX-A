@@ -140,7 +140,11 @@ func intelSurfaceKeys(surface string) []db.IntelKeyRef {
 	// 5) 产品 + 版本 → component。先走已知产品表（含 "nginx 1.18.0" 这种
 	// 空格分隔），再走 Product/1.2.3 token。
 	for _, m := range reIntelProductVer.FindAllStringSubmatch(text, -1) {
-		if k, _ := db.NormalizeComponent(m[1], m[2]); k != "" {
+		prod := m[1]
+		if c, ok := intelCanonicalProduct(prod); ok {
+			prod = c
+		}
+		if k, _ := db.NormalizeComponent(prod, m[2]); k != "" {
 			add(db.IntelKindComponent, k)
 		}
 	}

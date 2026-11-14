@@ -83,15 +83,16 @@ func (s *Server) taskIntelList(w http.ResponseWriter, r *http.Request) {
 }
 
 // taskIntelRebuild POST /api/tasks/{id}/intel/rebuild —— 同步重建。终态钩子
-// 是异步尽力而为，这里是可重试的确定性入口（幂等：重复调用行数不变，只有
-// 真新增才发图变更信号）。
+// 是异步尽力而为，这里是可重试的确定性入口：先删本任务由抽取生成的旧行再重建
+// （source=manual 保留），因此历史上抽错的噪声行会在这里被清掉；重复调用行数
+// 与 key 集合一致（幂等），只有相对旧表真正新增的 key 才发图变更信号。
 func (s *Server) taskIntelRebuild(w http.ResponseWriter, r *http.Request) {
 	taskID, ok := pathInt(r, "id")
 	if !ok || taskID <= 0 {
 		writeErr(w, 400, "任务 id 无效")
 		return
 	}
-	st, err := s.buildTaskIntel(r.Context(), taskID)
+	st, err := s.rebuildTaskIntel(r.Context(), taskID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

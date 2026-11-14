@@ -355,6 +355,243 @@ func TestTaskIntelListAPIGrouped(t *testing.T) {
 	}
 }
 
+// TestExtractTaskIntelNoiseSuppressed 覆盖线上实测的噪声样例行：修复后逐条不产出。
+// 每行都是独立来源文本，断言对应 key 不存在，并对凭据做"用户名/服务"二次校验。
+func TestExtractTaskIntelNoiseSuppressed(t *testing.T) {
+	cases := []struct {
+		name      string
+		text      string
+		kind      string
+		forbidden string
+	}{
+		{
+			name: "endpoint 整句被当 URL（中文逗号混进路径）",
+			text: "GET //127.0.0.1:9081，Apache/2.4.25 HTTP/1.1\nServer: Apache/2.4.25 (Debian)",
+			kind: pgdb.IntelKindEndpoint, forbidden: "get //127.0.0.1:9081，Apache/2.4.25",
+		},
+		{
+			name: "component 把 MariaDB 版本套到 PHP 上",
+			text: "PHP Version: 10.1.26\nMariaDB 10.1.26",
+			kind: pgdb.IntelKindComponent, forbidden: "php@10.1",
+		},
+		{
+			name: "component 状态码 200 当版本",
+			text: "php 200",
+			kind: pgdb.IntelKindComponent, forbidden: "php@200",
+		},
+		{
+			name: "credential 页面词 surname 当用户名",
+			text: "Surname: Smith\npassword=secret123\nHost: 127.0.0.1:9081",
+			kind: pgdb.IntelKindCredential, forbidden: "password|surname|127.0.0.1:9081",
+		},
+		{
+			name: "credential 页面词 name 当用户名",
+			text: "name: John\npassword=secret123\nHost: 127.0.0.1:9081",
+			kind: pgdb.IntelKindCredential, forbidden: "password|name|127.0.0.1:9081",
+		},
+		{
+			name: "credential 页面词 currently 当用户名",
+			text: "currently: active\npassword=secret123\nHost: 127.0.0.1:9081",
+			kind: pgdb.IntelKindCredential, forbidden: "password|currently|127.0.0.1:9081",
+		},
+		{
+			name: "credential 用户名 level + service 是路径",
+			text: "Level: low\nhttp://127.0.0.1:9081/login.php\npassword=secret123",
+			kind: pgdb.IntelKindCredential, forbidden: "password|level|login.php",
+		},
+		{
+			name: "credential 用户名 phpids + service 是路径",
+			text: "PHPIDS: enabled\nhttp://127.0.0.1:9081/login.php\npassword=secret123",
+			kind: pgdb.IntelKindCredential, forbidden: "password|phpids|login.php",
+		},
+		{
+			name: "credential cookie 的 service 是路径",
+			text: "Cookie: PHPSESSID=abc123def456\nadmin\nhttp://127.0.0.1:9081/login.php",
+			kind: pgdb.IntelKindCredential, forbidden: "cookie|admin|login.php",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rows := extractTaskIntel(intelBuildInput{TaskID: 1, Findings: []pgdb.IntelFinding{{
+				ID: 1, Evidence: c.text,
+			}}})
+			if r := findIntel(rows, c.kind, c.forbidden); r != nil {
+				t.Fatalf("噪声行未被抑制: %+v；同类现有=%v", *r, keysOf(rows, c.kind))
+			}
+			switch c.kind {
+			case pgdb.IntelKindEndpoint:
+				if got := endpointKeys(rows); len(got) != 0 {
+					t.Fatalf("含中文标点的残句不得产出 endpoint，现有=%v", got)
+				}
+			case pgdb.IntelKindComponent:
+				// 错配样例里 mariadb 应照常保留，但 php 的那条必须消失（已被上面断言覆盖）。
+				if c.forbidden == "php@200" && len(componentKeys(rows)) != 0 {
+					t.Fatalf("单段状态码不得产出任何 component，现有=%v", componentKeys(rows))
+				}
+			case pgdb.IntelKindCredential:
+				for _, r := range rows {
+					if r.Kind != pgdb.IntelKindCredential {
+						continue
+					}
+					parts := strings.Split(r.Key, "|")
+					if len(parts) == 3 && intelUsernameStopwords[parts[1]] {
+						t.Fatalf("停用词 %q 不得作凭据用户名: %s", parts[1], r.Key)
+					}
+					if strings.HasSuffix(r.Key, "|login.php") {
+						t.Fatalf("凭据 service 不得是路径: %s", r.Key)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestExtractTaskIntelStrictPositive 是收紧口径后的正例：请求行 + 绝对 URL 各 1 条
+// endpoint，三个紧邻组件（apache/php/mariadb），一条凭据（admin@127.0.0.1:9081）。
+func TestExtractTaskIntelStrictPositive(t *testing.T) {
+	text := strings.Join([]string{
+		"POST /dvwa/vulnerabilities/exec/ HTTP/1.1",
+		"http://127.0.0.1:9081/login.php?username=admin&password=password",
+		"Server: Apache/2.4.25 (Debian)",
+		"X-Powered-By: PHP/7.0.30",
+		"MariaDB 10.1.26",
+	}, "\n")
+	rows := extractTaskIntel(intelBuildInput{TaskID: 7, Findings: []pgdb.IntelFinding{{
+		ID: 3, Evidence: text,
+	}}})
+
+	eps := endpointKeys(rows)
+	if len(eps) != 2 {
+		t.Fatalf("endpoint rows=%d, want 2: %v", len(eps), eps)
+	}
+	if findIntel(rows, pgdb.IntelKindEndpoint, "post /dvwa/vulnerabilities/exec/") == nil {
+		t.Errorf("missing request-line endpoint: %v", eps)
+	}
+	if findIntel(rows, pgdb.IntelKindEndpoint, "get /login.php?password&username") == nil {
+		t.Errorf("missing absolute-URL endpoint: %v", eps)
+	}
+
+	comps := componentKeys(rows)
+	if len(comps) != 3 {
+		t.Fatalf("component rows=%d, want 3: %v", len(comps), comps)
+	}
+	for _, k := range []string{"apache@2.4", "php@7.0", "mariadb@10.1"} {
+		if findIntel(rows, pgdb.IntelKindComponent, k) == nil {
+			t.Errorf("missing component %q: %v", k, comps)
+		}
+	}
+	if findIntel(rows, pgdb.IntelKindComponent, "php@10.1") != nil {
+		t.Errorf("PHP 不得继承 MariaDB 的版本: %v", comps)
+	}
+
+	creds := credentialKeys(rows)
+	if len(creds) != 1 || creds[0] != "password|admin|127.0.0.1:9081" {
+		t.Fatalf("credentials=%v, want [password|admin|127.0.0.1:9081]", creds)
+	}
+	if c := findIntel(rows, pgdb.IntelKindCredential, creds[0]); c.Value != "password for admin@127.0.0.1:9081" {
+		t.Errorf("credential value=%q", c.Value)
+	}
+}
+
+// TestTaskIntelRebuildReplacesGeneratedPG 用真实 PG 验证 rebuild 语义：删除本任务
+// 由抽取生成的旧行（噪声行消失）、source=manual 保留、链接表不动、两次 rebuild
+// 行数与 key 集合一致。
+func TestTaskIntelRebuildReplacesGeneratedPG(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer m.Close()
+	pg := m.PG()
+	ctx := context.Background()
+
+	p, err := pg.CreateProject(pgdb.CreateProjectInput{Name: "intel-rebuild-" + strconv.FormatInt(time.Now().UnixNano(), 10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pg.Exec(`DELETE FROM projects WHERE id=$1`, p.ID) })
+	task, err := pg.CreateTaskWithOptions("intel rebuild task", "goal", pgdb.TaskCreateOptions{ProjectID: &p.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pg.AddFinding(task.ID, 0, "sqli", "SQL Injection on /login", "high",
+		"evidence", "POST /login HTTP/1.1\r\nHost: app.example.com\r\npassword=Sup3rSecret! user=admin at 10.0.0.5",
+		"worker", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	const noiseKey = "get //127.0.0.1:9081，Apache/2.4.25"
+	if _, err := pg.UpsertTaskIntel(ctx, p.ID, task.ID, []pgdb.TaskIntel{
+		{Kind: pgdb.IntelKindEndpoint, Key: noiseKey, Value: "//127.0.0.1:9081，Apache/2.4.25", Source: "finding"},
+		{Kind: pgdb.IntelKindEndpoint, Key: "get /manual", Value: "manual note", Source: "manual"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	linkID, err := pg.SaveTaskIntelLink(ctx, pgdb.TaskIntelLink{
+		ProjectID: p.ID, TaskID: task.ID, RelatedTaskID: task.ID + 1, Decision: "candidate",
+		Reason: "matched noise before rebuild", Matched: json.RawMessage(`[{"kind":"endpoint","key":"` + noiseKey + `"}]`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{m: m}
+	if _, err := s.rebuildTaskIntel(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := pg.TaskIntelForTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findIntel(rows, pgdb.IntelKindEndpoint, noiseKey) != nil {
+		t.Fatalf("rebuild 后噪声行仍在: %v", endpointKeys(rows))
+	}
+	manual := findIntel(rows, pgdb.IntelKindEndpoint, "get /manual")
+	if manual == nil || manual.Source != "manual" {
+		t.Fatalf("source=manual 的行必须保留: %+v", manual)
+	}
+	if findIntel(rows, pgdb.IntelKindEndpoint, "post /login") == nil {
+		t.Errorf("rebuild 未生成 endpoint: %v", endpointKeys(rows))
+	}
+	if findIntel(rows, pgdb.IntelKindCredential, "password|admin|app.example.com") == nil {
+		t.Errorf("rebuild 未生成 credential: %v", credentialKeys(rows))
+	}
+
+	// 链接保留、matched 原样（不级联删、不改写历史决策）。
+	links, err := pg.ListTaskIntelLinks(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 1 || links[0].ID != linkID || !strings.Contains(string(links[0].Matched), noiseKey) {
+		t.Fatalf("rebuild 不得改动 task_intel_links: %+v", links)
+	}
+
+	n1, keys1 := len(rows), allIntelKeys(rows)
+	if _, err := s.rebuildTaskIntel(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	rows2, err := pg.TaskIntelForTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2, keys2 := len(rows2), allIntelKeys(rows2)
+	if n1 != n2 {
+		t.Fatalf("两次 rebuild 行数不一致: %d != %d", n1, n2)
+	}
+	if strings.Join(keys1, "\n") != strings.Join(keys2, "\n") {
+		t.Fatalf("两次 rebuild key 集合不一致:\n%v\n%v", keys1, keys2)
+	}
+}
+
+// allIntelKeys 返回 "kind key" 的稳定列表（rows 已按 kind,key 排序）。
+func allIntelKeys(rows []pgdb.TaskIntel) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Kind+" "+r.Key)
+	}
+	return out
+}
+
 func endpointKeys(rows []pgdb.TaskIntel) []string   { return keysOf(rows, pgdb.IntelKindEndpoint) }
 func credentialKeys(rows []pgdb.TaskIntel) []string { return keysOf(rows, pgdb.IntelKindCredential) }
 func componentKeys(rows []pgdb.TaskIntel) []string  { return keysOf(rows, pgdb.IntelKindComponent) }

@@ -287,8 +287,23 @@ type UpsertIntelResult struct {
 // 幂等 upsert（value/detail/source 覆盖为最新计算值，created_at 保留首见时刻）。
 // 整批一个事务：中途失败不留半份情报表。projectID<=0 或空 rows 为 no-op。
 func (d *DB) UpsertTaskIntel(ctx context.Context, projectID, taskID int64, rows []TaskIntel) (UpsertIntelResult, error) {
+	return d.upsertTaskIntel(ctx, projectID, taskID, rows, false)
+}
+
+// ReplaceTaskIntel 与 UpsertTaskIntel 相同，但在同一事务里先删除本任务由抽取
+// 生成的行（source=finding/fact/asset），再写入新行——rebuild 用它把历史上抽错
+// 的噪声行清掉。source=manual 的行保留；task_intel_links.matched 里的 key 不做
+// 级联清理（链接是历史决策，保留原样）。
+func (d *DB) ReplaceTaskIntel(ctx context.Context, projectID, taskID int64, rows []TaskIntel) (UpsertIntelResult, error) {
+	return d.upsertTaskIntel(ctx, projectID, taskID, rows, true)
+}
+
+func (d *DB) upsertTaskIntel(ctx context.Context, projectID, taskID int64, rows []TaskIntel, replace bool) (UpsertIntelResult, error) {
 	res := UpsertIntelResult{ByKind: map[string]int{}}
-	if projectID <= 0 || taskID <= 0 || len(rows) == 0 {
+	if projectID <= 0 || taskID <= 0 {
+		return res, nil
+	}
+	if len(rows) == 0 && !replace {
 		return res, nil
 	}
 	tx, err := d.BeginTx(ctx, nil)
@@ -296,6 +311,12 @@ func (d *DB) UpsertTaskIntel(ctx context.Context, projectID, taskID int64, rows 
 		return res, err
 	}
 	defer tx.Rollback() //nolint:errcheck // 提交成功后是 no-op
+	if replace {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM task_intel
+WHERE task_id=$1 AND project_id=$2 AND source IN ('finding','fact','asset')`, taskID, projectID); err != nil {
+			return UpsertIntelResult{ByKind: map[string]int{}}, err
+		}
+	}
 	for _, r := range rows {
 		detail := r.Detail
 		if len(detail) == 0 || !json.Valid(detail) {

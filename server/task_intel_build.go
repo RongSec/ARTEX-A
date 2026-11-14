@@ -87,6 +87,17 @@ func (s *Server) onTaskTerminalBuildIntel(taskID int64, status string) {
 // buildTaskIntel 读任务 → 抽取 → upsert → 有新增则发图变更信号。幂等：同一
 // 任务重复调用行数不变（UNIQUE + upsert 覆盖），重复调用不重复发信号。
 func (s *Server) buildTaskIntel(ctx context.Context, taskID int64) (intelBuildStats, error) {
+	return s.buildTaskIntelMode(ctx, taskID, false)
+}
+
+// rebuildTaskIntel 是 rebuild 接口的实现：先删掉本任务由抽取生成的旧行
+// （source=finding/fact/asset），再按当前原料整表重建；source=manual 的行
+// 原样保留。这样历史上抽错的噪声行不会继续留在比对面（删除+写入同一事务）。
+func (s *Server) rebuildTaskIntel(ctx context.Context, taskID int64) (intelBuildStats, error) {
+	return s.buildTaskIntelMode(ctx, taskID, true)
+}
+
+func (s *Server) buildTaskIntelMode(ctx context.Context, taskID int64, replace bool) (intelBuildStats, error) {
 	st := intelBuildStats{TaskID: taskID, ByKind: map[string]int{}}
 	pg := s.m.pg
 	t, err := pg.GetTask(taskID)
@@ -119,14 +130,42 @@ func (s *Server) buildTaskIntel(ctx context.Context, taskID int64) (intelBuildSt
 
 	rows := extractTaskIntel(intelBuildInput{TaskID: taskID, Findings: findings, Facts: facts, Assets: assets})
 	st.Rows = len(rows)
-	res, err := pg.UpsertTaskIntel(ctx, pid, taskID, rows)
+
+	// 重建前记下已有 key：删除后重新插入的"老行"不算新增攻击面，不发信号。
+	var before map[string]bool
+	if replace {
+		old, err := pg.TaskIntelForTask(ctx, taskID)
+		if err != nil {
+			return st, fmt.Errorf("读旧情报表: %w", err)
+		}
+		before = make(map[string]bool, len(old))
+		for _, r := range old {
+			before[r.Kind+"\x00"+r.Key] = true
+		}
+	}
+
+	var res db.UpsertIntelResult
+	if replace {
+		res, err = pg.ReplaceTaskIntel(ctx, pid, taskID, rows)
+	} else {
+		res, err = pg.UpsertTaskIntel(ctx, pid, taskID, rows)
+	}
 	if err != nil {
 		return st, fmt.Errorf("写情报表: %w", err)
 	}
 	st.Inserted, st.Updated, st.ByKind = res.Inserted, res.Updated, res.ByKind
 
+	delta := res.ByKind
+	if replace {
+		delta = map[string]int{}
+		for _, r := range rows {
+			if !before[r.Kind+"\x00"+r.Key] {
+				delta[r.Kind]++
+			}
+		}
+	}
 	// 信号：只报「新增」——重复生成没有新攻击面，不该反复唤醒 reader。
-	if summary := db.IntelDeltaSummary(taskID, res.ByKind); summary != "" {
+	if summary := db.IntelDeltaSummary(taskID, delta); summary != "" {
 		if err := pg.InsertGraphEvent(ctx, pid, taskID, 0, "intel", summary); err != nil {
 			log.Printf("[task-intel] task %d 图变更事件写入失败: %v", taskID, err)
 		}
@@ -138,28 +177,59 @@ func (s *Server) buildTaskIntel(ctx context.Context, taskID int64) (intelBuildSt
 // 抽取（纯函数，无库）
 // ---------------------------------------------------------------------------
 
+// intelProductAlternation 是受控产品表的正则选择支（长名在前，避免前缀抢先）。
+// 只有这张表里的产品才会进 component：自由文本里的 "HTTP"/"OK" 这类泛词不入表，
+// 也就不可能变成一条"组件"。
+const intelProductAlternation = `apache|httpd|nginx|php|tomcat|redis|mariadb|postgresql|postgres|pgsql|mysql|docker|jenkins|dvwa|openssh|openssl|iis|expressjs|express|jquery|bootstrap|spring[ \t]+boot|spring`
+
+// intelProductAliases 把同一产品的别名归一到 canonical 名（apache/httpd 同族、
+// apache tomcat 归 tomcat）：跨任务比对要的是"同一个产品"，不是同一个写法。
+var intelProductAliases = map[string]string{
+	"apache": "apache", "apache httpd": "apache", "apache http server": "apache", "httpd": "apache",
+	"apache tomcat": "tomcat", "tomcat": "tomcat",
+	"nginx": "nginx", "php": "php", "redis": "redis",
+	"mysql": "mysql", "mariadb": "mariadb",
+	"postgresql": "postgresql", "postgres": "postgresql", "pgsql": "postgresql",
+	"docker": "docker", "jenkins": "jenkins", "dvwa": "dvwa",
+	"openssh": "openssh", "open ssh": "openssh", "openssl": "openssl",
+	"iis": "iis", "microsoft-iis": "iis", "microsoft iis": "iis",
+	"express": "express", "expressjs": "express", "express.js": "express",
+	"jquery": "jquery", "bootstrap": "bootstrap",
+	"spring": "spring", "spring boot": "spring", "springboot": "spring",
+}
+
 var (
-	// 请求行：GET /api/x HTTP/1.1
-	reIntelReqLine = regexp.MustCompile(`(?im)^[ \t]*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE)\s+(\S+)`)
-	// 裸绝对 URL（正文/证据里散落的接口地址）。
-	reIntelAbsURL = regexp.MustCompile(`(?i)https?://[^\s"'<>\)\]\}]+`)
+	// 请求行：GET /api/x HTTP/1.1。单独识别——目标只做"路径/绝对 URL"校验，
+	// 绝不把整行（或带中文标点的残句）丢给 URL 解析。
+	reIntelReqLine = regexp.MustCompile(`(?im)^[ \t]*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)[ \t]+(\S+)`)
+	// 裸绝对 URL：必须以 http(s):// 开头；遇到空白/引号/括号/中文标点即结束。
+	reIntelAbsURL = regexp.MustCompile("(?i)https?://[^\\s\"'<>()\\[\\]{}`，。；、！？（）【】《》「」]+")
 	// 响应头。
 	reIntelServerHdr = regexp.MustCompile(`(?im)^[ \t]*server[ \t]*:[ \t]*([^\r\n]+)`)
 	reIntelPoweredBy = regexp.MustCompile(`(?im)^[ \t]*x-powered-by[ \t]*:[ \t]*([^\r\n]+)`)
-	// 常见产品 + 版本（自由文本里要求带版本，避免 "mysql -u root" 之类噪音）。
-	reIntelProductVer = regexp.MustCompile(`(?i)\b(apache(?:\s+httpd)?|nginx|php|tomcat|redis|mysql|docker|jenkins|dvwa|iis|openssh|wordpress|spring(?:boot)?|jquery|vue\.js|react)\b[^\r\n]{0,12}?\bv?(\d+(?:\.\d+){0,3})\b`)
-	// 已知产品（无版本也收，仅用于资产 technologies 这种显式指纹列表）。
-	reIntelKnownProduct = regexp.MustCompile(`(?i)^\s*(apache(?:\s+httpd)?|nginx|php|tomcat|redis|mysql|docker|jenkins|dvwa|iis|openssh|wordpress)\s*$`)
+	// 受控产品名 + 版本：产品名与版本之间只允许 ≤3 个分隔字符（紧邻判据），
+	// 版本至少两段（"php 200" 这种状态码不成立）。
+	reIntelProductVer = regexp.MustCompile(`(?i)\b(` + intelProductAlternation + `)\b[ \t/:]{0,3}[vV]?(\d+(?:\.\d+){1,3})\b`)
 	// 产品名/版本拆分：nginx/1.18.0、PHP:7.4.33、Apache Tomcat 9.0.65。
 	reIntelProdWithVer = regexp.MustCompile(`^\s*([A-Za-z][A-Za-z0-9 ._+\-]*?)\s*(?:[/:]|\s)\s*[vV]?(\d[\w.\-]*)\s*$`)
 	reIntelProdOnly    = regexp.MustCompile(`^\s*([A-Za-z][A-Za-z0-9 ._+\-]*)\s*$`)
 	reIntelHdrProdVer  = regexp.MustCompile(`^\s*([A-Za-z][A-Za-z0-9._+\-]*)\s*[/ ]\s*[vV]?(\d[\w.\-]*)`)
 
-	// 凭据模式（顺序即优先级）。
+	// 版本合格线：至少 major.minor 两段，杜绝 "200"/"404" 被当版本。
+	reIntelVersionOK = regexp.MustCompile(`^[vV]?\d+(?:\.\d+){1,3}\b`)
+	// 用户名形态（2-32 位账号字符）。
+	reIntelUsername = regexp.MustCompile(`^[A-Za-z0-9_.@$-]{2,32}$`)
+	// 域名/IP 形态（服务归属必须是 host 或 host:port，路径不算）。
+	reIntelIPv4   = regexp.MustCompile(`^(?:\d{1,3}\.){3}\d{1,3}$`)
+	reIntelDomain = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$`)
+	// 文件名式伪域名后缀：login.php / index.html 是路径，不是服务。
+	reIntelFileTLD = regexp.MustCompile(`(?i)\.(php\d?|phtml|html?|shtml|asp|aspx|jsp|do|action|js|mjs|css|json|xml|txt|md|png|jpe?g|gif|svg|ico|pdf|zip|tar|gz|bz2|rar|exe|dll|sh|bash|py|pl|rb|log|bak|sql|ya?ml|ini|conf|env)$`)
+
+	// 凭据模式（顺序即优先级；只认显式结构）。
 	reIntelPwdAssign = regexp.MustCompile(`(?i)(?:password|passwd|pwd)\s*[=:]\s*["']?([^\s"'&;,\r\n]+)`)
-	reIntelUserHint  = regexp.MustCompile(`(?i)(?:user(?:name)?|login|account|账号|用户名)\s*[=:]\s*["']?([^\s"'&;,\r\n]+)`)
+	reIntelUserHint  = regexp.MustCompile(`(?i)(?:user(?:name)?|account|账号|用户名)\s*[=:]\s*["']?([^\s"'&;,\r\n]+)`)
 	reIntelCommonUsr = regexp.MustCompile(`(?i)\b(root|admin|administrator|sa|guest|test|operator)\b`)
-	reIntelUserPass  = regexp.MustCompile(`(?:^|[\s"'\[(,])([A-Za-z][A-Za-z0-9._-]{1,31})\s*:\s*([^\s"'/:<>]{3,64})(?:$|[\s"'\]),;])`)
+	reIntelUserPass  = regexp.MustCompile(`(?:^|[\s"'\[(,])([A-Za-z0-9_.@$-]{2,32})\s*:\s*([^\s"'/:<>]{3,64})(?:$|[\s"'\]),;])`)
 	reIntelBearer    = regexp.MustCompile(`(?i)authorization\s*:\s*bearer\s+([A-Za-z0-9\-._~+/=]{8,})`)
 	reIntelCookie    = regexp.MustCompile(`(?i)cookie\s*:\s*([^\r\n]{6,300})`)
 	reIntelHash      = regexp.MustCompile(`\b([0-9a-fA-F]{32}|[0-9a-fA-F]{40})\b`)
@@ -169,6 +239,18 @@ var (
 	// 主机（IPv4 或域名，可带端口）。
 	reIntelHost = regexp.MustCompile(`(?i)\b((?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,})(?::(\d{1,5}))?\b`)
 )
+
+// intelUsernameStopwords 是"字段名/页面词"而不是账号：它们会以 `xxx: value`
+// 的形态出现在证据里，落成凭据就是纯噪声。admin 不在此列（那是真账号）。
+var intelUsernameStopwords = map[string]bool{
+	"name": true, "username": true, "user": true, "password": true, "passwd": true,
+	"pwd": true, "level": true, "currently": true, "surname": true, "phpids": true,
+	"login": true, "submit": true, "security": true, "low": true, "high": true,
+	"medium": true, "impossible": true, "account": true,
+}
+
+// intelURLTrailing 是 URL 结束处允许出现的尾随标点（抽取时剥掉）。
+const intelURLTrailing = " \t\r\n\"'<>()[]{}，。；、,.;:!?！？）】》」』"
 
 // intelUserPassNoise 是 user:pass 模式的假阳性黑名单：报文头名、URL scheme
 // 与日期词。真实证据里到处都是 "Host: x" / "Date: Mon, 01 Jan…"，不加这层
@@ -221,6 +303,8 @@ func newIntelAcc() *intelAcc {
 	return &intelAcc{byKey: map[string]*intelEntry{}}
 }
 
+// get 取/建一行聚合。同 key 合并时**不改已有 value**（value 语义只由首条决定），
+// 但 count 与来源 id 在调用方逐条累加——合并行必须能反查到全部来源。
 func (a *intelAcc) get(kind, key, value, source string, sourceID int64) *intelEntry {
 	if key == "" {
 		return nil
@@ -229,6 +313,16 @@ func (a *intelAcc) get(kind, key, value, source string, sourceID int64) *intelEn
 	if e, ok := a.byKey[id]; ok {
 		if e.value == "" && value != "" {
 			e.value = value
+		}
+		if sourceID > 0 {
+			switch source {
+			case "finding":
+				e.findingIDs[sourceID] = true
+			case "asset":
+				e.assetIDs[sourceID] = true
+			case "fact":
+				e.factIDs[sourceID] = true
+			}
 		}
 		return e
 	}
@@ -384,29 +478,58 @@ func extractTaskIntel(in intelBuildInput) []db.TaskIntel {
 	for _, f := range in.Findings {
 		text := strings.Join([]string{f.Summary, f.Evidence}, "\n")
 		acc.addEndpointsFromText(text, "finding", f.ID)
-		acc.addCredentialsFromText(text, "finding", f.ID)
+		// 凭据的 service 若在正文里只剩路径（login.php），退回该 finding 的资产
+		// host——凭据必须挂在主机上，不能挂在路径上。
+		acc.addCredentialsFromText(text, intelFindingService(f, assetKeyByID), "finding", f.ID)
 		acc.addComponentsFromText(text, "finding", f.ID)
 		acc.addVuln(f, assetKeyByID, firstAssetKey)
 	}
 	for _, fact := range in.Facts {
 		text := strings.Join([]string{fact.Summary, fact.Detail, fact.Evidence}, "\n")
 		acc.addEndpointsFromText(text, "fact", fact.NodeID)
-		acc.addCredentialsFromText(text, "fact", fact.NodeID)
+		acc.addCredentialsFromText(text, "", "fact", fact.NodeID)
 		acc.addComponentsFromText(text, "fact", fact.NodeID)
 	}
 	return acc.rows(in.TaskID)
+}
+
+// intelFindingService 取 finding 关联资产的 host:port（凭据 service 的兜底归属）。
+// 资产键本身就是 host[:port]，可直接作为凭据归属。
+func intelFindingService(f db.IntelFinding, assetKeyByID map[int64]string) string {
+	for _, aid := range f.AssetIDs {
+		if k := assetKeyByID[aid]; k != "" {
+			return k
+		}
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
 // endpoint
 // ---------------------------------------------------------------------------
 
+// addEndpoint 落一条绝对 URL 接口。只接受 http(s):// 开头、可被 url.Parse 解析、
+// 路径以 "/" 开头且不含中文/全角字符的 URL；任何一项不满足就整条丢弃（宁可漏报，
+// 也不让 "//127.0.0.1:9081，Apache/2.4.25" 这种残句进比对面）。
 func (a *intelAcc) addEndpoint(method, rawurl, source string, sourceID int64) {
-	key, value := db.NormalizeEndpoint(method, rawurl)
+	u, ok := intelAbsoluteURL(rawurl)
+	if !ok {
+		return
+	}
+	a.addEndpointTarget(method, u, u, source, sourceID)
+}
+
+// addEndpointTarget 是 endpoint 的落库口：target 已通过形态校验，display 是
+// value 侧原文（请求行只记路径，不记整行）。
+func (a *intelAcc) addEndpointTarget(method, target, display, source string, sourceID int64) {
+	key, value := db.NormalizeEndpoint(method, target)
 	if key == "" {
 		return
 	}
-	e := a.get(db.IntelKindEndpoint, key, redactURLForValue(value), source, sourceID)
+	if strings.TrimSpace(display) == "" {
+		display = value
+	}
+	e := a.get(db.IntelKindEndpoint, key, redactURLForValue(display), source, sourceID)
 	if e == nil {
 		return
 	}
@@ -416,9 +539,56 @@ func (a *intelAcc) addEndpoint(method, rawurl, source string, sourceID int64) {
 	}
 	e.count++
 	e.methods[m] = true
-	if host := hostOfURL(rawurl); host != "" {
+	if host := hostOfURL(target); host != "" {
 		e.hosts[host] = true
 	}
+}
+
+// intelAbsoluteURL 校验并规范化一条绝对 URL；不合格返回 ("", false)。
+func intelAbsoluteURL(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	low := strings.ToLower(s)
+	if !strings.HasPrefix(low, "http://") && !strings.HasPrefix(low, "https://") {
+		return "", false
+	}
+	s = strings.TrimRight(s, intelURLTrailing)
+	if s == "" {
+		return "", false
+	}
+	for _, r := range s {
+		// 中文标点/全角字符/控制符/空格：整条 URL 判为无效（不做截断猜测）。
+		if r < 0x21 || r > 0x7e {
+			return "", false
+		}
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" {
+		return "", false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+	default:
+		return "", false
+	}
+	if u.Path != "" && !strings.HasPrefix(u.Path, "/") {
+		return "", false
+	}
+	return s, true
+}
+
+// intelRequestTarget 校验请求行里的 origin-form 目标：必须以单个 "/" 开头、
+// 无空白、纯 ASCII（"//host，中文" 这类协议相对残句直接否掉）。
+func intelRequestTarget(p string) (string, bool) {
+	p = strings.TrimSpace(p)
+	if p == "" || !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
+		return "", false
+	}
+	for _, r := range p {
+		if r <= 0x20 || r > 0x7e {
+			return "", false
+		}
+	}
+	return p, true
 }
 
 // addEndpointsFromText 从正文里抽请求行与裸 URL：请求行带方法，裸 URL 记 GET。
@@ -427,11 +597,26 @@ func (a *intelAcc) addEndpointsFromText(text, source string, sourceID int64) {
 		return
 	}
 	for _, m := range reIntelReqLine.FindAllStringSubmatch(text, -1) {
-		a.addEndpoint(m[1], m[2], source, sourceID)
+		a.addRequestLine(m[1], m[2], source, sourceID)
 	}
 	for _, raw := range reIntelAbsURL.FindAllString(text, -1) {
 		a.addEndpoint("", raw, source, sourceID)
 	}
+}
+
+// addRequestLine 处理 "METHOD target"：target 是绝对 URL 时按 URL 走，否则只做
+// 路径校验——请求行从不整行参与 URL 解析。
+func (a *intelAcc) addRequestLine(method, target, source string, sourceID int64) {
+	low := strings.ToLower(target)
+	if strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") {
+		a.addEndpoint(method, target, source, sourceID)
+		return
+	}
+	p, ok := intelRequestTarget(target)
+	if !ok {
+		return
+	}
+	a.addEndpointTarget(method, p, p, source, sourceID)
 }
 
 // hostOfURL 取 URL 的 host[:port]（解析失败返回空）。
@@ -494,12 +679,24 @@ func intelSensitiveQueryKey(k string) bool {
 
 // addCredentialsFromText 抽凭据。value 恒为脱敏描述；密文只以
 // detail.secret_masked（前 2 后 2）落库。
-func (a *intelAcc) addCredentialsFromText(text, source string, sourceID int64) {
+//
+// fallbackService 是调用方给的归属主机（finding 的资产 host）：正文里只剩
+// "login.php" 这种路径时，凭据挂到主机上，而不是挂到路径上。
+func (a *intelAcc) addCredentialsFromText(text, fallbackService, source string, sourceID int64) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
 	user := intelUsernameHint(text)
 	service := intelServiceHint(text)
+	if service == "" {
+		if s, ok := intelValidService(fallbackService); ok {
+			service = s
+		}
+	}
+	if service == "" {
+		// 没有可归属的主机：这条凭据无法参与"同账号同服务"的比对，不入表。
+		return
+	}
 
 	for _, m := range reIntelPwdAssign.FindAllStringSubmatch(text, -1) {
 		a.addCredential("password", user, service, m[1], "password=", source, sourceID)
@@ -512,11 +709,16 @@ func (a *intelAcc) addCredentialsFromText(text, source string, sourceID int64) {
 	}
 	hostSpans := reIntelHost.FindAllStringIndex(text, -1)
 	for _, m := range reIntelUserPass.FindAllStringSubmatchIndex(text, -1) {
-		u := strings.ToLower(text[m[2]:m[3]])
+		rawUser := text[m[2]:m[3]]
+		u := strings.ToLower(rawUser)
 		secret := text[m[4]:m[5]]
 		// 报文头/日期形态过滤：`Date: Mon, 01 Jan` 这类以逗号/分号结尾的"口令"
 		// 一律丢弃，宁可漏报也不把头部误记成凭据。
 		if intelUserPassNoise[u] || strings.ContainsAny(strings.TrimRight(secret, " "), ",;") {
+			continue
+		}
+		// 用户名必须是账号形态且不是字段名（Surname/name/currently/level…）。
+		if _, ok := intelValidUsername(rawUser); !ok {
 			continue
 		}
 		// host:port 过滤：`app.example.com:8080` 会被本模式误读成 user:pass，
@@ -524,7 +726,7 @@ func (a *intelAcc) addCredentialsFromText(text, source string, sourceID int64) {
 		if intelSpanInsideHost(m[2], m[5], hostSpans) {
 			continue
 		}
-		a.addCredential("password", text[m[2]:m[3]], service, secret, "user:pass", source, sourceID)
+		a.addCredential("password", rawUser, service, secret, "user:pass", source, sourceID)
 	}
 	for _, m := range reIntelHash.FindAllStringSubmatch(text, -1) {
 		a.addCredential("hash", user, service, m[1], "hex32/40", source, sourceID)
@@ -550,7 +752,19 @@ func intelSpanInsideHost(start, end int, spans [][]int) bool {
 
 func (a *intelAcc) addCredential(kind, username, service, secret, pattern, source string, sourceID int64) {
 	secret = strings.TrimSpace(strings.Trim(secret, `"'`))
-	key, value := db.NormalizeCredential(kind, username, service)
+	if username != "" {
+		u, ok := intelValidUsername(username)
+		if !ok {
+			return
+		}
+		username = u
+	}
+	svc, ok := intelValidService(service)
+	if !ok {
+		// service 为空/是路径（login.php）：这条凭据没有可比对的主机归属。
+		return
+	}
+	key, value := db.NormalizeCredential(kind, username, svc)
 	if key == "" || secret == "" {
 		return
 	}
@@ -574,24 +788,78 @@ func maskIntelSecret(s string) string {
 	return string(r[:2]) + "****" + string(r[len(r)-2:])
 }
 
-// intelUsernameHint 从正文猜账号：显式 user=/login= 优先，其次常见特权账号词。
+// intelValidUsername 校验账号形态：2-32 位账号字符 + 非字段停用词。
+func intelValidUsername(s string) (string, bool) {
+	s = strings.Trim(strings.TrimSpace(s), `"'`)
+	if !reIntelUsername.MatchString(s) {
+		return "", false
+	}
+	if intelUsernameStopwords[strings.ToLower(s)] {
+		return "", false
+	}
+	return s, true
+}
+
+// intelValidService 校验凭据归属：必须是 host 或 host:port（IP/域名），
+// 不能是登录页路径（login.php / /login）。
+func intelValidService(s string) (string, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" || strings.ContainsAny(s, "/\\ \t\r\n") {
+		return "", false
+	}
+	host, port := s, ""
+	if i := strings.LastIndex(s, ":"); i > 0 {
+		host, port = s[:i], s[i+1:]
+		n, err := strconv.Atoi(port)
+		if port == "" || err != nil || n < 1 || n > 65535 {
+			return "", false
+		}
+	}
+	if reIntelIPv4.MatchString(host) {
+		for _, part := range strings.Split(host, ".") {
+			n, err := strconv.Atoi(part)
+			if err != nil || n > 255 {
+				return "", false
+			}
+		}
+		return s, true
+	}
+	if host == "localhost" {
+		return s, true
+	}
+	if !reIntelDomain.MatchString(host) || reIntelFileTLD.MatchString(host) {
+		return "", false
+	}
+	return s, true
+}
+
+// intelUsernameHint 从正文猜账号：显式 user=/account= 优先，其次常见特权账号词。
+// 两种来源都要过 intelValidUsername（字段名不是账号）。
 func intelUsernameHint(text string) string {
 	if m := reIntelUserHint.FindStringSubmatch(text); m != nil {
-		return strings.Trim(m[1], `"'`)
+		if u, ok := intelValidUsername(m[1]); ok {
+			return u
+		}
 	}
 	if m := reIntelCommonUsr.FindStringSubmatch(text); m != nil {
-		return strings.ToLower(m[1])
+		if u, ok := intelValidUsername(m[1]); ok {
+			return u
+		}
 	}
 	return ""
 }
 
-// intelServiceHint 取正文里第一个 host[:port] 作为凭据归属服务。
+// intelServiceHint 取正文里第一个"合法主机"作为凭据归属服务；login.php 这类
+// 被域名正则撞上的文件名一律跳过（它不是服务，是路径）。
 func intelServiceHint(text string) string {
-	if m := reIntelHost.FindStringSubmatch(text); m != nil {
+	for _, m := range reIntelHost.FindAllStringSubmatch(text, -1) {
+		cand := m[1]
 		if m[2] != "" {
-			return m[1] + ":" + m[2]
+			cand += ":" + m[2]
 		}
-		return m[1]
+		if s, ok := intelValidService(cand); ok {
+			return s
+		}
 	}
 	return ""
 }
@@ -601,7 +869,8 @@ func intelServiceHint(text string) string {
 // ---------------------------------------------------------------------------
 
 // addComponentRaw 处理一条显式指纹（资产 technologies 项）：允许无版本
-// （product@*），因为它在指纹列表里就是"确认存在该组件"。
+// （product@*），因为它在指纹列表里就是"确认存在该组件"；但产品名仍必须在
+// 受控表内，版本也必须达到 major.minor。
 func (a *intelAcc) addComponentRaw(raw, source string, sourceID int64) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -611,9 +880,6 @@ func (a *intelAcc) addComponentRaw(raw, source string, sourceID int64) {
 	if m := reIntelProdWithVer.FindStringSubmatch(raw); m != nil {
 		product, version = m[1], m[2]
 	} else if m := reIntelProdOnly.FindStringSubmatch(raw); m != nil {
-		if !reIntelKnownProduct.MatchString(m[1]) {
-			return // 不认识的产品名不硬塞（防 "HTTP" 这类泛词入库）
-		}
 		product = m[1]
 	} else {
 		return
@@ -621,23 +887,52 @@ func (a *intelAcc) addComponentRaw(raw, source string, sourceID int64) {
 	a.addComponent(product, version, source, sourceID)
 }
 
+// addComponent 落一条组件情报。产品名先归一到受控表的 canonical 名（value 仍
+// 保留原文），版本必须匹配 \d+(?:\.\d+){1,3}——"200"/"404" 这种单段数字不是
+// 版本，直接丢弃，而不是记成 product@200。
 func (a *intelAcc) addComponent(product, version, source string, sourceID int64) {
-	key, value := db.NormalizeComponent(product, version)
+	canonical, ok := intelCanonicalProduct(product)
+	if !ok {
+		return
+	}
+	ver := strings.TrimSpace(version)
+	if len(ver) > 1 && (ver[0] == 'v' || ver[0] == 'V') && ver[1] >= '0' && ver[1] <= '9' {
+		ver = ver[1:]
+	}
+	if ver != "" && !reIntelVersionOK.MatchString(ver) {
+		return
+	}
+	key, _ := db.NormalizeComponent(canonical, ver)
 	if key == "" {
 		return
+	}
+	_, value := db.NormalizeComponent(strings.TrimSpace(product), ver)
+	if value == "" {
+		value = key
 	}
 	e := a.get(db.IntelKindComponent, key, value, source, sourceID)
 	if e == nil {
 		return
 	}
 	e.count++
-	if v := strings.TrimSpace(version); v != "" {
-		e.versions[v] = true
+	if ver != "" {
+		e.versions[ver] = true
 	}
 }
 
-// addComponentsFromText 从响应头/正文抽组件：Server: / X-Powered-By 头优先，
-// 其次是"产品 + 版本"的裸文本（要求带版本，避免泛词噪音）。
+// intelCanonicalProduct 把产品名/别名归一到受控表的 canonical 名。
+func intelCanonicalProduct(name string) (string, bool) {
+	k := strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(name)), " "))
+	if k == "" {
+		return "", false
+	}
+	c, ok := intelProductAliases[k]
+	return c, ok
+}
+
+// addComponentsFromText 只从紧邻形态抽组件：Server: / X-Powered-By 头，
+// 以及正文里"产品名 + ≤3 字符分隔 + 版本"的裸文本。产品归属严格按产品名，
+// 绝不把 MariaDB 的版本套到 PHP 头上。
 func (a *intelAcc) addComponentsFromText(text, source string, sourceID int64) {
 	if strings.TrimSpace(text) == "" {
 		return
@@ -659,10 +954,13 @@ func (a *intelAcc) addComponentsFromText(text, source string, sourceID int64) {
 
 func parseIntelHeaderProduct(v string) (product, version string, ok bool) {
 	if m := reIntelHdrProdVer.FindStringSubmatch(v); m != nil {
-		return m[1], m[2], true
+		if _, known := intelCanonicalProduct(m[1]); known {
+			return m[1], m[2], true
+		}
+		return "", "", false
 	}
 	v = strings.TrimSpace(v)
-	if v != "" && reIntelKnownProduct.MatchString(v) {
+	if _, known := intelCanonicalProduct(v); known {
 		return v, "", true
 	}
 	return "", "", false
