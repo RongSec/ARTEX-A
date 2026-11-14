@@ -757,6 +757,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/tasks/{id}/asset-refs", s.taskAssetRefs)
 	// V7-INTEL：任务情报表（收官时自动生成；GET 只读，rebuild 同步重建）。
 	mux.HandleFunc("GET /api/tasks/{id}/intel", s.taskIntelList)
+	// V8-INTEL3：任务小结覆盖率审计（正文见过的接口 vs 已入表）。
+	mux.HandleFunc("GET /api/tasks/{id}/intel/coverage", s.taskIntelCoverage)
 	mux.HandleFunc("POST /api/tasks/{id}/intel/rebuild", s.taskIntelRebuild)
 	// V8-NAME：任务视角的阅读者勾连审计（跨任务/跨项目两组 + 阅读者运行记录）。
 	mux.HandleFunc("GET /api/tasks/{id}/reader-traces", s.taskReaderTraces)

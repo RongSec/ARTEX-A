@@ -199,11 +199,26 @@ var intelProductAliases = map[string]string{
 }
 
 var (
-	// 请求行：GET /api/x HTTP/1.1。单独识别——目标只做"路径/绝对 URL"校验，
-	// 绝不把整行（或带中文标点的残句）丢给 URL 解析。
-	reIntelReqLine = regexp.MustCompile(`(?im)^[ \t]*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)[ \t]+(\S+)`)
+	// 请求行：GET /api/x HTTP/1.1。行首或空白/引号之后都算——事实正文里大量
+	// 请求是写在句子中间的（"…，GET /login.php 无 Cookie 返回 200"），只认行首
+	// 会把真实接口漏掉。目标串仍只做"路径/绝对 URL"校验，绝不把整行交给 URL 解析。
+	reIntelReqLine = regexp.MustCompile(`(?i)(?:^|[\s"'(\[（【])(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)[ \t]+(\S+)`)
 	// 裸绝对 URL：必须以 http(s):// 开头；遇到空白/引号/括号/中文标点即结束。
 	reIntelAbsURL = regexp.MustCompile("(?i)https?://[^\\s\"'<>()\\[\\]{}`，。；、！？（）【】《》「」]+")
+	// 反引号/引号包裹的裸路径：`/config.php`、"admin/login.php"。只认片段本身，
+	// 是否算接口由 intelQuotedPathOK 二次判定（/tmp 这类目录不当接口）。
+	reIntelQuotedPath = regexp.MustCompile("[`\"'](/[^\\s`\"'<>，。；、！？（）【】《》「」]*)[`\"']")
+	// 状态码：HTTP/1.1 302 / 返回 200 / 状态码：403 / status: 404。
+	reIntelHTTPStatus = regexp.MustCompile(`(?i)(?:HTTP/\d(?:\.\d)?[ \t]+|返回[ \t]*|状态码[ \t]*[:：]?[ \t]*|status(?:[ \t]*code)?[ \t]*[:=][ \t]*)([1-5]\d{2})\b`)
+	// 鉴权线索：401/403 或"未登录/需要登录/无 Cookie"——同段落出现即认为该段
+	// 描述的接口需要登录态。
+	reIntelAuthHint = regexp.MustCompile(`(?i)(?:\b401\b|\b403\b|未登录|需要登录|需登录|未授权|需要认证|无[ \t]*cookie)`)
+	// 参数名：query/表单形态 name=value（只取名，不取值）；小写开头，避开
+	// PHPSESSID 这类大写常量与报文头。
+	reIntelParamAssign = regexp.MustCompile(`(?:^|[\s&?;,(\[{'"])([a-z_][a-z0-9_\-]{0,30})[ \t]*=`)
+	// Host 头：段落里没有 URL 时，接口的主机归属只能从这里来。
+	reIntelHostHeader = regexp.MustCompile(`(?im)^[ \t]*host[ \t]*:[ \t]*([^\r\n]+)`)
+
 	// 响应头。
 	reIntelServerHdr = regexp.MustCompile(`(?im)^[ \t]*server[ \t]*:[ \t]*([^\r\n]+)`)
 	reIntelPoweredBy = regexp.MustCompile(`(?im)^[ \t]*x-powered-by[ \t]*:[ \t]*([^\r\n]+)`)
@@ -287,20 +302,35 @@ type intelEntry struct {
 	versions   map[string]bool
 	patterns   map[string]bool
 
+	// 接口层的"能不能用/怎么用"信息：用途、参数名、状态码、是否需登录。
+	// 这些字段只从证据正文里取，取不到就留空，绝不编。
+	purpose     string
+	params      map[string]bool
+	statusCodes map[int]bool
+	authNeeded  bool
+
+	// 凭据在哪些接口上用过（同段落里出现的 path）。
+	whereUsed map[string]bool
+
 	secretMasked string
 	assetType    string
 	assetURL     string
 	severity     string
 	vulnClass    string
+	vulnTitle    string
 }
 
 type intelAcc struct {
 	byKey map[string]*intelEntry
 	order []string
+	// hostPorts 是全文（finding/fact/资产 URL）出现过的 host → 端口集合。
+	// 只用于把"裸主机"补成 host:port：正文里 127.0.0.1 与 URL 里的
+	// 127.0.0.1:9081 是同一台机器，情报表不该留一个没有端口的键。
+	hostPorts map[string][]string
 }
 
 func newIntelAcc() *intelAcc {
-	return &intelAcc{byKey: map[string]*intelEntry{}}
+	return &intelAcc{byKey: map[string]*intelEntry{}, hostPorts: map[string][]string{}}
 }
 
 // get 取/建一行聚合。同 key 合并时**不改已有 value**（value 语义只由首条决定），
@@ -331,6 +361,7 @@ func (a *intelAcc) get(kind, key, value, source string, sourceID int64) *intelEn
 		methods: map[string]bool{}, hosts: map[string]bool{},
 		findingIDs: map[int64]bool{}, assetIDs: map[int64]bool{}, factIDs: map[int64]bool{},
 		versions: map[string]bool{}, patterns: map[string]bool{},
+		params: map[string]bool{}, statusCodes: map[int]bool{}, whereUsed: map[string]bool{},
 	}
 	if sourceID > 0 {
 		sid := sourceID
@@ -375,6 +406,17 @@ func (e *intelEntry) detail() map[string]any {
 	case db.IntelKindEndpoint:
 		d["methods"] = sortedKeys(e.methods)
 		d["hosts"] = sortedKeys(e.hosts)
+		if e.purpose != "" {
+			d["purpose"] = e.purpose
+		}
+		if p := sortedKeys(e.params); len(p) > 0 {
+			d["params"] = p
+		}
+		if s := sortedIntVals(e.statusCodes); len(s) > 0 {
+			d["status_codes"] = s
+		}
+		// auth_required 恒出现（false 也是结论："正文没要求登录"），前端不用判空。
+		d["auth_required"] = e.authNeeded
 		if ids := sortedIntKeys(e.findingIDs); len(ids) > 0 {
 			d["finding_ids"] = ids
 		}
@@ -388,6 +430,9 @@ func (e *intelEntry) detail() map[string]any {
 		d["secret_masked"] = e.secretMasked
 		if p := sortedKeys(e.patterns); len(p) > 0 {
 			d["patterns"] = p
+		}
+		if w := sortedKeys(e.whereUsed); len(w) > 0 {
+			d["where_used"] = w
 		}
 	case db.IntelKindComponent:
 		if v := sortedKeys(e.versions); len(v) > 0 {
@@ -410,6 +455,9 @@ func (e *intelEntry) detail() map[string]any {
 	case db.IntelKindVuln:
 		d["severity"] = e.severity
 		d["vulnclass"] = e.vulnClass
+		if e.vulnTitle != "" {
+			d["title"] = e.vulnTitle
+		}
 		if ids := sortedIntKeys(e.findingIDs); len(ids) > 0 {
 			d["finding_ids"] = ids
 		}
@@ -441,15 +489,28 @@ func sortedIntKeys(m map[int64]bool) []int64 {
 	return out
 }
 
+func sortedIntVals(m map[int]bool) []int {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]int, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Ints(out)
+	return out
+}
+
 // extractTaskIntel 纯函数：原料 → 情报表行。同 kind+key 合并，输出顺序=首见
 // 顺序（资产→finding→fact，各自 id 升序），重复调用结果完全一致。
 func extractTaskIntel(in intelBuildInput) []db.TaskIntel {
 	acc := newIntelAcc()
+	acc.hostPorts = intelHostPortIndex(in)
 	assetKeyByID := map[int64]string{}
 	var firstAssetKey string
 
 	for _, a := range in.Assets {
-		ak := intelAssetKey(a)
+		ak := intelAssetKey(a, acc.hostPorts)
 		if ak == "" {
 			continue
 		}
@@ -469,7 +530,7 @@ func extractTaskIntel(in intelBuildInput) []db.TaskIntel {
 			if strings.TrimSpace(method) == "" {
 				method = "GET"
 			}
-			acc.addEndpoint(method, a.URL, "asset", a.ID)
+			acc.addEndpoint(method, a.URL, "", "asset", a.ID)
 		}
 		for _, tech := range a.Technologies {
 			acc.addComponentRaw(tech, "asset", a.ID)
@@ -479,7 +540,7 @@ func extractTaskIntel(in intelBuildInput) []db.TaskIntel {
 
 	for _, f := range in.Findings {
 		text := strings.Join([]string{f.Summary, f.Evidence}, "\n")
-		acc.addEndpointsFromText(text, "finding", f.ID)
+		acc.addEndpointsFromText(text, intelFindingPurpose(f), "finding", f.ID)
 		// 凭据的 service 若在正文里只剩路径（login.php），退回该 finding 的资产
 		// host——凭据必须挂在主机上，不能挂在路径上。
 		acc.addCredentialsFromText(text, intelFindingService(f, assetKeyByID), "finding", f.ID)
@@ -488,11 +549,131 @@ func extractTaskIntel(in intelBuildInput) []db.TaskIntel {
 	}
 	for _, fact := range in.Facts {
 		text := strings.Join([]string{fact.Summary, fact.Detail, fact.Evidence}, "\n")
-		acc.addEndpointsFromText(text, "fact", fact.NodeID)
+		acc.addEndpointsFromText(text, intelClipRunes(fact.Summary, 60), "fact", fact.NodeID)
 		acc.addCredentialsFromText(text, "", "fact", fact.NodeID)
 		acc.addComponentsFromText(text, "fact", fact.NodeID)
 	}
 	return acc.rows(in.TaskID)
+}
+
+// intelFindingPurpose 取 finding 的"一句用途"：标题优先（缩写到 60 字），
+// 标题为空才退回漏洞分类。取不到就返回空——情报表不编用途。
+func intelFindingPurpose(f db.IntelFinding) string {
+	s := strings.TrimSpace(f.Name)
+	if s == "" {
+		s = strings.TrimSpace(f.VulnClass)
+	}
+	return intelClipRunes(s, 60)
+}
+
+// intelClipRunes 按字符（不是字节）截断，避免把中文从中间切开。
+func intelClipRunes(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return strings.TrimSpace(string(r[:n]))
+}
+
+// intelHostPortIndex 汇总全文出现过的 host → 端口（去重升序）。资产/凭据正文
+// 常常只写主机名，而同任务的 URL 里带着端口；索引用于把裸主机补成 host:port。
+func intelHostPortIndex(in intelBuildInput) map[string][]string {
+	set := map[string]map[string]bool{}
+	addHost := func(raw string) {
+		u, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || u.Host == "" {
+			return
+		}
+		host := strings.ToLower(u.Hostname())
+		if host == "" {
+			return
+		}
+		// 只记显式端口：这是"该主机在本任务用过哪个端口"的证据集，
+		// 补默认端口会让唯一性判定失效（80 与 9081 并存 → 放弃补全）。
+		port := u.Port()
+		if port == "" {
+			return
+		}
+		if set[host] == nil {
+			set[host] = map[string]bool{}
+		}
+		set[host][port] = true
+	}
+	scan := func(text string) {
+		for _, raw := range reIntelAbsURL.FindAllString(text, -1) {
+			addHost(raw)
+		}
+		for _, m := range reIntelHostHeader.FindAllStringSubmatch(text, -1) {
+			if s, ok := intelValidService(strings.TrimSpace(m[1])); ok {
+				// 只采信显式端口：Host 头没写端口时补 80 是假设，不能当作
+				// "该主机就是这个端口"的证据去改写资产键。
+				if i := strings.LastIndex(s, ":"); i > 0 {
+					if set[s[:i]] == nil {
+						set[s[:i]] = map[string]bool{}
+					}
+					set[s[:i]][s[i+1:]] = true
+				}
+			}
+		}
+	}
+	for _, a := range in.Assets {
+		if a == nil {
+			continue
+		}
+		addHost(a.URL)
+		if a.Port != nil && *a.Port > 0 {
+			host := strings.ToLower(strings.TrimSpace(a.Domain))
+			if host == "" {
+				host = strings.ToLower(strings.TrimSpace(a.IP))
+			}
+			if host != "" {
+				if set[host] == nil {
+					set[host] = map[string]bool{}
+				}
+				set[host][strconv.Itoa(*a.Port)] = true
+			}
+		}
+	}
+	for _, f := range in.Findings {
+		scan(f.Summary + "\n" + f.Evidence)
+	}
+	for _, fact := range in.Facts {
+		scan(fact.Summary + "\n" + fact.Detail + "\n" + fact.Evidence)
+	}
+	out := make(map[string][]string, len(set))
+	for host, ports := range set {
+		list := make([]string, 0, len(ports))
+		for p := range ports {
+			list = append(list, p)
+		}
+		sort.Strings(list)
+		out[host] = list
+	}
+	return out
+}
+
+// intelDefaultPort 按 scheme 取默认端口（未知按 http/80：情报面里的服务几乎
+// 都是 HTTP 系）。
+func intelDefaultPort(scheme string) int {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "https", "wss":
+		return 443
+	default:
+		return 80
+	}
+}
+
+// intelPortForHost 取某主机在全文里唯一的端口；没有或多于一个都不猜。
+func intelPortForHost(hostPorts map[string][]string, host string) string {
+	ports := hostPorts[strings.ToLower(strings.TrimSpace(host))]
+	if len(ports) != 1 {
+		return ""
+	}
+	return ports[0]
 }
 
 // intelFindingService 取 finding 关联资产的 host:port（凭据 service 的兜底归属）。
@@ -510,20 +691,36 @@ func intelFindingService(f db.IntelFinding, assetKeyByID map[int64]string) strin
 // endpoint
 // ---------------------------------------------------------------------------
 
+// intelEndpointCtx 是一段正文里与接口同现的附加信息。按"段"（空行分隔）统计：
+// auth_required 只在同段落出现鉴权线索时成立，避免一句 401 污染整篇。
+type intelEndpointCtx struct {
+	params      []string
+	statusCodes []int
+	auth        bool
+	hosts       []string
+}
+
+// intelEndpointHit 是一条"正文里见过的接口"。抽取与覆盖率审计共用同一个
+// 扫描函数（intelScanParagraph），保证两边规则永远一致。
+type intelEndpointHit struct {
+	method string
+	target string // 绝对 URL 或 origin-form 路径，均已过形态校验
+}
+
 // addEndpoint 落一条绝对 URL 接口。只接受 http(s):// 开头、可被 url.Parse 解析、
 // 路径以 "/" 开头且不含中文/全角字符的 URL；任何一项不满足就整条丢弃（宁可漏报，
 // 也不让 "//127.0.0.1:9081，Apache/2.4.25" 这种残句进比对面）。
-func (a *intelAcc) addEndpoint(method, rawurl, source string, sourceID int64) {
+func (a *intelAcc) addEndpoint(method, rawurl, purpose, source string, sourceID int64) {
 	u, ok := intelAbsoluteURL(rawurl)
 	if !ok {
 		return
 	}
-	a.addEndpointTarget(method, u, u, source, sourceID)
+	a.addEndpointTarget(method, u, u, purpose, intelEndpointCtx{}, source, sourceID)
 }
 
 // addEndpointTarget 是 endpoint 的落库口：target 已通过形态校验，display 是
 // value 侧原文（请求行只记路径，不记整行）。
-func (a *intelAcc) addEndpointTarget(method, target, display, source string, sourceID int64) {
+func (a *intelAcc) addEndpointTarget(method, target, display, purpose string, ctx intelEndpointCtx, source string, sourceID int64) {
 	key, value := db.NormalizeEndpoint(method, target)
 	if key == "" {
 		return
@@ -541,10 +738,46 @@ func (a *intelAcc) addEndpointTarget(method, target, display, source string, sou
 	}
 	e.count++
 	e.methods[m] = true
+	if purpose != "" && e.purpose == "" {
+		e.purpose = purpose
+	}
+	// 主机归属：绝对 URL 自带 host:port；相对路径用同段落/同文档里出现过的
+	// URL/Host 头补（正文写过的归属，不是凭空补）。
 	if host := hostOfURL(target); host != "" {
 		e.hosts[host] = true
+	} else {
+		for _, h := range ctx.hosts {
+			e.hosts[h] = true
+		}
+	}
+	for _, p := range ctx.params {
+		if len(e.params) >= intelMaxParams {
+			break
+		}
+		e.params[p] = true
+	}
+	// URL 自带的 query 参数名也是该接口的参数。
+	if u, err := url.Parse(strings.TrimSpace(target)); err == nil && u.RawQuery != "" {
+		for k := range u.Query() {
+			if len(e.params) >= intelMaxParams {
+				break
+			}
+			if k = strings.TrimSpace(k); k != "" {
+				e.params[k] = true
+			}
+		}
+	}
+	for _, sc := range ctx.statusCodes {
+		e.statusCodes[sc] = true
+	}
+	if ctx.auth {
+		e.authNeeded = true
 	}
 }
+
+// intelMaxParams 是一条接口最多保留的参数名个数（情报表是"接口形状"摘要，
+// 不是参数表；超过 12 个的多半是噪声或大表单）。
+const intelMaxParams = 12
 
 // intelAbsoluteURL 校验并规范化一条绝对 URL；不合格返回 ("", false)。
 func intelAbsoluteURL(raw string) (string, bool) {
@@ -593,32 +826,221 @@ func intelRequestTarget(p string) (string, bool) {
 	return p, true
 }
 
-// addEndpointsFromText 从正文里抽请求行与裸 URL：请求行带方法，裸 URL 记 GET。
-func (a *intelAcc) addEndpointsFromText(text, source string, sourceID int64) {
+// addEndpointsFromText 从正文里抽接口。正文按空行切段，每段独立判定参数/
+// 状态码/鉴权线索，再把结果附着到该段抽出的接口上；段落里没有 URL/Host 时
+// 退回整篇的 host 集合（同一个 fact 的 Host 头可能写在下一行）。
+func (a *intelAcc) addEndpointsFromText(text, purpose, source string, sourceID int64) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
-	for _, m := range reIntelReqLine.FindAllStringSubmatch(text, -1) {
-		a.addRequestLine(m[1], m[2], source, sourceID)
-	}
-	for _, raw := range reIntelAbsURL.FindAllString(text, -1) {
-		a.addEndpoint("", raw, source, sourceID)
+	docHosts := intelTextHosts(text)
+	for _, para := range intelTextParagraphs(text) {
+		if strings.TrimSpace(para) == "" {
+			continue
+		}
+		ctx := intelEndpointCtx{
+			params:      intelTextParamNames(para),
+			statusCodes: intelTextStatusCodes(para),
+			auth:        reIntelAuthHint.MatchString(para),
+			hosts:       intelTextHosts(para),
+		}
+		// 段内没有 URL/Host 时，只有全文唯一主机才敢回填：多主机文档里回填
+		// 等于给接口乱挂主机。
+		if len(ctx.hosts) == 0 && len(docHosts) == 1 {
+			ctx.hosts = docHosts
+		}
+		for _, hit := range intelScanParagraph(para) {
+			a.addEndpointTarget(hit.method, hit.target, hit.target, purpose, ctx, source, sourceID)
+		}
 	}
 }
 
-// addRequestLine 处理 "METHOD target"：target 是绝对 URL 时按 URL 走，否则只做
-// 路径校验——请求行从不整行参与 URL 解析。
-func (a *intelAcc) addRequestLine(method, target, source string, sourceID int64) {
-	low := strings.ToLower(target)
-	if strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") {
-		a.addEndpoint(method, target, source, sourceID)
-		return
+// intelTextParagraphs 按空行切段（连续多个空行也算分隔）：鉴权/状态码的
+// "同段落"判据就落在这里。
+func intelTextParagraphs(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	parts := strings.Split(text, "\n\n")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			out = append(out, p)
+		}
 	}
-	p, ok := intelRequestTarget(target)
-	if !ok {
-		return
+	return out
+}
+
+// intelScanParagraph 是一段正文 → 接口清单的唯一实现：抽取与覆盖率审计都走
+// 这里，规则只有一份。命中按 (method,target) 段内去重，避免同一行既被请求行
+// 又被裸 URL 命中而把 hit_count 翻倍。
+func intelScanParagraph(para string) []intelEndpointHit {
+	seen := map[string]bool{}
+	out := make([]intelEndpointHit, 0, 4)
+	appendHit := func(method, target string) {
+		// 去重键按"缺省 GET"算：同一目标既被请求行命中又被引号路径命中时只记一次。
+		m := strings.ToLower(strings.TrimSpace(method))
+		if m == "" {
+			m = "get"
+		}
+		id := m + "\x00" + target
+		if target == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		out = append(out, intelEndpointHit{method: method, target: target})
 	}
-	a.addEndpointTarget(method, p, p, source, sourceID)
+	for _, m := range reIntelReqLine.FindAllStringSubmatch(para, -1) {
+		target := strings.TrimRight(m[2], intelURLTrailing)
+		low := strings.ToLower(target)
+		if strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") {
+			if s, ok := intelAbsoluteURL(target); ok {
+				appendHit(m[1], s)
+			}
+			continue
+		}
+		if p, ok := intelRequestTarget(target); ok {
+			appendHit(m[1], p)
+		}
+	}
+	for _, m := range reIntelQuotedPath.FindAllStringSubmatch(para, -1) {
+		if p, ok := intelQuotedPathTarget(m[1]); ok {
+			appendHit("", p)
+		}
+	}
+	for _, raw := range reIntelAbsURL.FindAllString(para, -1) {
+		if s, ok := intelAbsoluteURL(raw); ok {
+			appendHit("", s)
+		}
+	}
+	return out
+}
+
+// intelQuotedPathTarget 判定反引号/引号里的裸路径算不算接口。只放行两类：
+//  1. 带服务端脚本/动作后缀（.php/.jsp/.do/.action）；
+//  2. 两段及以上的路径（/vulnerabilities/exec/）。
+//
+// 单段目录（/tmp、/etc）一律不算——那是文件系统路径，不是接口。
+func intelQuotedPathTarget(p string) (string, bool) {
+	p = strings.TrimSpace(strings.TrimRight(p, intelURLTrailing))
+	if p == "" || !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
+		return "", false
+	}
+	for _, r := range p {
+		if r <= 0x20 || r > 0x7e {
+			return "", false
+		}
+	}
+	path := p
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	low := strings.ToLower(path)
+	for _, ext := range []string{".php", ".jsp", ".do", ".action"} {
+		if strings.HasSuffix(low, ext) {
+			return p, true
+		}
+	}
+	segs := 0
+	for _, seg := range strings.Split(strings.Trim(path, "/"), "/") {
+		if strings.TrimSpace(seg) != "" {
+			segs++
+		}
+	}
+	if segs >= 2 {
+		return p, true
+	}
+	return "", false
+}
+
+// intelTextParamNames 取一段正文里的参数名（query/表单 name=value，只留名）。
+func intelTextParamNames(text string) []string {
+	set := map[string]bool{}
+	for _, m := range reIntelParamAssign.FindAllStringSubmatch(text, -1) {
+		name := strings.TrimSpace(m[1])
+		if name == "" || len(set) >= intelMaxParams {
+			continue
+		}
+		set[name] = true
+	}
+	return sortedKeys(set)
+}
+
+// intelTextStatusCodes 取一段正文里的 HTTP 状态码（"返回 200" / "HTTP/1.1 302"）。
+func intelTextStatusCodes(text string) []int {
+	set := map[int]bool{}
+	for _, m := range reIntelHTTPStatus.FindAllStringSubmatch(text, -1) {
+		n, err := strconv.Atoi(m[1])
+		if err != nil || n < 100 || n > 599 {
+			continue
+		}
+		set[n] = true
+	}
+	return sortedIntVals(set)
+}
+
+// intelTextHosts 取一段正文里出现的主机（URL 的 host:port + Host 头），
+// 归一化为 host:port；缺端口时按 scheme 补 80/443。
+func intelTextHosts(text string) []string {
+	set := map[string]bool{}
+	add := func(raw string) {
+		u, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || u.Host == "" {
+			return
+		}
+		host := strings.ToLower(u.Hostname())
+		if host == "" {
+			return
+		}
+		port := u.Port()
+		if port == "" {
+			port = strconv.Itoa(intelDefaultPort(u.Scheme))
+		}
+		set[host+":"+port] = true
+	}
+	for _, raw := range reIntelAbsURL.FindAllString(text, -1) {
+		add(raw)
+	}
+	for _, m := range reIntelHostHeader.FindAllStringSubmatch(text, -1) {
+		if s, ok := intelValidService(strings.TrimSpace(m[1])); ok {
+			// Host 头没写端口时按 http/80 补：明文 HTTP 证据里 Host 与端口同义。
+			if !strings.Contains(s, ":") {
+				s += ":80"
+			}
+			set[s] = true
+		}
+	}
+	return sortedKeys(set)
+}
+
+// intelTextPaths 取一段正文里"提到过的接口路径"（请求行/引号路径/URL 路径），
+// 用作凭据的 where_used：凭据和接口写在同一段里，就说明它在该接口用过。
+func intelTextPaths(text string) []string {
+	set := map[string]bool{}
+	for _, hit := range intelScanParagraph(text) {
+		p := intelPathOfTarget(hit.target)
+		if p != "" {
+			set[p] = true
+		}
+	}
+	return sortedKeys(set)
+}
+
+// intelPathOfTarget 取接口目标里的路径部分（绝对 URL 取 Path，否则去掉 query）。
+func intelPathOfTarget(target string) string {
+	t := strings.TrimSpace(target)
+	if t == "" {
+		return ""
+	}
+	if u, err := url.Parse(t); err == nil && u.Host != "" {
+		if u.Path == "" {
+			return "/"
+		}
+		return u.Path
+	}
+	if i := strings.IndexByte(t, '?'); i >= 0 {
+		t = t[:i]
+	}
+	return t
 }
 
 // hostOfURL 取 URL 的 host[:port]（解析失败返回空）。
@@ -699,15 +1121,24 @@ func (a *intelAcc) addCredentialsFromText(text, fallbackService, source string, 
 		// 没有可归属的主机：这条凭据无法参与"同账号同服务"的比对，不入表。
 		return
 	}
+	// 主机没带端口时，用同任务正文里出现过的唯一端口补齐（正文只写 127.0.0.1、
+	// URL 里写的是 127.0.0.1:9081，同一台机器不该出现两个键）。
+	if !strings.Contains(service, ":") {
+		if p := intelPortForHost(a.hostPorts, service); p != "" {
+			service += ":" + p
+		}
+	}
+	// 同段落里出现的接口路径 = 该凭据的使用位置。
+	used := intelTextPaths(text)
 
 	for _, m := range reIntelPwdAssign.FindAllStringSubmatch(text, -1) {
-		a.addCredential("password", user, service, m[1], "password=", source, sourceID)
+		a.addCredential("password", user, service, m[1], "password=", used, source, sourceID)
 	}
 	for _, m := range reIntelBearer.FindAllStringSubmatch(text, -1) {
-		a.addCredential("token", user, service, m[1], "authorization:bearer", source, sourceID)
+		a.addCredential("token", user, service, m[1], "authorization:bearer", used, source, sourceID)
 	}
 	for _, m := range reIntelCookie.FindAllStringSubmatch(text, -1) {
-		a.addCredential("cookie", user, service, m[1], "cookie:", source, sourceID)
+		a.addCredential("cookie", user, service, m[1], "cookie:", used, source, sourceID)
 	}
 	hostSpans := reIntelHost.FindAllStringIndex(text, -1)
 	for _, m := range reIntelUserPass.FindAllStringSubmatchIndex(text, -1) {
@@ -728,16 +1159,16 @@ func (a *intelAcc) addCredentialsFromText(text, fallbackService, source string, 
 		if intelSpanInsideHost(m[2], m[5], hostSpans) {
 			continue
 		}
-		a.addCredential("password", rawUser, service, secret, "user:pass", source, sourceID)
+		a.addCredential("password", rawUser, service, secret, "user:pass", used, source, sourceID)
 	}
 	for _, m := range reIntelHash.FindAllStringSubmatch(text, -1) {
-		a.addCredential("hash", user, service, m[1], "hex32/40", source, sourceID)
+		a.addCredential("hash", user, service, m[1], "hex32/40", used, source, sourceID)
 	}
 	if reIntelPrivKey.MatchString(text) {
-		a.addCredential("key", user, service, "PRIVATE KEY", "pem-private-key", source, sourceID)
+		a.addCredential("key", user, service, "PRIVATE KEY", "pem-private-key", used, source, sourceID)
 	}
 	for _, m := range reIntelSSHRSA.FindAllStringSubmatch(text, -1) {
-		a.addCredential("key", user, service, m[1], "ssh-rsa", source, sourceID)
+		a.addCredential("key", user, service, m[1], "ssh-rsa", used, source, sourceID)
 	}
 }
 
@@ -752,7 +1183,7 @@ func intelSpanInsideHost(start, end int, spans [][]int) bool {
 	return false
 }
 
-func (a *intelAcc) addCredential(kind, username, service, secret, pattern, source string, sourceID int64) {
+func (a *intelAcc) addCredential(kind, username, service, secret, pattern string, whereUsed []string, source string, sourceID int64) {
 	secret = strings.TrimSpace(strings.Trim(secret, `"'`))
 	if username != "" {
 		u, ok := intelValidUsername(username)
@@ -779,7 +1210,18 @@ func (a *intelAcc) addCredential(kind, username, service, secret, pattern, sourc
 	if e.secretMasked == "" {
 		e.secretMasked = maskIntelSecret(secret)
 	}
+	for _, p := range whereUsed {
+		if len(e.whereUsed) >= intelMaxWhereUsed {
+			break
+		}
+		if p != "" {
+			e.whereUsed[p] = true
+		}
+	}
 }
+
+// intelMaxWhereUsed 是一条凭据最多记多少个使用位置。
+const intelMaxWhereUsed = 8
 
 // maskIntelSecret 只留前 2 后 2 字符（≤4 字符全遮），返回值本身不含可用明文。
 func maskIntelSecret(s string) string {
@@ -1000,31 +1442,37 @@ func intelExtraText(extra map[string]any) string {
 // asset / vuln
 // ---------------------------------------------------------------------------
 
-// intelAssetKey 取资产的 host:port 键（URL 优先，其次 ip/domain + port）。
-// 端口未知时退化为纯 host：有端口比 host 更精确，但没有端口也不该丢掉资产。
-func intelAssetKey(a *db.Asset) string {
+// intelAssetKey 取资产的 host:port 键。口径（本单修正）：
+//   - 有 URL：显式端口优先，无端口按 scheme 补 80/443；
+//   - 无 URL：资产自带 port 优先；否则用同任务正文里该主机的唯一端口补齐；
+//   - 都没有才退回裸 host（没有证据就绝不编端口）。
+//
+// 现有缺陷是 URL 缺端口时直接退化到裸 host（127.0.0.1），使资产键与接口/
+// 凭据的 host:port 对不上，跨任务比对断链。
+func intelAssetKey(a *db.Asset, hostPorts map[string][]string) string {
 	if a == nil {
 		return ""
 	}
-	if u, err := url.Parse(strings.TrimSpace(a.URL)); err == nil && u.Host != "" {
-		host := strings.ToLower(u.Hostname())
-		if host == "" {
-			return ""
+	if raw := strings.TrimSpace(a.URL); raw != "" {
+		if u, ok := intelParseLooseURL(raw); ok {
+			host := strings.ToLower(u.Hostname())
+			if host == "" {
+				return ""
+			}
+			if p := u.Port(); p != "" {
+				return host + ":" + p
+			}
+			switch strings.ToLower(u.Scheme) {
+			case "https", "wss":
+				return host + ":443"
+			default:
+				return host + ":80"
+			}
 		}
-		if p := u.Port(); p != "" {
-			return host + ":" + p
-		}
-		switch strings.ToLower(u.Scheme) {
-		case "https", "wss":
-			return host + ":443"
-		case "http", "ws":
-			return host + ":80"
-		}
-		return host
 	}
 	host := strings.ToLower(strings.TrimSpace(a.Domain))
 	if host == "" {
-		host = strings.TrimSpace(a.IP)
+		host = strings.ToLower(strings.TrimSpace(a.IP))
 	}
 	if host == "" {
 		return ""
@@ -1032,7 +1480,30 @@ func intelAssetKey(a *db.Asset) string {
 	if a.Port != nil && *a.Port > 0 {
 		return host + ":" + strconv.Itoa(*a.Port)
 	}
+	if p := intelPortForHost(hostPorts, host); p != "" {
+		return host + ":" + p
+	}
 	return host
+}
+
+// intelParseLooseURL 解析"可能省略 scheme"的资产 URL：http://h:1/x、
+// //h:1/x、h:1/x 都能解出 Host。
+func intelParseLooseURL(raw string) (*url.URL, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false
+	}
+	if strings.HasPrefix(raw, "//") {
+		raw = strings.TrimPrefix(raw, "//")
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil, false
+	}
+	return u, true
 }
 
 // addVuln 落一条漏洞情报：key=title|asset（小写），供后续"同类打法"比对。
@@ -1070,5 +1541,6 @@ func (a *intelAcc) addVuln(f db.IntelFinding, assetKeyByID map[int64]string, fal
 	e.count++
 	e.severity = sev
 	e.vulnClass = f.VulnClass
+	e.vulnTitle = title
 	e.findingIDs[f.ID] = true
 }

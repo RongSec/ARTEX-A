@@ -339,19 +339,27 @@ func TestTaskIntelListAPIGrouped(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
+	// V8-INTEL3：groups 改为按 kind 的映射；旧数组结构保留在 legacy_groups。
 	var resp struct {
-		TaskID int64        `json:"task_id"`
-		Total  int          `json:"total"`
-		Groups []IntelGroup `json:"groups"`
+		TaskID       int64        `json:"task_id"`
+		Total        int          `json:"total"`
+		LegacyGroups []IntelGroup `json:"legacy_groups"`
+		Groups       intelGroups  `json:"groups"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp.TaskID != task.ID || resp.Total != 1 || len(resp.Groups) != len(intelGroupOrder) {
+	if resp.TaskID != task.ID || resp.Total != 1 || len(resp.LegacyGroups) != len(intelGroupOrder) {
 		t.Fatalf("resp=%+v", resp)
 	}
-	if resp.Groups[0].Kind != pgdb.IntelKindEndpoint || resp.Groups[0].Count != 1 {
-		t.Fatalf("endpoint group=%+v", resp.Groups[0])
+	if resp.LegacyGroups[0].Kind != pgdb.IntelKindEndpoint || resp.LegacyGroups[0].Count != 1 {
+		t.Fatalf("endpoint group=%+v", resp.LegacyGroups[0])
+	}
+	if len(resp.Groups.Endpoint) != 1 || resp.Groups.Endpoint[0].Key != "get /login" {
+		t.Fatalf("结构化 endpoint 组=%+v", resp.Groups.Endpoint)
+	}
+	if resp.Groups.Component == nil {
+		t.Error("空组必须为 [] 不是 null")
 	}
 }
 
@@ -606,4 +614,205 @@ func keysOf(rows []pgdb.TaskIntel, kind string) []string {
 		}
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// V8-INTEL3：事实正文补全（线上审计：fact#119 的 GET /login.php 没进表）
+// ---------------------------------------------------------------------------
+
+// intelDetailMap 把一行的 detail 解成 map（测试断言用）；解析失败直接 fail。
+func intelDetailMap(t *testing.T, r *pgdb.TaskIntel) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(r.Detail, &m); err != nil {
+		t.Fatalf("detail 解析失败 %s: %v", r.Key, err)
+	}
+	return m
+}
+
+func intelDetailStrings(m map[string]any, key string) []string {
+	raw, ok := m[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func intelDetailInts(m map[string]any, key string) []int {
+	raw, ok := m[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]int, 0, len(raw))
+	for _, v := range raw {
+		if f, ok := v.(float64); ok {
+			out = append(out, int(f))
+		}
+	}
+	return out
+}
+
+// TestExtractTaskIntelFactEndpointEnrichment 覆盖本单的四条识别规则与 detail 补全：
+// 行内请求行、带 Host 头的请求行、反引号裸路径、带端口完整 URL。
+func TestExtractTaskIntelFactEndpointEnrichment(t *testing.T) {
+	text := strings.Join([]string{
+		"GET /login.php 无 Cookie 返回 200",
+		"",
+		"POST /vulnerabilities/exec/ HTTP/1.1",
+		"Host: 127.0.0.1:9081",
+		"ip=127.0.0.1",
+		"",
+		"配置文件 `/config.php` 可读，需要登录",
+		"",
+		"http://127.0.0.1:9081/vulnerabilities/sqli/?id=1&Submit=Submit",
+	}, "\n")
+	in := intelBuildInput{
+		TaskID: 9,
+		Facts: []pgdb.IntelFact{{
+			NodeID: 119, Summary: "DVWA 命令注入验证入口", Detail: text,
+		}},
+		// IP 型资产：没有 URL、没有端口——端口只能从正文证据里补。
+		// （URL 无端口按 scheme 补 443 的口径由 TestIntelAssetKeyPort 覆盖。）
+		Assets: []*pgdb.Asset{{ID: 3, Type: "ip", IP: "127.0.0.1"}},
+	}
+	rows := extractTaskIntel(in)
+
+	eps := endpointKeys(rows)
+	if len(eps) != 4 {
+		t.Fatalf("endpoint rows=%d, want 4: %v", len(eps), eps)
+	}
+
+	exec := findIntel(rows, pgdb.IntelKindEndpoint, "post /vulnerabilities/exec/")
+	if exec == nil {
+		t.Fatalf("行内/请求行接口未入表: %v", eps)
+	}
+	d := intelDetailMap(t, exec)
+	if hosts := intelDetailStrings(d, "hosts"); len(hosts) != 1 || hosts[0] != "127.0.0.1:9081" {
+		t.Errorf("exec hosts=%v, want [127.0.0.1:9081]", hosts)
+	}
+	if got := intelDetailStrings(d, "params"); len(got) != 1 || got[0] != "ip" {
+		t.Errorf("exec params=%v, want [ip]", got)
+	}
+	if auth, _ := d["auth_required"].(bool); auth {
+		t.Errorf("exec 段落没有鉴权线索，auth_required 应为 false")
+	}
+	if d["purpose"] != "DVWA 命令注入验证入口" {
+		t.Errorf("purpose=%v，应取事实 summary", d["purpose"])
+	}
+
+	login := findIntel(rows, pgdb.IntelKindEndpoint, "get /login.php")
+	if login == nil {
+		t.Fatalf("正文中间的 GET /login.php 未入表: %v", eps)
+	}
+	dl := intelDetailMap(t, login)
+	if codes := intelDetailInts(dl, "status_codes"); len(codes) != 1 || codes[0] != 200 {
+		t.Errorf("login status_codes=%v, want [200]", codes)
+	}
+	if auth, _ := dl["auth_required"].(bool); !auth {
+		t.Errorf("login 段落出现「无 Cookie」，auth_required 应为 true")
+	}
+
+	cfg := findIntel(rows, pgdb.IntelKindEndpoint, "get /config.php")
+	if cfg == nil {
+		t.Fatalf("反引号裸路径未入表: %v", eps)
+	}
+	if auth, _ := intelDetailMap(t, cfg)["auth_required"].(bool); !auth {
+		t.Errorf("config 段落出现「需要登录」，auth_required 应为 true")
+	}
+
+	sqli := findIntel(rows, pgdb.IntelKindEndpoint, "get /vulnerabilities/sqli/?Submit&id")
+	if sqli == nil {
+		// query 参数名排序大小写敏感，兜底按包含判断并给出实际 key。
+		t.Fatalf("完整 URL 未入表: %v", eps)
+	}
+	if hosts := intelDetailStrings(intelDetailMap(t, sqli), "hosts"); len(hosts) != 1 || hosts[0] != "127.0.0.1:9081" {
+		t.Errorf("sqli hosts=%v", hosts)
+	}
+
+	// 资产键必须带端口：IP 资产从正文证据补 9081。
+	if findIntel(rows, pgdb.IntelKindAsset, "127.0.0.1:9081") == nil {
+		t.Errorf("IP 资产键未补端口: %v", assetKeys(rows))
+	}
+	if findIntel(rows, pgdb.IntelKindAsset, "127.0.0.1") != nil {
+		t.Errorf("不得留下裸 host 资产键: %v", assetKeys(rows))
+	}
+}
+
+// TestIntelAssetKeyPort 断言资产键的端口口径（URL 端口 / scheme 默认 / 证据补全）。
+func TestIntelAssetKeyPort(t *testing.T) {
+	port := 9081
+	cases := []struct {
+		name string
+		a    *pgdb.Asset
+		idx  map[string][]string
+		want string
+	}{
+		{"URL 带端口", &pgdb.Asset{URL: "http://127.0.0.1:9081/x"}, nil, "127.0.0.1:9081"},
+		{"URL 无端口 http", &pgdb.Asset{URL: "http://app.example.com/x"}, nil, "app.example.com:80"},
+		{"URL 无端口 https", &pgdb.Asset{URL: "https://app.example.com/x"}, nil, "app.example.com:443"},
+		{"省略 scheme", &pgdb.Asset{URL: "127.0.0.1:9081/x"}, nil, "127.0.0.1:9081"},
+		{"IP+Port", &pgdb.Asset{IP: "10.0.0.8", Port: &port}, nil, "10.0.0.8:9081"},
+		{"裸 IP 用证据补端口", &pgdb.Asset{IP: "10.0.0.8"}, map[string][]string{"10.0.0.8": {"9081"}}, "10.0.0.8:9081"},
+		{"裸 IP 无证据保持原样", &pgdb.Asset{IP: "10.0.0.8"}, nil, "10.0.0.8"},
+	}
+	for _, c := range cases {
+		if got := intelAssetKey(c.a, c.idx); got != c.want {
+			t.Errorf("%s: key=%q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestExtractTaskIntelCredentialWhereUsed 断言凭据带上使用位置、且明文不外泄。
+func TestExtractTaskIntelCredentialWhereUsed(t *testing.T) {
+	text := strings.Join([]string{
+		"登录接口 POST /login.php HTTP/1.1",
+		"Host: 127.0.0.1:9081",
+		"",
+		"username=admin password=Sup3rSecret!",
+	}, "\n")
+	rows := extractTaskIntel(intelBuildInput{TaskID: 9, Facts: []pgdb.IntelFact{{
+		NodeID: 120, Summary: "后台口令", Detail: text,
+	}}})
+	cred := findIntel(rows, pgdb.IntelKindCredential, "password|admin|127.0.0.1:9081")
+	if cred == nil {
+		t.Fatalf("凭据未入表: %v", credentialKeys(rows))
+	}
+	d := intelDetailMap(t, cred)
+	used := intelDetailStrings(d, "where_used")
+	if len(used) == 0 || used[0] != "/login.php" {
+		t.Errorf("where_used=%v, want [/login.php]", used)
+	}
+	if strings.Contains(cred.Value, "Sup3rSecret") {
+		t.Errorf("value 不得含明文: %q", cred.Value)
+	}
+	blob, _ := json.Marshal(rows)
+	if strings.Contains(string(blob), "Sup3rSecret") {
+		t.Errorf("明文泄漏到情报表: %s", blob)
+	}
+}
+
+// TestExtractTaskIntelQuotedPathNoise 断言单段目录不当接口（/tmp、/etc）。
+func TestExtractTaskIntelQuotedPathNoise(t *testing.T) {
+	text := "文件放在 `/tmp` 与 \"/etc\" 下，配置在 `/etc/passwd`"
+	rows := extractTaskIntel(intelBuildInput{TaskID: 1, Findings: []pgdb.IntelFinding{{
+		ID: 1, Evidence: text,
+	}}})
+	for _, k := range endpointKeys(rows) {
+		if strings.Contains(k, "/tmp") {
+			t.Errorf("单段目录不得当接口: %s", k)
+		}
+		if k == "get /etc" {
+			t.Errorf("单段目录不得当接口: %s", k)
+		}
+	}
+	// 两段路径是接口形态（/etc/passwd），允许入表。
+	if findIntel(rows, pgdb.IntelKindEndpoint, "get /etc/passwd") == nil {
+		t.Errorf("两段路径应识别为接口: %v", endpointKeys(rows))
+	}
 }

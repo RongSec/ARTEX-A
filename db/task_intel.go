@@ -432,6 +432,21 @@ RETURNING (xmax = 0)`,
 	return res, nil
 }
 
+// TaskIntelScopeCounts 返回任务侧的 finding / intent 计数（任务小结 summary
+// 的 counts 用：情报行只覆盖五类可比对单元，finding 与 intent 是任务的"工作量"
+// 维度，单独查库，不从情报表推断）。
+func (d *DB) TaskIntelScopeCounts(ctx context.Context, taskID int64) (findings, intents int, err error) {
+	if taskID <= 0 {
+		return 0, 0, nil
+	}
+	err = d.QueryRowContext(ctx, `
+SELECT (SELECT COUNT(*) FROM findings WHERE task_id=$1),
+       (SELECT COUNT(*) FROM exploration_nodes en
+          JOIN tasks t ON t.exploration_id = en.exploration_id
+         WHERE t.id=$1 AND en.kind='intent')`, taskID).Scan(&findings, &intents)
+	return findings, intents, err
+}
+
 // TaskIntelForTask 返回某任务的全部情报行（kind 升序、key 升序，稳定可断言）。
 func (d *DB) TaskIntelForTask(ctx context.Context, taskID int64) ([]TaskIntel, error) {
 	rows, err := d.QueryContext(ctx, `SELECT `+taskIntelCols+`
