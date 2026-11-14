@@ -132,6 +132,10 @@ var defaultShortCircuitConfig = ShortCircuitConfig{
 		"add_hint", "add_task_hint", "add_intent", "prove_goal",
 		"goal_met", "set_goals", "set_constraints", "insert_assets",
 		"bind_finding_traffic",
+		// V6-CP2：观察者/阅读者的落库工具。它们只写 DB，不执行、不读盘；
+		// 洞察正文如实引用「曾尝试 cat /root/.../data/jwt.key」是审计刚需，
+		// 不能因为正文里出现平台路径就把整条洞察拒掉（任务 #49 实测 153/154 被误拒）。
+		"write_project_insight", "write_global_insight", "push_task_hint",
 	},
 	// V6-CP：平台控制面 API。威胁模型是 agent 自己（而非持 JWT 的人）：
 	// 先读绝对路径的 jwt.key 拿到 token，再调 /api/intercept/**、/api/settings
