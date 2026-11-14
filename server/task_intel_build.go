@@ -359,8 +359,10 @@ func (a *intelAcc) rows(taskID int64) []db.TaskIntel {
 			raw = []byte(`{}`)
 		}
 		out = append(out, db.TaskIntel{
-			TaskID: taskID, Kind: e.kind, Key: e.key, Value: e.value,
-			Detail: json.RawMessage(raw), Source: e.source, SourceID: e.sourceID,
+			TaskID: taskID, Kind: e.kind, Key: e.key,
+			MatchKey: db.IntelMatchKey(e.kind, e.key),
+			Value:    e.value,
+			Detail:   json.RawMessage(raw), Source: e.source, SourceID: e.sourceID,
 		})
 	}
 	return out

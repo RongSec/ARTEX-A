@@ -383,6 +383,92 @@ func TestReaderLinkFlow(t *testing.T) {
 	}
 }
 
+// TestReaderLinkMatchKeyHitPG 复现实网缺陷（任务 #51 → 0 候选）：precise key
+// 三个维度全不同（GET vs POST / 带 query vs 不带 / mariadb 10.1 vs 10.3），
+// 但按 match_key 必须命中。
+//
+//	预置 A: endpoint|get /vulnerabilities/sqli/?id + component|mariadb@10.1
+//	surface: POST /vulnerabilities/sqli/ SQL 注入 MariaDB 10.3
+//	→ A 必须返回，hits 里 endpoint(match_key=/vulnerabilities/sqli/)、
+//	  component(match_key=mariadb) 各一条。
+//
+// 负例：POST /vulnerabilities/upload/ + nginx 1.18 不得返回 A。
+func TestReaderLinkMatchKeyHitPG(t *testing.T) {
+	s, pg := newInsightTestPG(t)
+	ctx := context.Background()
+	pid := intelLinkProject(t, pg, "matchkey-p", true)
+	_, idA := intelLinkTask(t, s, pg, pid, "matchkey-a")
+	_, idB := intelLinkTask(t, s, pg, pid, "matchkey-b")
+
+	if _, err := pg.UpsertTaskIntel(ctx, pid, idA, []db.TaskIntel{
+		{Kind: db.IntelKindEndpoint, Key: "get /vulnerabilities/sqli/?id", Value: "http://dvwa/vulnerabilities/sqli/?id=1", Source: "finding"},
+		{Kind: db.IntelKindComponent, Key: "mariadb@10.1", Value: "mariadb 10.1", Source: "asset"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := s.toolRequestReaderLinks()
+	call := func(c context.Context, raw json.RawMessage) (string, bool) {
+		r, err := req.Call(c, raw, nil)
+		if err != nil {
+			t.Fatalf("tool call: %v", err)
+		}
+		return r.Flatten(), r.IsError
+	}
+	bCtx := agent.WithRunInfo(ctx, agent.RunInfo{TaskID: idB})
+	var out struct {
+		Candidates []readerLinkCandidate `json:"candidates"`
+		Keys       []db.IntelKeyRef      `json:"keys"`
+		Debug      struct {
+			SurfaceKeys      []readerLinkSurfaceKey `json:"surface_keys"`
+			QueriedProjectID int64                  `json:"queried_project_id"`
+			Scope            string                 `json:"scope"`
+		} `json:"debug"`
+	}
+	callToolJSON(t, "request_reader_links", call, bCtx, map[string]any{
+		"surface": "POST /vulnerabilities/sqli/ SQL 注入 MariaDB 10.3",
+	}, &out)
+
+	if len(out.Candidates) != 1 || out.Candidates[0].TaskID != idA {
+		t.Fatalf("方法/query/版本都不同也必须命中原任务 A(%d)，got %+v", idA, out.Candidates)
+	}
+	hits := map[string]readerLinkHit{}
+	for _, h := range out.Candidates[0].Hits {
+		hits[h.Kind] = h
+	}
+	ep, ok := hits[db.IntelKindEndpoint]
+	if !ok || ep.Key != "get /vulnerabilities/sqli/?id" || ep.MatchKey != "/vulnerabilities/sqli/" {
+		t.Errorf("endpoint 命中不对: %+v", hits)
+	}
+	comp, ok := hits[db.IntelKindComponent]
+	if !ok || comp.Key != "mariadb@10.1" || comp.MatchKey != "mariadb" {
+		t.Errorf("component 命中不对: %+v", hits)
+	}
+	if out.Debug.QueriedProjectID != pid || out.Debug.Scope != "project" || len(out.Debug.SurfaceKeys) == 0 {
+		t.Errorf("debug 面不完整: %+v", out.Debug)
+	}
+	var sawEPQuery bool
+	for _, sk := range out.Debug.SurfaceKeys {
+		if sk.Kind == db.IntelKindEndpoint && sk.MatchKey == "/vulnerabilities/sqli/" {
+			sawEPQuery = true
+		}
+	}
+	if !sawEPQuery {
+		t.Errorf("debug.surface_keys 应含 endpoint 的匹配键 /vulnerabilities/sqli/: %+v", out.Debug.SurfaceKeys)
+	}
+
+	// 负例：不同接口 + 不同组件 → 不得把 A 连进来。
+	out.Candidates = nil
+	callToolJSON(t, "request_reader_links", call, bCtx, map[string]any{
+		"surface": "POST /vulnerabilities/upload/ nginx 1.18",
+	}, &out)
+	for _, c := range out.Candidates {
+		if c.TaskID == idA {
+			t.Fatalf("不同接口/组件不应命中 A: %+v", out.Candidates)
+		}
+	}
+}
+
 // TestReadTaskIntelTool 守 read_task_intel：按项目增量读、按 kind 分组、
 // 返回 next_since_id（下一轮水位）。
 func TestReadTaskIntelTool(t *testing.T) {

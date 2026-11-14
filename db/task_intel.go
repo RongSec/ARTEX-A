@@ -33,6 +33,7 @@ type TaskIntel struct {
 	TaskID    int64           `json:"task_id"`
 	Kind      string          `json:"kind"`
 	Key       string          `json:"key"`
+	MatchKey  string          `json:"match_key"`
 	Value     string          `json:"value"`
 	Detail    json.RawMessage `json:"detail"`
 	Source    string          `json:"source"`
@@ -268,11 +269,78 @@ func NormalizeCredential(kind, username, service string) (key, value string) {
 	return k + "|" + u + "|" + s, value
 }
 
+// IntelMatchKey 是纯函数：把一个精确情报键（kind+key）粗化成"跨任务可比对"
+// 的匹配键。精确 key 适合断言"同一条情报"，但跨任务勾连要的是"同一层面的
+// 东西"——方法不同（GET vs POST）、query 参数不同、组件小版本不同，都不该
+// 让两个任务错过彼此。因此比对面拆成两层：
+//
+//	key       精确键（落库唯一约束、下钻展示用，不做放宽）
+//	match_key 粗粒度键（request_reader_links 只按它比对）
+//
+// 规则（与 schema.sql 的存量回填表达式一致）：
+//   - endpoint：去掉方法前缀与 query，只留路径；末尾 "/" 归一到恰好一个
+//     （"get /vulnerabilities/sqli/?id" → "/vulnerabilities/sqli/"）。
+//   - component：只留产品名（"mariadb@10.1" → "mariadb"）——版本差不该断链。
+//   - asset：只留 host（"127.0.0.1:9081" → "127.0.0.1"）——端口差不该断链。
+//   - credential：kind|username（丢掉 service）——凭据可跨端口复用。
+//   - vuln：空串（标题做粗匹配会把"SQL 注入"这种泛词误连，宁可不连）。
+//
+// 空 kind / 空 key / 未知 kind 返回空串（调用方跳过该键）。
+func IntelMatchKey(kind, key string) string {
+	k := strings.ToLower(strings.TrimSpace(kind))
+	key = strings.TrimSpace(key)
+	if k == "" || key == "" {
+		return ""
+	}
+	switch k {
+	case IntelKindEndpoint:
+		path := key
+		// "method /path?params"：方法前缀只影响"怎么打"，不影响"打哪里"。
+		if i := strings.IndexByte(path, ' '); i > 0 {
+			path = strings.TrimSpace(path[i+1:])
+		}
+		if i := strings.IndexByte(path, '?'); i >= 0 {
+			path = path[:i]
+		}
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return ""
+		}
+		// 末尾斜杠归一：有则恰好保留一个，无则不补（与回填 SQL 同口径）。
+		if strings.HasSuffix(path, "/") {
+			path = strings.TrimRight(path, "/") + "/"
+		}
+		return path
+	case IntelKindComponent:
+		if i := strings.IndexByte(key, '@'); i >= 0 {
+			return strings.TrimSpace(key[:i])
+		}
+		return key
+	case IntelKindAsset:
+		if i := strings.IndexByte(key, ':'); i >= 0 {
+			return strings.TrimSpace(key[:i])
+		}
+		return key
+	case IntelKindCredential:
+		// 与回填 SQL 的 split_part(key,'|',1)||'|'||split_part(key,'|',2) 对齐。
+		parts := strings.Split(key, "|")
+		first := strings.TrimSpace(parts[0])
+		second := ""
+		if len(parts) > 1 {
+			second = strings.TrimSpace(parts[1])
+		}
+		return first + "|" + second
+	case IntelKindVuln:
+		return ""
+	}
+	return ""
+}
+
 // ---------------------------------------------------------------------------
 // 落库 / 读取
 // ---------------------------------------------------------------------------
 
-const taskIntelCols = `id, project_id, task_id, kind, key, value, detail, source, source_id, created_at, updated_at`
+const taskIntelCols = `id, project_id, task_id, kind, key, match_key, value, detail, source, source_id, created_at, updated_at`
 
 // UpsertIntelResult 是一次批量写入的统计（信号摘要只报**新增**行数：重复生成
 // 不产生新攻击面，不该反复唤醒 reader）。
@@ -326,18 +394,25 @@ WHERE task_id=$1 AND project_id=$2 AND source IN ('finding','fact','asset')`, ta
 		if src == "" {
 			src = "manual"
 		}
+		// match_key 是跨任务比对的粗粒度键：调用方没给就按 kind/key 现算，
+		// 保证任何写入口（抽取行/手工行/rebuild）都不会漏。
+		mk := strings.TrimSpace(r.MatchKey)
+		if mk == "" {
+			mk = IntelMatchKey(r.Kind, r.Key)
+		}
 		var inserted bool
 		err := tx.QueryRowContext(ctx, `
-INSERT INTO task_intel(project_id, task_id, kind, key, value, detail, source, source_id)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+INSERT INTO task_intel(project_id, task_id, kind, key, match_key, value, detail, source, source_id)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 ON CONFLICT (project_id, task_id, kind, key) DO UPDATE
-SET value = EXCLUDED.value,
+SET match_key = EXCLUDED.match_key,
+    value = EXCLUDED.value,
     detail = EXCLUDED.detail,
     source = EXCLUDED.source,
     source_id = EXCLUDED.source_id,
     updated_at = now()
 RETURNING (xmax = 0)`,
-			projectID, taskID, r.Kind, truncateRunes(utf8Clean(r.Key), 500),
+			projectID, taskID, r.Kind, truncateRunes(utf8Clean(r.Key), 500), mk,
 			truncateRunes(utf8Clean(r.Value), 2000), string(detail),
 			truncateRunes(src, 32), r.SourceID).Scan(&inserted)
 		if err != nil {
@@ -400,7 +475,7 @@ func scanTaskIntelRows(rows *sql.Rows) ([]TaskIntel, error) {
 		var r TaskIntel
 		var detail []byte
 		var sourceID sql.NullInt64
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.TaskID, &r.Kind, &r.Key, &r.Value,
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.TaskID, &r.Kind, &r.Key, &r.MatchKey, &r.Value,
 			&detail, &r.Source, &sourceID, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}

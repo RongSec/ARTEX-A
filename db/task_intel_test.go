@@ -128,12 +128,60 @@ func TestIntelDeltaSummary(t *testing.T) {
 	}
 }
 
+// TestIntelMatchKey 守跨任务比对的粗粒度键（V7-LINK2）：endpoint 去方法/query
+// 只留路径、component 只留产品名、asset 只留 host、credential 丢 service、
+// vuln 不做粗匹配；空输入/未知 kind 一律空串。
+func TestIntelMatchKey(t *testing.T) {
+	cases := []struct {
+		name      string
+		kind, key string
+		want      string
+	}{
+		// endpoint：方法、query、末尾斜杠。
+		{"endpoint 去方法去query", IntelKindEndpoint, "get /vulnerabilities/sqli/?id", "/vulnerabilities/sqli/"},
+		{"endpoint 方法不同不影响", IntelKindEndpoint, "POST /vulnerabilities/sqli/", "/vulnerabilities/sqli/"},
+		{"endpoint 无query无尾斜杠", IntelKindEndpoint, "post /api/user/{id}", "/api/user/{id}"},
+		{"endpoint 多尾斜杠归一", IntelKindEndpoint, "get /a/b///", "/a/b/"},
+		{"endpoint 根路径", IntelKindEndpoint, "get /", "/"},
+		{"endpoint 空key", IntelKindEndpoint, "   ", ""},
+		// component：版本段差异不断链。
+		{"component 去版本", IntelKindComponent, "mariadb@10.1", "mariadb"},
+		{"component 多段版本", IntelKindComponent, "postgresql@14.2", "postgresql"},
+		{"component 无版本星号", IntelKindComponent, "nginx@*", "nginx"},
+		{"component 空key", IntelKindComponent, "", ""},
+		// asset：端口差异不断链。
+		{"asset 去端口", IntelKindAsset, "127.0.0.1:9081", "127.0.0.1"},
+		{"asset 域名带端口", IntelKindAsset, "app.example.com:443", "app.example.com"},
+		{"asset 无端口", IntelKindAsset, "10.0.0.8", "10.0.0.8"},
+		{"asset 空key", IntelKindAsset, "", ""},
+		// credential：丢 service，kind|username 保留。
+		{"credential 丢service", IntelKindCredential, "password|admin|10.0.0.5", "password|admin"},
+		{"credential 空username", IntelKindCredential, "token|-|api.example.com", "token|-"},
+		{"credential 无service段", IntelKindCredential, "hash|root|-", "hash|root"},
+		{"credential 空key", IntelKindCredential, "", ""},
+		// vuln：不做粗匹配。
+		{"vuln 恒空", IntelKindVuln, "sql injection|10.0.0.1", ""},
+		{"vuln 空key", IntelKindVuln, "", ""},
+		// 边界。
+		{"空kind", "", "get /a", ""},
+		{"未知kind", "hostname", "x", ""},
+	}
+	for _, c := range cases {
+		if got := IntelMatchKey(c.kind, c.key); got != c.want {
+			t.Errorf("%s: IntelMatchKey(%q,%q)=%q, want %q", c.name, c.kind, c.key, got, c.want)
+		}
+	}
+}
+
 // TestSchemaContainsTaskIntel 无库断言 schema.sql 里有表/列/索引（防漏发迁移）。
 func TestSchemaContainsTaskIntel(t *testing.T) {
 	for _, w := range []string{
 		"CREATE TABLE IF NOT EXISTS task_intel",
 		"CREATE TABLE IF NOT EXISTS task_intel_links",
 		"idx_tintel_match ON task_intel(kind, key)",
+		"idx_tintel_matchkey ON task_intel(match_key)",
+		"ADD COLUMN IF NOT EXISTS match_key TEXT NOT NULL DEFAULT ''",
+		"UPDATE task_intel SET match_key",
 		"idx_tintel_task  ON task_intel(task_id)",
 		"idx_tintel_proj  ON task_intel(project_id, created_at DESC)",
 		"UNIQUE (project_id, task_id, kind, key)",
@@ -188,6 +236,24 @@ func TestTaskIntelUpsertIdempotentPG(t *testing.T) {
 	}
 	if res.ByKind[IntelKindEndpoint] != 1 {
 		t.Fatalf("by kind: %+v", res.ByKind)
+	}
+	// upsert 必须同步写 match_key（跨任务勾连只按它比对）。
+	mks := map[string]string{}
+	rowsMK, err := d.QueryContext(ctx, `SELECT kind, match_key FROM task_intel WHERE task_id=$1`, tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rowsMK.Next() {
+		var kind, mk string
+		if err := rowsMK.Scan(&kind, &mk); err != nil {
+			rowsMK.Close()
+			t.Fatal(err)
+		}
+		mks[kind] = mk
+	}
+	rowsMK.Close()
+	if mks[IntelKindEndpoint] != "/api/user/{id}" || mks[IntelKindCredential] != "password|admin" || mks[IntelKindComponent] != "nginx" {
+		t.Fatalf("upsert 未写 match_key: %+v", mks)
 	}
 
 	var firstCreated time.Time
@@ -284,6 +350,55 @@ WHERE table_schema='public' AND table_name IN ('task_intel','task_intel_links')`
 	}
 	if n != 2 {
 		t.Fatalf("task_intel tables: %d, want 2", n)
+	}
+}
+
+// TestSchemaBackfillsMatchKeyPG 模拟存量库：match_key 尚为空的历史行，在
+// schema 迁移里按 kind 回填；连续应用两次 0 error 且结果不变（幂等）。
+func TestSchemaBackfillsMatchKeyPG(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+	pid, tid := intelTestTask(t, d)
+
+	legacy := []struct{ kind, key, want string }{
+		{IntelKindEndpoint, "get /vulnerabilities/sqli/?id", "/vulnerabilities/sqli/"},
+		{IntelKindComponent, "mariadb@10.1", "mariadb"},
+		{IntelKindAsset, "127.0.0.1:9081", "127.0.0.1"},
+		{IntelKindCredential, "password|admin|10.0.0.5:80", "password|admin"},
+		{IntelKindVuln, "sql injection|127.0.0.1:80", ""},
+	}
+	for _, r := range legacy {
+		if _, err := d.Exec(`INSERT INTO task_intel(project_id, task_id, kind, key, value, source, match_key)
+VALUES ($1,$2,$3,$4,'v','manual','')`, pid, tid, r.kind, r.key); err != nil {
+			t.Fatalf("insert legacy %s: %v", r.kind, err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := d.Exec(schemaSQL); err != nil {
+			t.Fatalf("re-apply schema #%d: %v", i+1, err)
+		}
+		got := map[string]string{}
+		rows, err := d.Query(`SELECT kind, match_key FROM task_intel WHERE task_id=$1`, tid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var kind, mk string
+			if err := rows.Scan(&kind, &mk); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			got[kind] = mk
+		}
+		rows.Close()
+		for _, r := range legacy {
+			if got[r.kind] != r.want {
+				t.Fatalf("apply #%d: %s match_key=%q, want %q", i+1, r.kind, got[r.kind], r.want)
+			}
+		}
 	}
 }
 

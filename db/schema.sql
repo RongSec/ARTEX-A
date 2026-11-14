@@ -1765,7 +1765,8 @@ CREATE TABLE IF NOT EXISTS task_intel (
     project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     task_id    BIGINT NOT NULL,                            -- 无 FK：任务删档后情报表仍可作历史比对
     kind       TEXT NOT NULL CHECK (kind IN ('endpoint','credential','component','asset','vuln')),
-    key        TEXT NOT NULL,                              -- 归一化后的可比对键（见 db/task_intel.go）
+    key        TEXT NOT NULL,                              -- 归一化后的精确可比对键（见 db/task_intel.go）
+    match_key  TEXT NOT NULL DEFAULT '',                   -- 粗粒度比对键：跨任务勾连只按它（IntelMatchKey）
     value      TEXT NOT NULL,                              -- 人类可读原文（凭据恒为脱敏描述，不含明文）
     detail     JSONB NOT NULL DEFAULT '{}',                -- 合并明细：次数/来源 id/hosts/secret_masked…
     source     TEXT NOT NULL,                              -- finding|fact|asset|manual
@@ -1779,8 +1780,20 @@ ALTER TABLE task_intel ADD COLUMN IF NOT EXISTS detail JSONB NOT NULL DEFAULT '{
 ALTER TABLE task_intel ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual';
 ALTER TABLE task_intel ADD COLUMN IF NOT EXISTS source_id BIGINT;
 ALTER TABLE task_intel ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- V7-LINK2：精确 key 之外再存一份粗粒度匹配键（方法/query/端口/版本差不断链）。
+-- 回填表达式与 db.IntelMatchKey 同语义；只补空值，重复执行不改变已有结果。
+ALTER TABLE task_intel ADD COLUMN IF NOT EXISTS match_key TEXT NOT NULL DEFAULT '';
+UPDATE task_intel SET match_key = CASE kind
+    WHEN 'endpoint'   THEN regexp_replace(regexp_replace(split_part(key, ' ', 2), '\?.*$', ''), '/+$', '/')
+    WHEN 'component'  THEN split_part(key, '@', 1)
+    WHEN 'asset'      THEN split_part(key, ':', 1)
+    WHEN 'credential' THEN split_part(key, '|', 1) || '|' || split_part(key, '|', 2)
+    ELSE ''
+END
+WHERE match_key = '' AND kind <> 'vuln';  -- vuln 恒为空键，无需每次启动重写
 -- 索引必须写在补列之后（存量库补列失败时索引引用的列可能尚不存在）。
-CREATE INDEX IF NOT EXISTS idx_tintel_match ON task_intel(kind, key);          -- 跨任务勾连：同 kind 同 key
+CREATE INDEX IF NOT EXISTS idx_tintel_match ON task_intel(kind, key);          -- 下钻/精确查：同 kind 同 key
+CREATE INDEX IF NOT EXISTS idx_tintel_matchkey ON task_intel(match_key);       -- 跨任务勾连：按匹配键比对
 CREATE INDEX IF NOT EXISTS idx_tintel_task  ON task_intel(task_id);            -- 单任务情报表
 CREATE INDEX IF NOT EXISTS idx_tintel_proj  ON task_intel(project_id, created_at DESC); -- 增量水位/项目面板
 

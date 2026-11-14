@@ -222,10 +222,21 @@ func intelAssetKeyFromURL(raw string) string {
 // ---------------------------------------------------------------------------
 
 // readerLinkHit 是一条命中明细（同时作为 task_intel_links.matched 的元素形状）。
+// Key 是命中行的精确键（供下钻复核），MatchKey 是本次据以连上的粗粒度键
+// （planner 据此知道"是按接口路径还是按组件产品名连上的"）。
 type readerLinkHit struct {
-	Kind  string `json:"kind"`
-	Key   string `json:"key"`
-	Value string `json:"value"`
+	Kind     string `json:"kind"`
+	Key      string `json:"key"`
+	MatchKey string `json:"match_key,omitempty"`
+	Value    string `json:"value"`
+}
+
+// readerLinkSurfaceKey 是 debug.surface_keys 的元素：surface 抽出的精确键 +
+// 它换算出的匹配键。线上核对"为什么 0 候选"时，一眼能看出比对口径。
+type readerLinkSurfaceKey struct {
+	Kind     string `json:"kind"`
+	Key      string `json:"key"`
+	MatchKey string `json:"match_key"`
 }
 
 // readerLinkCandidate 是 request_reader_links 返回的候选任务。
@@ -302,12 +313,26 @@ func (s *Server) toolRequestReaderLinks() actool.CoreTool {
 				limit = readerLinkMaxLimit
 			}
 			keys := intelSurfaceKeys(a.Surface)
+			// debug 面：把 surface → 精确键 → 匹配键的换算结果一并回给模型/
+			// 运维，线上排查"为什么 0 候选"时不必再猜比对口径。
+			surfaceKeys := make([]readerLinkSurfaceKey, 0, len(keys))
+			for _, k := range keys {
+				surfaceKeys = append(surfaceKeys, readerLinkSurfaceKey{
+					Kind: k.Kind, Key: k.Key, MatchKey: db.IntelMatchKey(k.Kind, k.Key),
+				})
+			}
+			debug := map[string]any{
+				"surface_keys":       surfaceKeys,
+				"queried_project_id": tctx.ProjectID,
+				"scope":              scope,
+			}
 			if len(keys) == 0 {
 				return jsonResult(map[string]any{
 					"surface":    a.Surface,
 					"scope":      scope,
 					"keys":       []db.IntelKeyRef{},
 					"candidates": []readerLinkCandidate{},
+					"debug":      debug,
 					"note":       "未能从 surface 中抽出可比对的键（URL/路径/host:port/产品版本）；可改用更具体的接口或资产描述重试。" + readerLinkCandidateNote,
 				})
 			}
@@ -324,6 +349,7 @@ func (s *Server) toolRequestReaderLinks() actool.CoreTool {
 				"scope":      scope,
 				"keys":       keys,
 				"candidates": cands,
+				"debug":      debug,
 				"note":       readerLinkCandidateNote,
 			}
 			if len(cands) == 0 {
@@ -359,7 +385,7 @@ func aggregateReaderLinkCandidates(matches []db.IntelTaskMatch, limit int) []rea
 			continue
 		}
 		hitSeen[m.TaskID][id] = true
-		c.Hits = append(c.Hits, readerLinkHit{Kind: m.Kind, Key: m.Key, Value: m.Value})
+		c.Hits = append(c.Hits, readerLinkHit{Kind: m.Kind, Key: m.Key, MatchKey: m.MatchKey, Value: m.Value})
 	}
 	out := make([]readerLinkCandidate, 0, len(byTask))
 	for _, c := range byTask {
@@ -494,7 +520,7 @@ func (s *Server) intelHitsForTask(ctx context.Context, taskID int64, n int) []re
 		if len(out) >= n {
 			break
 		}
-		out = append(out, readerLinkHit{Kind: r.Kind, Key: r.Key, Value: r.Value})
+		out = append(out, readerLinkHit{Kind: r.Kind, Key: r.Key, MatchKey: r.MatchKey, Value: r.Value})
 	}
 	return out
 }

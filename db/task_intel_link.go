@@ -29,7 +29,11 @@ type IntelTaskMatch struct {
 	IntentCount  int    `json:"intent_count"`
 }
 
-// MatchTaskIntel 按 (kind,key) 命中 task_intel，排除当前任务。
+// MatchTaskIntel 按【匹配键】命中 task_intel，排除当前任务。
+//
+// 比对用 match_key（IntelMatchKey 粗化后的键），不是精确 key：用户要的是
+// "接口/凭据/组件层面可比"，同一个路径换了方法、少了 query、组件差个小版本
+// 都不该断链。返回行仍带精确 key/value，供 planner 下钻。
 //
 // scope 语义：
 //   - cross=false（项目内）：只查 projectID 这一个项目；
@@ -37,40 +41,44 @@ type IntelTaskMatch struct {
 //     reader_enabled=true 且 status='active'（跨项目尺度开关，与
 //     observer_enabled 无关）。
 //
-// 命中键按调用方给的顺序拼 OR（键数很少，索引 idx_tintel_match 可用）；
-// 已删档任务不参与（情报表仍留档，但 planner 无法 adopt 一个不存在的任务）。
-// 返回按 task_id/kind/key 稳定排序，聚合排序在 server 层做。
+// (kind, match_key) 去重后按对传入 unnest：既精确到 kind（避免 endpoint 路径
+// 与 asset 主机同名误撞），又能走 idx_tintel_matchkey。已删档任务不参与
+// （情报表仍留档，但 planner 无法 adopt 一个不存在的任务）。返回按
+// task_id/kind/key 稳定排序，聚合排序在 server 层做。
 func (d *DB) MatchTaskIntel(ctx context.Context, projectID int64, keys []IntelKeyRef, excludeTaskID int64, cross bool) ([]IntelTaskMatch, error) {
 	if projectID <= 0 || len(keys) == 0 {
 		return nil, nil
 	}
-	args := make([]any, 0, len(keys)*2+2)
-	conds := make([]string, 0, len(keys))
+	kinds := make([]string, 0, len(keys))
+	matchKeys := make([]string, 0, len(keys))
+	seen := map[string]bool{}
 	for _, k := range keys {
 		kind := strings.ToLower(strings.TrimSpace(k.Kind))
-		key := strings.TrimSpace(k.Key)
-		if kind == "" || key == "" {
+		mk := IntelMatchKey(kind, k.Key)
+		if kind == "" || mk == "" {
 			continue
 		}
-		args = append(args, kind, key)
-		conds = append(conds, fmt.Sprintf("(ti.kind=$%d AND ti.key=$%d)", len(args)-1, len(args)))
+		id := kind + "\x00" + mk
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		kinds = append(kinds, kind)
+		matchKeys = append(matchKeys, mk)
 	}
-	if len(conds) == 0 {
+	if len(kinds) == 0 {
 		return nil, nil
 	}
-	args = append(args, projectID)
-	pidPos := len(args)
+	args := []any{kinds, matchKeys, excludeTaskID, projectID}
 	var scope string
 	if cross {
-		scope = fmt.Sprintf(`ti.project_id <> $%d AND ti.project_id IN (
-SELECT id FROM projects WHERE reader_enabled = TRUE AND status = 'active')`, pidPos)
+		scope = `ti.project_id <> $4 AND ti.project_id IN (
+SELECT id FROM projects WHERE reader_enabled = TRUE AND status = 'active')`
 	} else {
-		scope = fmt.Sprintf("ti.project_id = $%d", pidPos)
+		scope = "ti.project_id = $4"
 	}
-	args = append(args, excludeTaskID)
-	excludePos := len(args)
 
-	q := `SELECT ti.id, ti.project_id, ti.task_id, ti.kind, ti.key, ti.value, ti.detail,
+	q := `SELECT ti.id, ti.project_id, ti.task_id, ti.kind, ti.key, ti.match_key, ti.value, ti.detail,
        ti.source, ti.source_id, ti.created_at, ti.updated_at,
        COALESCE(t.name, ''),
        (SELECT COUNT(*) FROM findings f WHERE f.task_id = ti.task_id),
@@ -78,8 +86,9 @@ SELECT id FROM projects WHERE reader_enabled = TRUE AND status = 'active')`, pid
           WHERE en.exploration_id = t.exploration_id AND en.kind = 'intent')
 FROM task_intel ti
 JOIN tasks t ON t.id = ti.task_id AND t.deleted_at IS NULL
-WHERE ti.task_id <> $` + fmt.Sprint(excludePos) + ` AND ` + scope + `
-  AND (` + strings.Join(conds, " OR ") + `)
+JOIN unnest($1::text[], $2::text[]) AS q(kind, match_key)
+  ON ti.kind = q.kind AND ti.match_key = q.match_key
+WHERE ti.task_id <> $3 AND ` + scope + `
 ORDER BY ti.task_id, ti.kind, ti.key`
 
 	rows, err := d.QueryContext(ctx, q, args...)
@@ -92,7 +101,7 @@ ORDER BY ti.task_id, ti.kind, ti.key`
 		var m IntelTaskMatch
 		var detail []byte
 		var sourceID sql.NullInt64
-		if err := rows.Scan(&m.ID, &m.ProjectID, &m.TaskID, &m.Kind, &m.Key, &m.Value, &detail,
+		if err := rows.Scan(&m.ID, &m.ProjectID, &m.TaskID, &m.Kind, &m.Key, &m.MatchKey, &m.Value, &detail,
 			&m.Source, &sourceID, &m.CreatedAt, &m.UpdatedAt,
 			&m.TaskName, &m.FindingCount, &m.IntentCount); err != nil {
 			return nil, err
