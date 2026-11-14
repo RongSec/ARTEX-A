@@ -110,6 +110,7 @@ import type {
   TaskConstraint,
   TaskGoal,
   TaskLLMResolutions,
+  TaskIntelResp,
   TaskNode,
   TaskScopeRow,
   TaskTemplate,
@@ -472,6 +473,8 @@ export const api = {
   taskCoverageGraph: (id: string) => get<CoverageGraphData>(`/tasks/${id}/coverage-graph`),
   // 任务视角的阅读者勾连审计：跨任务（同项目）与跨项目两组记录 + 阅读者运行记录。
   taskReaderTraces: (id: string) => get<ReaderTraces>(`/tasks/${id}/reader-traces`),
+  // 任务小结：头部摘要 + 五类结构化情报（接口/凭据/组件/资产/漏洞）。
+  taskIntel: (id: string) => get<TaskIntelResp>(`/tasks/${id}/intel`),
   // 全局 llm_usage 聚合（仪表盘新版 token 视图）：按 profile 总量 + 按天分桶。
   usageStats: (days = 365) => get<UsageStats>(`/tokens/usage?days=${days}`),
   // ---- 目标管理（总览）----

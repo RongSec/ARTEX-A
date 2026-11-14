@@ -1,522 +1,289 @@
 "use client";
 
-// 事实台账页（V4-A）：三层结构浏览/编辑全部事实（exploration_nodes kind='fact'）。
-// 项目（含"未挂项目"组）→ 任务（状态徽+详情链接）→ 事实行。
-// 行=summary 加粗一行 + description 折叠展开 + 徽章（来源/类别/锚定资产）
-// + 时间 + 行内编辑（乐观更新，失败回滚 toast，照 findings 页 updateStatus 范式）。
-// 人工编辑过的行带"人工编辑"徽 + 可展开机器原文（machine_original）。
-// 顶部工具条：项目/任务两级筛选 + 300ms 防抖搜索 + 统计。数据量可控不分页。
+// 任务小结（路由 /function/facts）：文档树 + 三段式详情。
+// 左：项目 → 任务树（默认折叠、可搜索、键盘上下切换、深链 ?task_id=）。
+// 右：固定摘要条 + 基本摘要 / 测过的接口 / 账号与口令 / 折叠的组件·资产·漏洞。
+// 数据：GET /api/projects + GET /api/tasks 组树；GET /api/tasks/{id}/intel 取详情。
 
 import * as React from "react";
 
-import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
-import {
-  BookOpenTextIcon,
-  ChevronDownIcon,
-  ChevronRightIcon,
-  PencilIcon,
-  SearchIcon,
-  XIcon,
-} from "lucide-react";
-import { toast } from "sonner";
+import { AlertCircleIcon, FileTextIcon, RefreshCwIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Spinner } from "@/components/ui/spinner";
-import { Textarea } from "@/components/ui/textarea";
+import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import { Skeleton } from "@/components/ui/skeleton";
 import { api } from "@/lib/api";
-import { statusMeta, toneClasses } from "@/lib/status";
-import {
-  FACT_CATEGORY_OPTIONS,
-  type Fact,
-  type FactProjectGroup,
-  type FactSource,
-  type FactTaskGroup,
-} from "@/lib/types";
-import { cn } from "@/lib/utils";
+import type { ProjectWithStats, Task, TaskIntelGroups, TaskIntelResp } from "@/lib/types";
 
-const ALL = "all";
+import { CredentialTable } from "./_components/credential-table";
+import { EndpointTable } from "./_components/endpoint-table";
+import { IntelExtraSections } from "./_components/intel-extra";
+import { TaskTree, type TreeProject, type TreeTask } from "./_components/task-tree";
+import { TaskSummaryBar, TaskSummarySection } from "./_components/task-summary";
 
-function fmtTime(ts: string) {
-  return new Date(ts).toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+// 后端 groups 固定键、空组为 []，但前端仍按缺失兜底：不显示 undefined。
+function normalizeIntel(raw: TaskIntelResp): TaskIntelResp {
+  const g = (raw.groups ?? {}) as Partial<TaskIntelGroups>;
+  return {
+    ...raw,
+    summary: raw.summary ?? null,
+    groups: {
+      endpoint: g.endpoint ?? [],
+      credential: g.credential ?? [],
+      component: g.component ?? [],
+      asset: g.asset ?? [],
+      vuln: g.vuln ?? [],
+    },
+  };
 }
 
-const sourceMeta: Record<FactSource, { label: string; cls: string }> = {
-  worker: { label: "worker", cls: "bg-muted text-muted-foreground border-transparent" },
-  observer: { label: "observer", cls: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/20" },
-  human: { label: "人工", cls: "bg-blue-500/15 text-blue-600 dark:text-blue-400 border-blue-500/20" },
-};
+// buildTree 把项目列表与任务列表拼成「项目 → 任务」，未挂项目的任务单列一组。
+function buildTree(projects: ProjectWithStats[], tasks: Task[]): TreeProject[] {
+  const byProject = new Map<number, TreeTask[]>();
+  const orphans: TreeTask[] = [];
+  for (const t of tasks) {
+    const item: TreeTask = {
+      id: String(t.id),
+      name: t.name?.trim() || t.description?.trim() || `任务#${t.id}`,
+      goal: t.goal ?? "",
+      status: t.status,
+    };
+    if (t.project_id == null) {
+      orphans.push(item);
+      continue;
+    }
+    const list = byProject.get(t.project_id);
+    if (list) list.push(item);
+    else byProject.set(t.project_id, [item]);
+  }
+  const out: TreeProject[] = projects.map((p) => ({
+    id: String(p.id),
+    name: p.name,
+    tasks: byProject.get(p.id) ?? [],
+  }));
+  if (orphans.length > 0) out.push({ id: "none", name: "未挂项目", tasks: orphans });
+  return out;
+}
 
-function MiniBadge({ children, className }: { children: React.ReactNode; className?: string }) {
+function DetailSkeleton() {
   return (
-    <span
-      className={cn(
-        "inline-flex items-center rounded border px-1.5 py-0.5 text-[11px] leading-none whitespace-nowrap",
-        className,
-      )}
-    >
-      {children}
-    </span>
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-40" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-32" />
+        <Skeleton className="h-40 w-full" />
+      </div>
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-32" />
+        <Skeleton className="h-28 w-full" />
+      </div>
+    </div>
   );
 }
 
-// 行内编辑表单的草稿态。
-interface EditDraft {
-  summary: string;
-  description: string;
-  category: string; // ""=未选（保存时按"其他"落空串删键）
+function ErrorBar({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="border-destructive/40 bg-destructive/5 flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2">
+      <AlertCircleIcon className="text-destructive size-4 shrink-0" />
+      <span className="text-destructive min-w-0 flex-1 text-xs">加载失败：{message}</span>
+      <Button size="sm" variant="outline" onClick={onRetry}>
+        <RefreshCwIcon className="size-3.5" /> 重试
+      </Button>
+    </div>
+  );
 }
 
-export default function FactsPage() {
-  const [groups, setGroups] = React.useState<FactProjectGroup[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState("");
+function FactsPageInner() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const urlTaskId = searchParams.get("task_id") ?? "";
 
-  // 筛选 + 搜索（300ms 防抖）
-  const [projectFilter, setProjectFilter] = React.useState<string>(ALL);
-  const [taskFilter, setTaskFilter] = React.useState<string>(ALL);
-  const [search, setSearch] = React.useState("");
-  const [debouncedSearch, setDebouncedSearch] = React.useState("");
-  React.useEffect(() => {
-    const t = setTimeout(() => setDebouncedSearch(search.trim()), 300);
-    return () => clearTimeout(t);
-  }, [search]);
+  // ---- 树数据 ----
+  const [projects, setProjects] = React.useState<TreeProject[]>([]);
+  const [listLoading, setListLoading] = React.useState(true);
+  const [listError, setListError] = React.useState("");
+  const [listAttempt, setListAttempt] = React.useState(0);
 
-  // 项目/任务下拉选项（任务选项随项目筛选级联）
-  const [projectOptions, setProjectOptions] = React.useState<{ id: string; name: string }[]>([]);
-  const [taskOptions, setTaskOptions] = React.useState<{ id: string; name: string; project_id?: number | null }[]>([]);
-  React.useEffect(() => {
-    api
-      .projects()
-      .then((r) => setProjectOptions(r.projects.map((p) => ({ id: String(p.id), name: p.name }))))
-      .catch(() => setProjectOptions([]));
-    api
-      .tasks()
-      .then((r) =>
-        setTaskOptions(
-          r.tasks.map((t) => ({ id: String(t.id), name: t.name || t.description, project_id: t.project_id })),
-        ),
-      )
-      .catch(() => setTaskOptions([]));
-  }, []);
-  const visibleTaskOptions =
-    projectFilter === ALL
-      ? taskOptions
-      : projectFilter === "none"
-        ? taskOptions.filter((t) => t.project_id == null)
-        : taskOptions.filter((t) => t.project_id != null && String(t.project_id) === projectFilter);
-  React.useEffect(() => {
-    // 项目切换后已选任务可能不在新范围内，回退"全部"。
-    if (taskFilter !== ALL && !visibleTaskOptions.some((t) => t.id === taskFilter)) setTaskFilter(ALL);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectFilter]);
-
-  // 折叠态（默认展开；Set 里存"已收起"的 key）
-  const [collapsedProjects, setCollapsedProjects] = React.useState<Set<string>>(new Set());
-  const [collapsedTasks, setCollapsedTasks] = React.useState<Set<string>>(new Set());
-  const [expandedDesc, setExpandedDesc] = React.useState<Set<string>>(new Set());
-  const [expandedOriginal, setExpandedOriginal] = React.useState<Set<string>>(new Set());
-
-  const toggleSet = (setter: React.Dispatch<React.SetStateAction<Set<string>>>, key: string) =>
-    setter((cur) => {
-      const next = new Set(cur);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-
-  // 数据拉取：筛选/防抖搜索变化时。
   React.useEffect(() => {
     let alive = true;
-    setLoading(true);
-    api
-      .listFacts({
-        project_id: projectFilter === ALL ? undefined : projectFilter,
-        task_id: taskFilter === ALL ? undefined : taskFilter,
-        q: debouncedSearch || undefined,
-      })
-      .then((g) => {
+    setListLoading(true);
+    Promise.all([api.projects(), api.tasks()])
+      .then(([projectResp, taskResp]) => {
         if (!alive) return;
-        setGroups(g);
-        setError("");
+        setProjects(buildTree(projectResp.projects, taskResp.tasks));
+        setListError("");
       })
       .catch((e) => {
-        if (!alive) return;
-        setError((e as Error).message);
+        if (alive) setListError((e as Error).message || "加载失败");
       })
-      .finally(() => alive && setLoading(false));
+      .finally(() => {
+        if (alive) setListLoading(false);
+      });
     return () => {
       alive = false;
     };
-  }, [projectFilter, taskFilter, debouncedSearch]);
+  }, [listAttempt]);
 
-  // 编辑态
-  const [editingId, setEditingId] = React.useState<string | null>(null);
-  const [draft, setDraft] = React.useState<EditDraft>({ summary: "", description: "", category: "" });
-  const [saving, setSaving] = React.useState(false);
+  // ---- 选中任务 ----
+  const [selectedId, setSelectedId] = React.useState(urlTaskId);
+  const [treeOpen, setTreeOpen] = React.useState(false);
 
-  // 三层扁平化：定位 fact + 计数（统计条）。
-  const factIndex = React.useMemo(() => {
-    const map = new Map<string, { fact: Fact; task: FactTaskGroup }>();
-    let taskCount = 0;
-    let factCount = 0;
-    for (const g of groups) {
-      for (const t of g.tasks) {
-        taskCount += 1;
-        for (const f of t.facts) {
-          map.set(f.id, { fact: f, task: t });
-          factCount += 1;
-        }
-      }
-    }
-    return { map, projectCount: groups.length, taskCount, factCount };
-  }, [groups]);
+  // 外部改 URL（深链/浏览器前进后退）时跟随；选任务本身由 selectTask 驱动。
+  React.useEffect(() => {
+    if (urlTaskId && urlTaskId !== selectedId) setSelectedId(urlTaskId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlTaskId]);
 
-  const startEdit = (f: Fact) => {
-    setEditingId(f.id);
-    setDraft({ summary: f.summary, description: f.description, category: f.category ?? "" });
+  // 选中变化用 replace 同步 URL（不新增历史记录）。
+  React.useEffect(() => {
+    if (!selectedId || urlTaskId === selectedId) return;
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("task_id", selectedId);
+    router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, urlTaskId, pathname, router]);
+
+  const selectTask = (id: string) => {
+    setSelectedId(id);
+    setTreeOpen(false);
   };
 
-  const replaceFact = (id: string, next: Fact) =>
-    setGroups((cur) =>
-      cur.map((g) => ({
-        ...g,
-        tasks: g.tasks.map((t) => ({
-          ...t,
-          facts: t.facts.map((f) => (f.id === id ? next : f)),
-        })),
-      })),
-    );
+  const selectedTask = React.useMemo(() => {
+    for (const p of projects) {
+      const t = p.tasks.find((x) => x.id === selectedId);
+      if (t) return t;
+    }
+    return null;
+  }, [projects, selectedId]);
 
-  const saveEdit = async (f: Fact) => {
-    if (!draft.summary.trim()) {
-      toast.error("摘要不能为空");
+  // ---- 详情数据 ----
+  const [intel, setIntel] = React.useState<TaskIntelResp | null>(null);
+  const [intelLoading, setIntelLoading] = React.useState(false);
+  const [intelError, setIntelError] = React.useState("");
+  const [detailAttempt, setDetailAttempt] = React.useState(0);
+
+  React.useEffect(() => {
+    if (!selectedId) {
+      setIntel(null);
+      setIntelError("");
+      setIntelLoading(false);
       return;
     }
-    const prev = f;
-    const optimistic: Fact = {
-      ...prev,
-      summary: draft.summary,
-      description: draft.description,
-      category: draft.category || prev.category,
-      edited: true,
-      source: "human",
+    let alive = true;
+    setIntelLoading(true);
+    setIntelError("");
+    setIntel(null);
+    api
+      .taskIntel(selectedId)
+      .then((r) => {
+        if (alive) setIntel(normalizeIntel(r));
+      })
+      .catch((e) => {
+        if (alive) setIntelError((e as Error).message || "加载失败");
+      })
+      .finally(() => {
+        if (alive) setIntelLoading(false);
+      });
+    return () => {
+      alive = false;
     };
-    // 乐观更新（含类别清空语义：空串=其他，后端删键；本地先按"其他"呈现）。
-    replaceFact(f.id, { ...optimistic, category: draft.category });
-    setSaving(true);
-    try {
-      const updated = await api.patchFact(f.id, {
-        summary: draft.summary,
-        description: draft.description,
-        category: draft.category,
-      });
-      // 用后端回读（machine_original 首次出现等）覆盖本地行；task_id/created_at
-      // 保持本地值（PATCH 响应不带归属，后端回 0 占位）。
-      replaceFact(f.id, {
-        ...updated,
-        task_id: prev.task_id,
-        origin_fact: updated.origin_fact ?? prev.origin_fact,
-        created_at: updated.created_at || prev.created_at,
-        anchors: updated.anchors?.length ? updated.anchors : prev.anchors,
-        machine_original: updated.machine_original ?? prev.machine_original,
-      });
-      toast.success("已保存");
-      setEditingId(null);
-    } catch (e) {
-      replaceFact(f.id, prev); // 回滚
-      toast.error(`更新失败：${(e as Error).message}`);
-    } finally {
-      setSaving(false);
-    }
-  };
+  }, [selectedId, detailAttempt]);
+
+  // 摘要条在 intel 未到时用树里的任务信息兜底（名称/状态/目标），不闪空。
+  const barSummary = intel?.summary ?? (selectedTask
+    ? { name: selectedTask.name, goal: selectedTask.goal, status: selectedTask.status }
+    : null);
+
+  const tree = (
+    <TaskTree
+      projects={projects}
+      selectedId={selectedId}
+      loading={listLoading}
+      error={listError}
+      onRetry={() => setListAttempt((n) => n + 1)}
+      onSelect={selectTask}
+    />
+  );
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4 p-4">
-      {/* 工具条 */}
-      <Card className="shrink-0">
-        <CardContent className="flex flex-wrap items-center gap-3 p-3">
-          <div className="flex items-center gap-1.5 text-sm font-medium">
-            <BookOpenTextIcon className="size-4" /> 任务小结
-          </div>
-          <Select value={projectFilter} onValueChange={setProjectFilter}>
-            <SelectTrigger size="sm" className="w-40">
-              <SelectValue placeholder="项目" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={ALL}>全部项目</SelectItem>
-              {projectOptions.map((p) => (
-                <SelectItem key={p.id} value={p.id}>
-                  {p.name}
-                </SelectItem>
-              ))}
-              <SelectItem value="none">未挂项目</SelectItem>
-            </SelectContent>
-          </Select>
-          <Select value={taskFilter} onValueChange={setTaskFilter}>
-            <SelectTrigger size="sm" className="w-44">
-              <SelectValue placeholder="任务" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={ALL}>全部任务</SelectItem>
-              {visibleTaskOptions.map((t) => (
-                <SelectItem key={t.id} value={t.id}>
-                  {t.name || `任务#${t.id}`}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <InputGroup className="w-64">
-            <InputGroupAddon>
-              <SearchIcon className="size-4" />
-            </InputGroupAddon>
-            <InputGroupInput
-              placeholder="搜索摘要/描述…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-            {search && (
-              <InputGroupAddon align="inline-end">
-                <button className="text-muted-foreground hover:text-foreground" onClick={() => setSearch("")} aria-label="清除搜索">
-                  <XIcon className="size-3.5" />
-                </button>
-              </InputGroupAddon>
-            )}
-          </InputGroup>
-          <div className="text-muted-foreground ml-auto text-xs tabular-nums">
-            {factIndex.projectCount} 个项目 / {factIndex.taskCount} 个任务 / {factIndex.factCount} 条事实
-          </div>
-        </CardContent>
-      </Card>
+    <div className="flex h-full min-h-0 flex-col gap-3 lg:flex-row lg:gap-4">
+      <aside className="hidden w-[300px] shrink-0 overflow-hidden rounded-xl border bg-card lg:block">
+        {tree}
+      </aside>
 
-      {/* 三层主体（滚动容器） */}
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {loading ? (
-          <div className="flex items-center justify-center py-16">
-            <Spinner className="size-5" />
+      <Sheet open={treeOpen} onOpenChange={setTreeOpen}>
+        <SheetContent side="left" className="w-[88vw] max-w-[320px] gap-0 p-0">
+          <SheetTitle className="sr-only">任务列表</SheetTitle>
+          {tree}
+        </SheetContent>
+      </Sheet>
+
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border bg-card">
+        <TaskSummaryBar
+          taskId={selectedId}
+          summary={barSummary}
+          fallbackName={selectedTask?.name ?? ""}
+          onOpenTree={() => setTreeOpen(true)}
+        />
+
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className="space-y-4 p-4">
+            {!selectedId ? (
+              <div className="flex flex-col items-center justify-center gap-2 py-20 text-center">
+                <FileTextIcon className="text-muted-foreground/60 size-8" />
+                <p className="text-sm font-medium">选择一个任务查看小结</p>
+                <p className="text-muted-foreground text-xs">
+                  左侧任务树按项目归档；窄屏点顶部「选择任务」打开列表。
+                </p>
+              </div>
+            ) : intelLoading ? (
+              <DetailSkeleton />
+            ) : intelError ? (
+              <ErrorBar message={intelError} onRetry={() => setDetailAttempt((n) => n + 1)} />
+            ) : intel ? (
+              <>
+                <TaskSummarySection
+                  key={`summary-${selectedId}`}
+                  taskId={selectedId}
+                  summary={intel.summary}
+                  hint={intel.hint}
+                />
+                <EndpointTable
+                  key={`endpoint-${selectedId}`}
+                  taskId={selectedId}
+                  rows={intel.groups.endpoint}
+                />
+                <CredentialTable
+                  key={`credential-${selectedId}`}
+                  rows={intel.groups.credential}
+                />
+                <IntelExtraSections
+                  key={`extra-${selectedId}`}
+                  taskId={selectedId}
+                  components={intel.groups.component}
+                  assets={intel.groups.asset}
+                  vulns={intel.groups.vuln}
+                />
+              </>
+            ) : null}
           </div>
-        ) : error ? (
-          <p className="text-destructive py-16 text-center text-sm">加载失败：{error}</p>
-        ) : groups.length === 0 ? (
-          <p className="text-muted-foreground py-16 text-center text-sm">暂无事实。任务探索中由 agent record_fact 写入后会自动出现在这里。</p>
-        ) : (
-          <div className="space-y-4">
-            {groups.map((g) => {
-              const pKey = g.project ? `p${g.project.id}` : "p-none";
-              const collapsed = collapsedProjects.has(pKey);
-              return (
-                <Card key={pKey}>
-                  <button
-                    className="hover:bg-muted/50 flex w-full items-center gap-2 px-4 py-3 text-left"
-                    onClick={() => toggleSet(setCollapsedProjects, pKey)}
-                  >
-                    {collapsed ? <ChevronRightIcon className="size-4" /> : <ChevronDownIcon className="size-4" />}
-                    <span className="text-sm font-semibold">{g.project ? g.project.name : "未挂项目"}</span>
-                    <span className="text-muted-foreground text-xs tabular-nums">
-                      {g.tasks.length} 个任务 / {g.tasks.reduce((n, t) => n + t.facts.length, 0)} 条事实
-                    </span>
-                  </button>
-                  {!collapsed && (
-                    <CardContent className="space-y-4 border-t pt-3">
-                      {g.tasks.map((t) => {
-                        const tKey = `t${t.id}`;
-                        const tCollapsed = collapsedTasks.has(tKey);
-                        return (
-                          <div key={tKey} className="space-y-1.5">
-                            <div className="flex items-center gap-2">
-                              <button
-                                className="text-muted-foreground hover:text-foreground"
-                                onClick={() => toggleSet(setCollapsedTasks, tKey)}
-                                aria-label={tCollapsed ? "展开任务" : "收起任务"}
-                              >
-                                {tCollapsed ? <ChevronRightIcon className="size-3.5" /> : <ChevronDownIcon className="size-3.5" />}
-                              </button>
-                              <Link
-                                href={`/function/tasks/detail?id=${encodeURIComponent(t.id)}`}
-                                className="hover:text-primary truncate text-sm font-medium"
-                              >
-                                {t.name || `任务#${t.id}`}
-                              </Link>
-                              <MiniBadge className={toneClasses[statusMeta("task", t.status).tone]}>
-                                {statusMeta("task", t.status).label}
-                              </MiniBadge>
-                              <span className="text-muted-foreground text-xs tabular-nums">{t.facts.length} 条</span>
-                            </div>
-                            {!tCollapsed && (
-                              <div className="ml-5 space-y-1.5">
-                                {t.facts.map((f) => (
-                                  <FactRow
-                                    key={f.id}
-                                    fact={f}
-                                    editing={editingId === f.id}
-                                    saving={saving}
-                                    draft={draft}
-                                    setDraft={setDraft}
-                                    descExpanded={expandedDesc.has(f.id)}
-                                    onToggleDesc={() => toggleSet(setExpandedDesc, f.id)}
-                                    origExpanded={expandedOriginal.has(f.id)}
-                                    onToggleOrig={() => toggleSet(setExpandedOriginal, f.id)}
-                                    onEdit={() => startEdit(f)}
-                                    onCancel={() => setEditingId(null)}
-                                    onSave={() => void saveEdit(f)}
-                                  />
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </CardContent>
-                  )}
-                </Card>
-              );
-            })}
-          </div>
-        )}
-      </div>
+        </div>
+      </section>
     </div>
   );
 }
 
-function FactRow(props: {
-  fact: Fact;
-  editing: boolean;
-  saving: boolean;
-  draft: EditDraft;
-  setDraft: React.Dispatch<React.SetStateAction<EditDraft>>;
-  descExpanded: boolean;
-  onToggleDesc: () => void;
-  origExpanded: boolean;
-  onToggleOrig: () => void;
-  onEdit: () => void;
-  onCancel: () => void;
-  onSave: () => void;
-}) {
-  const { fact: f } = props;
-  const src = sourceMeta[f.source] ?? sourceMeta.worker;
-  const hasDesc = Boolean(f.description || f.evidence);
-
-  if (props.editing) {
-    return (
-      <div className="bg-muted/40 rounded-lg border p-2.5">
-        <div className="space-y-2">
-          <Input
-            value={props.draft.summary}
-            onChange={(e) => props.setDraft((d) => ({ ...d, summary: e.target.value }))}
-            placeholder="摘要（一行结论）"
-            autoFocus
-          />
-          <Textarea
-            rows={3}
-            value={props.draft.description}
-            onChange={(e) => props.setDraft((d) => ({ ...d, description: e.target.value }))}
-            placeholder="描述/细节（可留空）"
-          />
-          <Select value={props.draft.category || "none"} onValueChange={(v) => props.setDraft((d) => ({ ...d, category: v === "none" ? "" : String(v) }))}>
-            <SelectTrigger size="sm" className="w-40">
-              <SelectValue placeholder="类别" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="none">未分类（其他）</SelectItem>
-              {FACT_CATEGORY_OPTIONS.map((c) => (
-                <SelectItem key={c} value={c}>
-                  {c}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="mt-2 flex gap-2">
-          <Button size="sm" onClick={props.onSave} disabled={props.saving}>
-            {props.saving ? <Spinner className="size-3.5" /> : null} 保存
-          </Button>
-          <Button size="sm" variant="outline" onClick={props.onCancel} disabled={props.saving}>
-            取消
-          </Button>
-        </div>
-      </div>
-    );
-  }
-
+// useSearchParams 在静态导出下必须位于 Suspense 边界内。
+export default function FactsPage() {
   return (
-    <div className="hover:bg-muted/30 rounded-lg border px-3 py-2">
-      <div className="flex items-start gap-2">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="truncate text-sm font-semibold">{f.summary || "（无摘要）"}</span>
-            <MiniBadge className={src.cls}>{src.label}</MiniBadge>
-            {f.origin_fact && (
-              <MiniBadge className="border-transparent bg-muted text-muted-foreground">任务起点</MiniBadge>
-            )}
-            <MiniBadge className="border-transparent bg-muted text-muted-foreground">
-              {f.category || "其他"}
-            </MiniBadge>
-            {f.edited && (
-              <MiniBadge className="border-blue-500/20 bg-blue-500/15 text-blue-600 dark:text-blue-400">人工编辑</MiniBadge>
-            )}
-            {f.anchors?.map((a) => (
-              <MiniBadge key={a.id} className="border-transparent bg-slate-500/15 font-mono text-slate-600 dark:text-slate-400">
-                {a.label}
-              </MiniBadge>
-            ))}
-          </div>
-          {hasDesc && (
-            <button
-              className="text-muted-foreground hover:text-foreground mt-0.5 flex items-center gap-1 text-xs"
-              onClick={props.onToggleDesc}
-            >
-              {props.descExpanded ? <ChevronDownIcon className="size-3" /> : <ChevronRightIcon className="size-3" />}
-              {props.descExpanded ? "收起细节" : "展开细节"}
-            </button>
-          )}
-          {props.descExpanded && (
-            <div className="mt-1 space-y-1">
-              {f.description && (
-                <p className="text-muted-foreground text-xs break-words whitespace-pre-wrap">{f.description}</p>
-              )}
-              {f.evidence && (
-                <p className="text-muted-foreground bg-muted/60 rounded border px-2 py-1 font-mono text-xs break-words whitespace-pre-wrap">
-                  {f.evidence}
-                </p>
-              )}
-            </div>
-          )}
-          {f.edited && (
-            <button
-              className="text-muted-foreground hover:text-foreground mt-0.5 flex items-center gap-1 text-xs"
-              onClick={props.onToggleOrig}
-            >
-              {props.origExpanded ? <ChevronDownIcon className="size-3" /> : <ChevronRightIcon className="size-3" />}
-              机器原文
-            </button>
-          )}
-          {props.origExpanded && f.machine_original && (
-            <div className="mt-1 space-y-0.5 rounded border border-dashed px-2 py-1.5">
-              <p className="text-xs break-words whitespace-pre-wrap">{f.machine_original.summary || "（无）"}</p>
-              {f.machine_original.description && (
-                <p className="text-muted-foreground text-xs break-words whitespace-pre-wrap">{f.machine_original.description}</p>
-              )}
-            </div>
-          )}
-        </div>
-        <div className="flex shrink-0 items-center gap-1.5">
-          <span className="text-muted-foreground text-xs tabular-nums" title={`创建 ${fmtTime(f.created_at)} / 更新 ${fmtTime(f.updated_at)}`}>
-            {fmtTime(f.updated_at)}
-          </span>
-          <Button size="sm" variant="ghost" className="text-muted-foreground h-6 w-6 p-0" onClick={props.onEdit} aria-label="编辑">
-            <PencilIcon className="size-3.5" />
-          </Button>
-        </div>
-      </div>
-    </div>
+    <React.Suspense fallback={null}>
+      <FactsPageInner />
+    </React.Suspense>
   );
 }

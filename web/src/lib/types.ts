@@ -2000,3 +2000,94 @@ export const FACT_CATEGORY_OPTIONS = [
   "防护行为",
   "其他",
 ] as const;
+
+// ---------------------------------------------------------------------------
+// 任务小结（GET /api/tasks/{id}/intel）：头部摘要 + 五类结构化情报。
+// 后端 groups 是固定键映射（空组为 []，不会是 null）；前端仍按缺失兜底。
+// ---------------------------------------------------------------------------
+
+// TaskIntelEvidence 是一条情报的来源指针：同一次命中可能同时来自 finding /
+// fact / asset，单条来源时其余字段缺省。
+export interface TaskIntelEvidence {
+  finding_id?: number;
+  fact_node_id?: number;
+  asset_id?: number;
+}
+
+// TaskIntelEndpoint 是一条测过的接口（用途/参数/状态码/鉴权来自证据正文）。
+export interface TaskIntelEndpoint {
+  key: string;
+  method: string;
+  path: string;
+  hosts: string[];
+  purpose: string;
+  params: string[];
+  status_codes: number[];
+  auth_required: boolean;
+  hit_count: number;
+  evidence: TaskIntelEvidence[];
+}
+
+// TaskIntelCredential 的 value 恒为脱敏描述，密文只在 secret_masked（前2后2）。
+export interface TaskIntelCredential {
+  key: string;
+  credential_type: string;
+  username: string;
+  service: string;
+  value: string;
+  secret_masked: string;
+  where_used: string[];
+  source: string;
+}
+
+export interface TaskIntelComponent {
+  key: string;
+  product: string;
+  version: string;
+  value: string;
+}
+
+export interface TaskIntelAsset {
+  key: string;
+  host: string;
+  port: number;
+  value: string;
+}
+
+export interface TaskIntelVuln {
+  key: string;
+  title: string;
+  severity: string;
+  asset: string;
+  finding_id: number;
+}
+
+export interface TaskIntelGroups {
+  endpoint: TaskIntelEndpoint[];
+  credential: TaskIntelCredential[];
+  component: TaskIntelComponent[];
+  asset: TaskIntelAsset[];
+  vuln: TaskIntelVuln[];
+}
+
+// counts 键与后端 db.IntelKind* 一致：endpoint/credential/component/asset/
+// vuln/finding/intent。
+export interface TaskIntelSummary {
+  name: string;
+  goal: string;
+  status: string;
+  project_id?: number;
+  project_name?: string;
+  started_at?: string;
+  ended_at?: string;
+  duration_seconds?: number;
+  counts?: Record<string, number>;
+}
+
+export interface TaskIntelResp {
+  task_id: number;
+  total?: number;
+  summary: TaskIntelSummary | null;
+  groups: TaskIntelGroups;
+  hint?: string;
+}
