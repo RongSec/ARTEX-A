@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,7 +28,9 @@ func TestReaderPromptUpgradeFor(t *testing.T) {
 		{"旧默认带尾随空白", readerPromptV1 + "\n\n", readerPromptReplace},
 		{"V4-E 资产优先旧默认", readerPrompt, readerPromptReplace}, // V6-U3 起也是旧默认，升到统一版
 		{"V6 统一版旧默认", readerUnifiedPromptV6, readerPromptReplace},
-		{"V7-LINK 旧默认", readerUnifiedPrompt, readerPromptReplace}, // V8-NAME 起升级到新称谓版
+		{"V7-LINK 旧默认", readerUnifiedPrompt, readerPromptReplace},      // V8-NAME 起升级到新称谓版
+		{"V8-NAME 旧默认", readerUnifiedPromptNames, readerPromptReplace}, // V9-READER 起升级到下钻判定版
+		{"V9-READER 当前默认", readerUnifiedPromptV9, readerPromptKeep},
 		{"用户编辑过", readerPromptV1 + "\n补充：只看 443 端口。", readerPromptKeep},
 		{"用户全新正文", "自定义阅读者", readerPromptKeep},
 	}
@@ -43,6 +46,13 @@ func TestReaderPromptUpgradeFor(t *testing.T) {
 	}
 	if readerUnifiedPromptNames == readerUnifiedPrompt {
 		t.Fatal("新称谓默认正文与 V7 默认相同：V8-NAME 升级无从发生")
+	}
+	if readerUnifiedPromptV9 == readerUnifiedPromptNames {
+		t.Fatal("V9-READER 默认正文与 V8 默认相同：下钻判定升级无从发生")
+	}
+	if !strings.Contains(readerUnifiedPromptV9, "不要把未判定的候选丢给规划者") ||
+		!strings.Contains(readerUnifiedPromptV9, "最多判定 3 个候选") {
+		t.Fatal("V9-READER 默认正文缺少下钻判定工作流关键约束")
 	}
 }
 

@@ -1808,9 +1808,11 @@ CREATE TABLE IF NOT EXISTS task_intel_links (
     decision        TEXT NOT NULL CHECK (decision IN ('adopted','dismissed','candidate')),
     reason          TEXT NOT NULL DEFAULT '',
     matched         JSONB NOT NULL DEFAULT '[]',           -- 命中明细 [{kind,key,value}]
+    decided_by      TEXT NOT NULL DEFAULT '',              -- 决策者：reader（V9-READER 起）；旧行为 ''
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (task_id, related_task_id)
 );
 ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS matched JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS decided_by TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_tintel_link_task ON task_intel_links(task_id, decision);

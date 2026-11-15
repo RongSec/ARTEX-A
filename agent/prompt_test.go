@@ -5,6 +5,25 @@ import (
 	"testing"
 )
 
+func TestPlannerPromptAdoptsReaderHint(t *testing.T) {
+	// V9-READER：规划者不再持有/调用勾连工具，相关任务经验由阅读者判定后以
+	// hint 下发，planner 直接采信。
+	t.Cleanup(func() { PromptOverride = nil })
+	PromptOverride = nil
+	got := plannerSystem("拿下X", "/data", "/data")
+	for _, banned := range []string{"request_reader_links", "adopt_related_task", "dismiss_related_task"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("planner prompt 不应再出现勾连工具 %q: %s", banned, got)
+		}
+	}
+	if !strings.Contains(got, "直接采信") {
+		t.Errorf("planner prompt 应写明「直接采信」阅读者 hint: %s", got)
+	}
+	if !strings.Contains(got, "不要再调用勾连工具") || !strings.Contains(got, "不要自己下钻核对") {
+		t.Errorf("planner prompt 应禁止再下钻核对: %s", got)
+	}
+}
+
 func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	t.Cleanup(func() { PromptOverride = nil })
 

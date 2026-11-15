@@ -812,6 +812,7 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 		log.Printf("[trigger] append msg failed: %v", err)
 	}
 	busyKey := s.convBusyKey(c.ID)
+	defer s.clearReaderDecisions(busyKey) // V9-READER：一轮判定计数随会话结束清理
 	s.chatMu.Lock()
 	s.chatBusy[busyKey] = true
 	s.chatMu.Unlock()

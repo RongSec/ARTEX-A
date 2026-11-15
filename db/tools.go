@@ -42,6 +42,18 @@ ON CONFLICT (key) DO NOTHING`, key, desc, schema, agents)
 	return err
 }
 
+// SetSystemToolAgents overwrites a built-in tool's agent binding. Unlike
+// SeedTool (first-insert-only) this reaches rows seeded by older versions, so a
+// changed ownership (e.g. planner → reader) propagates on restart. Only touches
+// system tools; custom tools keep their page-managed bindings.
+func (d *DB) SetSystemToolAgents(key string, agents json.RawMessage) error {
+	if len(agents) == 0 {
+		agents = json.RawMessage("[]")
+	}
+	_, err := d.Exec(`UPDATE tools SET agents=$2 WHERE key=$1 AND system`, key, agents)
+	return err
+}
+
 // AddAgentToToolBinding adds an agent key to the given tools' `agents` arrays if
 // not already present (idempotent). Used to give the built-in Auto agent its
 // default toolset on existing DBs.

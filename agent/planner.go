@@ -368,10 +368,10 @@ func plannerSystem(goal, dataDir, workDir string) string {
 	return body + artifactSpec(workDir) + plannerLinkGuidance
 }
 
-// plannerLinkGuidance 是 V7-LINK 的固定指引（代码所有，不可在 prompt 页编辑）：
-// 新攻击面必须先申请跨任务/跨项目阅读者勾连候选，再自己下钻做保留/舍弃决策。跨项目情报
-// 不再由 resolver 自动注入（见 server/project_insight.go），这条指引是唯一入口。
-const plannerLinkGuidance = "\n\n**攻击面勾连（形成新攻击面时先做）**：当你形成新的攻击面（准备产出意图）时，先调用 request_reader_links 查询相关任务；对返回的候选逐条下钻，有关的用 adopt_related_task 保留，无关的用 dismiss_related_task 舍弃。"
+// plannerLinkGuidance 是 V9-READER 的固定指引（代码所有，不可在 prompt 页编辑）：
+// 相关任务的经验由阅读者判定后以 hint 形式下发，规划者直接采信，不再自己申请/
+// 下钻/核对旧任务——规划者的上下文只花在当前任务上。
+const plannerLinkGuidance = "\n\n**相关任务经验（直接采信）**：相关任务的经验由阅读者判定后以 hint 形式给你，**直接采信**：hint 里写了来源任务、关联理由和可复用要点，不要再调用勾连工具、不要自己下钻核对；若 hint 与当前目标冲突，按 hint 里的要点验证而不是重读旧任务。"
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution
 // steps (so users can see how it reads the situation and judges goals — the

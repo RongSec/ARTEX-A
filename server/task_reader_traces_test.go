@@ -57,7 +57,7 @@ func TestTaskReaderTracesGrouping(t *testing.T) {
 	// 本任务 → 同项目对端（out，adopted，有命中明细）
 	if _, err := pg.SaveTaskIntelLink(ctx, db.TaskIntelLink{
 		ProjectID: pa.ID, TaskID: self.ID, RelatedTaskID: peerSame.ID,
-		Decision: "adopted", Reason: "同组件",
+		Decision: "adopted", Reason: "同组件", DecidedBy: "reader",
 		Matched: json.RawMessage(`[{"kind":"component","key":"canal@1.1","value":"Canal 1.1.5"}]`),
 	}); err != nil {
 		t.Fatal(err)
@@ -122,6 +122,9 @@ func TestTaskReaderTracesGrouping(t *testing.T) {
 	}
 	if resp.CrossTask[1].RelatedProjectName != pa.Name {
 		t.Fatalf("related project name=%q want %q", resp.CrossTask[1].RelatedProjectName, pa.Name)
+	}
+	if resp.CrossTask[1].DecidedBy != "reader" {
+		t.Fatalf("decided_by=%q want reader", resp.CrossTask[1].DecidedBy)
 	}
 	if len(resp.CrossTask[1].Matched) != 1 || resp.CrossTask[1].Matched[0].Kind != "component" {
 		t.Fatalf("matched=%+v", resp.CrossTask[1].Matched)

@@ -36,6 +36,7 @@ type ReaderTraceItem struct {
 	Decision           string             `json:"decision"`
 	Reason             string             `json:"reason"`
 	Matched            []ReaderTraceMatch `json:"matched"`
+	DecidedBy          string             `json:"decided_by"`
 	CreatedAt          time.Time          `json:"created_at"`
 	Direction          string             `json:"direction"` // out=本任务勾连别人，in=别人勾连本任务
 }
@@ -77,6 +78,7 @@ func (s *Server) taskReaderTraces(w http.ResponseWriter, r *http.Request) {
 			Decision:           row.Decision,
 			Reason:             row.Reason,
 			Matched:            decodeReaderTraceMatches(row.Matched),
+			DecidedBy:          row.DecidedBy,
 			CreatedAt:          row.CreatedAt,
 			Direction:          row.Direction,
 		}

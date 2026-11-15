@@ -91,6 +91,11 @@ type Server struct {
 	triggerActive map[string]int
 	triggerCfg    map[string]triggerBehavior
 
+	// readerDecisions 按会话累计阅读者的勾连判定数，每轮结束时打印
+	// 「判定了 N 个候选：adopt x / dismiss y」；会话结束后清理（V9-READER）。
+	readerDecisionMu sync.Mutex
+	readerDecisions  map[string]*readerDecisionStat
+
 	// profChatAgents caches a per-profile ChatAgent (chat page), keyed by profile id.
 	// Built lazily on first use; invalidated when any profile is saved/activated/deleted
 	// so edits take effect.

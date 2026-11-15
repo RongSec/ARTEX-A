@@ -521,6 +521,7 @@ type TaskIntelLink struct {
 	Decision      string          `json:"decision"`
 	Reason        string          `json:"reason"`
 	Matched       json.RawMessage `json:"matched"`
+	DecidedBy     string          `json:"decided_by"`
 	CreatedAt     time.Time       `json:"created_at"`
 }
 
@@ -548,22 +549,24 @@ func (d *DB) SaveTaskIntelLink(ctx context.Context, l TaskIntelLink) (int64, err
 	}
 	var id int64
 	err := d.QueryRowContext(ctx, `
-INSERT INTO task_intel_links(project_id, task_id, related_task_id, decision, reason, matched)
-VALUES ($1,$2,$3,$4,$5,$6)
+INSERT INTO task_intel_links(project_id, task_id, related_task_id, decision, reason, matched, decided_by)
+VALUES ($1,$2,$3,$4,$5,$6,$7)
 ON CONFLICT (task_id, related_task_id) DO UPDATE
 SET decision = EXCLUDED.decision,
     reason = EXCLUDED.reason,
-    matched = EXCLUDED.matched
+    matched = EXCLUDED.matched,
+    decided_by = EXCLUDED.decided_by
 RETURNING id`,
 		l.ProjectID, l.TaskID, l.RelatedTaskID, l.Decision,
-		truncateRunes(utf8Clean(l.Reason), 1000), string(matched)).Scan(&id)
+		truncateRunes(utf8Clean(l.Reason), 1000), string(matched),
+		truncateRunes(utf8Clean(l.DecidedBy), 40)).Scan(&id)
 	return id, err
 }
 
 // ListTaskIntelLinks 返回某发起方任务的全部勾连决策（新在前）。
 func (d *DB) ListTaskIntelLinks(ctx context.Context, taskID int64) ([]TaskIntelLink, error) {
 	rows, err := d.QueryContext(ctx, `
-SELECT id, project_id, task_id, related_task_id, decision, reason, matched, created_at
+SELECT id, project_id, task_id, related_task_id, decision, reason, matched, decided_by, created_at
 FROM task_intel_links WHERE task_id=$1 ORDER BY id DESC`, taskID)
 	if err != nil {
 		return nil, err
@@ -574,7 +577,7 @@ FROM task_intel_links WHERE task_id=$1 ORDER BY id DESC`, taskID)
 		var l TaskIntelLink
 		var matched []byte
 		if err := rows.Scan(&l.ID, &l.ProjectID, &l.TaskID, &l.RelatedTaskID,
-			&l.Decision, &l.Reason, &matched, &l.CreatedAt); err != nil {
+			&l.Decision, &l.Reason, &matched, &l.DecidedBy, &l.CreatedAt); err != nil {
 			return nil, err
 		}
 		if len(matched) == 0 {

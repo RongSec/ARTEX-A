@@ -456,9 +456,9 @@ const readerPromptLinkSection = "\n情报表勾连（V7-LINK）：收到图变�
 // 内部 agent key 仍是 reader（历史标识不改）。
 const readerUnifiedPrompt = readerUnifiedPromptV6 + readerPromptLinkSection
 
-// readerUnifiedPromptNames 是 V8-NAME 起的当前默认正文：流程与 V7 完全一致，
-// 只把称谓改成按作用域区分的两个名字——项目内=【跨任务阅读者】、跨项目=
-// 【跨项目阅读者】。内部 key/触发器/工具名一个不动。
+// readerUnifiedPromptNames 是 V8-NAME 的默认正文（现为旧默认，V9 升级比对基准）：
+// 流程与 V7 完全一致，只把称谓改成按作用域区分的两个名字——项目内=【跨任务
+// 阅读者】、跨项目=【跨项目阅读者】。内部 key/触发器/工具名一个不动。
 const readerUnifiedPromptNames = "你同时承担两个只读视角：项目内【跨任务阅读者】（scope=project）、跨项目【跨项目阅读者】（scope=cross）。只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
 	"触发时机：项目探索图变更（图变更触发）或定时兜底（每 30 分钟一轮）；一条触发器同时挂这两个条件。\n" +
 	"【先看触发消息前缀判别本轮作用域】\n" +
@@ -474,6 +474,27 @@ const readerUnifiedPromptNames = "你同时承担两个只读视角：项目内�
 	"  3) 确有串联价值才 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
 	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。" +
 	readerPromptLinkSection
+
+// readerUnifiedPromptV9 是 V9-READER 的当前默认正文：勾连判定从规划者移到
+// 阅读者——图变更时读增量情报表、读两边任务摘要、判相关/不相关，相关的用
+// adopt_related_task 把被勾连任务图以结构化 hint 暴露给发起方规划者。
+// V8 版本（readerUnifiedPromptNames）保留为升级比对基准。
+const readerUnifiedPromptV9 = "你同时承担两个只读视角：项目内【跨任务阅读者】（scope=project）、跨项目【跨项目阅读者】（scope=cross）。只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
+	"触发时机：项目探索图变更（图变更触发）或定时兜底（每 30 分钟一轮）；一条触发器同时挂这两个条件。\n" +
+	"【先看触发消息前缀判别本轮作用域】\n" +
+	"· 【scope=project】（项目图变更，消息里还带本批变更清单 kind/摘要/task_id）：做项目内跨任务阅读（你是跨任务阅读者），核心职责是【替规划者下钻判定勾连】——\n" +
+	"  1) read_task_intel 读增量情报表（since_id 传上一轮返回的 next_since_id）；用触发消息里的 task_id 定位本轮变更任务（发起方）；\n" +
+	"  2) 在增量里找同项目其它任务命中的强信号（同一接口/同一凭据/同一资产/同类漏洞）；仅组件版本相同的候选只作旁证，不作为勾连候选；\n" +
+	"  3) 每次最多判定 3 个候选。对每个候选，用 get_task_graph_digest 读【发起方任务】与【被勾连任务】两边上下文（读摘要，不读全文，不逐节点翻）；\n" +
+	"  4) 相关（同一攻击面/同一资产可复用/同一利用链）→ adopt_related_task(task_id=发起方, related_task_id=被勾连, strength, reason)。reason 必须写「读到了什么」（如：两边都出现未授权 /api/user/{id}，且被勾连任务已验证越权），不能只写「键相同」；\n" +
+	"  5) 不相关 → dismiss_related_task(task_id=发起方, related_task_id=被勾连, reason 一句话)；\n" +
+	"  6) 可选：确有跨任务可借鉴结论时，写一条 write_project_insight。\n" +
+	"  ★不要把未判定的候选丢给规划者：规划者不读旧任务、不做下钻，只采信你 adopt 后写入的 hint；你判完才轮到它。\n" +
+	"· 【scope=cross】（定时触发）：做跨项目串联（你是跨项目阅读者）——\n" +
+	"  1) read_all_project_insights 拿本轮输入，【先看 cross_project_assets】——它已 join 好「同一资产/组件出现在 ≥2 个项目」；为空即无跨项目信号，直接空转结束；\n" +
+	"  2) cross_project_assets 非空时围绕这些行写全局洞察，点名是哪个资产、涉及哪几个项目、同一资产上的同类漏洞面该搬到哪；\n" +
+	"  3) 确有串联价值才 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
+	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。"
 
 // seedObserverAgent 是 V6 之前的「跨任务观察者」seed（回退路径保留）。
 // V6-U3 起 observer 退化为只读别名：收敛完成后（reader_unified_v1 置位）
@@ -545,7 +566,7 @@ func (s *Server) seedReaderAgent() {
 		log.Printf("[reader] 创建 agent 失败: %v", err)
 		return
 	}
-	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptNames); err != nil {
+	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV9); err != nil {
 		log.Printf("[reader] seed prompt 失败: %v", err)
 	}
 	// serial+merge=all：整波图变更合并成一次会话（observer 原策略），max_parallel=2。
@@ -641,6 +662,10 @@ func (s *Server) unifyReaderAgent() {
 	log.Printf("[reader-unify] 已收敛为 reader 单 agent / 单条双条件触发器")
 }
 
+// taskIntelLinkToolsV9Flag 是「勾连工具归属迁到 reader 且描述/参数已刷新」的
+// 一次性标记。绑定本身每次启动都覆盖（幂等），此 flag 只控制 schema/描述刷新。
+const taskIntelLinkToolsV9Flag = "task_intel_link_tools_v9"
+
 // seedProjectTools 把项目工具 SeedTool 入库（首插生效），并跑阅读者的
 // seed/收敛/升级。由 seedOrchestrationTools 末尾调用——agent 绑定要求工具行
 // 先存在（reporter 同款顺序依赖）。绑定不给 auto/planner：跨任务读图+写 hint
@@ -664,30 +689,40 @@ func (s *Server) seedProjectTools() {
 	} else if err := s.m.PG().SeedTool(rt.Name(), rt.Description(), schema, agents); err != nil {
 		log.Printf("[project-tools] seed %s: %v", rt.Name(), err)
 	}
-	// V7-LINK：情报表勾连工具。planner 三件（request_reader_links /
-	// adopt_related_task / dismiss_related_task）首插即只绑 planner；reader
-	// 两件（read_task_intel / link_tasks）只绑 reader——与 reject_insight 同款
-	// 「首插生效」：用户日后在工具页取消绑定不会被重启复活。
-	for _, spec := range []struct {
-		tools  []actool.CoreTool
-		agents []string
-	}{
-		{s.taskIntelPlannerTools(), []string{"planner"}},
-		{s.taskIntelReaderTools(), []string{"reader"}},
-	} {
-		agents, err := json.Marshal(spec.agents)
-		if err != nil {
-			log.Printf("[project-tools] seed %v agents: %v", spec.agents, err)
-			continue
+	// V9-READER：情报表勾连工具全部只绑 reader（read_task_intel / link_tasks /
+	// request_reader_links / adopt_related_task / dismiss_related_task）。
+	// 与 reject_insight 的「首插生效」不同——归属迁移必须能改掉存量库的旧绑定
+	// （V7 曾把前三件绑 planner），所以这里 seed 后无条件覆盖 agents；描述/参数
+	// 结构用一次性 flag 刷新到代码默认，避免每次重启冲掉页面上的参数说明编辑。
+	agents, err := json.Marshal([]string{"reader"})
+	if err != nil {
+		log.Printf("[project-tools] seed reader link agents: %v", err)
+	} else {
+		refresh := false
+		if v, _, _ := s.m.pg.GetSetting(taskIntelLinkToolsV9Flag); v != "true" {
+			refresh = true
 		}
-		for _, t := range spec.tools {
-			schema, err := json.Marshal(t.InputSchema())
-			if err != nil {
-				log.Printf("[project-tools] seed %s schema: %v", t.Name(), err)
+		for _, t := range s.taskIntelReaderTools() {
+			schema, serr := json.Marshal(t.InputSchema())
+			if serr != nil {
+				log.Printf("[project-tools] seed %s schema: %v", t.Name(), serr)
 				continue
 			}
 			if err := s.m.PG().SeedTool(t.Name(), t.Description(), schema, agents); err != nil {
 				log.Printf("[project-tools] seed %s: %v", t.Name(), err)
+			}
+			if refresh {
+				if err := s.m.PG().RefreshToolDefaults(t.Name(), t.Description(), schema); err != nil {
+					log.Printf("[project-tools] refresh %s: %v", t.Name(), err)
+				}
+			}
+			if err := s.m.PG().SetSystemToolAgents(t.Name(), agents); err != nil {
+				log.Printf("[project-tools] bind %s → reader: %v", t.Name(), err)
+			}
+		}
+		if refresh {
+			if err := s.m.pg.SetSetting(taskIntelLinkToolsV9Flag, "true"); err != nil {
+				log.Printf("[project-tools] 写入 %s 标记失败: %v", taskIntelLinkToolsV9Flag, err)
 			}
 		}
 	}
@@ -756,11 +791,11 @@ func (s *Server) reconcileReaderAgentNames() {
 	}
 }
 
-// readerPromptUpgradeFlag 是「默认正文已切换到 V8-NAME 称谓」的一次性标记。
-// V7-LINK 的旧 flag（reader_prompt_link_v7）在存量库已置位，继续用它会让
-// 「跨任务阅读者/跨项目阅读者」称谓永远到不了 reader；换 flag 即再执行一次
-// 「逐字节比对旧默认才升级」的幂等收编。
-const readerPromptUpgradeFlag = "reader_prompt_names_v8"
+// readerPromptUpgradeFlag 是「默认正文已切换到 V9-READER 下钻判定版」的一次性
+// 标记。V8-NAME 的旧 flag（reader_prompt_names_v8）在存量库已置位，继续用它
+// 会让新流程永远到不了 reader；换 flag 即再执行一次「逐字节比对旧默认才升级」
+// 的幂等收编。
+const readerPromptUpgradeFlag = "reader_prompt_drill_v9"
 
 // readerPromptUpgrade 是 upgradeReaderPrompt 的纯判定结果（无库可单测）。
 type readerPromptUpgrade int
@@ -774,28 +809,28 @@ const (
 	readerPromptReplace
 )
 
-// readerPromptUpgradeFor 是「能不能升级」的纯判定：旧默认有四个——readerPromptV1
+// readerPromptUpgradeFor 是「能不能升级」的纯判定：旧默认有五个——readerPromptV1
 // （V4-E 之前）、readerPrompt（V4-E 资产优先版）、readerUnifiedPromptV6（V6 统一
-// 版）与 readerUnifiedPrompt（V7-LINK 勾连版）。当前与任一逐字节相同＝用户没
-// 编辑过，升到带新称谓的 readerUnifiedPromptNames；已是当前版本或用户手改的
-// 正文一律 Keep，不覆盖。
+// 版）、readerUnifiedPrompt（V7-LINK 勾连版）与 readerUnifiedPromptNames
+// （V8-NAME 称谓版）。当前与任一逐字节相同＝用户没编辑过，升到 V9-READER 的
+// 下钻判定版；已是当前版本或用户手改的正文一律 Keep，不覆盖。
 func readerPromptUpgradeFor(cur string) readerPromptUpgrade {
 	switch strings.TrimSpace(cur) {
 	case "":
 		return readerPromptSeed
-	case readerPromptV1, readerPrompt, readerUnifiedPromptV6, readerUnifiedPrompt:
+	case readerPromptV1, readerPrompt, readerUnifiedPromptV6, readerUnifiedPrompt, readerUnifiedPromptNames:
 		return readerPromptReplace
 	default:
 		return readerPromptKeep
 	}
 }
 
-// upgradeReaderPrompt 把存量库 reader 的 system prompt 升到 V8-NAME 称谓版：
+// upgradeReaderPrompt 把存量库 reader 的 system prompt 升到 V9-READER 下钻判定版：
 //
 //   - 当前 prompt 为空（seed 曾失败）→ 播种新默认；
 //   - 当前 prompt 与任一旧默认（readerPromptV1 / readerPrompt /
-//     readerUnifiedPromptV6 / readerUnifiedPrompt）逐字节相同
-//     ＝用户没编辑过 → 追加一个新版本（SavePrompt 保留历史，可在 UI 回滚）；
+//     readerUnifiedPromptV6 / readerUnifiedPrompt / readerUnifiedPromptNames）
+//     逐字节相同＝用户没编辑过 → 追加一个新版本（SavePrompt 保留历史，可在 UI 回滚）；
 //   - 已是当前版本或已被用户编辑 → 不覆盖，只记一行日志并置 flag。
 //
 // 用「逐字节比对旧默认」而不是无条件 ResetPromptToDefault：后者会把用户手写
@@ -820,17 +855,17 @@ func (s *Server) upgradeReaderPrompt() {
 	}
 	switch readerPromptUpgradeFor(cur) {
 	case readerPromptSeed:
-		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptNames); err != nil {
+		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV9); err != nil {
 			log.Printf("[reader] 播种新默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已播种「跨项目阅读者」默认 prompt")
+		log.Printf("[reader] 已播种 V9-READER 默认 prompt")
 	case readerPromptReplace:
-		if _, err := pg.SavePrompt(a.ID, readerUnifiedPromptNames, "V8-NAME 默认正文升级：跨任务阅读者/跨项目阅读者称谓", "system"); err != nil {
+		if _, err := pg.SavePrompt(a.ID, readerUnifiedPromptV9, "V9-READER 默认正文升级：阅读者下钻判定勾连，规划者直接采信 hint", "system"); err != nil {
 			log.Printf("[reader] 升级默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已把未编辑的默认 prompt 升级为「跨任务阅读者/跨项目阅读者」版（历史版本保留）")
+		log.Printf("[reader] 已把未编辑的默认 prompt 升级为 V9-READER 下钻判定版（历史版本保留）")
 	default:
 		log.Printf("[reader] 当前 prompt 已是新版或被用户编辑，跳过默认正文升级（如需新流程请手动恢复内置默认）")
 	}

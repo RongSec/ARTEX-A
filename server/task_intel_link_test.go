@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 )
 
@@ -136,6 +135,12 @@ func intelLinkTask(t *testing.T, s *Server, pg *db.DB, pid int64, name string) (
 	return task, taskID
 }
 
+// floatOf 安全取 JSON 数字（缺失/类型不符返回 0）。
+func floatOf(v any) float64 {
+	f, _ := v.(float64)
+	return f
+}
+
 func callToolJSON(t *testing.T, toolName string, call func(context.Context, json.RawMessage) (string, bool), ctx context.Context, in map[string]any, out any) {
 	t.Helper()
 	raw, err := json.Marshal(in)
@@ -154,7 +159,7 @@ func callToolJSON(t *testing.T, toolName string, call func(context.Context, json
 }
 
 // TestTaskIntelToolsWired 守历史 P0：工具绑定进库还不够，必须真的进 hostTools()
-// 装配，否则运行时不出现。
+// 装配，否则运行时不出现。V9-READER 起五件全部只归 reader，planner 一件不持有。
 func TestTaskIntelToolsWired(t *testing.T) {
 	s, _ := newInsightTestPG(t)
 	tools, _ := s.hostTools()
@@ -167,25 +172,53 @@ func TestTaskIntelToolsWired(t *testing.T) {
 			t.Errorf("hostTools 缺少 %s（绑定未装配）", k)
 		}
 	}
-	if n := len(s.taskIntelPlannerTools()); n != 3 {
-		t.Errorf("planner 勾连工具应为 3 件，got %d", n)
+	if n := len(s.taskIntelReaderTools()); n != 5 {
+		t.Errorf("reader 勾连工具应为 5 件，got %d", n)
 	}
-	if n := len(s.taskIntelReaderTools()); n != 2 {
-		t.Errorf("reader 勾连工具应为 2 件，got %d", n)
-	}
-	// seed 绑定：工具行必须存在且只绑对应 agent（planner 三件 / reader 两件）。
+	// seed 绑定：工具行必须存在且只绑 reader（planner 不再持有任何一件）。
 	s.seedProjectTools()
-	for name, agentKey := range map[string]string{
-		"request_reader_links": "planner", "adopt_related_task": "planner", "dismiss_related_task": "planner",
-		"read_task_intel": "reader", "link_tasks": "reader",
+	for _, name := range []string{
+		"request_reader_links", "adopt_related_task", "dismiss_related_task",
+		"read_task_intel", "link_tasks",
 	} {
 		row, err := s.m.pg.GetTool(name)
 		if err != nil || row == nil {
 			t.Errorf("工具 %s 未入库: err=%v", name, err)
 			continue
 		}
-		if !contains(row.Agents, agentKey) {
-			t.Errorf("工具 %s 应绑定 %s，got %v", name, agentKey, row.Agents)
+		if !contains(row.Agents, "reader") {
+			t.Errorf("工具 %s 应绑定 reader，got %v", name, row.Agents)
+		}
+		if contains(row.Agents, "planner") {
+			t.Errorf("工具 %s 不应再绑定 planner，got %v", name, row.Agents)
+		}
+	}
+}
+
+// TestTaskIntelToolOwnershipMigration 守存量库迁移：V7 曾把三件绑给 planner，
+// 新 seed 必须能把旧绑定改掉（不能只首插）。
+func TestTaskIntelToolOwnershipMigration(t *testing.T) {
+	s, pg := newInsightTestPG(t)
+	// 先造「存量库」：三件工具以 planner 绑定入库。
+	for _, name := range []string{"request_reader_links", "adopt_related_task", "dismiss_related_task"} {
+		agents, _ := json.Marshal([]string{"planner"})
+		schema, _ := json.Marshal(map[string]any{"type": "object"})
+		if err := pg.SeedTool(name, "旧描述", schema, agents); err != nil {
+			t.Fatal(err)
+		}
+		if err := pg.SetSystemToolAgents(name, agents); err != nil { // 覆盖可能存在的旧行
+			t.Fatal(err)
+		}
+	}
+	// 跑 seed：归属必须迁到 reader。
+	s.seedProjectTools()
+	for _, name := range []string{"request_reader_links", "adopt_related_task", "dismiss_related_task"} {
+		row, err := pg.GetTool(name)
+		if err != nil || row == nil {
+			t.Fatalf("工具 %s 未入库: err=%v", name, err)
+		}
+		if len(row.Agents) != 1 || row.Agents[0] != "reader" {
+			t.Errorf("存量库迁移后 %s 应只绑 reader，got %v", name, row.Agents)
 		}
 	}
 }
@@ -243,13 +276,13 @@ func TestReaderLinkFlow(t *testing.T) {
 		}
 		return r.Flatten(), r.IsError
 	}
-	bCtx := agent.WithRunInfo(ctx, agent.RunInfo{TaskID: idB})
+	// V9-READER：阅读者按项目视野找候选，显式传 project_id + 排除发起方任务。
 	var out struct {
 		Candidates []readerLinkCandidate `json:"candidates"`
 		Note       string                `json:"note"`
 	}
-	callToolJSON(t, "request_reader_links", call, bCtx, map[string]any{
-		"surface": "GET /api/user/123",
+	callToolJSON(t, "request_reader_links", call, ctx, map[string]any{
+		"surface": "GET /api/user/123", "project_id": pid, "exclude_task_id": idB,
 	}, &out)
 
 	if len(out.Candidates) != 1 || out.Candidates[0].TaskID != idA {
@@ -266,22 +299,21 @@ func TestReaderLinkFlow(t *testing.T) {
 		t.Errorf("返回必须带「候选须下钻」提示: %q", out.Note)
 	}
 
-	// 从 A 自己申请：A 必须被排除。
-	aCtx := agent.WithRunInfo(ctx, agent.RunInfo{TaskID: idA})
+	// 排除 A 自己：A 必须被排除。
 	out.Candidates = nil
-	callToolJSON(t, "request_reader_links", call, aCtx, map[string]any{
-		"surface": "GET /api/user/123",
+	callToolJSON(t, "request_reader_links", call, ctx, map[string]any{
+		"surface": "GET /api/user/123", "project_id": pid, "exclude_task_id": idA,
 	}, &out)
 	for _, c := range out.Candidates {
 		if c.TaskID == idA {
-			t.Fatalf("当前任务 A 不应作为自己的候选: %+v", out.Candidates)
+			t.Fatalf("发起方任务 A 不应作为自己的候选: %+v", out.Candidates)
 		}
 	}
 
 	// scope=cross：C 未开 reader_enabled → 不返回；开启后才返回。
 	out.Candidates = nil
-	callToolJSON(t, "request_reader_links", call, bCtx, map[string]any{
-		"surface": "GET /api/user/123", "scope": "cross",
+	callToolJSON(t, "request_reader_links", call, ctx, map[string]any{
+		"surface": "GET /api/user/123", "project_id": pid, "exclude_task_id": idB, "scope": "cross",
 	}, &out)
 	if len(out.Candidates) != 0 {
 		t.Fatalf("C 未开 reader_enabled，cross 不应返回任何候选，got %+v", out.Candidates)
@@ -290,14 +322,32 @@ func TestReaderLinkFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	out.Candidates = nil
-	callToolJSON(t, "request_reader_links", call, bCtx, map[string]any{
-		"surface": "GET /api/user/123", "scope": "cross",
+	callToolJSON(t, "request_reader_links", call, ctx, map[string]any{
+		"surface": "GET /api/user/123", "project_id": pid, "exclude_task_id": idB, "scope": "cross",
 	}, &out)
 	if len(out.Candidates) != 1 || out.Candidates[0].TaskID != idC {
 		t.Fatalf("C 开启 reader_enabled 后应被 cross 命中，got %+v", out.Candidates)
 	}
 
-	// ---------- adopt ----------
+	// ---------- adopt（阅读者判定相关，暴露给发起方 B 的规划者） ----------
+	if _, err := taskA.Store.AddNode(db.KindFact, map[string]any{
+		"summary": "A 任务已验证 /api/user/{id} 存在越权",
+	}, 0, "confirmed", "worker", nil); err != nil {
+		t.Fatal(err)
+	}
+	var hintGraphEvents int
+	ix := newProjectIndexer(pg)
+	ix.Start(ctx)
+	t.Cleanup(ix.Stop)
+	prevHook := taskB.Store.OnGraphChange
+	taskB.Store.OnGraphChange = func(ev db.GraphChange) {
+		if ev.Kind == db.KindHint {
+			hintGraphEvents++
+			ix.Enqueue(idB, ev) // 走生产同款投影/事件落库路径
+		}
+	}
+	defer func() { taskB.Store.OnGraphChange = prevHook }()
+
 	adopt := s.toolAdoptRelatedTask()
 	adoptCall := func(c context.Context, in map[string]any) string {
 		raw, _ := json.Marshal(in)
@@ -310,17 +360,18 @@ func TestReaderLinkFlow(t *testing.T) {
 		}
 		return r.Flatten()
 	}
-	adoptCall(bCtx, map[string]any{
-		"related_task_id": idA, "reason": "同一用户接口",
-		"matched": []map[string]any{{"kind": db.IntelKindEndpoint, "key": epKey, "value": "https://a.example.com/api/user/9"}},
+	adoptCall(ctx, map[string]any{
+		"task_id": idB, "related_task_id": idA, "reason": "两边都命中 /api/user/{id}，A 已验证越权",
+		"strength": "strong",
+		"matched":  []map[string]any{{"kind": db.IntelKindEndpoint, "key": epKey, "value": "https://a.example.com/api/user/9"}},
 	})
-	var decision, reason, matched string
-	if err := pg.QueryRow(`SELECT decision, reason, matched::text FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, idB, idA).
-		Scan(&decision, &reason, &matched); err != nil {
+	var decision, reason, matched, decidedBy string
+	if err := pg.QueryRow(`SELECT decision, reason, matched::text, decided_by FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, idB, idA).
+		Scan(&decision, &reason, &matched, &decidedBy); err != nil {
 		t.Fatal(err)
 	}
-	if decision != "adopted" || reason != "同一用户接口" || !strings.Contains(matched, epKey) {
-		t.Errorf("adopt 落库不对: decision=%q reason=%q matched=%s", decision, reason, matched)
+	if decision != "adopted" || decidedBy != "reader" || !strings.Contains(reason, "/api/user/{id}") || !strings.Contains(matched, epKey) {
+		t.Errorf("adopt 落库不对: decision=%q decided_by=%q reason=%q matched=%s", decision, decidedBy, reason, matched)
 	}
 	hintCount := func() int {
 		var n int
@@ -332,35 +383,129 @@ func TestReaderLinkFlow(t *testing.T) {
 	if n := hintCount(); n != 1 {
 		t.Fatalf("adopt 应写 1 条 hint，got %d", n)
 	}
-	var hintText string
-	if err := pg.QueryRow(`SELECT payload->>'text' FROM exploration_nodes WHERE exploration_id=$1 AND kind='hint' ORDER BY id DESC LIMIT 1`, taskB.ExpID).Scan(&hintText); err != nil {
+	var payloadRaw []byte
+	if err := pg.QueryRow(`SELECT payload FROM exploration_nodes WHERE exploration_id=$1 AND kind='hint' ORDER BY id DESC LIMIT 1`, taskB.ExpID).Scan(&payloadRaw); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(hintText, fmt.Sprintf("任务#%d", idA)) || !strings.Contains(hintText, epKey) {
-		t.Errorf("hint 正文缺少任务/命中项: %q", hintText)
+	var payload map[string]any
+	if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	hintText, _ := payload["text"].(string)
+	if !strings.Contains(hintText, fmt.Sprintf("任务#%d", idA)) || !strings.Contains(hintText, epKey) || !strings.Contains(hintText, "直接采信") {
+		t.Errorf("hint 正文缺少来源任务/要点/直接采信: %q", hintText)
+	}
+	if got := int64(floatOf(payload["source_task_id"])); got != idA {
+		t.Errorf("hint payload.source_task_id=%d want %d", got, idA)
+	}
+	if got, _ := payload["source_task_name"].(string); strings.TrimSpace(got) == "" {
+		t.Errorf("hint payload.source_task_name 不应为空: %+v", payload)
+	}
+	if got := int64(floatOf(payload["source_project_id"])); got != pid {
+		t.Errorf("hint payload.source_project_id=%d want %d", got, pid)
+	}
+	if got, _ := payload["strength"].(string); got != "strong" {
+		t.Errorf("hint payload.strength=%q want strong", got)
+	}
+	points, _ := payload["reusable_points"].([]any)
+	if len(points) == 0 {
+		t.Fatalf("hint payload 应含可复用要点: %+v", payload)
+	}
+	foundEP := false
+	for _, p := range points {
+		if strings.Contains(fmt.Sprint(p), epKey) {
+			foundEP = true
+		}
+	}
+	if !foundEP {
+		t.Errorf("可复用要点应含接口 %q: %+v", epKey, points)
+	}
+	if facts, _ := payload["key_facts"].([]any); len(facts) == 0 {
+		t.Errorf("hint payload 应含关键事实摘要: %+v", payload)
+	}
+	// 采纳必须触发图变更（生产链=project_graph_events）并唤醒规划者。
+	if hintGraphEvents == 0 {
+		t.Error("adopt 写 hint 后应触发图变更回调（规划者会被唤醒）")
+	}
+	// 生产链是 OnGraphChange → ProjectIndexer → project_graph_events；等异步
+	// 消费者落库，确认事件真的新增（reader 触发器/审计都靠它）。
+	var graphEvents int
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := pg.QueryRow(`SELECT COUNT(*) FROM project_graph_events WHERE task_id=$1 AND kind='hint'`, idB).Scan(&graphEvents); err != nil {
+			t.Fatal(err)
+		}
+		if graphEvents > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if graphEvents == 0 {
+		t.Error("project_graph_events 应有 hint 事件（规划者由图变更唤醒）")
+	}
+	taskB.trigMu.Lock()
+	var hintTriggers int
+	for _, ev := range taskB.pendingTriggers {
+		if ev.Kind == "hint" {
+			hintTriggers++
+		}
+	}
+	taskB.trigMu.Unlock()
+	if hintTriggers == 0 {
+		t.Error("adopt 后发起方任务应有 hint 触发事件（NotifyHint 唤醒规划者）")
 	}
 
 	// 重复 adopt 幂等：hint 不重复写。
-	adoptCall(bCtx, map[string]any{"related_task_id": idA, "reason": "同一用户接口（复核）"})
+	adoptCall(ctx, map[string]any{"task_id": idB, "related_task_id": idA, "reason": "同一用户接口（复核）"})
 	if n := hintCount(); n != 1 {
 		t.Errorf("重复 adopt 不应重复写 hint，got %d", n)
 	}
 
-	// ---------- dismiss ----------
+	// ---------- dismiss（只留 links，无 hint、无事件、无唤醒） ----------
+	eventsBefore := hintGraphEvents
+	hintsBefore := hintCount()
+	var pgEventsBefore int
+	if err := pg.QueryRow(`SELECT COUNT(*) FROM project_graph_events WHERE task_id=$1 AND kind='hint'`, idB).Scan(&pgEventsBefore); err != nil {
+		t.Fatal(err)
+	}
 	dismiss := s.toolDismissRelatedTask()
-	rawDismiss, _ := json.Marshal(map[string]any{"related_task_id": idC, "reason": "不同资产"})
-	rd, err := dismiss.Call(bCtx, rawDismiss, nil)
+	rawDismiss, _ := json.Marshal(map[string]any{"task_id": idB, "related_task_id": idC, "reason": "不同资产，读完两边无复用点"})
+	rd, err := dismiss.Call(ctx, rawDismiss, nil)
 	if err != nil || rd.IsError {
 		t.Fatalf("dismiss: err=%v res=%+v", err, rd)
 	}
-	if err := pg.QueryRow(`SELECT decision FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, idB, idC).Scan(&decision); err != nil {
+	if err := pg.QueryRow(`SELECT decision, decided_by FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, idB, idC).
+		Scan(&decision, &decidedBy); err != nil {
 		t.Fatal(err)
 	}
-	if decision != "dismissed" {
-		t.Errorf("dismiss 决策应为 dismissed，got %q", decision)
+	if decision != "dismissed" || decidedBy != "reader" {
+		t.Errorf("dismiss 决策应为 dismissed/reader，got %q/%q", decision, decidedBy)
 	}
-	if n := hintCount(); n != 1 {
-		t.Errorf("dismiss 不应写 hint，hint 数=%d", n)
+	if n := hintCount(); n != hintsBefore {
+		t.Errorf("dismiss 不应写 hint，hint 数=%d (before %d)", n, hintsBefore)
+	}
+	if hintGraphEvents != eventsBefore {
+		t.Errorf("dismiss 不应触发图变更，events=%d (before %d)", hintGraphEvents, eventsBefore)
+	}
+	// 留一点时间让可能的异步投影落库，再确认事件数没涨。
+	time.Sleep(100 * time.Millisecond)
+	var pgEventsAfter int
+	if err := pg.QueryRow(`SELECT COUNT(*) FROM project_graph_events WHERE task_id=$1 AND kind='hint'`, idB).Scan(&pgEventsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if pgEventsAfter != pgEventsBefore {
+		t.Errorf("dismiss 不应新增 project_graph_events，got %d (before %d)", pgEventsAfter, pgEventsBefore)
+	}
+	taskB.trigMu.Lock()
+	hintTriggersAfterDismiss := 0
+	for _, ev := range taskB.pendingTriggers {
+		if ev.Kind == "hint" {
+			hintTriggersAfterDismiss++
+		}
+	}
+	taskB.trigMu.Unlock()
+	if hintTriggersAfterDismiss != hintTriggers {
+		t.Errorf("dismiss 不应唤醒规划者，hint 触发数=%d (before %d)", hintTriggersAfterDismiss, hintTriggers)
 	}
 
 	// ---------- reader link_tasks 不覆盖 adopted ----------
@@ -415,7 +560,6 @@ func TestReaderLinkMatchKeyHitPG(t *testing.T) {
 		}
 		return r.Flatten(), r.IsError
 	}
-	bCtx := agent.WithRunInfo(ctx, agent.RunInfo{TaskID: idB})
 	var out struct {
 		Candidates []readerLinkCandidate `json:"candidates"`
 		Keys       []db.IntelKeyRef      `json:"keys"`
@@ -425,8 +569,8 @@ func TestReaderLinkMatchKeyHitPG(t *testing.T) {
 			Scope            string                 `json:"scope"`
 		} `json:"debug"`
 	}
-	callToolJSON(t, "request_reader_links", call, bCtx, map[string]any{
-		"surface": "POST /vulnerabilities/sqli/ SQL 注入 MariaDB 10.3",
+	callToolJSON(t, "request_reader_links", call, ctx, map[string]any{
+		"surface": "POST /vulnerabilities/sqli/ SQL 注入 MariaDB 10.3", "project_id": pid, "exclude_task_id": idB,
 	}, &out)
 
 	if len(out.Candidates) != 1 || out.Candidates[0].TaskID != idA {
@@ -459,8 +603,8 @@ func TestReaderLinkMatchKeyHitPG(t *testing.T) {
 
 	// 负例：不同接口 + 不同组件 → 不得把 A 连进来。
 	out.Candidates = nil
-	callToolJSON(t, "request_reader_links", call, bCtx, map[string]any{
-		"surface": "POST /vulnerabilities/upload/ nginx 1.18",
+	callToolJSON(t, "request_reader_links", call, ctx, map[string]any{
+		"surface": "POST /vulnerabilities/upload/ nginx 1.18", "project_id": pid, "exclude_task_id": idB,
 	}, &out)
 	for _, c := range out.Candidates {
 		if c.TaskID == idA {
@@ -551,7 +695,6 @@ func TestReaderLinkScopeSwitches(t *testing.T) {
 	}
 
 	link := s.toolRequestReaderLinks()
-	bCtx := agent.WithRunInfo(ctx, agent.RunInfo{TaskID: idB})
 	callLink := func(c context.Context, raw json.RawMessage) (string, bool) {
 		r, err := link.Call(c, raw, nil)
 		if err != nil {
@@ -566,8 +709,8 @@ func TestReaderLinkScopeSwitches(t *testing.T) {
 
 	// 1) observer 开 → 跨任务视角可用。
 	var out linkOut
-	callToolJSON(t, "request_reader_links", callLink, bCtx, map[string]any{
-		"surface": "POST /vulnerabilities/sqli/",
+	callToolJSON(t, "request_reader_links", callLink, ctx, map[string]any{
+		"surface": "POST /vulnerabilities/sqli/", "project_id": pid, "exclude_task_id": idB,
 	}, &out)
 	if len(out.Candidates) != 1 || out.Candidates[0].TaskID != idA {
 		t.Fatalf("observer_enabled=true 时应命中任务 A，got %+v", out.Candidates)
@@ -579,8 +722,8 @@ func TestReaderLinkScopeSwitches(t *testing.T) {
 	}
 	out.Candidates = nil
 	out.Note = ""
-	callToolJSON(t, "request_reader_links", callLink, bCtx, map[string]any{
-		"surface": "POST /vulnerabilities/sqli/",
+	callToolJSON(t, "request_reader_links", callLink, ctx, map[string]any{
+		"surface": "POST /vulnerabilities/sqli/", "project_id": pid, "exclude_task_id": idB,
 	}, &out)
 	if len(out.Candidates) != 0 {
 		t.Fatalf("observer_enabled=false 时不应有跨任务候选，got %+v", out.Candidates)

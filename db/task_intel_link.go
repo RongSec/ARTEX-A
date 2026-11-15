@@ -1,7 +1,7 @@
 package db
 
-// 任务情报勾连的查询面（V7-LINK）：planner 按「新攻击面」抽出的 (kind,key)
-// 反查情报表里命中的任务；reader 的 link_tasks 写候选关联。
+// 任务情报勾连的查询面：V9-READER 起由阅读者按攻击面/增量 (kind,key) 反查
+// 情报表里命中的任务，link_tasks 仍可写候选关联。
 //
 // 与 db/task_intel.go 的落库读写分开，避免那个文件继续膨胀；本文件只做
 // 「按 (kind,key) 命中 + 任务价值统计」和「candidate 写保护」两件事。
@@ -22,7 +22,7 @@ type IntelKeyRef struct {
 	Key  string `json:"key"`
 }
 
-// IntelTaskMatch 是命中行 + 任务侧价值统计（planner 判断候选值不值得下钻）。
+// IntelTaskMatch 是命中行 + 任务侧价值统计（阅读者判断候选值不值得下钻）。
 type IntelTaskMatch struct {
 	TaskIntel
 	TaskName     string `json:"task_name"`
@@ -34,7 +34,7 @@ type IntelTaskMatch struct {
 //
 // 比对用 match_key（IntelMatchKey 粗化后的键），不是精确 key：用户要的是
 // "接口/凭据/组件层面可比"，同一个路径换了方法、少了 query、组件差个小版本
-// 都不该断链。返回行仍带精确 key/value，供 planner 下钻。
+// 都不该断链。返回行仍带精确 key/value，供阅读者下钻。
 //
 // scope 语义：
 //   - cross=false（项目内）：只查 projectID 这一个项目；
@@ -44,7 +44,7 @@ type IntelTaskMatch struct {
 //
 // (kind, match_key) 去重后按对传入 unnest：既精确到 kind（避免 endpoint 路径
 // 与 asset 主机同名误撞），又能走 idx_tintel_matchkey。已删档任务不参与
-// （情报表仍留档，但 planner 无法 adopt 一个不存在的任务）。返回按
+// （情报表仍留档，但阅读者无法 adopt 一个不存在的任务）。返回按
 // task_id/kind/key 稳定排序，聚合排序在 server 层做。
 func (d *DB) MatchTaskIntel(ctx context.Context, projectID int64, keys []IntelKeyRef, excludeTaskID int64, cross bool) ([]IntelTaskMatch, error) {
 	if projectID <= 0 || len(keys) == 0 {
@@ -129,9 +129,9 @@ func (d *DB) TaskIntelLinkFor(ctx context.Context, taskID, relatedTaskID int64) 
 	var l TaskIntelLink
 	var matched []byte
 	err := d.QueryRowContext(ctx, `
-SELECT id, project_id, task_id, related_task_id, decision, reason, matched, created_at
+SELECT id, project_id, task_id, related_task_id, decision, reason, matched, decided_by, created_at
 FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, taskID, relatedTaskID).
-		Scan(&l.ID, &l.ProjectID, &l.TaskID, &l.RelatedTaskID, &l.Decision, &l.Reason, &matched, &l.CreatedAt)
+		Scan(&l.ID, &l.ProjectID, &l.TaskID, &l.RelatedTaskID, &l.Decision, &l.Reason, &matched, &l.DecidedBy, &l.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -156,6 +156,7 @@ type TaskIntelLinkTrace struct {
 	Decision           string
 	Reason             string
 	Matched            json.RawMessage
+	DecidedBy          string
 	CreatedAt          time.Time
 	Direction          string // out=本任务发起，in=对端勾连本任务
 	RelatedTaskName    string
@@ -172,7 +173,7 @@ func (d *DB) ListTaskIntelLinkTraces(ctx context.Context, taskID int64) ([]TaskI
 	rows, err := d.QueryContext(ctx, `
 SELECT l.id, l.project_id, l.task_id,
        CASE WHEN l.task_id = $1 THEN l.related_task_id ELSE l.task_id END,
-       l.decision, l.reason, l.matched, l.created_at,
+       l.decision, l.reason, l.matched, l.decided_by, l.created_at,
        CASE WHEN l.task_id = $1 THEN 'out' ELSE 'in' END,
        COALESCE(rt.name, ''),
        rt.project_id,
@@ -192,7 +193,7 @@ ORDER BY l.created_at DESC, l.id DESC`, taskID)
 		var t TaskIntelLinkTrace
 		var matched []byte
 		if err := rows.Scan(&t.ID, &t.ProjectID, &t.TaskID, &t.RelatedTaskID, &t.Decision, &t.Reason, &matched,
-			&t.CreatedAt, &t.Direction, &t.RelatedTaskName, &t.RelatedProjectID, &t.RelatedProjectName); err != nil {
+			&t.DecidedBy, &t.CreatedAt, &t.Direction, &t.RelatedTaskName, &t.RelatedProjectID, &t.RelatedProjectName); err != nil {
 			return nil, err
 		}
 		if len(matched) == 0 {
@@ -205,7 +206,7 @@ ORDER BY l.created_at DESC, l.id DESC`, taskID)
 }
 
 // SaveCandidateIntelLink 写 reader 的候选关联：幂等 upsert，但【不覆盖】已有
-// adopted/dismissed —— 阅读者的机器判断永远不能推翻规划者下钻后的人工决策。
+// adopted/dismissed —— candidate 不能覆盖已做过的正式决策。
 // 返回行 id 与是否真的写入（被保护时 applied=false，返回 existing id）。
 func (d *DB) SaveCandidateIntelLink(ctx context.Context, l TaskIntelLink) (id int64, applied bool, err error) {
 	if l.ProjectID <= 0 || l.TaskID <= 0 || l.RelatedTaskID <= 0 {
@@ -216,12 +217,13 @@ func (d *DB) SaveCandidateIntelLink(ctx context.Context, l TaskIntelLink) (id in
 		matched = json.RawMessage(`[]`)
 	}
 	err = d.QueryRowContext(ctx, `
-INSERT INTO task_intel_links(project_id, task_id, related_task_id, decision, reason, matched)
-VALUES ($1,$2,$3,'candidate',$4,$5)
+INSERT INTO task_intel_links(project_id, task_id, related_task_id, decision, reason, matched, decided_by)
+VALUES ($1,$2,$3,'candidate',$4,$5,'reader')
 ON CONFLICT (task_id, related_task_id) DO UPDATE
 SET decision = 'candidate',
     reason = EXCLUDED.reason,
-    matched = EXCLUDED.matched
+    matched = EXCLUDED.matched,
+    decided_by = EXCLUDED.decided_by
 WHERE task_intel_links.decision NOT IN ('adopted','dismissed')
 RETURNING id`,
 		l.ProjectID, l.TaskID, l.RelatedTaskID,
