@@ -198,16 +198,26 @@ func (s *Server) reportsDownloadBatch(w http.ResponseWriter, r *http.Request) {
 	if !s.pgReportDBGuard(w) {
 		return
 	}
-	var body struct {
-		ReportIDs []int64 `json:"report_ids"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		writeErr(w, 400, "请求格式错误")
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		writeErr(w, 400, "读取请求失败")
 		return
 	}
-	ids := make([]int64, 0, len(body.ReportIDs))
+	// 兼容两种 body 形状：裸数组 [1,2]（派工书原文）与 {report_ids:[1,2]}。
+	var bodyIDs []int64
+	if json.Unmarshal(raw, &bodyIDs) != nil {
+		var body struct {
+			ReportIDs []int64 `json:"report_ids"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			writeErr(w, 400, "请求格式错误")
+			return
+		}
+		bodyIDs = body.ReportIDs
+	}
+	ids := make([]int64, 0, len(bodyIDs))
 	seen := map[int64]bool{}
-	for _, id := range body.ReportIDs {
+	for _, id := range bodyIDs {
 		if id <= 0 || seen[id] {
 			continue
 		}
