@@ -1,23 +1,33 @@
 "use client";
 
 import * as React from "react";
-import { AlertTriangleIcon, PowerIcon, RotateCcwIcon, SaveIcon, ShieldCheckIcon, XIcon } from "lucide-react";
+import {
+  AlertTriangleIcon,
+  PencilIcon,
+  PowerIcon,
+  RotateCcwIcon,
+  SaveIcon,
+  ShieldCheckIcon,
+  XIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import type { ShortCircuitConfig, ShortCircuitState, ShortCircuitTools } from "@/lib/types";
 
-// V6-CFG：短路规则页。
+// V6-CFG / V9-UI：短路规则页。
 //
 // 交互模型刻意是「编辑草稿 → 保存文件 → 重启生效」：
 // 保存不会改变正在运行的判定（GET 的 config 始终是生效配置），dirty=true
 // 明确告诉用户"文件已改，重启才生效"。页面不提供任何热加载按钮。
+//
+// 布局跟拦截规则页对齐：一条规则一行卡片、等宽等高（文本框固定高度、内部滚动，
+// 不随内容撑高），默认只读，点「编辑」只把这一行切到可编辑态，其余行仍只读。
 
 type TextField =
   | "platform_paths"
@@ -29,42 +39,36 @@ type TextField =
   | "record_only_tools"
   | "control_plane_patterns";
 
-const TEXT_FIELDS: Array<{ key: TextField; title: string; hint: string; mono?: boolean }> = [
+const TEXT_FIELDS: Array<{ key: TextField; title: string; hint: string }> = [
   {
     key: "platform_paths",
     title: "平台凭据正则",
     hint: "命中即 deny，不吃远程指代豁免。一行一条，RE2 语法。",
-    mono: true,
   },
   {
     key: "platform_loose_patterns",
     title: "平台凭据宽松正则",
     hint: "覆盖 jwt.key 被插入空白/分隔符的变形（如 /app/j w t . k e y）。",
-    mono: true,
   },
   {
     key: "bare_read_names",
     title: "裸读文件名",
     hint: "读命令（cat/head/…）第一参数恰为这些裸相对名时 deny。按字面量处理，不需要转义点号。",
-    mono: true,
   },
   {
     key: "host_paths",
     title: "本机系统凭据正则",
     hint: "命中且命令中无远程指代（ssh/scp/http 等）时 deny。一行一条。",
-    mono: true,
   },
   {
     key: "ssh_host_key_patterns",
     title: "本机 SSH 主机私钥正则",
     hint: "默认匹配 /etc/ssh/ssh_host_*key；.pub 公钥由代码放行。",
-    mono: true,
   },
   {
     key: "remote_exempt_patterns",
     title: "远程指代豁免正则",
     hint: "命令串出现任一形态即视为远程打靶，本机凭据档整体豁免。",
-    mono: true,
   },
   {
     key: "record_only_tools",
@@ -74,10 +78,14 @@ const TEXT_FIELDS: Array<{ key: TextField; title: string; hint: string; mono?: b
   {
     key: "control_plane_patterns",
     title: "平台控制面 API 正则",
-    hint: "对平台自身监听地址（127.0.0.1/localhost:<端口>）的管理接口请求（/api/intercept|settings|system|agents|mcp|tools、/api/tasks/<id>/control）命中即 deny；实际 -addr 的 host/端口由启动时自动追加，/api/health 等只读面不拦。",
-    mono: true,
+    hint: "对平台自身监听地址（127.0.0.1/localhost:<端口>）的管理接口请求命中即 deny；实际 -addr 的 host/端口由启动时自动追加。",
   },
 ];
+
+// TOOLS_FIELD 只是「工具名单」这一行卡片的编辑态标识。
+const TOOLS_FIELD = "tools";
+
+type EditingKey = TextField | typeof TOOLS_FIELD | null;
 
 function linesToArray(v: string): string[] {
   return v
@@ -153,6 +161,92 @@ function ChipInput({
   );
 }
 
+// ChipList 是只读态的工具名单：只展示，不提供删除按钮。
+function ChipList({ items }: { items: string[] }) {
+  if (items.length === 0) return <span className="text-muted-foreground text-xs">（空）</span>;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {items.map((it) => (
+        <Badge key={it} variant="secondary" className="font-mono text-[11px]">
+          {it}
+        </Badge>
+      ))}
+    </div>
+  );
+}
+
+// RuleRow 是一条规则卡片的外壳：等宽等高靠固定高度的内容区 + 单行提示文字。
+function RuleRow({
+  title,
+  hint,
+  count,
+  editing,
+  onEdit,
+  onSave,
+  onCancel,
+  editDisabled,
+  children,
+}: {
+  title: string;
+  hint: string;
+  count: string;
+  editing: boolean;
+  onEdit: () => void;
+  onSave: () => void;
+  onCancel: () => void;
+  editDisabled: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <Card className="overflow-hidden">
+      <CardContent className="flex flex-col gap-2 p-3">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-2">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className="truncate text-sm font-medium">{title}</span>
+              <Badge variant="secondary" className="shrink-0 px-1 py-0 text-[10px] tabular-nums">
+                {count}
+              </Badge>
+              {editing && (
+                <Badge variant="outline" className="shrink-0 px-1 py-0 text-[10px]">
+                  编辑中
+                </Badge>
+              )}
+            </div>
+            <p className="text-muted-foreground mt-0.5 line-clamp-1 h-4 text-xs" title={hint}>
+              {hint}
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            {editing ? (
+              <>
+                <Button size="sm" className="h-7 px-2 text-xs" onClick={onSave}>
+                  保存
+                </Button>
+                <Button size="sm" variant="outline" className="h-7 px-2 text-xs" onClick={onCancel}>
+                  取消
+                </Button>
+              </>
+            ) : (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                onClick={onEdit}
+                disabled={editDisabled}
+              >
+                <PencilIcon className="size-3.5" />
+                编辑
+              </Button>
+            )}
+          </div>
+        </div>
+        {children}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function ShortCircuitPage() {
   const [active, setActive] = React.useState<ShortCircuitState | null>(null);
   const [tools, setTools] = React.useState<ShortCircuitTools>({ deny: [], ask: [], allow: [] });
@@ -166,6 +260,10 @@ export default function ShortCircuitPage() {
     record_only_tools: "",
     control_plane_patterns: "",
   });
+  // 单行编辑：editing 指向唯一处于编辑态的规则，draft 是它的草稿。
+  const [editing, setEditing] = React.useState<EditingKey>(null);
+  const [draft, setDraft] = React.useState("");
+  const [draftTools, setDraftTools] = React.useState<ShortCircuitTools>({ deny: [], ask: [], allow: [] });
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
   const [resetting, setResetting] = React.useState(false);
@@ -188,6 +286,7 @@ export default function ShortCircuitPage() {
       record_only_tools: arrayToLines(cfg.record_only_tools),
       control_plane_patterns: arrayToLines(cfg.control_plane_patterns),
     });
+    setEditing(null);
   }, []);
 
   const reload = React.useCallback(async () => {
@@ -203,26 +302,30 @@ export default function ShortCircuitPage() {
       .finally(() => setLoading(false));
   }, [hydrate, reload]);
 
-  const buildConfig = (): ShortCircuitConfig => ({
+  const buildConfig = (
+    nextTexts: Record<TextField, string>,
+    nextTools: ShortCircuitTools,
+  ): ShortCircuitConfig => ({
     version: active?.config.version ?? 1,
-    tools,
-    platform_paths: linesToArray(texts.platform_paths),
-    platform_loose_patterns: linesToArray(texts.platform_loose_patterns),
-    bare_read_names: linesToArray(texts.bare_read_names),
-    host_paths: linesToArray(texts.host_paths),
-    ssh_host_key_patterns: linesToArray(texts.ssh_host_key_patterns),
-    remote_exempt_patterns: linesToArray(texts.remote_exempt_patterns),
-    record_only_tools: linesToArray(texts.record_only_tools),
-    control_plane_patterns: linesToArray(texts.control_plane_patterns),
+    tools: nextTools,
+    platform_paths: linesToArray(nextTexts.platform_paths),
+    platform_loose_patterns: linesToArray(nextTexts.platform_loose_patterns),
+    bare_read_names: linesToArray(nextTexts.bare_read_names),
+    host_paths: linesToArray(nextTexts.host_paths),
+    ssh_host_key_patterns: linesToArray(nextTexts.ssh_host_key_patterns),
+    remote_exempt_patterns: linesToArray(nextTexts.remote_exempt_patterns),
+    record_only_tools: linesToArray(nextTexts.record_only_tools),
+    control_plane_patterns: linesToArray(nextTexts.control_plane_patterns),
     // 运行时派生值：服务端会忽略（按启动时的 dataDir 重新生成），仅为类型完整回传。
     platform_abs_dir: active?.config.platform_abs_dir ?? "",
   });
 
-  const save = () => {
+  // persist 是唯一的写文件出口：整页保存与单行保存都走它，避免两套语义。
+  const persist = (nextTexts: Record<TextField, string>, nextTools: ShortCircuitTools) => {
     setSaving(true);
     setError("");
     api
-      .saveShortCircuit(buildConfig())
+      .saveShortCircuit(buildConfig(nextTexts, nextTools))
       .then(() => {
         toast.success("已保存到文件，需重启服务端才生效");
         return reload();
@@ -233,6 +336,45 @@ export default function ShortCircuitPage() {
         toast.error("保存失败：" + msg);
       })
       .finally(() => setSaving(false));
+  };
+
+  const save = () => {
+    if (editing) return;
+    persist(texts, tools);
+  };
+
+  const startEdit = (key: EditingKey) => {
+    if (editing) return;
+    if (key === TOOLS_FIELD) {
+      setDraftTools({
+        deny: [...tools.deny],
+        ask: [...tools.ask],
+        allow: [...tools.allow],
+      });
+    } else if (key) {
+      setDraft(texts[key]);
+    }
+    setEditing(key);
+  };
+
+  const cancelEdit = () => {
+    setEditing(null);
+    setDraft("");
+    setDraftTools({ deny: [], ask: [], allow: [] });
+  };
+
+  // 单行保存：先把草稿落到本地状态，再按当前完整配置写文件（原子，不会丢别的行）。
+  const commitRow = () => {
+    if (!editing) return;
+    if (editing === TOOLS_FIELD) {
+      setTools(draftTools);
+      persist(texts, draftTools);
+    } else {
+      const next = { ...texts, [editing]: draft };
+      setTexts(next);
+      persist(next, tools);
+    }
+    cancelEdit();
   };
 
   const reset = () => {
@@ -296,21 +438,21 @@ export default function ShortCircuitPage() {
       .finally(() => setRestarting(false));
   };
 
-  const setField = (key: TextField, value: string) => setTexts((prev) => ({ ...prev, [key]: value }));
+  const busy = saving || resetting || restarting;
 
   return (
-    <div className="flex flex-1 flex-col gap-4 md:gap-6">
-      <div>
-        <h1 className="flex items-center gap-2 text-xl font-semibold tracking-tight">
-          <ShieldCheckIcon className="size-5" />
-          短路规则
-        </h1>
-        <p className="text-muted-foreground text-sm">
-          代码级红线（不进 DB、不受 /api/settings 热改影响），只能改文件 + 重启服务端生效
-        </p>
+    <div className="flex flex-1 flex-col gap-5 p-6">
+      <div className="flex items-center gap-2.5">
+        <ShieldCheckIcon className="h-5 w-5 shrink-0" />
+        <div>
+          <h1 className="text-lg font-semibold leading-tight">短路规则</h1>
+          <p className="text-muted-foreground mt-0.5 text-sm">
+            代码级红线（不进 DB、不受 /api/settings 热改影响），只能改文件 + 重启服务端生效
+          </p>
+        </div>
       </div>
 
-      {/* 黄色警示条：这是整页最重要的约束，放在所有可编辑控件之前。 */}
+      {/* 黄色警示条：这是整页最重要的约束。 */}
       <div className="flex gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-amber-900 dark:text-amber-200">
         <AlertTriangleIcon className="mt-0.5 size-5 shrink-0" />
         <div className="space-y-1 text-sm">
@@ -349,83 +491,125 @@ export default function ShortCircuitPage() {
         <div className="text-muted-foreground text-sm">加载中…</div>
       ) : (
         <>
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">工具名单</CardTitle>
-              <CardDescription>
-                判定顺序：deny（硬拦，无人工放行）→ ask（转人工，60s 超时拒绝）→ allow（显式放行）。
-                不命中任何名单且不触发凭据正则时，才进入 DB 规则与判官。
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="grid gap-5 md:grid-cols-3">
-              <div className="space-y-2">
-                <Label className="text-destructive">deny · 硬拦</Label>
-                <ChipInput
-                  items={tools.deny}
-                  onChange={(deny) => setTools((t) => ({ ...t, deny }))}
-                  placeholder="如 create_mcp"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label className="text-amber-600">ask · 人工确认</Label>
-                <ChipInput
-                  items={tools.ask}
-                  onChange={(ask) => setTools((t) => ({ ...t, ask }))}
-                  placeholder="如 update_skill_file"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label className="text-emerald-600">allow · 显式放行</Label>
-                <ChipInput
-                  items={tools.allow}
-                  onChange={(allow) => setTools((t) => ({ ...t, allow }))}
-                  placeholder="如 create_skill"
-                />
-              </div>
-            </CardContent>
-          </Card>
+          {/* 工具条与拦截规则页一致：说明在左，按钮右对齐、size=sm。 */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-muted-foreground text-xs">
+              默认只读；点某行的「编辑」只改这一行，其余行保持只读。一行一条，保存后仍需重启服务端。
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button size="sm" onClick={save} disabled={busy || !!editing}>
+                <SaveIcon className="size-4" />
+                {saving ? "保存中…" : "保存（需重启）"}
+              </Button>
+              <Button size="sm" variant="outline" onClick={reset} disabled={busy || !!editing}>
+                <RotateCcwIcon className="size-4" />
+                {resetting ? "恢复中…" : "恢复默认"}
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                onClick={restart}
+                disabled={busy || !!editing}
+              >
+                <PowerIcon className="size-4" />
+                {restarting ? "重启中…" : "重启服务端"}
+              </Button>
+            </div>
+          </div>
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">凭据与路径正则</CardTitle>
-              <CardDescription>
-                一行一条。保存前后端会逐条编译校验；出现非法正则或关键列表为空会直接拒绝保存。
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="grid gap-6 lg:grid-cols-2">
-              {TEXT_FIELDS.map((f) => (
-                <div key={f.key} className="space-y-2">
-                  <Label htmlFor={`sc-${f.key}`}>{f.title}</Label>
-                  <p className="text-muted-foreground text-xs">{f.hint}</p>
+          <div className="flex flex-col gap-2">
+            {TEXT_FIELDS.map((f) => {
+              const isEditing = editing === f.key;
+              const count = linesToArray(isEditing ? draft : texts[f.key]).length;
+              return (
+                <RuleRow
+                  key={f.key}
+                  title={f.title}
+                  hint={f.hint}
+                  count={`${count} 条`}
+                  editing={isEditing}
+                  onEdit={() => startEdit(f.key)}
+                  onSave={commitRow}
+                  onCancel={cancelEdit}
+                  editDisabled={!!editing || busy}
+                >
                   <Textarea
                     id={`sc-${f.key}`}
-                    value={texts[f.key]}
-                    onChange={(e) => setField(f.key, e.target.value)}
+                    aria-label={f.title}
+                    value={isEditing ? draft : texts[f.key]}
+                    onChange={(e) => setDraft(e.target.value)}
+                    readOnly={!isEditing}
                     spellCheck={false}
-                    className={`min-h-28 text-xs ${f.mono ? "font-mono" : ""}`}
+                    placeholder="（空）"
+                    className={`h-28 resize-none overflow-auto font-mono text-xs leading-relaxed ${
+                      isEditing ? "" : "bg-muted/40"
+                    }`}
                   />
-                </div>
-              ))}
-            </CardContent>
-          </Card>
+                </RuleRow>
+              );
+            })}
 
-          <div className="flex flex-wrap items-center gap-2">
-            <Button onClick={save} disabled={saving || resetting || restarting}>
-              <SaveIcon className="size-4" />
-              {saving ? "保存中…" : "保存（需重启）"}
-            </Button>
-            <Button variant="outline" onClick={reset} disabled={saving || resetting || restarting}>
-              <RotateCcwIcon className="size-4" />
-              {resetting ? "恢复中…" : "恢复默认"}
-            </Button>
-            <Button variant="destructive" onClick={restart} disabled={saving || resetting || restarting}>
-              <PowerIcon className="size-4" />
-              {restarting ? "重启中…" : "重启服务端"}
-            </Button>
-            <span className="text-muted-foreground text-xs">
-              重启会短暂中断服务；新进程起来后本页会自动确认 /api/health。
-            </span>
+            <RuleRow
+              title="工具名单"
+              hint="判定顺序：deny（硬拦，无人工放行）→ ask（转人工，60s 超时拒绝）→ allow（显式放行）。"
+              count={`${tools.deny.length + tools.ask.length + tools.allow.length} 项`}
+              editing={editing === TOOLS_FIELD}
+              onEdit={() => startEdit(TOOLS_FIELD)}
+              onSave={commitRow}
+              onCancel={cancelEdit}
+              editDisabled={!!editing || busy}
+            >
+              <div className="h-28 space-y-3 overflow-auto rounded-md border p-2">
+                {editing === TOOLS_FIELD ? (
+                  <div className="grid gap-3 md:grid-cols-3">
+                    <div className="space-y-1.5">
+                      <span className="text-destructive text-xs font-medium">deny · 硬拦</span>
+                      <ChipInput
+                        items={draftTools.deny}
+                        onChange={(deny) => setDraftTools((t) => ({ ...t, deny }))}
+                        placeholder="如 create_mcp"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <span className="text-xs font-medium text-amber-600">ask · 人工确认</span>
+                      <ChipInput
+                        items={draftTools.ask}
+                        onChange={(ask) => setDraftTools((t) => ({ ...t, ask }))}
+                        placeholder="如 update_skill_file"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <span className="text-xs font-medium text-emerald-600">allow · 显式放行</span>
+                      <ChipInput
+                        items={draftTools.allow}
+                        onChange={(allow) => setDraftTools((t) => ({ ...t, allow }))}
+                        placeholder="如 create_skill"
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="grid gap-3 md:grid-cols-3">
+                    <div className="space-y-1.5">
+                      <span className="text-destructive text-xs font-medium">deny · 硬拦</span>
+                      <ChipList items={tools.deny} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <span className="text-xs font-medium text-amber-600">ask · 人工确认</span>
+                      <ChipList items={tools.ask} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <span className="text-xs font-medium text-emerald-600">allow · 显式放行</span>
+                      <ChipList items={tools.allow} />
+                    </div>
+                  </div>
+                )}
+              </div>
+            </RuleRow>
           </div>
+
+          <p className="text-muted-foreground text-xs">
+            重启会短暂中断服务；新进程起来后本页会自动确认 /api/health。
+          </p>
         </>
       )}
     </div>
