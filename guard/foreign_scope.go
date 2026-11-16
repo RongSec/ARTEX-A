@@ -25,10 +25,10 @@ import (
 // 保护的是「跨任务授权边界」，必须无法在运行期关掉。判定顺序在 applyIntercept
 // 最前面（先于短路表与 DB 规则），命中 deny 后不再送判官。
 
+// foreignScopeRuleName 定义在 builtin_rules.go（内置规则目录与判定共用同一
+// 常量）。前缀 [代码内置] 是 db.interceptSource 识别
+// decision_source=builtin_foreign_scope 的约定标记，勿改。
 const (
-	// foreignScopeRuleName 进审计链的规则名。前缀 [代码内置] 是 db.interceptSource
-	// 识别 decision_source=builtin_foreign_scope 的约定标记，勿改。
-	foreignScopeRuleName = "[代码内置] 外部任务资产范围"
 	// foreignScopeDenyMessage 是给模型看的固定文案（不含 host，避免把扫描目标
 	// 写进历史时被误当成「可用地址」）。
 	foreignScopeDenyMessage = "该地址来自其它任务的经验参考，不在本任务授权范围；如确需测试，请先在本任务登记该资产并由人工确认"
@@ -107,7 +107,7 @@ func (g *Guard) checkForeignScope(ctx context.Context, ev hook.Event) *hook.Resu
 		}
 		dec := intercept.Decision{
 			Action:   "deny",
-			RuleName: foreignScopeRuleName,
+			RuleName: builtinForeignScopeRuleName,
 			Message:  foreignScopeDenyMessage,
 		}
 		if g.interceptor != nil {

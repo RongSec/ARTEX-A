@@ -146,7 +146,7 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 			if g.interceptor != nil && g.interceptor.AskBurstExceeded(ctx, ev.ToolName) {
 				esc := *dec
 				esc.Action = "deny"
-				esc.RuleName = "[代码常量] 审批请求超阈值（同一 agent 重复请求）"
+				esc.RuleName = builtinAskBurstRuleName
 				esc.Message = "同一 agent 在时间窗内对本工具的审批请求已超阈值，按防疲劳策略直接拒绝。"
 				logCtx := intercept.WithCall(ctx, ev.ToolName, ev.Input)
 				g.interceptor.Log(logCtx, intercept.ConvIDFromContext(logCtx), esc, ev.ToolName, ev.Input, "denied")

@@ -111,7 +111,7 @@ func TestForeignScopeDeniesAdoptedHost(t *testing.T) {
 	if !strings.Contains(msg, "不在本任务授权范围") {
 		t.Fatalf("拦截消息必须说明授权范围，got %q", msg)
 	}
-	if len(cap.logged) != 1 || cap.logged[0].RuleName != foreignScopeRuleName {
+	if len(cap.logged) != 1 || cap.logged[0].RuleName != builtinForeignScopeRuleName {
 		t.Fatalf("必须按内置规则留痕，got %+v", cap.logged)
 	}
 }

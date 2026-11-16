@@ -941,7 +941,7 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 	if err := shortCircuitConfigError(); err != nil {
 		return &intercept.Decision{
 			Action:   "deny",
-			RuleName: "[代码常量] 短路规则配置非法（fail-closed）",
+			RuleName: builtinFailClosedRuleName,
 			Message:  "短路规则配置文件加载失败，按 fail-closed 策略拒绝全部工具调用：" + err.Error(),
 		}
 	}
@@ -950,9 +950,9 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 	}
 	// 必须独立求值而非并入 platformAskTools：deny 无人工放行路径，ask 有超时兜底，合并即丢一档语义。
 	if platformDenyTools[toolName] {
-		ruleName, msg := "[代码常量] MCP 注册属凭据汇", msgMCPDeny
+		ruleName, msg := builtinMCPRegisterRuleName, msgMCPDeny
 		if toolName == deleteAssetsTool {
-			ruleName, msg = "[代码常量] 删除业务资产属破坏性操作", msgDeleteAssetsDeny
+			ruleName, msg = builtinDeleteAssetsRuleName, msgDeleteAssetsDeny
 		}
 		return &intercept.Decision{
 			Action:   "deny",
@@ -1033,7 +1033,7 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 			(decoded != "" && (platformCredentialRe.MatchString(decoded) || platformCredentialLooseRe.MatchString(decoded))) {
 			return &intercept.Decision{
 				Action:   "deny",
-				RuleName: "[代码常量] 平台凭据/进程环境",
+				RuleName: builtinPlatformCredRuleName,
 				Message:  msgSensitiveDeny,
 			}
 		}
@@ -1042,7 +1042,7 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 		if controlPlaneDetector.hit(credText) || (decoded != "" && controlPlaneDetector.hit(decoded)) {
 			return &intercept.Decision{
 				Action:   "deny",
-				RuleName: "[代码常量] 平台控制面 API",
+				RuleName: builtinControlPlaneRuleName,
 				Message:  msgControlPlaneDeny,
 			}
 		}
@@ -1053,7 +1053,7 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 		if hostSystemCredentialHit(hostScanText(input)) {
 			return &intercept.Decision{
 				Action:   "deny",
-				RuleName: "[代码常量] 本机系统凭据裸读",
+				RuleName: builtinHostCredRuleName,
 				Message:  msgHostCredentialDeny,
 			}
 		}
