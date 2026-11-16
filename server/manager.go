@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -397,6 +398,14 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	}
 	if err := pg.EnsureLLMUsageTable(); err != nil {
 		log.Printf("[llmusage] create table: %v", err)
+	}
+	// 一次性清理：task_intel_links 历史上没有指向 tasks 的外键，删任务不会级联，
+	// 留下指向不存在任务的孤儿行（线上曾出现 task_id=54 这类残留）。幂等，
+	// 每次启动跑一遍；新删除由 DeleteTaskCascadePrepared 的显式级联负责。
+	if n, err := pg.CleanupOrphanTaskIntelLinks(context.Background()); err != nil {
+		log.Printf("[intel] 清理孤儿勾连记录失败: %v", err)
+	} else if n > 0 {
+		log.Printf("[intel] 已清理孤儿勾连记录 %d 条", n)
 	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
 	if proxyAddr != "" {

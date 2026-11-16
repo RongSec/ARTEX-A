@@ -662,6 +662,13 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 	}
 	// llm_usage (the token metering ledger) is intentionally NOT deleted with the
 	// task — it is kept as historical accounting even after the task is gone.
+	//
+	// task_intel_links 没有指向 tasks 的外键（表建得比删档流程早），必须在这里
+	// 显式级联：发起方与被勾连方任一被删，记录就失去对端，留着只会在审计面
+	// 里指向不存在的任务（线上曾残留 task_id=54 这类孤儿行）。
+	if _, err := tx.Exec(`DELETE FROM task_intel_links WHERE task_id=$1 OR related_task_id=$1`, id); err != nil {
+		return result, err
+	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {
 		return result, err
 	}

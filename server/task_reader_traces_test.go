@@ -1,7 +1,7 @@
 package server
 
-// V8-NAME 测试：任务视角的阅读者勾连审计接口。
-// 三类用例：有 adopts+候选（双向、跨任务/跨项目分组）、只有入向、全空不报错。
+// V8-NAME / V9-UI 测试：任务视角的阅读者勾连审计接口。
+// 四类用例：已决记录的双向分组、只有入向、全空不报错、candidate 不进审计面。
 // 库集成照仓库 testDSN 范式：连不上 PG 时 skip。
 
 import (
@@ -48,9 +48,10 @@ func TestTaskReaderTracesGrouping(t *testing.T) {
 	self := newReaderTraceTestTask(t, pg, &pa.ID, "rt-self-"+suffix)
 	peerSame := newReaderTraceTestTask(t, pg, &pa.ID, "rt-peer-same-"+suffix)
 	peerCross := newReaderTraceTestTask(t, pg, &pb.ID, "rt-peer-cross-"+suffix)
+	peerPending := newReaderTraceTestTask(t, pg, &pb.ID, "rt-peer-pending-"+suffix)
 	t.Cleanup(func() {
-		_, _ = pg.Exec(`DELETE FROM task_intel_links WHERE task_id IN ($1,$2,$3) OR related_task_id IN ($1,$2,$3)`,
-			self.ID, peerSame.ID, peerCross.ID)
+		_, _ = pg.Exec(`DELETE FROM task_intel_links WHERE task_id IN ($1,$2,$3,$4) OR related_task_id IN ($1,$2,$3,$4)`,
+			self.ID, peerSame.ID, peerCross.ID, peerPending.ID)
 		_, _ = pg.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'')=$1`, i64s(self.ID))
 	})
 
@@ -66,11 +67,19 @@ func TestTaskReaderTracesGrouping(t *testing.T) {
 	if _, err := pg.RecordTaskForeignAssets(ctx, self.ID, peerSame.ID, []string{"10.0.0.9"}); err != nil {
 		t.Fatal(err)
 	}
-	// 本任务 → 跨项目对端（out，candidate）
+	// 本任务 → 跨项目对端（out，adopted）
 	if _, err := pg.SaveTaskIntelLink(ctx, db.TaskIntelLink{
 		ProjectID: pa.ID, TaskID: self.ID, RelatedTaskID: peerCross.ID,
-		Decision: "candidate", Reason: "同接口",
+		Decision: "adopted", Reason: "同接口", DecidedBy: "reader",
 		Matched: json.RawMessage(`[{"kind":"endpoint","key":"get /login","value":"/login"}]`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 本任务 → 另一个跨项目对端（out，candidate）：中间态，接口层必须过滤掉
+	if _, err := pg.SaveTaskIntelLink(ctx, db.TaskIntelLink{
+		ProjectID: pa.ID, TaskID: self.ID, RelatedTaskID: peerPending.ID,
+		Decision: "candidate", Reason: "待判",
+		Matched: json.RawMessage(`[{"kind":"endpoint","key":"get /admin","value":"/admin"}]`),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -143,6 +152,15 @@ func TestTaskReaderTracesGrouping(t *testing.T) {
 	if resp.CrossProject[0].RelatedTaskID != peerCross.ID || resp.CrossProject[0].RelatedProjectID != pb.ID {
 		t.Fatalf("cross_project[0]=%+v", resp.CrossProject[0])
 	}
+	// V9-UI：candidate 是阅读者下钻的中间态，不能出现在审计面。
+	for _, item := range append(append([]ReaderTraceItem{}, resp.CrossTask...), resp.CrossProject...) {
+		if item.Decision == "candidate" {
+			t.Fatalf("审计面不应包含 candidate: %+v", item)
+		}
+		if item.RelatedTaskID == peerPending.ID {
+			t.Fatalf("candidate 对端任务不应出现: %+v", item)
+		}
+	}
 	if len(resp.Runs) != 1 || resp.Runs[0].Worker != "reader" || resp.Runs[0].Summary != "跨项目串联完成" {
 		t.Fatalf("runs=%+v", resp.Runs)
 	}
@@ -173,7 +191,7 @@ func TestTaskReaderTracesInboundOnly(t *testing.T) {
 
 	if _, err := pg.SaveTaskIntelLink(ctx, db.TaskIntelLink{
 		ProjectID: p.ID, TaskID: peer.ID, RelatedTaskID: self.ID,
-		Decision: "candidate", Reason: "可疑关联",
+		Decision: "adopted", Reason: "复用组件", DecidedBy: "reader",
 	}); err != nil {
 		t.Fatal(err)
 	}

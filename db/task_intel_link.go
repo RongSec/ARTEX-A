@@ -164,8 +164,12 @@ type TaskIntelLinkTrace struct {
 	RelatedProjectName sql.NullString
 }
 
-// ListTaskIntelLinkTraces 返回与本任务相关的全部勾连记录（双向），按时间倒序。
-// 只连未删除的对端任务（已删档任务仍留在 links 表，但审计面展示无意义）。
+// ListTaskIntelLinkTraces 返回与本任务相关的全部【已决】勾连记录（双向），
+// 按时间倒序。只连未删除的对端任务（已删档任务仍留在 links 表，但审计面展示
+// 无意义）。
+//
+// decision='candidate' 是阅读者下钻过程中的中间态，不是结论：展示出来会被读
+// 成「确实存在这层关系」，所以在这里直接过滤（过滤发生在接口层，不改表）。
 func (d *DB) ListTaskIntelLinkTraces(ctx context.Context, taskID int64) ([]TaskIntelLinkTrace, error) {
 	if taskID <= 0 {
 		return nil, nil
@@ -182,7 +186,8 @@ FROM task_intel_links l
 JOIN tasks rt ON rt.id = CASE WHEN l.task_id = $1 THEN l.related_task_id ELSE l.task_id END
              AND rt.deleted_at IS NULL
 LEFT JOIN projects rp ON rp.id = rt.project_id
-WHERE l.task_id = $1 OR l.related_task_id = $1
+WHERE (l.task_id = $1 OR l.related_task_id = $1)
+  AND l.decision <> 'candidate'
 ORDER BY l.created_at DESC, l.id DESC`, taskID)
 	if err != nil {
 		return nil, err
@@ -243,4 +248,24 @@ RETURNING id`,
 		return 0, false, err
 	}
 	return id, true, nil
+}
+
+// CleanupOrphanTaskIntelLinks 删除孤儿勾连行：task_id 或 related_task_id 指向
+// 已不存在任务的记录（历史遗留：表没有指向 tasks 的外键，删任务时不会级联）。
+//
+// 幂等：同一批孤儿行第二次执行返回 0。启动时跑一次，之后由
+// DeleteTaskCascadePrepared 的显式级联保证不再产生新的孤儿。
+func (d *DB) CleanupOrphanTaskIntelLinks(ctx context.Context) (int64, error) {
+	res, err := d.ExecContext(ctx, `
+DELETE FROM task_intel_links l
+WHERE NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = l.task_id)
+   OR NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = l.related_task_id)`)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
