@@ -38,9 +38,11 @@ import (
 )
 
 // taskIntelBuildTimeout 是终态钩子里生成情报表的预算：只读本任务数据 +
-// 一两百行 upsert，30s 对慢查询也宽裕；超时即放弃（本轮缺失可由手动 rebuild
-// 或下次任务重跑补上）。
-const taskIntelBuildTimeout = 30 * time.Second
+// 一两百行 upsert，30s 对慢查询也宽裕。V9-PURPOSE 起还要容纳接口用途的模型
+// 补充（单次 30s、解析失败重试 1 次），因此把总预算放宽到 90s；钩子本身在
+// 后台 goroutine 里跑，放宽不会阻塞任务状态写入。超时即放弃（本轮缺失可由
+// 手动 rebuild 或下次任务重跑补上）。
+const taskIntelBuildTimeout = 90 * time.Second
 
 // intelBuildInput 是一次抽取的全部原料（纯数据，便于无库单测）。
 type intelBuildInput struct {
@@ -87,17 +89,25 @@ func (s *Server) onTaskTerminalBuildIntel(taskID int64, status string) {
 // buildTaskIntel 读任务 → 抽取 → upsert → 有新增则发图变更信号。幂等：同一
 // 任务重复调用行数不变（UNIQUE + upsert 覆盖），重复调用不重复发信号。
 func (s *Server) buildTaskIntel(ctx context.Context, taskID int64) (intelBuildStats, error) {
-	return s.buildTaskIntelMode(ctx, taskID, false)
+	return s.buildTaskIntelMode(ctx, taskID, false, false)
 }
 
 // rebuildTaskIntel 是 rebuild 接口的实现：先删掉本任务由抽取生成的旧行
 // （source=finding/fact/asset），再按当前原料整表重建；source=manual 的行
 // 原样保留。这样历史上抽错的噪声行不会继续留在比对面（删除+写入同一事务）。
+// forcePurpose=false：已经由模型生成的接口用途沿用到新表，不重复请求模型。
 func (s *Server) rebuildTaskIntel(ctx context.Context, taskID int64) (intelBuildStats, error) {
-	return s.buildTaskIntelMode(ctx, taskID, true)
+	return s.buildTaskIntelMode(ctx, taskID, true, false)
 }
 
-func (s *Server) buildTaskIntelMode(ctx context.Context, taskID int64, replace bool) (intelBuildStats, error) {
+// rebuildTaskIntelForcePurpose 是 rebuild 的显式强制模式（?force_purpose=1）：
+// 忽略已有 purpose_source=model，重新请求模型。普通 rebuild 默认不强制，保证
+// 重复点击「重建」不会反复烧模型调用。
+func (s *Server) rebuildTaskIntelForcePurpose(ctx context.Context, taskID int64) (intelBuildStats, error) {
+	return s.buildTaskIntelMode(ctx, taskID, true, true)
+}
+
+func (s *Server) buildTaskIntelMode(ctx context.Context, taskID int64, replace, forcePurpose bool) (intelBuildStats, error) {
 	st := intelBuildStats{TaskID: taskID, ByKind: map[string]int{}}
 	pg := s.m.pg
 	t, err := pg.GetTask(taskID)
@@ -129,15 +139,20 @@ func (s *Server) buildTaskIntelMode(ctx context.Context, taskID int64, replace b
 	}
 
 	rows := extractTaskIntel(intelBuildInput{TaskID: taskID, Findings: findings, Facts: facts, Assets: assets})
+	// 接口用途：规则值先落 purpose_rule/purpose_source=rule，再由一次批量模型
+	// 调用覆盖成抽象用途（见 task_intel_purpose.go）。模型是旁路增强：无配置/
+	// 失败/超时都保留规则值，绝不让情报表生成失败。
+	annotateIntelPurposeRules(rows)
+	old, err := pg.TaskIntelForTask(ctx, taskID)
+	if err != nil {
+		return st, fmt.Errorf("读旧情报表: %w", err)
+	}
+	s.fillIntelEndpointPurposes(ctx, t, findings, old, rows, forcePurpose)
 	st.Rows = len(rows)
 
 	// 重建前记下已有 key：删除后重新插入的"老行"不算新增攻击面，不发信号。
 	var before map[string]bool
 	if replace {
-		old, err := pg.TaskIntelForTask(ctx, taskID)
-		if err != nil {
-			return st, fmt.Errorf("读旧情报表: %w", err)
-		}
 		before = make(map[string]bool, len(old))
 		for _, r := range old {
 			before[r.Kind+"\x00"+r.Key] = true

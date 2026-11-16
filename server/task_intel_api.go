@@ -70,16 +70,17 @@ type intelEvidence struct {
 
 // intelEndpointItem 是一条接口情报：不只"打哪里"，还带用途/参数/状态码/鉴权。
 type intelEndpointItem struct {
-	Key          string          `json:"key"`
-	Method       string          `json:"method"`
-	Path         string          `json:"path"`
-	Hosts        []string        `json:"hosts"`
-	Purpose      string          `json:"purpose"`
-	Params       []string        `json:"params"`
-	StatusCodes  []int           `json:"status_codes"`
-	AuthRequired bool            `json:"auth_required"`
-	HitCount     int             `json:"hit_count"`
-	Evidence     []intelEvidence `json:"evidence"`
+	Key           string          `json:"key"`
+	Method        string          `json:"method"`
+	Path          string          `json:"path"`
+	Hosts         []string        `json:"hosts"`
+	Purpose       string          `json:"purpose"`
+	PurposeSource string          `json:"purpose_source"`
+	Params        []string        `json:"params"`
+	StatusCodes   []int           `json:"status_codes"`
+	AuthRequired  bool            `json:"auth_required"`
+	HitCount      int             `json:"hit_count"`
+	Evidence      []intelEvidence `json:"evidence"`
 }
 
 // intelCredentialItem 是一条凭据：value 恒为脱敏描述，密文只出现在
@@ -151,25 +152,27 @@ type taskIntelResp struct {
 
 // intelRowDetail 是 task_intel.detail 的解码投影（缺字段即零值）。
 type intelRowDetail struct {
-	Count        int      `json:"count"`
-	Methods      []string `json:"methods"`
-	Hosts        []string `json:"hosts"`
-	Purpose      string   `json:"purpose"`
-	Params       []string `json:"params"`
-	StatusCodes  []int    `json:"status_codes"`
-	AuthRequired bool     `json:"auth_required"`
-	FindingIDs   []int64  `json:"finding_ids"`
-	FactNodeIDs  []int64  `json:"fact_node_ids"`
-	AssetIDs     []int64  `json:"asset_ids"`
-	SecretMasked string   `json:"secret_masked"`
-	Patterns     []string `json:"patterns"`
-	WhereUsed    []string `json:"where_used"`
-	Versions     []string `json:"versions"`
-	Severity     string   `json:"severity"`
-	VulnClass    string   `json:"vulnclass"`
-	Title        string   `json:"title"`
-	AssetType    string   `json:"asset_type"`
-	URL          string   `json:"url"`
+	Count         int      `json:"count"`
+	Methods       []string `json:"methods"`
+	Hosts         []string `json:"hosts"`
+	Purpose       string   `json:"purpose"`
+	PurposeRule   string   `json:"purpose_rule"`
+	PurposeSource string   `json:"purpose_source"`
+	Params        []string `json:"params"`
+	StatusCodes   []int    `json:"status_codes"`
+	AuthRequired  bool     `json:"auth_required"`
+	FindingIDs    []int64  `json:"finding_ids"`
+	FactNodeIDs   []int64  `json:"fact_node_ids"`
+	AssetIDs      []int64  `json:"asset_ids"`
+	SecretMasked  string   `json:"secret_masked"`
+	Patterns      []string `json:"patterns"`
+	WhereUsed     []string `json:"where_used"`
+	Versions      []string `json:"versions"`
+	Severity      string   `json:"severity"`
+	VulnClass     string   `json:"vulnclass"`
+	Title         string   `json:"title"`
+	AssetType     string   `json:"asset_type"`
+	URL           string   `json:"url"`
 }
 
 func decodeIntelDetail(raw json.RawMessage) intelRowDetail {
@@ -178,6 +181,27 @@ func decodeIntelDetail(raw json.RawMessage) intelRowDetail {
 		_ = json.Unmarshal(raw, &d)
 	}
 	return d
+}
+
+// intelEffectivePurpose 取小结核对的用途：purpose 优先（build 时已把模型值写进
+// purpose），为空才退回 purpose_rule（兼容 V9 之前只有规则值的旧行）。
+func intelEffectivePurpose(d intelRowDetail) string {
+	if p := strings.TrimSpace(d.Purpose); p != "" {
+		return p
+	}
+	return strings.TrimSpace(d.PurposeRule)
+}
+
+// intelEffectivePurposeSource 标注用途来自 model 还是 rule；旧行没有来源字段，
+// 有用途即视为规则值。
+func intelEffectivePurposeSource(d intelRowDetail) string {
+	if s := strings.TrimSpace(d.PurposeSource); s != "" {
+		return s
+	}
+	if intelEffectivePurpose(d) != "" {
+		return "rule"
+	}
+	return ""
 }
 
 // splitEndpointKey 拆 "method /path?params"：方法小写、路径去掉 query。
@@ -251,13 +275,14 @@ func buildIntelGroups(rows []db.TaskIntel) intelGroups {
 			}
 			g.Endpoint = append(g.Endpoint, intelEndpointItem{
 				Key: r.Key, Method: method, Path: path,
-				Hosts:        emptyIfNil(d.Hosts),
-				Purpose:      d.Purpose,
-				Params:       emptyIfNil(d.Params),
-				StatusCodes:  makeIntSlice(d.StatusCodes),
-				AuthRequired: d.AuthRequired,
-				HitCount:     hit,
-				Evidence:     emptyIfNil(buildIntelEvidence(d)),
+				Hosts:         emptyIfNil(d.Hosts),
+				Purpose:       intelEffectivePurpose(d),
+				PurposeSource: intelEffectivePurposeSource(d),
+				Params:        emptyIfNil(d.Params),
+				StatusCodes:   makeIntSlice(d.StatusCodes),
+				AuthRequired:  d.AuthRequired,
+				HitCount:      hit,
+				Evidence:      emptyIfNil(buildIntelEvidence(d)),
 			})
 		case db.IntelKindCredential:
 			parts := strings.SplitN(r.Key, "|", 3)
@@ -428,10 +453,26 @@ func (s *Server) taskIntelRebuild(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "任务 id 无效")
 		return
 	}
-	st, err := s.rebuildTaskIntel(r.Context(), taskID)
+	var st intelBuildStats
+	var err error
+	if forcePurposeQuery(r) {
+		st, err = s.rebuildTaskIntelForcePurpose(r.Context(), taskID)
+	} else {
+		st, err = s.rebuildTaskIntel(r.Context(), taskID)
+	}
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	writeJSON(w, 200, st)
+}
+
+// forcePurposeQuery 判断 rebuild 是否显式要求重新请求模型生成接口用途。
+// 默认 false：重复 rebuild 沿用已有 purpose_source=model，不重复烧模型调用。
+func forcePurposeQuery(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("force_purpose"))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
 }
