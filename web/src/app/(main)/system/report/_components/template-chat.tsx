@@ -22,25 +22,37 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { ReportTemplateInput, TemplateChatMessage } from "@/lib/types";
+import type { ReportTemplateInput, TemplateChatMessage, TemplateChatResponse } from "@/lib/types";
 
 export function TemplateChat(props: {
   templateId: number | null; // null=未保存新建，禁用发送
   draft: ReportTemplateInput | null;
   onApplyTemplate: (t: ReportTemplateInput) => void; // 合并草稿进编辑态（dirty 由父级管）
   locale: string;
+  // R3：把当前预览数据源带进对话请求——用户说「按现有数据渲染」时服务端用
+  // 同一份数据渲染，结果随回复返回。
+  preview?: {
+    demo?: boolean;
+    scope?: "task" | "project";
+    task_id?: number;
+    project_id?: number;
+    locale?: string;
+  };
 }) {
-  const { templateId, draft, onApplyTemplate, locale } = props;
+  const { templateId, draft, onApplyTemplate, locale, preview } = props;
   const [messages, setMessages] = React.useState<TemplateChatMessage[]>([]);
   const [input, setInput] = React.useState("");
   const [sending, setSending] = React.useState(false);
   const [warnings, setWarnings] = React.useState<string[]>([]);
+  // R3：对话内嵌预览（服务端 renderChatPreview 返回的 HTML）。
+  const [renderPreview, setRenderPreview] = React.useState<NonNullable<TemplateChatResponse["preview"]> | null>(null);
   const scrollRef = React.useRef<HTMLDivElement | null>(null);
 
   // 切模板=新调试会话（消息流与模板强相关，留着会误导模型）。
   React.useEffect(() => {
     setMessages([]);
     setWarnings([]);
+    setRenderPreview(null);
     setInput("");
   }, [templateId]);
 
@@ -57,10 +69,12 @@ export function TemplateChat(props: {
         messages: next,
         template: draft,
         locale: locale || undefined,
+        preview,
       });
       setMessages((cur) => [...cur, { role: "assistant", content: resp.reply }]);
       onApplyTemplate(resp.template);
       setWarnings(resp.warnings ?? []);
+      if (resp.preview) setRenderPreview(resp.preview);
     } catch (e) {
       // 失败回滚本轮用户消息（可编辑重发），错误 toast。
       setMessages(messages);
@@ -91,6 +105,7 @@ export function TemplateChat(props: {
         {messages.length === 0 ? (
           <p className="text-muted-foreground py-6 text-center text-xs">
             用自然语言描述想改的模板设定，例如：把漏洞明细标题改成「发现事项」、正文字体换成宋体、关掉声明章。
+            也可以直接说「按现有数据渲染看看效果」——平台会用当前预览数据源渲染一份小样回在这里。
             改动先进草稿（右侧设置区同步可见），点保存才落库。
           </p>
         ) : (
@@ -112,6 +127,22 @@ export function TemplateChat(props: {
           </div>
         )}
       </div>
+
+      {renderPreview && (
+        <div className="overflow-hidden rounded-lg border">
+          <div className="bg-muted/50 flex items-center justify-between gap-2 px-2 py-1 text-xs">
+            <span>
+              渲染预览 · <span className="font-medium">{renderPreview.label}</span>
+            </span>
+            <button type="button" className="text-muted-foreground hover:text-foreground" onClick={() => setRenderPreview(null)}>
+              收起
+            </button>
+          </div>
+          {/* sandbox 空值=禁脚本；产物是服务端转义过的静态 HTML。 */}
+          <iframe title={`对话渲染预览-${renderPreview.label}`} srcDoc={renderPreview.html} sandbox="" className="h-56 w-full bg-white" />
+          {renderPreview.warning && <p className="text-amber-600 px-2 py-1 text-xs">{renderPreview.warning}</p>}
+        </div>
+      )}
 
       {warnings.length > 0 && (
         <div className="rounded-md border border-amber-400/60 bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-400">

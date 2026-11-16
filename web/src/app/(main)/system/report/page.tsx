@@ -704,6 +704,23 @@ function ReportCenterInner() {
                   draft={draft}
                   onApplyTemplate={applyChatTemplate}
                   locale={previewForm.locale}
+                  preview={
+                    previewSource === "demo"
+                      ? { demo: true, locale: previewForm.locale }
+                      : previewSource === "task"
+                        ? {
+                            demo: false,
+                            scope: "task",
+                            task_id: Number(previewForm.task_id) || undefined,
+                            locale: previewForm.locale,
+                          }
+                        : {
+                            demo: false,
+                            scope: "project",
+                            project_id: Number(previewForm.project_id) || undefined,
+                            locale: previewForm.locale,
+                          }
+                  }
                 />
               </CardContent>
             </Card>

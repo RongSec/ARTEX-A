@@ -50,7 +50,7 @@ const templateChatSystemPrompt = `你是渗透测试报告模板的编辑助手�
 {"reply":"给用户看的简短中文说明（改了什么、为何这么改）","patch":{...}}
 2. patch 里只放**要改的字段**，每个字段值=该字段的**全量新值**（不做局部 diff）：改 skeleton 就给出完整章节数组（含没动的章节）；改 style 就给出完整 style 对象（含没动的键，把当前值抄全）。
 3. 不得虚构 issuer、人员真实信息；用户没说的值保持请求 template 里的原样。
-4. 诉求与 schema 无关或做不到（如"改成 PDF 交付"），patch 给 {}，在 reply 里说明原因。
+4. 诉求与 schema 无关或做不到（如"改成 PDF 交付"），patch 给 {}，在 reply 里说明原因。但「按现有数据/示例数据重新生成、渲染、预览一份报告」不是做不到：平台会在本轮自动执行渲染并把预览一并回传，不要拒绝；你只需在 reply 里确认，并按需给出模板 patch（无需改模板则 patch 给 {}）。
 5. 用户只想聊天/提问而没有要改的内容时，patch 给 {}。`
 
 // reportTemplateChat POST /api/report-templates/{id}/chat。
@@ -74,10 +74,15 @@ func (s *Server) reportTemplateChat(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB：模板 JSON + 会话轮次上限兜底
 	var body struct {
-		Messages      []chatMessage     `json:"messages"`
-		Template      json.RawMessage   `json:"template"`
-		LLMProfileID  int64             `json:"llm_profile_id"`
-		Locale        string            `json:"locale"`
+		Messages     []chatMessage      `json:"messages"`
+		Template     json.RawMessage    `json:"template"`
+		LLMProfileID int64              `json:"llm_profile_id"`
+		Locale       string             `json:"locale"`
+		// R3：预览上下文（前端把当前预览源带上来：示例/任务/项目）。用户说
+		// 「按现有数据渲染」时服务端据此渲染 HTML 预览随回复返回。
+		Preview *chatPreviewInput `json:"preview"`
+		// WantRender 显式要求渲染（测试/脚本用；普通对话由 wantsRenderIntent 判定）。
+		WantRender bool `json:"want_render"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "请求格式错误: "+err.Error())
@@ -89,6 +94,7 @@ func (s *Server) reportTemplateChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "messages 必须非空且以 user 结尾")
 		return
 	}
+	userText := msgs[len(msgs)-1].Content
 	// 基准模板=请求里的当前 draft（编辑未保存态），缺省回退 DB 行。
 	base := tmpl
 	if len(body.Template) > 0 {
@@ -164,12 +170,29 @@ func (s *Server) reportTemplateChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	merged := mergeTemplateDraft(base, patch)
-	writeJSON(w, 200, map[string]any{
+	resp := map[string]any{
 		"reply":    reply,
 		"patch":    patch,
 		"template": templateDraftView(merged),
 		"warnings": warnings,
-	})
+	}
+	// R3：对话里允许「按现有数据渲染预览」。判定=用户明确提到渲染/预览/生成
+	// 报告（或请求体显式 want_render）。渲染失败不打断对话（模板修改照常返回）。
+	if body.WantRender || chatRequestsRender(userText) {
+		rctx, rcancel := context.WithTimeout(r.Context(), 30*time.Second)
+		pres, rerr := s.renderChatPreview(rctx, merged, body.Preview, r)
+		rcancel()
+		if rerr != nil {
+			warnings = append(warnings, "预览渲染失败: "+rerr.Error())
+			reply += "\n\n（本轮预览渲染失败：" + rerr.Error() + "）"
+		} else {
+			resp["preview"] = pres
+			reply += "\n\n（已按「" + pres.Label + "」渲染预览，见下方预览卡片；可继续对话调整模板。）"
+		}
+		resp["reply"] = reply
+		resp["warnings"] = warnings
+	}
+	writeJSON(w, 200, resp)
 }
 
 // templateDraftView 把模板行投影成前端 draft 形态（去掉 DB 只读元键；
@@ -194,6 +217,46 @@ func templateDraftView(t *db.ReportTemplate) map[string]any {
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+// chatPreviewInput 是对话渲染的数据源上下文（R3）。Demo=true 或无任务/项目时
+// 用内置示例数据；否则用指定任务/项目真实数据渲染（与 render-draft 同管道）。
+type chatPreviewInput struct {
+	Demo       bool    `json:"demo"`
+	Scope      string  `json:"scope"`
+	TaskID     int64   `json:"task_id"`
+	ProjectID  int64   `json:"project_id"`
+	FindingIDs []int64 `json:"finding_ids"`
+	Locale     string  `json:"locale"`
+}
+
+// chatRenderResult 是随对话返回的预览（HTML 片段/整页，前端 iframe 直接嵌入）。
+type chatRenderResult struct {
+	HTML    string `json:"html"`
+	Label   string `json:"label"`  // 示例数据 / 任务#N / 项目#N
+	Source  string `json:"source"` // demo | task | project
+	Warning string `json:"warning,omitempty"`
+}
+
+// chatRequestsRender 判定用户这句话是否在要求「渲染/预览报告」。纯函数：
+//   - 否定词（不要渲染/别预览…）优先，避免用户明确拒绝时误渲染；
+//   - 命中渲染/预览/看效果/生成报告 等意图才渲染。
+func chatRequestsRender(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	if t == "" {
+		return false
+	}
+	for _, neg := range []string{"不要渲染", "别渲染", "无需渲染", "不用渲染", "不要预览", "别预览", "不用预览", "无需预览"} {
+		if strings.Contains(t, neg) {
+			return false
+		}
+	}
+	for _, kw := range []string{"渲染", "预览", "看效果", "看下效果", "生成报告", "生成一份报告", "出一份报告", "出报告", "按现有数据", "重新生成一份报告"} {
+		if strings.Contains(t, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeChatMessages 过滤非法角色/空内容并按 max 截尾。

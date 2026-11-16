@@ -812,6 +812,63 @@ func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, outPath)
 }
 
+// renderChatPreview（R3）把模板对话里的「按现有数据渲染」落成 HTML 预览：
+// 复用 render-draft 的数据组装（示例 fixture 或真实任务/项目）+ 纯 Go HTML
+// 渲染，不落库、不进队列。失败返回错误给 handler 降级为 warning（对话不中断）。
+func (s *Server) renderChatPreview(ctx context.Context, tmpl *db.ReportTemplate, p *chatPreviewInput, r *http.Request) (*chatRenderResult, error) {
+	if s.m.pg == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	if p == nil {
+		p = &chatPreviewInput{Demo: true}
+	}
+	locale := strings.TrimSpace(p.Locale)
+	if locale == "" && tmpl != nil {
+		locale = tmpl.OutputLang
+	}
+	if locale == "" {
+		locale = "zh-CN"
+	}
+	res := &chatRenderResult{Source: "demo", Label: "示例数据"}
+	var in *report.ReportInput
+	var warning string
+	if p.Demo || (p.TaskID <= 0 && p.ProjectID <= 0) {
+		in = report.DemoInput()
+		in.Locale = locale
+		report.DemoTouchGeneratedAt(in)
+		applyTemplateMeta(in, tmpl, s.m.dir)
+	} else {
+		scope := strings.TrimSpace(p.Scope)
+		if scope == "" {
+			scope = db.ReportScopeTask
+		}
+		vjob := &db.Report{
+			Scope: scope, Format: "html", Locale: locale,
+			FindingIDs: p.FindingIDs, CreatedAt: time.Now(),
+		}
+		if scope == db.ReportScopeProject {
+			vjob.ProjectID = &p.ProjectID
+			res.Source, res.Label = "project", fmt.Sprintf("项目#%d", p.ProjectID)
+		} else {
+			vjob.TaskID = &p.TaskID
+			res.Source, res.Label = "task", fmt.Sprintf("任务#%d", p.TaskID)
+		}
+		var err error
+		in, warning, err = s.buildReportInput(ctx, vjob)
+		if err != nil {
+			return nil, err
+		}
+		// inline 合并草稿覆盖模板段（vjob 不带 TemplateID，避免回查旧行）。
+		applyTemplateMeta(in, tmpl, s.m.dir)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("预览渲染被取消: %w", err)
+	}
+	res.HTML = report.HTMLPreviewFromInput(in, s.requestOrigin(r))
+	res.Warning = warning
+	return res, nil
+}
+
 // renderDraftBytes 是 render-draft 的纯 Go 格式分派（T20，可测无副作用）：
 // "md"→MarkdownFromInput、"html"→HTMLPreviewFromInput（证据图 src 拼 origin
 // ——blob 预览下相对路径失效，见 report/html.go），pure=true；其余（docx）

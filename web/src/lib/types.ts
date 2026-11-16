@@ -1902,6 +1902,17 @@ export interface TemplateChatRequest {
   template?: ReportTemplateInput;
   llm_profile_id?: number;
   locale?: string;
+  // R3：当前预览上下文（示例/任务/项目）；用户要求「按现有数据渲染」时服务端
+  // 用它渲染 HTML 预览随回复返回。
+  preview?: {
+    demo?: boolean;
+    scope?: "task" | "project";
+    task_id?: number;
+    project_id?: number;
+    finding_ids?: number[];
+    locale?: string;
+  };
+  want_render?: boolean;
 }
 
 export interface TemplateChatResponse {
@@ -1909,6 +1920,13 @@ export interface TemplateChatResponse {
   patch: Record<string, unknown>;
   template: ReportTemplateInput;
   warnings?: string[];
+  // R3：服务端本轮渲染的预览（HTML 整页；前端 iframe srcDoc 展示）。
+  preview?: {
+    html: string;
+    label: string; // 示例数据 / 任务#N / 项目#N
+    source: "demo" | "task" | "project";
+    warning?: string;
+  };
 }
 
 // ReportImportResult 是 POST /api/report-templates/import-docx 的响应
