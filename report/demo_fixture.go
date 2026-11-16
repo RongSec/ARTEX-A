@@ -3,9 +3,10 @@ package report
 // T20（N1-D）demo fixture：内置样例报告输入，供报告中心「对话调模板+实时预览」
 // 与 demo 调试通道使用。**旁路 DB**——不建 demo 任务/findings 行（设计 §1.2D：
 // FindingsForReport 以 task_id 为硬谓词、存在性校验要真实任务行，走 demo 任务
-// 会污染任务列表/统计/投影事件流）。3 条虚构漏洞（critical 未授权/high SQLi/
-// medium XSS），域名统一 demo.example.com、报文逐字但全假（明显虚构的口令/
-// Cookie/token），无证据图。
+// 会污染任务列表/统计/投影事件流）。2 个虚构资产（demo.example.com /
+// admin.demo.example.com）、3 条虚构漏洞（critical 未授权/high SQLi/medium
+// XSS，均带 PoC 复现）与 1 个虚构凭据（demo_user / Demo#2026，仅用于演示），
+// 报文逐字但全假（明显虚构的口令/Cookie/token），无证据图。
 //
 // 红线：fixture 的伪资产校验（FilterPseudoTargets）在 demo 通道由调用方显式
 // 跳过（targets 自洽即可，校验针对真实交付）——见 server 侧装配注释。

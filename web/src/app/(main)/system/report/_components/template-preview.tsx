@@ -182,7 +182,7 @@ export function TemplatePreview(props: {
         <div className="ml-auto flex items-center gap-1.5">
           {busy && <Spinner className="size-4" />}
           <Button variant="outline" size="sm" onClick={() => void doRender()} disabled={busy || !targetReady}>
-            <RefreshCwIcon /> 重渲
+            <RefreshCwIcon /> 预览渲染
           </Button>
           <Button variant="outline" size="sm" onClick={() => void renderDocx()} disabled={!targetReady}>
             <DownloadIcon /> docx 交付预览
@@ -195,6 +195,10 @@ export function TemplatePreview(props: {
       </div>
 
       <div className="flex items-center gap-2 text-xs">
+        {/* R2：数据来源必须显式标注，避免「示例数据」与真实任务混淆。 */}
+        <Badge variant="secondary">
+          {source === "demo" ? "示例数据" : source === "task" ? `任务#${form.task_id || "?"}` : `项目#${form.project_id || "?"}`}
+        </Badge>
         <Badge variant="outline" className="border-amber-400 text-amber-600">
           结构预览，交付以 docx 为准
         </Badge>
