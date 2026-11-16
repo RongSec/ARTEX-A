@@ -1882,6 +1882,35 @@ export interface ReportGenerateInput {
   format?: "docx" | "md" | "html";
 }
 
+// ReportTree 是 R6 报告归档页的「项目→任务→报告」树（GET /api/reports/tree）。
+export interface ReportStatusCounts {
+  total: number;
+  done: number;
+  failed: number;
+  pending: number;
+  running: number;
+}
+
+export interface ReportTreeTask {
+  id: number; // 0=未归档
+  name: string;
+  reports: ReportJob[];
+  counts: ReportStatusCounts;
+}
+
+export interface ReportTreeProject {
+  id: number;
+  name: string;
+  reports: ReportJob[]; // 项目级报告
+  tasks: ReportTreeTask[];
+  counts: ReportStatusCounts;
+}
+
+export interface ReportTree {
+  projects: ReportTreeProject[];
+  orphans: ReportTreeTask[];
+}
+
 // ReportDraftInput 是 POST /api/report/render-draft 的入参（同步小样，不落库）。
 // T20 扩展：template=inline 草稿（优先于 template_id，未保存也能预览）；
 // demo=true=内置样例数据旁路（跳过任务/项目取数与伪资产校验）。

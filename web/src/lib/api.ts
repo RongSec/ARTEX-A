@@ -86,6 +86,7 @@ import type {
   ReportSkillDraft,
   ReportTemplate,
   ReportTemplateInput,
+  ReportTree,
   TemplateChatRequest,
   TemplateChatResponse,
   ProjectWithStats,
@@ -1590,6 +1591,43 @@ export const api = {
   // exportFindings）；文件名优先取 Content-Disposition 的 RFC5987 filename*。
   reportDownloadURL: (id: number) => `/report/jobs/${id}/download`,
   downloadReportJob: (id: number) => downloadBlob(`/report/jobs/${id}/download`, `report-${id}.docx`),
+  // R6 报告归档树（项目→任务→报告；status/q 过滤在服务端做）。
+  reportsTree: (q?: { status?: string; q?: string }) => {
+    const p = new URLSearchParams();
+    if (q?.status) p.set("status", q.status);
+    if (q?.q) p.set("q", q.q);
+    const qs = p.toString();
+    return get<ReportTree>(`/reports/tree${qs ? `?${qs}` : ""}`);
+  },
+  // R6 报告内嵌预览：后端用来源数据重建 HTML；这里拉 blob 供 iframe 用。
+  reportPreviewBlob: async (id: number, signal?: AbortSignal): Promise<Blob> => {
+    if (MOCK) {
+      return new Blob([`<html><body><h1>（demo）报告 #${id} 预览</h1></body></html>`], { type: "text/html" });
+    }
+    const token = getToken();
+    const r = await fetch(`/api/reports/${id}/preview`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      signal,
+    });
+    if (!r.ok) {
+      let message = `报告预览失败: ${r.status}`;
+      try {
+        const p = (await r.json()) as { error?: unknown };
+        if (typeof p.error === "string" && p.error.trim()) message = p.error.trim();
+      } catch {
+        /* 非 JSON 错误体保留状态码文案 */
+      }
+      throw new Error(message);
+    }
+    return r.blob();
+  },
+  // R6 多选打包下载（后端 zip；同名文件自动加序号）。
+  downloadReportsBatch: (ids: number[]) =>
+    downloadBlob("/reports/download-batch", "reports.zip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ report_ids: ids }),
+    }),
   // 同步渲染模板调试小样（60s 超时；不落库不进队列）。X-Report-Warning 透传
   // 伪资产剔除提示，调用方解码展示。
   renderReportDraft: (input: ReportDraftInput) =>

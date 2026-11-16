@@ -1060,6 +1060,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/report/jobs/{id}/download", s.reportJobDownload)
 	mux.HandleFunc("GET /api/reports", s.reportsList)
 	mux.HandleFunc("DELETE /api/reports/{id}", s.reportsDelete)
+	// R6 报告归档中心：项目→任务树 / 报告内嵌预览 / 多选打包下载。
+	mux.HandleFunc("GET /api/reports/tree", s.reportsTree)
+	mux.HandleFunc("GET /api/reports/{id}/preview", s.reportPreview)
+	mux.HandleFunc("POST /api/reports/download-batch", s.reportsDownloadBatch)
 
 	// ==== T16(3/3) 发现证据截图（/api/findings 前缀，与 /api/exploration/findings
 	// 原版路由零重叠）：上传/列表/删除/原图服务。{id}=findings 表 id。====
