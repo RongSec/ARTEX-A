@@ -138,8 +138,9 @@ export function TemplateChat(props: {
               收起
             </button>
           </div>
-          {/* sandbox 空值=禁脚本；产物是服务端转义过的静态 HTML。 */}
-          <iframe title={`对话渲染预览-${renderPreview.label}`} srcDoc={renderPreview.html} sandbox="" className="h-56 w-full bg-white" />
+          {/* sandbox=allow-same-origin（禁脚本）：与服务端 HTML 预览同口径，
+              证据图走同源 /api 路径时可正常加载。 */}
+          <iframe title={`对话渲染预览-${renderPreview.label}`} srcDoc={renderPreview.html} sandbox="allow-same-origin" className="h-56 w-full bg-white" />
           {renderPreview.warning && <p className="text-amber-600 px-2 py-1 text-xs">{renderPreview.warning}</p>}
         </div>
       )}

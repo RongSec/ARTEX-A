@@ -292,6 +292,11 @@ export default function ReportsArchivePage() {
                   警告
                 </Badge>
               )}
+              {preview && (
+                <Badge variant="outline" className="text-muted-foreground">
+                  按当前模板重建 · 交付以 docx 为准
+                </Badge>
+              )}
             </div>
             {preview && (
               <Button
