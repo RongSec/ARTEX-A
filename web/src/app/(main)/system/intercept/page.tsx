@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import {
   BotIcon,
   ListFilterIcon,
+  LockIcon,
   PencilIcon,
   PlusIcon,
   ShieldAlertIcon,
@@ -48,10 +49,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Card, CardContent } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
 import type {
+  BuiltinInterceptRule,
   InterceptAction,
   InterceptRule,
   JudgeConfig,
@@ -188,6 +190,71 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       </Label>
       {children}
     </div>
+  );
+}
+
+// ---- builtin rules (代码内置，只读) ----
+
+// BuiltinRulesCard 列 guard 包里硬编码的红线规则：名称/说明/动作全部由后端
+// 常量下发，前端不写字面量。这里只读——不是遗漏了开关，而是这些规则没有
+// 运行期开关（DB 规则可 toggle/删除，内置规则不能）。
+function BuiltinRulesCard() {
+  const [rules, setRules] = React.useState<BuiltinInterceptRule[]>([]);
+  const [loading, setLoading] = React.useState(true);
+
+  React.useEffect(() => {
+    api
+      .interceptBuiltinRules()
+      .then(setRules)
+      // 目录只是说明性信息：拉取失败不打断规则管理。
+      .catch(() => setRules([]))
+      .finally(() => setLoading(false));
+  }, []);
+
+  return (
+    <Card>
+      <CardHeader className="border-b py-3">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <LockIcon className="h-4 w-4 text-muted-foreground" />
+          内置规则（代码内置，不可编辑）
+        </CardTitle>
+        <CardDescription className="text-xs">
+          代码内置，不受数据库规则与判官影响，页面不可关闭。即使删光下面的数据库规则、关掉模型兜底，这些红线仍然生效。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="p-0">
+        {loading ? (
+          <p className="px-6 py-4 text-sm text-muted-foreground">加载中…</p>
+        ) : rules.length === 0 ? (
+          <p className="px-6 py-4 text-sm text-muted-foreground">暂无可展示的内置规则</p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead className="w-[220px]">名称</TableHead>
+                <TableHead>说明</TableHead>
+                <TableHead className="w-[72px]">动作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rules.map((rule) => (
+                <TableRow key={rule.key} className="hover:bg-transparent">
+                  <TableCell className="align-top">
+                    <span className="text-xs font-medium">{rule.name}</span>
+                  </TableCell>
+                  <TableCell className="align-top">
+                    <span className="text-xs text-muted-foreground">{rule.description}</span>
+                  </TableCell>
+                  <TableCell className="align-top">
+                    <ActionBadge action={rule.action} />
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -751,6 +818,8 @@ export default function InterceptPage() {
           )}
             </CardContent>
           </Card>
+
+          <BuiltinRulesCard />
         </TabsContent>
 
         {/* ---- tab: 模型配置 ---- */}

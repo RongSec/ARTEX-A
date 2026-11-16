@@ -20,6 +20,7 @@ import type {
   BatchCategoryItem,
   BatchControlItem,
   BatchTasksResult,
+  BuiltinInterceptRule,
   ChatAttachment,
   CommandRecord,
   Company,
@@ -1324,6 +1325,9 @@ export const api = {
   deleteInterceptRule: (id: number) => del<{ deleted: number }>(`/intercept/rules/${id}`),
   toggleInterceptRule: (id: number, enabled: boolean) =>
     post<{ ok: boolean; enabled: boolean }>(`/intercept/rules/${id}/toggle`, { enabled }),
+  // 代码内置规则目录（只读）：名称/说明由服务端从 guard 包常量下发。
+  interceptBuiltinRules: () =>
+    get<{ rules: BuiltinInterceptRule[] }>("/intercept/builtin-rules").then((r) => arr(r.rules)),
 
   // ---- asset intercept rules（资产拦截：全局黑名单） ----
   assetInterceptRules: () => get<{ rules: AssetInterceptRule[] }>("/asset-intercept/rules").then((r) => arr(r.rules)),

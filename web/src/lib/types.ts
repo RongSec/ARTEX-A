@@ -781,8 +781,12 @@ export interface ReaderTraceItem {
   decision: "adopted" | "dismissed" | "candidate" | string;
   reason: string;
   matched: ReaderTraceMatch[];
+  // 采纳带进发起方任务的外部资产 host（仅 adopted 有值，其余为空数组）。
+  foreign_hosts: string[];
+  // 决策者：reader=阅读者判定；''=旧流程（V9-READER 之前）。
+  decided_by: string;
   created_at: string;
-  direction: "in" | "out" | string; // out=本任务勾连别人，in=别人勾连本任务
+  direction: "in" | "out" | string; // out=本任务借鉴了对方，in=对方借鉴了本任务
 }
 
 export interface ReaderTraceRun {
@@ -1339,6 +1343,16 @@ export interface InterceptRule {
   timeout_action: "deny" | "allow";
   created_at: string;
   updated_at: string;
+}
+
+// ---- 内置规则（代码内置，只读） ----
+// 数据源 GET /api/intercept/builtin-rules：名称/说明来自 guard 包常量，
+// 前端不写字面量；action 目前恒为 deny。
+export interface BuiltinInterceptRule {
+  key: string;
+  name: string;
+  description: string;
+  action: InterceptAction;
 }
 
 // ---- Asset Intercept Rules（资产拦截：全局黑名单） ----

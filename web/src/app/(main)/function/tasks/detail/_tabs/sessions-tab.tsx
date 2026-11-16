@@ -518,10 +518,10 @@ function WorkerAssetBadge({ assets }: { assets: IntentAsset[] }) {
   );
 }
 
+// candidate 是阅读者下钻的中间态，后端接口层已过滤，这里不再给展示文案。
 const readerDecisionMeta: Record<string, { label: string; cls: string }> = {
   adopted: { label: "保留", cls: "text-emerald-600 border-emerald-500/40 dark:text-emerald-400" },
   dismissed: { label: "舍弃", cls: "text-muted-foreground" },
-  candidate: { label: "候选", cls: "text-amber-600 border-amber-500/40 dark:text-amber-400" },
 };
 
 function fmtReaderTraceTime(ts: string): string {
@@ -530,7 +530,8 @@ function fmtReaderTraceTime(ts: string): string {
   return d.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
-// ReaderTraceCard 一条勾连记录：对端任务 / 方向 / 决策 / 理由 / 命中明细。
+// ReaderTraceCard 一条借鉴记录：对端任务 / 方向（谁借鉴谁）/ 决策 / 判定者 /
+// 理由 / 命中明细。方向刻意用「借鉴」措辞：这里是知识复用，不是主动串联对方。
 function ReaderTraceCard({ item }: { item: ReaderTraceItem }) {
   const decision = readerDecisionMeta[item.decision] ?? { label: item.decision, cls: "" };
   const out = item.direction === "out";
@@ -553,7 +554,10 @@ function ReaderTraceCard({ item }: { item: ReaderTraceItem }) {
           variant="outline"
           className={out ? "border-emerald-500/40 font-normal" : "border-blue-500/40 font-normal"}
         >
-          {out ? "本任务勾连" : "对方勾连本任务"}
+          {out ? "本任务借鉴了对方" : "对方借鉴了本任务"}
+        </Badge>
+        <Badge variant="outline" className="text-muted-foreground font-normal">
+          {item.decided_by === "reader" ? "阅读者判定" : "旧流程"}
         </Badge>
         <Badge variant="outline" className={"font-normal " + decision.cls}>
           {decision.label}
@@ -601,7 +605,7 @@ function ReaderTracePanel({
     return (
       <div className="text-muted-foreground flex items-center gap-2 text-xs">
         <Loader2Icon className="size-3.5 animate-spin" />
-        加载勾连记录…
+        加载借鉴记录…
       </div>
     );
   }
@@ -619,12 +623,15 @@ function ReaderTracePanel({
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center justify-between gap-2">
-        <p className="text-muted-foreground text-xs">
-          {isTask
-            ? "本项目内与本任务存在勾连关系的任务记录（同项目任务小结比对）。"
-            : "其它项目中与本任务存在勾连关系的任务记录（跨项目任务小结比对）。"}
-        </p>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="text-sm font-medium">{isTask ? "跨任务借鉴记录" : "跨项目借鉴记录"}</h3>
+          <p className="text-muted-foreground mt-0.5 text-xs">
+            {isTask
+              ? "本项目内任务小结的借鉴关系：本任务借鉴了对方，或对方借鉴了本任务。只展示已决记录。"
+              : "其它项目任务小结的借鉴关系：本任务借鉴了对方，或对方借鉴了本任务。只展示已决记录。"}
+          </p>
+        </div>
         <Button size="sm" variant="ghost" className="h-6 shrink-0 px-2 text-xs" onClick={onRetry} disabled={loading}>
           {loading ? <Loader2Icon className="size-3 animate-spin" /> : <RotateCwIcon className="size-3" />}
           刷新
@@ -632,11 +639,11 @@ function ReaderTracePanel({
       </div>
       {list.length === 0 ? (
         <div className="rounded-lg border border-dashed p-8 text-center">
-          <p className="text-sm font-medium">{isTask ? "暂无跨任务勾连记录" : "暂无跨项目勾连记录"}</p>
+          <p className="text-sm font-medium">{isTask ? "暂无跨任务借鉴记录" : "暂无跨项目借鉴记录"}</p>
           <p className="text-muted-foreground mt-1 text-xs">
             {isTask
-              ? "同项目任务完成并生成小结表后，勾连记录会出现在这里"
-              : "相关项目任务完成并生成小结表后，勾连记录会出现在这里"}
+              ? "同项目任务完成并生成小结表后，阅读者判定采纳/舍弃的记录会出现在这里"
+              : "相关项目任务完成并生成小结表后，阅读者判定采纳/舍弃的记录会出现在这里"}
           </p>
         </div>
       ) : (
