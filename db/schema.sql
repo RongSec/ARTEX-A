@@ -524,7 +524,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     timeout_seconds INTEGER NOT NULL DEFAULT 0,
     plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300,
     coverage_enabled BOOLEAN NOT NULL DEFAULT true,
-    auto_report    BOOLEAN NOT NULL DEFAULT false,           -- R5：任务终态自动生成**任务级**报告（勾选即生效；优先于项目级 auto_report）
+    auto_report    BOOLEAN NOT NULL DEFAULT false,           -- R5：任务终态自动生成**任务级**报告（叠加语义：勾了就一定出该任务报告，不受项目设置影响）
     pinned_at      TIMESTAMPTZ,
     first_run_at   TIMESTAMPTZ,
     deadline_at    TIMESTAMPTZ,
@@ -547,7 +547,8 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT false
 -- 给 agent 开放 add_task_scope/list_untested_assets;false=全部关闭(见 task_scope.go)。
 -- 存量任务默认 true 保持原行为;company 关联(task_scope kind=company)不受此开关影响。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coverage_enabled BOOLEAN NOT NULL DEFAULT true;
--- R5：任务级「完成后自动生成报告」开关（默认关；创建任务表单勾选）。
+-- R5：任务级「完成后自动生成报告」开关（默认关；创建任务表单勾选）。叠加语义：
+-- 勾了就一定出该任务报告（V9-RPT2）。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS auto_report BOOLEAN NOT NULL DEFAULT false;
 -- queued_at makes admission FIFO reflect the actual enqueue order rather than the
 -- task creation order. queue_mode distinguishes first bootstrap from resuming an
@@ -1441,7 +1442,8 @@ CREATE TABLE IF NOT EXISTS projects (
     concurrency       INTEGER NOT NULL DEFAULT 2,           -- 项目内批量任务并发数：1=严格串行，2=同时两任务
     observer_enabled  BOOLEAN NOT NULL DEFAULT false,       -- 跨任务（项目内）阅读开关：默认关闭。管 scope='project' 洞察的写入/图变更触发/项目段注入；project_index 投影常开（大图 tab 数据源，关着也能看）。与 reader_enabled 互相独立（V6-DUAL）
     report_template_id BIGINT,                             -- 项目默认报告模板（report_templates.id）；NULL=走默认模板链。无 FK：模板行允许被删（view-time/建 job 时判缺回退默认，照 tasks.template_id 同款策略）
-    auto_report       BOOLEAN NOT NULL DEFAULT false,      -- 整项目收官自动写报告：默认关闭。任务终态钩子查此开关决定是否建 project 级报告 job（T18）
+    auto_report       BOOLEAN NOT NULL DEFAULT false,      -- 只出一个项目汇总报告：全部任务收官后建 project 级 job（T18/V9-RPT2）
+    auto_report_tasks BOOLEAN NOT NULL DEFAULT false,      -- 子任务都出报告：每个任务终态各建 task 级 job（V9-RPT2，可与 auto_report 同勾=叠加）
     reader_enabled    BOOLEAN NOT NULL DEFAULT false,      -- 跨项目阅读开关：默认关闭=行为等于基线（T18）。管 scope='cross' 洞察的聚合/来源校验/跨项目段注入；与 observer_enabled 互相独立（V6-DUAL）
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -1458,6 +1460,9 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS project_id BIGINT REFERENCES projects
 -- 幂等约束照 :249-255 写法；新库走 CREATE、存量库走 ALTER，语义一致）。
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS report_template_id BIGINT;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS auto_report BOOLEAN NOT NULL DEFAULT false;
+-- V9-RPT2：项目级两个独立勾选——auto_report=只出项目汇总；auto_report_tasks=
+-- 每个子任务各出一份。两者可同时勾选（汇总 + 每个子任务）。
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS auto_report_tasks BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS reader_enabled BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at DESC)
     WHERE deleted_at IS NULL AND project_id IS NOT NULL;

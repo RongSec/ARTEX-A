@@ -21,13 +21,13 @@ type Task struct {
 	Goal          string     `json:"goal"`
 	ExplorationID int64      `json:"exploration_id"`
 	// ProjectID 是 artex-hs 二开的可选项目归属（T05）；nil=无项目，全链路行为与原版一致。
-	ProjectID     *int64     `json:"project_id,omitempty"`
-	Status        string     `json:"status"`
-	Paused        bool       `json:"paused"`
-	Queued        bool       `json:"queued"`
-	QueuedAt      *time.Time `json:"queued_at,omitempty"`
-	QueueMode     string     `json:"queue_mode,omitempty"`
-	LLMProfileID  *int64     `json:"llm_profile_id,omitempty"`
+	ProjectID    *int64     `json:"project_id,omitempty"`
+	Status       string     `json:"status"`
+	Paused       bool       `json:"paused"`
+	Queued       bool       `json:"queued"`
+	QueuedAt     *time.Time `json:"queued_at,omitempty"`
+	QueueMode    string     `json:"queue_mode,omitempty"`
+	LLMProfileID *int64     `json:"llm_profile_id,omitempty"`
 	// Task-level ordered LLM chain. LLMProfileID remains the compatibility alias
 	// for ActiveLLMProfileID while older API clients still send one profile id.
 	LLMProfileIDs      []int64    `json:"llm_profile_ids,omitempty"`
@@ -53,7 +53,8 @@ type Task struct {
 	// (task_scope kind=company)与此开关无关，永不受影响。见 db/task_scope.go。
 	CoverageEnabled bool `json:"coverage_enabled"`
 	// AutoReport 是任务级「完成后自动生成报告」开关（R5，默认关）。任务终态
-	// 钩子据此建 task 级报告 job；为 true 时优先于项目级 auto_report。
+	// 钩子据此建 task 级报告 job；叠加语义：勾了就一定出该任务报告（与项目
+	// 的 auto_report / auto_report_tasks 无关）。
 	AutoReport bool `json:"auto_report"`
 }
 
@@ -164,7 +165,8 @@ type TaskCreateOptions struct {
 	// CoverageEnabled 是「资产覆盖度功能」开关;nil=默认开(true)，让不关心该开关的创建
 	// 路径(编排 spawn、老 API)沿用原行为。仅 web 创建任务时可显式传 false 关闭。
 	CoverageEnabled *bool
-	// AutoReport 是任务级「完成后自动生成报告」开关（R5；默认 false）。
+	// AutoReport 是任务级「完成后自动生成报告」开关（R5；默认 false）。叠加
+	// 语义：勾了就一定出该任务报告。
 	AutoReport bool
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
 	InterceptRules []TaskInterceptRuleInput
@@ -239,7 +241,7 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 	}
 	t := &Task{
 		ProjectID: opts.ProjectID,
-		Name: opts.Name, CategoryID: opts.CategoryID, CategoryName: categoryName,
+		Name:      opts.Name, CategoryID: opts.CategoryID, CategoryName: categoryName,
 		Description: description, Goal: goal, ExplorationID: expID,
 		LLMProfileID: active, ActiveLLMProfileID: active,
 		LLMProfileIDs:  append([]int64(nil), opts.LLMProfileIDs...),

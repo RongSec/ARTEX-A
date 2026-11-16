@@ -61,24 +61,28 @@ func (s *Server) installTerminalHooks() {
 	}
 }
 
-// autoReportAction 是任务终态自动报告的决策（纯函数，单测覆盖）：
-//   - 任务级 auto_report 勾选 → 只出任务级报告（任务级优先，项目级不再重复）；
-//   - 未勾选 + 项目开启 auto_report → 项目级（原 T18 行为）；
-//   - 其余 → 无动作。
-func autoReportAction(taskAuto, hasProject, projectAuto bool) string {
-	if taskAuto {
-		return "task"
-	}
-	if hasProject && projectAuto {
-		return "project"
-	}
-	return "none"
+// autoReportPlan 是任务终态自动报告的决策（纯函数，单测覆盖四组语义）。
+// V9-RPT2 起任务级与项目级不再互斥，而是**叠加**：
+//   - taskReport    = 任务自己勾了 auto_report，或项目勾了「子任务都出报告」；
+//   - projectIntent = 项目勾了「只出一个项目汇总报告」——实际是否出报告还要
+//     等项目收官（由 settleProjectAndReport 在锁内判定）。
+//
+// 四组组合：
+//   - 仅项目汇总（projectAuto=true, projectAutoTasks=false）：每个任务终态不出
+//     任务报告，最后收官出 1 份项目报告；
+//   - 仅子任务（projectAuto=false, projectAutoTasks=true）：每个任务各出 1 份；
+//   - 两者都勾：每个任务各出 1 份 + 收官再出 1 份项目汇总；
+//   - 都不勾：零动作（任务自己勾了 auto_report 仍出）。
+func autoReportPlan(taskAuto, hasProject, projectAuto, projectAutoTasks bool) (taskReport, projectIntent bool) {
+	taskReport = taskAuto || (hasProject && projectAutoTasks)
+	projectIntent = hasProject && projectAuto
+	return taskReport, projectIntent
 }
 
 // onTaskTerminalAutoReport 是钩子实现。入参可能来自任意任务（含无项目任务），
-// 先做最便宜的全局闸，再按 autoReportAction 分流：
-//   - task：任务勾选了 auto_report → 用默认模板为本任务建 job（R5）；
-//   - project：任务未勾选、项目级 auto_report 开启 → 原 T18 整项目收官出报告。
+// 先做最便宜的全局闸，再按 autoReportPlan 分流（两段互不短路=叠加）：
+//   - taskReport → 用默认模板为本任务建 job（R5）；
+//   - projectIntent → 尝试整项目收官出汇总报告（settle 内部去抖/去重）。
 //
 // 查库用独立 ctx（钩子在后台协程里跑，s.ctx 取消=进程退出，此时查询自然失败、
 // 就地吞掉即可）。
@@ -104,10 +108,12 @@ func (s *Server) onTaskTerminalAutoReport(taskID int64, status string) {
 			return
 		}
 	}
-	switch autoReportAction(t.AutoReport, hasProject && p != nil, p != nil && p.AutoReport) {
-	case "task":
+	taskReport, projectIntent := autoReportPlan(t.AutoReport, hasProject && p != nil,
+		p != nil && p.AutoReport, p != nil && p.AutoReportTasks)
+	if taskReport {
 		s.createTaskReport(t)
-	case "project":
+	}
+	if projectIntent {
 		s.settleProjectAndReport(*t.ProjectID, taskID, status, p.ReportTemplateID)
 	}
 }

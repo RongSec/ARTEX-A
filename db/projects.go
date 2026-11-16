@@ -19,11 +19,15 @@ type Project struct {
 	ObserverEnabled bool   `json:"observer_enabled"` // 跨任务/项目内阅读开关（scope='project'；默认关）
 	// T18 项目设置扩展三列。ReportTemplateID=nil → 走默认模板链；指针区分
 	// 「未设置」与「显式 0」，PATCH 语义与其余两列一致。
-	ReportTemplateID *int64    `json:"report_template_id"`
-	AutoReport       bool      `json:"auto_report"`    // 整项目收官自动写报告（默认关）
-	ReaderEnabled    bool      `json:"reader_enabled"` // 跨项目阅读开关（scope='cross' 聚合/来源校验/注入；默认关）
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ReportTemplateID *int64 `json:"report_template_id"`
+	// V9-RPT2：两个独立勾选，可同时为 true。
+	//   AutoReport      = 只出一个项目汇总报告（全部任务收官后）
+	//   AutoReportTasks = 子任务都出报告（每个任务终态各一份）
+	AutoReport      bool      `json:"auto_report"`
+	AutoReportTasks bool      `json:"auto_report_tasks"`
+	ReaderEnabled   bool      `json:"reader_enabled"` // 跨项目阅读开关（scope='cross' 聚合/来源校验/注入；默认关）
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // ProjectStats 是项目列表/详情的聚合统计（任务数/排队数/finding 分档数）。
@@ -54,11 +58,11 @@ func normalizeProjectConcurrency(n int) int {
 	return n
 }
 
-const projectCols = `id, name, description, status, owner, concurrency, observer_enabled, report_template_id, auto_report, reader_enabled, created_at, updated_at`
+const projectCols = `id, name, description, status, owner, concurrency, observer_enabled, report_template_id, auto_report, auto_report_tasks, reader_enabled, created_at, updated_at`
 
 func scanProject(sc interface{ Scan(...any) error }) (*Project, error) {
 	var p Project
-	if err := sc.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Owner, &p.Concurrency, &p.ObserverEnabled, &p.ReportTemplateID, &p.AutoReport, &p.ReaderEnabled, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := sc.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Owner, &p.Concurrency, &p.ObserverEnabled, &p.ReportTemplateID, &p.AutoReport, &p.AutoReportTasks, &p.ReaderEnabled, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &p, nil
@@ -74,7 +78,8 @@ type CreateProjectInput struct {
 	Concurrency      int
 	ObserverEnabled  bool
 	ReportTemplateID *int64 // nil=不绑定，走默认模板链
-	AutoReport       bool
+	AutoReport       bool   // 只出一个项目汇总报告
+	AutoReportTasks  bool   // 子任务都出报告（可与 AutoReport 同真=叠加）
 	ReaderEnabled    bool
 }
 
@@ -96,10 +101,10 @@ func (d *DB) CreateProject(in CreateProjectInput) (*Project, error) {
 	//   observer_enabled = 跨任务/项目内（scope='project' 洞察的写/触发/注入）
 	//   reader_enabled   = 跨项目（scope='cross' 的聚合/来源校验/注入）
 	return scanProject(d.QueryRow(`
-INSERT INTO projects(name, description, owner, concurrency, observer_enabled, report_template_id, auto_report, reader_enabled)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+INSERT INTO projects(name, description, owner, concurrency, observer_enabled, report_template_id, auto_report, auto_report_tasks, reader_enabled)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 RETURNING `+projectCols, name, strings.TrimSpace(in.Description), strings.TrimSpace(in.Owner),
-		normalizeProjectConcurrency(concurrency), in.ObserverEnabled, tmpl, in.AutoReport, in.ReaderEnabled))
+		normalizeProjectConcurrency(concurrency), in.ObserverEnabled, tmpl, in.AutoReport, in.AutoReportTasks, in.ReaderEnabled))
 }
 
 // GetProject 返回单个项目；不存在时返回 ErrProjectNotFound。
@@ -217,6 +222,7 @@ type UpdateProjectPatch struct {
 	ReportTemplateID    *int64
 	ReportTemplateIDSet bool
 	AutoReport          *bool
+	AutoReportTasks     *bool
 	ReaderEnabled       *bool
 }
 
@@ -247,7 +253,8 @@ func (d *DB) UpdateProject(id int64, patch UpdateProjectPatch) (*Project, error)
 	observer_enabled = CASE WHEN $12::boolean THEN $13 ELSE observer_enabled END,
 	report_template_id = CASE WHEN $14::boolean THEN $15::bigint ELSE report_template_id END,
 	auto_report   = CASE WHEN $16::boolean THEN $17 ELSE auto_report END,
-	reader_enabled = CASE WHEN $18::boolean THEN $19 ELSE reader_enabled END
+	auto_report_tasks = CASE WHEN $18::boolean THEN $19 ELSE auto_report_tasks END,
+	reader_enabled = CASE WHEN $20::boolean THEN $21 ELSE reader_enabled END
 WHERE id=$1
 RETURNING `+projectCols,
 		id,
@@ -259,6 +266,7 @@ RETURNING `+projectCols,
 		patch.ObserverEnabled != nil, derefBool(patch.ObserverEnabled),
 		patch.ReportTemplateIDSet, templateAny,
 		patch.AutoReport != nil, derefBool(patch.AutoReport),
+		patch.AutoReportTasks != nil, derefBool(patch.AutoReportTasks),
 		patch.ReaderEnabled != nil, derefBool(patch.ReaderEnabled)))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrProjectNotFound

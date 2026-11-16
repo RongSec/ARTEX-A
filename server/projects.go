@@ -136,8 +136,9 @@ func (m *Manager) EnqueueTaskProjectBatch(id string) error {
 // --- HTTP handlers ---
 
 // projectsCreate 建项目。body {name, description?, owner?, concurrency?,
-// observer_enabled?, report_template_id?, auto_report?, reader_enabled?}
-// （后三字段 T18，observer_enabled T19 方案 A 补齐=与 PATCH 字段集对齐；缺省全关）。
+// observer_enabled?, report_template_id?, auto_report?, auto_report_tasks?,
+// reader_enabled?}（auto_report=只出项目汇总；auto_report_tasks=子任务都出，
+// 两者可同勾=叠加）。
 // V6-DUAL：observer_enabled（跨任务/项目内）与 reader_enabled（跨项目）各自
 // 独立生效、各自回显，互不镜像。
 func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +150,7 @@ func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 		ObserverEnabled  bool   `json:"observer_enabled"`
 		ReportTemplateID *int64 `json:"report_template_id"`
 		AutoReport       bool   `json:"auto_report"`
+		AutoReportTasks  bool   `json:"auto_report_tasks"`
 		ReaderEnabled    bool   `json:"reader_enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -180,6 +182,7 @@ func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 		ObserverEnabled:  req.ObserverEnabled,
 		ReportTemplateID: req.ReportTemplateID,
 		AutoReport:       req.AutoReport,
+		AutoReportTasks:  req.AutoReportTasks,
 		ReaderEnabled:    req.ReaderEnabled,
 	})
 	if err != nil {
@@ -362,6 +365,14 @@ func (s *Server) projectsUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		patch.AutoReport = &b
+	}
+	if v, has := raw["auto_report_tasks"]; has {
+		var b bool
+		if err := json.Unmarshal(v, &b); err != nil {
+			writeErr(w, 400, "auto_report_tasks 须为布尔")
+			return
+		}
+		patch.AutoReportTasks = &b
 	}
 	if v, has := raw["reader_enabled"]; has {
 		var b bool

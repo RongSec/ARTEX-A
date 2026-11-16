@@ -7,32 +7,59 @@ import (
 	"time"
 )
 
-// TestAutoReportAction R5：任务级优先——勾选任务 auto_report 时只出任务级报告；
-// 未勾选才回落到项目级；两者都没开则零动作。
-func TestAutoReportAction(t *testing.T) {
+// TestAutoReportSemanticsFourGroups 覆盖 V9-RPT2 的叠加语义四组：
+// 仅项目汇总 / 仅子任务 / 两者都勾 / 都不勾。用两个任务模拟终态序列
+// （第 2 个任务=最后一个收官者），验证任务报告数与项目汇总报告数。
+func TestAutoReportSemanticsFourGroups(t *testing.T) {
 	cases := []struct {
-		taskAuto, hasProject, projectAuto bool
-		want                              string
+		name                        string
+		projectAuto, projectTasks   bool
+		wantTaskReports, wantSummar int
 	}{
-		{true, false, false, "task"},
-		{true, true, true, "task"}, // 任务级优先，项目级不重复
-		{false, true, true, "project"},
-		{false, true, false, "none"},
-		{false, false, false, "none"},
+		{"仅项目汇总", true, false, 0, 1},
+		{"仅子任务", false, true, 2, 0},
+		{"两者都勾=汇总+每个子任务", true, true, 2, 1},
+		{"都不勾=零动作", false, false, 0, 0},
 	}
 	for _, c := range cases {
-		if got := autoReportAction(c.taskAuto, c.hasProject, c.projectAuto); got != c.want {
-			t.Errorf("autoReportAction(%v,%v,%v)=%q, want %q", c.taskAuto, c.hasProject, c.projectAuto, got, c.want)
+		taskReports, summaries := 0, 0
+		for i := 0; i < 2; i++ {
+			taskReport, projectIntent := autoReportPlan(false, true, c.projectAuto, c.projectTasks)
+			if taskReport {
+				taskReports++
+			}
+			// 只有最后一个任务终态时项目才收官。
+			if projectIntent && i == 1 {
+				summaries++
+			}
 		}
+		if taskReports != c.wantTaskReports || summaries != c.wantSummar {
+			t.Errorf("%s: taskReports=%d, summaries=%d, want (%d,%d)",
+				c.name, taskReports, summaries, c.wantTaskReports, c.wantSummar)
+		}
+	}
+}
+
+// TestAutoReportPlanTaskOverride 校验任务级单勾=一定出任务报告（叠加语义，
+// 不再抑制项目汇总），以及无项目时项目开关不生效。
+func TestAutoReportPlanTaskOverride(t *testing.T) {
+	if task, proj := autoReportPlan(true, true, true, false); !task || !proj {
+		t.Errorf("任务勾选 + 项目汇总应同时成立: task=%v proj=%v", task, proj)
+	}
+	if task, proj := autoReportPlan(true, false, false, false); !task || proj {
+		t.Errorf("无项目时任务勾选只出任务报告: task=%v proj=%v", task, proj)
+	}
+	if task, proj := autoReportPlan(false, false, true, true); task || proj {
+		t.Errorf("无项目时项目开关必须无效: task=%v proj=%v", task, proj)
 	}
 }
 
 // TestProjectSettled 覆盖去抖判定纯函数的四种形态（无库）。
 func TestProjectSettled(t *testing.T) {
 	cases := []struct {
-		name         string
-		all, term    map[int64]bool
-		wantSettled  bool
+		name          string
+		all, term     map[int64]bool
+		wantSettled   bool
 		wantTaskCount int
 	}{
 		{"空项目不算收官", map[int64]bool{}, map[int64]bool{}, false, 0},

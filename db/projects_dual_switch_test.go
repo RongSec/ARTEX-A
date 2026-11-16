@@ -11,6 +11,49 @@ import (
 	"time"
 )
 
+// TestProjectAutoReportSwitchesIndependent 校验 V9-RPT2 的两个报告勾选列：
+// auto_report（只出项目汇总）与 auto_report_tasks（子任务都出）各自独立、
+// 可同时为真，PATCH 某一列不会镜像/覆盖另一列。
+func TestProjectAutoReportSwitchesIndependent(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+
+	suffix := strconv.FormatInt(time.Now().UnixNano()%1000000, 10)
+	p, err := d.CreateProject(CreateProjectInput{
+		Name:            fmt.Sprintf("auto-report-%s", suffix),
+		AutoReport:      true,
+		AutoReportTasks: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM projects WHERE id=$1`, p.ID) //nolint:errcheck
+	if !p.AutoReport || p.AutoReportTasks {
+		t.Fatalf("create: want 汇总=true/子任务=false, got %+v", p)
+	}
+
+	on := true
+	got, err := d.UpdateProject(p.ID, UpdateProjectPatch{AutoReportTasks: &on})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.AutoReport || !got.AutoReportTasks {
+		t.Fatalf("两个勾选应可同时为真: %+v", got)
+	}
+
+	off := false
+	got, err = d.UpdateProject(p.ID, UpdateProjectPatch{AutoReport: &off})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AutoReport || !got.AutoReportTasks {
+		t.Fatalf("只关汇总不该动子任务: %+v", got)
+	}
+}
+
 func TestProjectSwitchesIndependent(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
