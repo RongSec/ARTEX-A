@@ -7,6 +7,26 @@ import (
 	"time"
 )
 
+// TestAutoReportAction R5：任务级优先——勾选任务 auto_report 时只出任务级报告；
+// 未勾选才回落到项目级；两者都没开则零动作。
+func TestAutoReportAction(t *testing.T) {
+	cases := []struct {
+		taskAuto, hasProject, projectAuto bool
+		want                              string
+	}{
+		{true, false, false, "task"},
+		{true, true, true, "task"}, // 任务级优先，项目级不重复
+		{false, true, true, "project"},
+		{false, true, false, "none"},
+		{false, false, false, "none"},
+	}
+	for _, c := range cases {
+		if got := autoReportAction(c.taskAuto, c.hasProject, c.projectAuto); got != c.want {
+			t.Errorf("autoReportAction(%v,%v,%v)=%q, want %q", c.taskAuto, c.hasProject, c.projectAuto, got, c.want)
+		}
+	}
+}
+
 // TestProjectSettled 覆盖去抖判定纯函数的四种形态（无库）。
 func TestProjectSettled(t *testing.T) {
 	cases := []struct {

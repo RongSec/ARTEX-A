@@ -61,10 +61,27 @@ func (s *Server) installTerminalHooks() {
 	}
 }
 
+// autoReportAction 是任务终态自动报告的决策（纯函数，单测覆盖）：
+//   - 任务级 auto_report 勾选 → 只出任务级报告（任务级优先，项目级不再重复）；
+//   - 未勾选 + 项目开启 auto_report → 项目级（原 T18 行为）；
+//   - 其余 → 无动作。
+func autoReportAction(taskAuto, hasProject, projectAuto bool) string {
+	if taskAuto {
+		return "task"
+	}
+	if hasProject && projectAuto {
+		return "project"
+	}
+	return "none"
+}
+
 // onTaskTerminalAutoReport 是钩子实现。入参可能来自任意任务（含无项目任务），
-// 前三个短路条件把 99% 的派发挡在最便宜的检查上：全局闸 → 任务有项目 →
-// 项目 auto_report。查库用独立 ctx（钩子在后台协程里跑，s.ctx 取消=进程退出，
-// 此时查询自然失败、就地吞掉即可）。
+// 先做最便宜的全局闸，再按 autoReportAction 分流：
+//   - task：任务勾选了 auto_report → 用默认模板为本任务建 job（R5）；
+//   - project：任务未勾选、项目级 auto_report 开启 → 原 T18 整项目收官出报告。
+//
+// 查库用独立 ctx（钩子在后台协程里跑，s.ctx 取消=进程退出，此时查询自然失败、
+// 就地吞掉即可）。
 func (s *Server) onTaskTerminalAutoReport(taskID int64, status string) {
 	pg := s.m.pg
 	if !pg.GetBool(settingAutoReportEnabled, true) {
@@ -75,19 +92,67 @@ func (s *Server) onTaskTerminalAutoReport(taskID int64, status string) {
 		log.Printf("[auto-report] task %d 读取失败: %v", taskID, err)
 		return
 	}
-	if t == nil || t.ProjectID == nil || *t.ProjectID <= 0 {
-		return // 无项目=原版路径，零行为
-	}
-	pid := *t.ProjectID
-	p, err := pg.GetProject(pid)
-	if err != nil {
-		log.Printf("[auto-report] project %d 读取失败: %v", pid, err)
+	if t == nil {
 		return
 	}
-	if p == nil || !p.AutoReport {
-		return // 项目开关默认关=基线
+	hasProject := t.ProjectID != nil && *t.ProjectID > 0
+	var p *db.Project
+	if hasProject {
+		p, err = pg.GetProject(*t.ProjectID)
+		if err != nil {
+			log.Printf("[auto-report] project %d 读取失败: %v", *t.ProjectID, err)
+			return
+		}
 	}
-	s.settleProjectAndReport(pid, taskID, status, p.ReportTemplateID)
+	switch autoReportAction(t.AutoReport, hasProject && p != nil, p != nil && p.AutoReport) {
+	case "task":
+		s.createTaskReport(t)
+	case "project":
+		s.settleProjectAndReport(*t.ProjectID, taskID, status, p.ReportTemplateID)
+	}
+}
+
+// createTaskReport 为单个任务建 task 级报告 job（R5：与手动 /api/report/generate
+// 同管道——同一 InsertReport + runReportJob 状态机 + 默认模板解析链）。旁路增强：
+// 无 findings/模板解析失败/建 job 失败都只记日志，不影响任务终态。
+func (s *Server) createTaskReport(t *db.Task) {
+	pg := s.m.pg
+	fs, err := pg.FindingsForReport([]int64{t.ID}, nil)
+	if err != nil {
+		log.Printf("[auto-report] task %d findings 读取失败: %v", t.ID, err)
+		return
+	}
+	if len(fs) == 0 {
+		log.Printf("[auto-report] task %d 已开启自动报告但无漏洞发现，跳过", t.ID)
+		return
+	}
+	tmpl, err := pg.ResolveTemplateIDBySettings(0) // 0=settings→is_default 默认模板链
+	if err != nil {
+		log.Printf("[auto-report] task %d 模板解析失败: %v", t.ID, err)
+		return
+	}
+	tmplID := int64(0)
+	locale := ""
+	if tmpl != nil {
+		tmplID = tmpl.ID
+		locale = tmpl.OutputLang
+	}
+	if locale == "" {
+		if st, err := pg.GetReportSettings(); err == nil {
+			locale = st.DefaultLocale
+		}
+	}
+	findIDs := make([]int64, 0, len(fs))
+	for _, f := range fs {
+		findIDs = append(findIDs, f.ID)
+	}
+	job, err := pg.InsertReport(db.ReportScopeTask, t.ID, 0, tmplID, locale, "docx", findIDs)
+	if err != nil {
+		log.Printf("[auto-report] task %d 建报告 job 失败: %v", t.ID, err)
+		return
+	}
+	log.Printf("[auto-report] task %d 终态，自动任务级报告 job %d 已入队", t.ID, job.ID)
+	go s.runReportJob(job)
 }
 
 // autoReportLockFor 取项目级互斥锁（sync.Map load-or-store，锁本身永不删除——

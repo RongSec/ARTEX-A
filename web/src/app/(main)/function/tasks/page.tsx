@@ -3087,6 +3087,7 @@ function CreateTaskSheet({
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
+  const [autoReport, setAutoReport] = React.useState(false); // R5: 完成后自动生成任务级报告;默认关
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
   // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
   const [uploading, setUploading] = React.useState(false);
@@ -3154,6 +3155,7 @@ function CreateTaskSheet({
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
+        autoReport,
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
@@ -3171,6 +3173,7 @@ function CreateTaskSheet({
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
+      setAutoReport(false);
       setInterceptRules([]);
       setUploadCount(0);
       draftIdRef.current = "";
@@ -3395,6 +3398,15 @@ function CreateTaskSheet({
                   <p className="text-muted-foreground text-xs">
                     默认开启：计算并展示测试覆盖度、态势图显示测试进度、自动累积测试范围。关闭后不再计算/展示覆盖度，
                     态势图仅展示资产不显示进度，agent 也不再获得范围类工具。关闭不影响「关联企业资产范围」。
+                  </p>
+                </div>
+                <div className="grid gap-2">
+                  <label htmlFor="auto-report" className="flex items-center gap-2 text-sm">
+                    <Checkbox id="auto-report" checked={autoReport} onCheckedChange={(v) => setAutoReport(!!v)} />
+                    完成后自动生成报告
+                  </label>
+                  <p className="text-muted-foreground text-xs">
+                    任务进入终态后用默认模板生成本任务的 Word 报告（与报告中心手动生成同一管道）。勾选后优先于项目级自动报告；无漏洞发现时跳过。
                   </p>
                 </div>
               </CollapsibleContent>
