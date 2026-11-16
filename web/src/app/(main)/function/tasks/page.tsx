@@ -3406,7 +3406,7 @@ function CreateTaskSheet({
                     完成后自动生成报告
                   </label>
                   <p className="text-muted-foreground text-xs">
-                    任务进入终态后用默认模板生成本任务的 Word 报告（与报告中心手动生成同一管道）。勾选后优先于项目级自动报告；无漏洞发现时跳过。
+                    任务进入终态后用默认模板生成本任务的 Word 报告（与报告中心手动生成同一管道）。勾选即一定出该任务报告，与项目级设置叠加生效；无漏洞发现时跳过。
                   </p>
                 </div>
               </CollapsibleContent>

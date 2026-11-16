@@ -447,6 +447,7 @@ function EditProjectDialog({
   const [observer, setObserver] = React.useState(project.observer_enabled);
   const [reader, setReader] = React.useState(project.reader_enabled);
   const [autoReport, setAutoReport] = React.useState(project.auto_report);
+  const [autoReportTasks, setAutoReportTasks] = React.useState(project.auto_report_tasks);
   const [templateId, setTemplateId] = React.useState<string>(project.report_template_id ? String(project.report_template_id) : "");
   const [saving, setSaving] = React.useState(false);
 
@@ -459,6 +460,7 @@ function EditProjectDialog({
       setObserver(project.observer_enabled);
       setReader(project.reader_enabled);
       setAutoReport(project.auto_report);
+      setAutoReportTasks(project.auto_report_tasks);
       setTemplateId(project.report_template_id ? String(project.report_template_id) : "");
     }
   }, [open, project]);
@@ -483,6 +485,7 @@ function EditProjectDialog({
         observer_enabled: observer,
         reader_enabled: reader,
         auto_report: autoReport,
+        auto_report_tasks: autoReportTasks,
         // "" = 默认链（显式 null 清除绑定）；数字 = 绑定该模板。
         report_template_id: templateId ? Number(templateId) : null,
       });
@@ -550,10 +553,17 @@ function EditProjectDialog({
               本项目参与跨项目串联：允许跨项目阅读者聚合本项目洞察、接受别的项目读回来的跨项目经验。与项目无关的项目可以关掉，省配额。
             </p>
             <label className="flex items-center justify-between gap-3 text-sm">
-              <span>自动写报告</span>
+              <span>只出一个项目报告（汇总）</span>
               <Switch checked={autoReport} onCheckedChange={setAutoReport} />
             </label>
-            <p className="text-muted-foreground text-xs">自动报告=全部任务收官后按上方模板生成项目报告。三项均默认关。</p>
+            <p className="text-muted-foreground text-xs">全部任务收官后按上方模板生成一份项目汇总报告。</p>
+            <label className="flex items-center justify-between gap-3 text-sm">
+              <span>子任务都出报告</span>
+              <Switch checked={autoReportTasks} onCheckedChange={setAutoReportTasks} />
+            </label>
+            <p className="text-muted-foreground text-xs">
+              每个子任务终态各生成一份任务报告。两个勾选可同时开启；任务级勾选始终叠加生效。三项均默认关。
+            </p>
           </div>
         </div>
         <DialogFooter>

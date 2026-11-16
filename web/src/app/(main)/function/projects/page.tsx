@@ -230,6 +230,7 @@ function CreateProjectDialog({
   const [observer, setObserver] = React.useState(false);
   const [reader, setReader] = React.useState(false);
   const [autoReport, setAutoReport] = React.useState(false);
+  const [autoReportTasks, setAutoReportTasks] = React.useState(false);
   const [templateId, setTemplateId] = React.useState<string>(""); // "" = 默认链
   const [templates, setTemplates] = React.useState<{ id: number; name: string; is_default: boolean }[]>([]);
   const [saving, setSaving] = React.useState(false);
@@ -243,6 +244,7 @@ function CreateProjectDialog({
       setObserver(false);
       setReader(false);
       setAutoReport(false);
+      setAutoReportTasks(false);
       setTemplateId("");
       api
         .reportTemplates()
@@ -271,6 +273,7 @@ function CreateProjectDialog({
         observer_enabled: observer,
         report_template_id: templateId ? Number(templateId) : null,
         auto_report: autoReport,
+        auto_report_tasks: autoReportTasks,
         reader_enabled: reader,
       });
       toast.success(`项目已创建：${p.name}`);
@@ -337,10 +340,17 @@ function CreateProjectDialog({
               本项目参与跨项目串联：允许跨项目阅读者聚合本项目洞察、接受别的项目读回来的跨项目经验。与项目无关的项目可以关掉，省配额。
             </p>
             <label className="flex items-center justify-between gap-3 text-sm">
-              <span>自动写报告</span>
+              <span>只出一个项目报告（汇总）</span>
               <Switch checked={autoReport} onCheckedChange={setAutoReport} />
             </label>
-            <p className="text-muted-foreground text-xs">三项默认关闭；自动写报告在该项目全部任务收官后按所选模板生成一份项目报告。</p>
+            <p className="text-muted-foreground text-xs">全部任务收官后生成一份项目汇总报告。</p>
+            <label className="flex items-center justify-between gap-3 text-sm">
+              <span>子任务都出报告</span>
+              <Switch checked={autoReportTasks} onCheckedChange={setAutoReportTasks} />
+            </label>
+            <p className="text-muted-foreground text-xs">
+              每个子任务终态各生成一份任务报告。两个勾选可同时开启（汇总 + 每个子任务各一份）；任务级勾选始终叠加生效。
+            </p>
           </div>
         </div>
         <DialogFooter>
