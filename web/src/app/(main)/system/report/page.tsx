@@ -399,16 +399,25 @@ function ReportCenterInner() {
     }
   };
 
-  // 转成 Skill（T20 端点，幂等：同哨兵目录覆盖；非哨兵 409 如实报错）。
+  // 蒸馏为 Skill（R4；T20 端点幂等：同哨兵目录覆盖；非哨兵 409 如实报错）。
+  // 同名再次蒸馏前先确认（覆盖既有导出）。
   const [toSkillBusy, setToSkillBusy] = React.useState(false);
+  const [skillResult, setSkillResult] = React.useState<{ skill_name: string; dir?: string } | null>(null);
+  const [skillOpen, setSkillOpen] = React.useState(false);
+  const [skillExported, setSkillExported] = React.useState<Record<number, string>>({});
   const toSkill = async () => {
     if (selectedId == null) return;
+    const prior = skillExported[selectedId];
+    if (prior && !window.confirm(`本模板已蒸馏为 Skill「${prior}」，再次蒸馏将覆盖同名 Skill，是否继续？`)) return;
     setToSkillBusy(true);
     try {
       const r = await api.reportTemplateToSkill(selectedId);
-      toast.success(`已导出 skill：${r.skill_name}（skills/ 目录，可拷贝复用/再导入）`);
+      setSkillResult(r);
+      setSkillOpen(true);
+      setSkillExported((m) => ({ ...m, [selectedId]: r.skill_name }));
+      toast.success(`已蒸馏为 Skill：${r.skill_name}`);
     } catch (e) {
-      toast.error(`转成 Skill 失败：${(e as Error).message}`);
+      toast.error(`蒸馏为 Skill 失败：${(e as Error).message}`);
     } finally {
       setToSkillBusy(false);
     }
@@ -598,10 +607,10 @@ function ReportCenterInner() {
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button variant="outline" size="sm" onClick={() => void toSkill()} disabled={selectedId == null || toSkillBusy}>
-                  {toSkillBusy ? <Spinner /> : <SendIcon data-icon="inline-start" className="rotate-[-35deg]" />} 转成 Skill
+                  {toSkillBusy ? <Spinner /> : <SendIcon data-icon="inline-start" className="rotate-[-35deg]" />} 蒸馏为 Skill
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>把当前模板导出为 skills/ 目录下的报告模板 skill（幂等覆盖）</TooltipContent>
+              <TooltipContent>把当前模板蒸馏为 skills/ 下的报告模板 skill（同名再次蒸馏会先确认覆盖）</TooltipContent>
             </Tooltip>
             <Button size="sm" onClick={createNew}>
               <PlusIcon /> 新建模板
@@ -984,6 +993,36 @@ function ReportCenterInner() {
             </Button>
             <Button onClick={() => void confirmImportSkill()} disabled={!skillName || importing}>
               {importing ? <Spinner /> : null} 导入为模板
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* R4：蒸馏为 Skill 结果（名称 + 磁盘路径 + 再次蒸馏） */}
+      <Dialog open={skillOpen} onOpenChange={setSkillOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>已蒸馏为 Skill</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2 py-1 text-sm">
+            <div className="flex items-center gap-2">
+              <span className="text-muted-foreground">Skill 名称</span>
+              <code className="rounded bg-muted px-1.5 py-0.5">{skillResult?.skill_name}</code>
+            </div>
+            <div className="space-y-1">
+              <span className="text-muted-foreground">存放路径</span>
+              <code className="block break-all rounded bg-muted px-1.5 py-0.5 text-xs">{skillResult?.dir}</code>
+            </div>
+            <p className="text-muted-foreground text-xs">
+              该 skill 含 SKILL.md / template.json / manifest.json，可拷贝到其它机器后在「导入模板 → 从 Skill 导入」反哺为模板。
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setSkillOpen(false)}>
+              关闭
+            </Button>
+            <Button onClick={() => void toSkill()} disabled={toSkillBusy || selectedId == null}>
+              {toSkillBusy ? <Spinner /> : null} 再次蒸馏（覆盖同名）
             </Button>
           </DialogFooter>
         </DialogContent>

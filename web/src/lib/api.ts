@@ -1644,7 +1644,8 @@ export const api = {
   reportTemplateChat: (id: number, req: TemplateChatRequest) =>
     post<TemplateChatResponse>(`/report-templates/${id}/chat`, req),
   // T20 模板转 skill（幂等：同哨兵目录覆盖，非哨兵 409）。
-  reportTemplateToSkill: (id: number) => post<{ skill_name: string }>(`/report-templates/${id}/to-skill`, {}),
+  reportTemplateToSkill: (id: number) =>
+    post<{ skill_name: string; dir?: string }>(`/report-templates/${id}/to-skill`, {}),
   // T20 从 skill 读模板预填体（不建模板；前端填进新建表单）。
   reportTemplateFromSkill: (name: string) =>
     get<ReportSkillDraft>(`/report-templates/from-skill/${encodeURIComponent(name)}`),
