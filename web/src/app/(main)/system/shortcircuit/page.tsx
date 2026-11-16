@@ -395,7 +395,8 @@ export default function ShortCircuitPage() {
       .then(() => {
         setPending((n) => n + 1);
         toast.success("已保存到文件，需重启服务端才生效");
-        void reload();
+        // 保存已成功；刷新失败只影响页面展示，不能把成功结果翻成失败。
+        void reload().catch(() => {});
         return true;
       })
       .catch((e) => {
