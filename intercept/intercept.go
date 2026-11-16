@@ -88,6 +88,13 @@ func taskInfoFromCtx(ctx context.Context) (taskID, agentName string) {
 	return "", ""
 }
 
+// TaskIDFromContext 返回 WithTaskContext 注入的任务 id（空串表示不在任务上下文，
+// 如普通聊天会话）。供 guard 的内置规则按任务查外部资产范围。
+func TaskIDFromContext(ctx context.Context) string {
+	taskID, _ := taskInfoFromCtx(ctx)
+	return taskID
+}
+
 func taskEmitFromCtx(ctx context.Context) func(db.Activity) {
 	f, _ := ctx.Value(taskEmitCtxKey).(func(db.Activity))
 	return f

@@ -28,6 +28,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -513,6 +514,13 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			// V9-SCOPE：把被勾连任务的资产 host 记到发起方名下（负向清单）。
+			// 幂等（UNIQUE(task_id,host)），重复 adopt 也会补齐；失败只记日志，
+			// 不影响采纳本身 —— 执行层的匹配查不到就放行（宁漏不误伤）。
+			foreignHosts := s.foreignAssetHostsForTask(ctx, relatedID)
+			if _, ferr := s.m.pg.RecordTaskForeignAssets(ctx, taskID, relatedID, foreignHosts); ferr != nil {
+				log.Printf("[reader] 记录任务#%d 的外部资产失败（source=#%d）: %v", taskID, relatedID, ferr)
+			}
 			if prev != nil && prev.Decision == "adopted" {
 				s.noteReaderDecision(ctx, "adopted", fmt.Sprintf("%d:%d", taskID, relatedID))
 				return actool.Text(fmt.Sprintf("任务#%d ↔ #%d 已是 adopted，决策与明细已更新；hint 不重复写入", taskID, relatedID)), nil
@@ -525,7 +533,8 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 			hintID, err := s.writeReaderAdoptHint(taskID, readerAdoptHint{
 				SourceTaskID: relatedID, SourceTaskName: srcName,
 				SourceProjectID: rctx.ProjectID, SourceProjectName: rctx.ProjectName,
-				Strength: strength, Reason: reason, Points: points, Facts: facts, LinkID: linkID,
+				Strength: strength, Reason: reason, Points: points, Facts: facts,
+				ForeignHosts: foreignHosts, LinkID: linkID,
 			})
 			s.noteReaderDecision(ctx, "adopted", fmt.Sprintf("%d:%d", taskID, relatedID))
 			if err != nil {
@@ -606,7 +615,10 @@ type readerAdoptHint struct {
 	Reason            string
 	Points            []string
 	Facts             []string
-	LinkID            int64
+	// ForeignHosts 是被勾连任务情报表（task_intel kind=asset）里的资产 host。
+	// 它们只是经验参考的对象，不属于发起方任务授权范围（V9-SCOPE）。
+	ForeignHosts []string
+	LinkID       int64
 }
 
 // writeReaderAdoptHint 把 adopted 结论写进发起方任务图（与 add_hint 同形态：
@@ -621,6 +633,8 @@ func (s *Server) writeReaderAdoptHint(taskID int64, h readerAdoptHint) (int64, e
 	payload := map[string]any{
 		"text":                text,
 		"decided_by":          readerLinkDecidedBy,
+		"reference_only":      true,
+		"foreign_hosts":       nonNilStrings(h.ForeignHosts),
 		"source_task_id":      h.SourceTaskID,
 		"source_task_name":    h.SourceTaskName,
 		"source_project_id":   h.SourceProjectID,
@@ -680,8 +694,59 @@ func renderReaderAdoptHint(h readerAdoptHint) string {
 			b.WriteString(f)
 		}
 	}
+	b.WriteString("\n经验参考：reference_only=true，以上内容仅用于借鉴打法，来源任务的资产不属于本任务授权范围。")
+	if len(h.ForeignHosts) > 0 {
+		b.WriteString("禁止对以下地址发起任何请求/扫描/利用：")
+		const maxShown = 20
+		shown := h.ForeignHosts
+		if len(shown) > maxShown {
+			shown = shown[:maxShown]
+		}
+		b.WriteString(strings.Join(shown, "、"))
+		if len(h.ForeignHosts) > maxShown {
+			b.WriteString(fmt.Sprintf(" 等 %d 个", len(h.ForeignHosts)))
+		}
+		b.WriteString("。要把经验用到本任务已有资产上；确需扩到新资产，先由本任务正常登记资产后再打。")
+	}
 	b.WriteString("\n直接采信以上结论，不要再重读来源任务；若要验证，按上述要点在当前任务执行。")
 	return b.String()
+}
+
+// nonNilStrings 保证 JSON 里是 [] 而不是 null（前端/模型都按数组消费）。
+func nonNilStrings(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
+}
+
+// foreignAssetHostsForTask 从被勾连任务的小结表（task_intel）取资产 host。
+// 只认 kind=asset（接口/凭据里出现的 IP 不在此列 —— 那些是打法素材，不是
+// 被勾连任务的授权资产），归一化后去重排序，供 task_foreign_assets 落库。
+func (s *Server) foreignAssetHostsForTask(ctx context.Context, taskID int64) []string {
+	rows, err := s.m.pg.TaskIntelForTask(ctx, taskID)
+	if err != nil {
+		log.Printf("[reader] 读取任务#%d 资产情报失败（外部资产不记录）: %v", taskID, err)
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.Kind != db.IntelKindAsset {
+			continue
+		}
+		h := guard.NormalizeHost(r.Key)
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // reusableIntelForTask 从被勾连任务的小结表抽取可复用要点与关键事实：

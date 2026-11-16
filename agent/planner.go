@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
@@ -41,6 +43,7 @@ type Planner struct {
 	noaEnabledFn      func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
+	guard             *guard.Guard                           // V9-SCOPE：planner 自己的探测也必须过护栏；nil = 不挂 hooks
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -60,6 +63,13 @@ func (p *Planner) SetCompactionWindowResolver(fn func() int) { p.windowFn = fn }
 // planner wake-up to advance the round counter, maintain cold stamps, and
 // (off the hot path) fold cold nodes into digests. nil = feature disabled.
 func (p *Planner) SetCompactor(c *Compactor) { p.compactor = c }
+
+// SetGuard 把任务护栏挂到规划者自己的工具调用上（V9-SCOPE）。
+//
+// 规划者虽然被要求不自己下钻，但仍保留极少量探测（Bash/WebFetch）。若这些
+// 调用不过 PreToolUse，hint 里的外部资产就可能在规划阶段被直接打——执行层的
+// 内置规则必须在规划者身上同样生效。nil = 不挂 hooks（旧行为）。
+func (p *Planner) SetGuard(g *guard.Guard) { p.guard = g }
 
 // SetNonStreaming wires a resolver deciding whether runs use the non-streaming
 // model path (true = non-streaming). nil/unset = streaming (default).
@@ -371,7 +381,8 @@ func plannerSystem(goal, dataDir, workDir string) string {
 // plannerLinkGuidance 是 V9-READER 的固定指引（代码所有，不可在 prompt 页编辑）：
 // 相关任务的经验由阅读者判定后以 hint 形式下发，规划者直接采信，不再自己申请/
 // 下钻/核对旧任务——规划者的上下文只花在当前任务上。
-const plannerLinkGuidance = "\n\n**相关任务经验（直接采信）**：相关任务的经验由阅读者判定后以 hint 形式给你，**直接采信**：hint 里写了来源任务、关联理由和可复用要点，不要再调用勾连工具、不要自己下钻核对；若 hint 与当前目标冲突，按 hint 里的要点验证而不是重读旧任务。"
+const plannerLinkGuidance = "\n\n**相关任务经验（直接采信）**：相关任务的经验由阅读者判定后以 hint 形式给你，**直接采信**：hint 里写了来源任务、关联理由和可复用要点，不要再调用勾连工具、不要自己下钻核对；若 hint 与当前目标冲突，按 hint 里的要点验证而不是重读旧任务。" +
+	"\n\n**经验参考的授权边界（硬规则）**：阅读者给的 hint 是**经验参考**（reference_only=true），其中的资产不属于本任务授权范围。禁止对 foreign_hosts 里的地址（hint 中标注的外部任务资产）发起任何请求/扫描/利用；要把经验用到**本任务已有资产**上。确需扩到新资产，先由本任务正常登记资产后再打。"
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution
 // steps (so users can see how it reads the situation and judges goals — the
@@ -471,6 +482,10 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		Settlement:   settle,
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+	}
+	if p.guard != nil { // V9-SCOPE：规划者自己的探测同样过 PreToolUse（任务上下文供内置规则查范围）
+		ctx = intercept.WithTaskContext(ctx, strconv.FormatInt(taskID, 10), "planner", nil)
+		opts.Hooks = p.guard.Hooks()
 	}
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx

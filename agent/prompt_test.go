@@ -24,6 +24,23 @@ func TestPlannerPromptAdoptsReaderHint(t *testing.T) {
 	}
 }
 
+func TestPlannerPromptForbidsForeignHosts(t *testing.T) {
+	// V9-SCOPE：阅读者 hint 只是经验参考，不能把规划者引向其它任务的资产。
+	t.Cleanup(func() { PromptOverride = nil })
+	PromptOverride = nil
+	got := plannerSystem("拿下X", "/data", "/data")
+	for _, want := range []string{
+		"经验参考", "reference_only",
+		"禁止对 foreign_hosts", "发起任何请求/扫描/利用",
+		"要把经验用到", "本任务已有资产",
+		"先由本任务正常登记资产后再打",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("planner prompt 缺少跨任务资产边界规则 %q", want)
+		}
+	}
+}
+
 func TestRenderSystemOverrideAndFallback(t *testing.T) {
 	t.Cleanup(func() { PromptOverride = nil })
 

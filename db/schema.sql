@@ -1816,3 +1816,20 @@ ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAU
 ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS matched JSONB NOT NULL DEFAULT '[]';
 ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS decided_by TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_tintel_link_task ON task_intel_links(task_id, decision);
+
+-- V9-SCOPE：阅读者采纳任务时，被勾连任务的资产 host 写到发起方任务名下。
+-- 这是「负向清单」：hint 里的经验可以复用，但这些 host 不属于发起方授权范围，
+-- guard 的内置规则会拒绝对它们发起的请求/扫描/利用（见 guard/foreign_scope.go）。
+-- source_task_id 标明 host 来自哪个被勾连任务；UNIQUE 保证重复 adopt 幂等。
+CREATE TABLE IF NOT EXISTS task_foreign_assets (
+    id             BIGSERIAL PRIMARY KEY,
+    task_id        BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    host           TEXT NOT NULL,
+    -- 来源任务不做外键：来源任务被删档后，这条负向清单仍要保护发起方
+    -- （资产可能全局仍存在，hint 也已写进图里；删掉记录=静默放开越权面）。
+    source_task_id BIGINT NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, host)
+);
+CREATE INDEX IF NOT EXISTS idx_task_foreign_assets_task ON task_foreign_assets(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_foreign_assets_source ON task_foreign_assets(task_id, source_task_id);

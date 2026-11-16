@@ -53,6 +53,8 @@ type Guard struct {
 	interceptor   interceptorAPI     // optional; nil disables user-configured rules
 	judgeCache    *judgeVerdictCache // 白名单外工具的判官结论缓存（见 judge_all.go）
 	externalProbe func(string) bool  // 测试注入的工具外部性分类器；nil 走 interceptor
+	scope         ScopeResolver      // V9-SCOPE 内置外部资产范围规则；nil 关闭（见 foreign_scope.go）
+	scopeOnly     bool               // 只跑内置外部资产范围规则（planner 专用，见 SetScopeOnly）
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -114,6 +116,17 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 // applyIntercept evaluates user-configured intercept rules against the tool call.
 // Both rules and the fallback judge receive the complete tool input.
 func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
+	// V9-SCOPE：外部任务资产范围是【代码内置规则】，不进 DB 规则表、不提供
+	// 运行期开关。放在最前面（先于短路表与 DB 规则），命中即终局，不再送判官。
+	if res := g.checkForeignScope(ctx, ev); res != nil {
+		return *res
+	}
+	// 规划者专用护栏只做这一条规则：规划者在 V9-SCOPE 之前不挂任何 hooks，
+	// 直接接入完整规则表会让 add_intent 正文里的 rm -rf/凭据路径被误拦。外部
+	// 资产范围是本次新增的唯一约束，其余判官/DB 规则保持规划者原行为。
+	if g.scopeOnly {
+		return hook.Result{}
+	}
 	// 短路表须先于规则匹配求值：它是代码常量红线，对全部工具生效，命中即终局。
 	if dec := shortCircuit(ev.ToolName, ev.Input); dec != nil {
 		switch dec.Action {

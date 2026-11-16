@@ -36,9 +36,12 @@ type ReaderTraceItem struct {
 	Decision           string             `json:"decision"`
 	Reason             string             `json:"reason"`
 	Matched            []ReaderTraceMatch `json:"matched"`
-	DecidedBy          string             `json:"decided_by"`
-	CreatedAt          time.Time          `json:"created_at"`
-	Direction          string             `json:"direction"` // out=本任务勾连别人，in=别人勾连本任务
+	// ForeignHosts 是本条采纳带进发起方任务的外部资产 host（V9-SCOPE）。
+	// 只有 decision=adopted 才有；dismissed/候选恒为空数组。
+	ForeignHosts []string  `json:"foreign_hosts"`
+	DecidedBy    string    `json:"decided_by"`
+	CreatedAt    time.Time `json:"created_at"`
+	Direction    string    `json:"direction"` // out=本任务勾连别人，in=别人勾连本任务
 }
 
 // taskReaderTraces GET /api/tasks/{id}/reader-traces。
@@ -78,9 +81,22 @@ func (s *Server) taskReaderTraces(w http.ResponseWriter, r *http.Request) {
 			Decision:           row.Decision,
 			Reason:             row.Reason,
 			Matched:            decodeReaderTraceMatches(row.Matched),
+			ForeignHosts:       []string{},
 			DecidedBy:          row.DecidedBy,
 			CreatedAt:          row.CreatedAt,
 			Direction:          row.Direction,
+		}
+		if row.Decision == "adopted" {
+			// out：本任务是发起方，外部资产记在 (本任务 ← 对端)；
+			// in ：对端是发起方，外部资产记在 (对端任务 ← 本任务)，也一并展示，
+			//      让被勾连方能看到「我的哪些资产被带进了对方的任务」。
+			adoptTask, sourceTask := taskID, row.RelatedTaskID
+			if row.Direction == "in" {
+				adoptTask, sourceTask = row.TaskID, taskID
+			}
+			if hosts, err := s.m.pg.ForeignHostsForTaskSource(r.Context(), adoptTask, sourceTask); err == nil && len(hosts) > 0 {
+				item.ForeignHosts = hosts
+			}
 		}
 		// 同项目才有「跨任务」视角；本任务未挂项目时，任何勾连都只能算跨项目。
 		if projectID > 0 && row.RelatedProjectID.Valid && row.RelatedProjectID.Int64 == projectID {

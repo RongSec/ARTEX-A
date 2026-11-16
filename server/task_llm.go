@@ -573,6 +573,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
+	pl.SetGuard(s.newPlannerGuard()) // V9-SCOPE：hint 里的外部资产对规划者自己的探测同样拦截（只跑范围规则）
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetReproEnricher(s.reproEnricherFor()) // T14(2/2): 同 worker
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)

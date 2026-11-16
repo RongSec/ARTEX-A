@@ -62,6 +62,10 @@ func TestTaskReaderTracesGrouping(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// V9-SCOPE：采纳带进来的外部资产 host，审计接口必须逐条展示。
+	if _, err := pg.RecordTaskForeignAssets(ctx, self.ID, peerSame.ID, []string{"10.0.0.9"}); err != nil {
+		t.Fatal(err)
+	}
 	// 本任务 → 跨项目对端（out，candidate）
 	if _, err := pg.SaveTaskIntelLink(ctx, db.TaskIntelLink{
 		ProjectID: pa.ID, TaskID: self.ID, RelatedTaskID: peerCross.ID,
@@ -128,6 +132,13 @@ func TestTaskReaderTracesGrouping(t *testing.T) {
 	}
 	if len(resp.CrossTask[1].Matched) != 1 || resp.CrossTask[1].Matched[0].Kind != "component" {
 		t.Fatalf("matched=%+v", resp.CrossTask[1].Matched)
+	}
+	// V9-SCOPE：采纳记录带 foreign_hosts；非采纳（in/dismissed）为空数组。
+	if len(resp.CrossTask[1].ForeignHosts) != 1 || resp.CrossTask[1].ForeignHosts[0] != "10.0.0.9" {
+		t.Fatalf("adopted foreign_hosts=%v want [10.0.0.9]", resp.CrossTask[1].ForeignHosts)
+	}
+	if resp.CrossTask[0].ForeignHosts == nil || len(resp.CrossTask[0].ForeignHosts) != 0 {
+		t.Fatalf("dismissed foreign_hosts 应为空数组，got %v", resp.CrossTask[0].ForeignHosts)
 	}
 	if resp.CrossProject[0].RelatedTaskID != peerCross.ID || resp.CrossProject[0].RelatedProjectID != pb.ID {
 		t.Fatalf("cross_project[0]=%+v", resp.CrossProject[0])

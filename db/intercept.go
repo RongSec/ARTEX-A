@@ -246,10 +246,10 @@ const approvalRowSelectWithAudit = `SELECT ` + approvalRowColumns + `, ip.audit`
 
 // interceptSource 判定一条拦截记录的来源标签。
 //
-// 三种来源：DB 规则（rule）、模型兜底审批（model）、代码常量短路表
-// （shortcircuit）。短路表的判定没有 rule_id（它不是一条 DB 规则），
-// 靠 audit 里的 RuleName 前缀识别 —— 前缀是代码常量短路表的约定标记
-// （见 guard/shortcircuit.go）。
+// 四种来源：DB 规则（rule）、模型兜底审批（model）、代码常量短路表
+// （shortcircuit）、代码内置的跨任务资产范围规则（builtin_foreign_scope）。
+// 后两者没有 rule_id，靠 audit 里的 RuleName 前缀识别 —— 前缀是代码侧规则
+// 的约定标记（见 guard/shortcircuit.go、guard/foreign_scope.go）。
 //
 // [自主] 与 [模型] 同归 model：前者是判官自己给不出结论后，按规则超时策略
 // 合成的终局（V6-AUTO），同样是模型参与后的判定，不是 DB 规则命中。
@@ -260,8 +260,13 @@ func interceptSource(ruleID int64, reason string, audits []*InterceptAudit) stri
 	if strings.HasPrefix(reason, "[模型]") || strings.HasPrefix(reason, "[自主]") {
 		return "model"
 	}
-	if len(audits) > 0 && audits[0] != nil && strings.HasPrefix(audits[0].RuleName, "[代码常量]") {
-		return "shortcircuit"
+	if len(audits) > 0 && audits[0] != nil {
+		switch {
+		case strings.HasPrefix(audits[0].RuleName, "[代码内置]"):
+			return "builtin_foreign_scope"
+		case strings.HasPrefix(audits[0].RuleName, "[代码常量]"):
+			return "shortcircuit"
+		}
 	}
 	return "unknown"
 }

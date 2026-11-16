@@ -19,6 +19,7 @@ func TestInterceptSourceAutonomousIsModel(t *testing.T) {
 		{"规则命中（有 RuleID）", 7, "拦截规则 [x] 禁止执行此工具", nil, "rule"},
 		{"规则命中（无前缀无 RuleID）", 0, "拦截规则 [x] 禁止执行此工具", nil, "unknown"},
 		{"短路表", 0, "", []*InterceptAudit{{RuleName: "[代码常量] 平台低危工具放行"}}, "shortcircuit"},
+		{"跨任务资产范围（内置）", 0, "该地址来自其它任务的经验参考，不在本任务授权范围；如确需测试，请先在本任务登记该资产并由人工确认。", []*InterceptAudit{{RuleName: "[代码内置] 外部任务资产范围"}}, "builtin_foreign_scope"},
 	}
 	for _, c := range cases {
 		if got := interceptSource(c.ruleID, c.reason, c.audits); got != c.want {

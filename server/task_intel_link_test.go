@@ -245,12 +245,15 @@ func TestReaderLinkFlow(t *testing.T) {
 		{Kind: db.IntelKindEndpoint, Key: epKey, Value: "https://a.example.com/api/user/9", Source: "finding"},
 		{Kind: db.IntelKindEndpoint, Key: "post /api/login", Value: "https://a.example.com/api/login", Source: "finding"},
 		{Kind: db.IntelKindCredential, Key: "password|admin|a.example.com:443", Value: "password for admin@a.example.com:443", Source: "fact"},
+		// V9-SCOPE：被勾连任务的资产（带端口，落库时归一成 host）。
+		{Kind: db.IntelKindAsset, Key: "10.0.0.9:8080", Value: "10.0.0.9:8080", Source: "asset"},
 	}
 	if _, err := pg.UpsertTaskIntel(ctx, pid, idA, rowsA); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pg.UpsertTaskIntel(ctx, pidC, idC, []db.TaskIntel{
 		{Kind: db.IntelKindEndpoint, Key: epKey, Value: "https://c.example.com/api/user/1", Source: "finding"},
+		{Kind: db.IntelKindAsset, Key: "10.0.0.10:80", Value: "10.0.0.10:80", Source: "asset"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -423,6 +426,34 @@ func TestReaderLinkFlow(t *testing.T) {
 	if facts, _ := payload["key_facts"].([]any); len(facts) == 0 {
 		t.Errorf("hint payload 应含关键事实摘要: %+v", payload)
 	}
+	// V9-SCOPE：hint 必须自我声明只是经验参考，并列出外部任务资产 host。
+	if ref, _ := payload["reference_only"].(bool); !ref {
+		t.Errorf("hint payload 必须 reference_only=true: %+v", payload)
+	}
+	foreign := fmt.Sprint(payload["foreign_hosts"])
+	if !strings.Contains(foreign, "10.0.0.9") || strings.Contains(foreign, "8080") {
+		t.Errorf("hint payload.foreign_hosts 应为归一 host（去端口），got %v", payload["foreign_hosts"])
+	}
+	if !strings.Contains(hintText, "禁止对以下地址") || !strings.Contains(hintText, "10.0.0.9") {
+		t.Errorf("hint 正文应列出禁止地址: %q", hintText)
+	}
+	// 落库：幂等一行，host 已归一去端口。
+	var foreignSource int64
+	var foreignCount int
+	if err := pg.QueryRow(`SELECT COUNT(*) FROM task_foreign_assets WHERE task_id=$1`, idB).Scan(&foreignCount); err != nil {
+		t.Fatal(err)
+	}
+	if foreignCount != 1 {
+		t.Fatalf("adopt 应写 1 条外部资产，got %d", foreignCount)
+	}
+	var host string
+	if err := pg.QueryRow(`SELECT host, source_task_id FROM task_foreign_assets WHERE task_id=$1`, idB).
+		Scan(&host, &foreignSource); err != nil {
+		t.Fatal(err)
+	}
+	if host != "10.0.0.9" || foreignSource != idA {
+		t.Fatalf("外部资产应为 host=10.0.0.9 source=%d，got host=%s source=%d", idA, host, foreignSource)
+	}
 	// 采纳必须触发图变更（生产链=project_graph_events）并唤醒规划者。
 	if hintGraphEvents == 0 {
 		t.Error("adopt 写 hint 后应触发图变更回调（规划者会被唤醒）")
@@ -460,6 +491,9 @@ func TestReaderLinkFlow(t *testing.T) {
 	if n := hintCount(); n != 1 {
 		t.Errorf("重复 adopt 不应重复写 hint，got %d", n)
 	}
+	if n, _ := pg.CountTaskForeignAssets(ctx, idB); n != 1 {
+		t.Errorf("重复 adopt 不应重复写外部资产，got %d", n)
+	}
 
 	// ---------- dismiss（只留 links，无 hint、无事件、无唤醒） ----------
 	eventsBefore := hintGraphEvents
@@ -480,6 +514,10 @@ func TestReaderLinkFlow(t *testing.T) {
 	}
 	if decision != "dismissed" || decidedBy != "reader" {
 		t.Errorf("dismiss 决策应为 dismissed/reader，got %q/%q", decision, decidedBy)
+	}
+	// V9-SCOPE：dismiss 不写外部资产（C 有资产情报，也不得进负向清单）。
+	if n, _ := pg.CountTaskForeignAssets(ctx, idB); n != 1 {
+		t.Errorf("dismiss 不应写外部资产，task_foreign_assets=%d", n)
 	}
 	if n := hintCount(); n != hintsBefore {
 		t.Errorf("dismiss 不应写 hint，hint 数=%d (before %d)", n, hintsBefore)
