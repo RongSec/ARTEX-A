@@ -134,6 +134,15 @@ type Server struct {
 	// 生命周期/API/表结构零改动。见 reportgen.go。
 	reportRenderer ReportRenderer
 
+	// V9-RPT2：docx 保真预览（LibreOffice → PDF）的能力探测缓存与测试缝。
+	// pdfProbe/pdfConvert 仅测试注入（nil = 真实执行），见 preview_pdf.go。
+	pdfCapMu   sync.Mutex
+	pdfCapAt   time.Time
+	pdfCap     previewCapability
+	pdfLocks   sync.Map
+	pdfProbe   func() previewCapability
+	pdfConvert func(ctx context.Context, sofficePath, docxPath, outPDF string) (string, error)
+
 	// 试判（POST /api/intercept/judge/test）的 per-token 限流器：进程内存、
 	// 重启清零。sync.Once 惰性初始化，保证 &Server{} 直构的测试也能用。见
 	// intercept_preview.go。
@@ -1063,7 +1072,11 @@ func (s *Server) Handler() http.Handler {
 	// R6 报告归档中心：项目→任务树 / 报告内嵌预览 / 多选打包下载。
 	mux.HandleFunc("GET /api/reports/tree", s.reportsTree)
 	mux.HandleFunc("GET /api/reports/{id}/preview", s.reportPreview)
+	mux.HandleFunc("GET /api/reports/{id}/preview.pdf", s.reportPreviewPDF)
+	mux.HandleFunc("GET /api/preview/capability", s.previewCapabilityGet)
 	mux.HandleFunc("POST /api/reports/download-batch", s.reportsDownloadBatch)
+	mux.HandleFunc("POST /api/reports/delete-batch", s.reportsDeleteBatch)
+	mux.HandleFunc("POST /api/reports/regenerate-batch", s.reportsRegenerateBatch)
 
 	// ==== T16(3/3) 发现证据截图（/api/findings 前缀，与 /api/exploration/findings
 	// 原版路由零重叠）：上传/列表/删除/原图服务。{id}=findings 表 id。====
@@ -1598,7 +1611,7 @@ type createTaskReq struct {
 	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
-	AutoReport           bool     `json:"auto_report,omitempty"`      // R5：完成后自动生成任务级报告（默认关；勾选即生效）
+	AutoReport           bool     `json:"auto_report,omitempty"`       // R5：完成后自动生成任务级报告（默认关；勾选即生效）
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 }

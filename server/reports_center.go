@@ -2,16 +2,17 @@ package server
 
 // R6（V9-RPT）报告中心归档页后端：
 //   GET  /api/reports/tree?status=&q=        项目→任务的报告树（含数量/状态）
-//   GET  /api/reports/{id}/preview           用报告数据重建 HTML 预览（docx 也
-//                                            可内嵌预览；不落盘、不改 job）
-//   POST /api/reports/download-batch         多选报告打包 zip（同名自动加序号）
+//   GET  /api/reports/{id}/preview           用报告数据重建 HTML 预览（回退通道）
+//   GET  /api/reports/{id}/preview.pdf       docx→PDF 保真预览（见 preview_pdf.go）
+//   POST /api/reports/download-batch         多选报告打包 zip（含同目录 PDF）
+//   POST /api/reports/delete-batch           多选删除（行+文件）
+//   POST /api/reports/regenerate-batch       多选重新生成（复用生成管道）
 //
 // 树分组/文件名去重都是纯函数（无 DB），单测直接覆盖。
 
 import (
 	"archive/zip"
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,7 +24,6 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/report"
 )
 
 // maxReportBatch 是单次批量下载的报告数上限（防一次拉爆内存/磁盘）。
@@ -180,49 +180,19 @@ func (s *Server) reportPreview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "报告尚未生成完成")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
-	in, _, err := s.buildReportInput(ctx, job)
-	if err != nil {
-		writeErr(w, 400, "重建报告数据失败: "+err.Error())
-		return
-	}
-	html := report.HTMLPreviewFromInput(in, s.requestOrigin(r))
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(html))
+	s.writeReportHTMLPreview(w, r, job)
 }
 
 // POST /api/reports/download-batch — body {report_ids:[...]}，返回 zip 字节流。
 // 只打包 done 且文件存在的报告；全部不可用 → 400。同名文件自动加「 (2)」序号。
+// V9-RPT2：若报告同目录已有 PDF（保真预览缓存），一并打包。
 func (s *Server) reportsDownloadBatch(w http.ResponseWriter, r *http.Request) {
 	if !s.pgReportDBGuard(w) {
 		return
 	}
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
-	if err != nil {
-		writeErr(w, 400, "读取请求失败")
+	ids, ok := readReportIDsBody(w, r)
+	if !ok {
 		return
-	}
-	// 兼容两种 body 形状：裸数组 [1,2]（派工书原文）与 {report_ids:[1,2]}。
-	var bodyIDs []int64
-	if json.Unmarshal(raw, &bodyIDs) != nil {
-		var body struct {
-			ReportIDs []int64 `json:"report_ids"`
-		}
-		if err := json.Unmarshal(raw, &body); err != nil {
-			writeErr(w, 400, "请求格式错误")
-			return
-		}
-		bodyIDs = body.ReportIDs
-	}
-	ids := make([]int64, 0, len(bodyIDs))
-	seen := map[int64]bool{}
-	for _, id := range bodyIDs {
-		if id <= 0 || seen[id] {
-			continue
-		}
-		seen[id] = true
-		ids = append(ids, id)
 	}
 	if len(ids) == 0 {
 		writeErr(w, 400, "report_ids 为空")
@@ -242,25 +212,20 @@ func (s *Server) reportsDownloadBatch(w http.ResponseWriter, r *http.Request) {
 		if err != nil || job == nil || job.Status != db.ReportDone || job.FilePath == "" {
 			continue
 		}
-		path := job.FilePath
-		if _, err := os.Stat(path); err != nil {
-			path = filepath.Join(s.m.dir, "reports", filepath.Base(job.FilePath))
-			if _, err := os.Stat(path); err != nil {
-				continue
-			}
-		}
-		f, err := os.Open(path)
-		if err != nil {
+		path, found := s.reportArtifactPath(job)
+		if !found {
 			continue
 		}
 		name := uniqueArchiveEntry(sanitizeArchiveName(s.reportDownloadName(job, path)), used)
-		entry, err := zw.Create(name)
-		if err == nil {
-			if _, err := io.Copy(entry, f); err == nil {
-				added++
-			}
+		if addFileToZip(zw, path, name) {
+			added++
 		}
-		_ = f.Close()
+		// 同目录 PDF 一并打包（有则加，无则跳过；文件名同名换后缀）。
+		pdf := pdfCachePath(path)
+		if fi, err := os.Stat(pdf); err == nil && !fi.IsDir() {
+			pdfName := uniqueArchiveEntry(strings.TrimSuffix(name, filepath.Ext(name))+".pdf", used)
+			_ = addFileToZip(zw, pdf, pdfName)
+		}
 	}
 	_ = zw.Close()
 	if added == 0 {
@@ -271,6 +236,199 @@ func (s *Server) reportsDownloadBatch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", contentDispositionAttachment(name))
 	_, _ = w.Write(buf.Bytes())
+}
+
+// addFileToZip 把磁盘文件写成 zip 条目；成功返回 true。
+func addFileToZip(zw *zip.Writer, path, name string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	entry, err := zw.Create(name)
+	if err != nil {
+		return false
+	}
+	_, err = io.Copy(entry, f)
+	return err == nil
+}
+
+// readReportIDsBody 统一解析批量端点 body：兼容裸数组 [1,2] 与
+// {report_ids:[1,2]}，去重并丢弃非正数。返回 ok=false 时已写好 400。
+func readReportIDsBody(w http.ResponseWriter, r *http.Request) ([]int64, bool) {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		writeErr(w, 400, "读取请求失败")
+		return nil, false
+	}
+	var bodyIDs []int64
+	if json.Unmarshal(raw, &bodyIDs) != nil {
+		var body struct {
+			ReportIDs []int64 `json:"report_ids"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			writeErr(w, 400, "请求格式错误")
+			return nil, false
+		}
+		bodyIDs = body.ReportIDs
+	}
+	ids := make([]int64, 0, len(bodyIDs))
+	seen := map[int64]bool{}
+	for _, id := range bodyIDs {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids, true
+}
+
+// reportBatchFailure 是批量操作中单条失败的原因（前端逐条提示）。
+type reportBatchFailure struct {
+	ID    int64  `json:"id"`
+	Error string `json:"error"`
+}
+
+// POST /api/reports/delete-batch — 删行 + 删文件（docx/pdf），逐条返回失败原因。
+func (s *Server) reportsDeleteBatch(w http.ResponseWriter, r *http.Request) {
+	if !s.pgReportDBGuard(w) {
+		return
+	}
+	ids, ok := readReportIDsBody(w, r)
+	if !ok {
+		return
+	}
+	if len(ids) == 0 {
+		writeErr(w, 400, "report_ids 为空")
+		return
+	}
+	if len(ids) > maxReportBatch {
+		writeErr(w, 400, fmt.Sprintf("单次最多删除 %d 份报告", maxReportBatch))
+		return
+	}
+	deleted := 0
+	failed := make([]reportBatchFailure, 0)
+	for _, id := range ids {
+		job, err := s.m.pg.GetReport(id)
+		if err != nil {
+			failed = append(failed, reportBatchFailure{ID: id, Error: err.Error()})
+			continue
+		}
+		if job == nil {
+			failed = append(failed, reportBatchFailure{ID: id, Error: "报告不存在"})
+			continue
+		}
+		ok, err := s.m.pg.DeleteReport(id)
+		if err != nil {
+			failed = append(failed, reportBatchFailure{ID: id, Error: err.Error()})
+			continue
+		}
+		if !ok {
+			failed = append(failed, reportBatchFailure{ID: id, Error: "报告不存在"})
+			continue
+		}
+		s.removeReportFiles(job)
+		deleted++
+	}
+	writeJSON(w, 200, map[string]any{"deleted": deleted, "failed": failed})
+}
+
+// removeReportFiles 尽力删除产物与 PDF 缓存（DB 绝对路径 + dataDir 回退路径）。
+func (s *Server) removeReportFiles(job *db.Report) {
+	if job == nil || strings.TrimSpace(job.FilePath) == "" {
+		return
+	}
+	seen := map[string]bool{}
+	for _, p := range []string{job.FilePath, filepath.Join(s.m.dir, "reports", filepath.Base(job.FilePath))} {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		_ = os.Remove(p)
+		_ = os.Remove(pdfCachePath(p))
+	}
+}
+
+// POST /api/reports/regenerate-batch — 按原 scope/template 重建 job（复用生成
+// 管道；失败报告同样允许重生成）。返回新建 job id 列表与逐条失败原因。
+func (s *Server) reportsRegenerateBatch(w http.ResponseWriter, r *http.Request) {
+	if !s.pgReportDBGuard(w) {
+		return
+	}
+	ids, ok := readReportIDsBody(w, r)
+	if !ok {
+		return
+	}
+	if len(ids) == 0 {
+		writeErr(w, 400, "report_ids 为空")
+		return
+	}
+	if len(ids) > maxReportBatch {
+		writeErr(w, 400, fmt.Sprintf("单次最多重新生成 %d 份报告", maxReportBatch))
+		return
+	}
+	queued := make([]int64, 0)
+	failed := make([]reportBatchFailure, 0)
+	for _, id := range ids {
+		job, err := s.m.pg.GetReport(id)
+		if err != nil {
+			failed = append(failed, reportBatchFailure{ID: id, Error: err.Error()})
+			continue
+		}
+		if job == nil {
+			failed = append(failed, reportBatchFailure{ID: id, Error: "报告不存在"})
+			continue
+		}
+		var taskID, projectID int64
+		switch job.Scope {
+		case db.ReportScopeTask:
+			taskID = valueOr0(job.TaskID)
+			if taskID <= 0 {
+				failed = append(failed, reportBatchFailure{ID: id, Error: "报告缺少来源任务"})
+				continue
+			}
+			t, err := s.m.pg.GetTask(taskID)
+			if err != nil {
+				failed = append(failed, reportBatchFailure{ID: id, Error: err.Error()})
+				continue
+			}
+			if t == nil {
+				failed = append(failed, reportBatchFailure{ID: id, Error: fmt.Sprintf("来源任务 #%d 已不存在", taskID)})
+				continue
+			}
+		case db.ReportScopeProject:
+			projectID = valueOr0(job.ProjectID)
+			if projectID <= 0 {
+				failed = append(failed, reportBatchFailure{ID: id, Error: "报告缺少来源项目"})
+				continue
+			}
+			p, err := s.m.pg.GetProject(projectID)
+			if err != nil {
+				failed = append(failed, reportBatchFailure{ID: id, Error: err.Error()})
+				continue
+			}
+			if p == nil {
+				failed = append(failed, reportBatchFailure{ID: id, Error: fmt.Sprintf("来源项目 #%d 已不存在", projectID)})
+				continue
+			}
+		default:
+			failed = append(failed, reportBatchFailure{ID: id, Error: "未知的报告 scope: " + job.Scope})
+			continue
+		}
+		tmplID := int64(0)
+		if job.TemplateID != nil {
+			tmplID = *job.TemplateID
+		}
+		newJob, err := s.m.pg.InsertReport(job.Scope, taskID, projectID, tmplID, job.Locale, job.Format, job.FindingIDs)
+		if err != nil {
+			failed = append(failed, reportBatchFailure{ID: id, Error: err.Error()})
+			continue
+		}
+		queued = append(queued, newJob.ID)
+		go s.runReportJob(newJob)
+	}
+	writeJSON(w, 200, map[string]any{"queued": queued, "failed": failed})
 }
 
 // sanitizeArchiveName 去掉 zip 条目名里的路径分隔/保留字符（任务名可能含

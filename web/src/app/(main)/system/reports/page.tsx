@@ -1,10 +1,13 @@
 "use client";
 
-// R6 报告归档中心：左侧「项目 → 任务 → 报告」树，右侧内嵌预览，多选打包下载。
+// R6 报告归档中心：左侧「项目 → 任务 → 报告」树，右侧内嵌预览，多选
+// 导出 / 重新生成 / 删除。
 //
-// 后端：GET /api/reports/tree（status/q 过滤）、GET /api/reports/{id}/preview
-// （用来源数据重建 HTML，docx 也能内嵌）、POST /api/reports/download-batch
-// （zip；同名自动加序号）。预览走 fetch+blob（iframe 带不了 JWT 头）。
+// 后端：GET /api/reports/tree（status/q 过滤）、GET /api/reports/{id}/preview.pdf
+// （docx→PDF 保真预览；无 LibreOffice 时回退 HTML 近似预览）、
+// POST /api/reports/download-batch（zip，含同目录 PDF）、
+// POST /api/reports/delete-batch、POST /api/reports/regenerate-batch。
+// 预览走 fetch+blob（iframe 带不了 JWT 头）。
 
 import * as React from "react";
 
@@ -14,10 +17,22 @@ import {
   FileTextIcon,
   FolderIcon,
   RefreshCwIcon,
+  RotateCcwIcon,
   SearchIcon,
+  Trash2Icon,
 } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -27,7 +42,7 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
 import { api } from "@/lib/api";
-import type { ReportJob, ReportTree, ReportTreeProject, ReportTreeTask } from "@/lib/types";
+import type { PreviewCapability, ReportJob, ReportTree, ReportTreeProject, ReportTreeTask } from "@/lib/types";
 
 const STATUS_OPTIONS = [
   { v: "", label: "全部状态" },
@@ -47,12 +62,38 @@ export default function ReportsArchivePage() {
   const [expanded, setExpanded] = React.useState<Set<number>>(new Set());
 
   const [previewId, setPreviewId] = React.useState<number | null>(null);
-  const [preview, setPreview] = React.useState<{ id: number; url: string; report: ReportJob } | null>(null);
+  const [preview, setPreview] = React.useState<{
+    id: number;
+    url: string;
+    report: ReportJob;
+    fidelity: "exact" | "approximate";
+    pdf: boolean;
+  } | null>(null);
   const [previewBusy, setPreviewBusy] = React.useState(false);
   const [previewErr, setPreviewErr] = React.useState("");
+  const [capability, setCapability] = React.useState<PreviewCapability | null>(null);
   const [downloading, setDownloading] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
+  const [regenerating, setRegenerating] = React.useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = React.useState(false);
   const previewUrlRef = React.useRef<string | null>(null);
   const previewAbortRef = React.useRef<AbortController | null>(null);
+  const mountedRef = React.useRef(true);
+
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // PDF 保真预览能力（LibreOffice 是否安装），决定徽标文案。
+  React.useEffect(() => {
+    api
+      .previewCapability()
+      .then(setCapability)
+      .catch(() => setCapability({ pdf: false, engine: "none", version: "" }));
+  }, []);
 
   // 搜索防抖 300ms。
   React.useEffect(() => {
@@ -82,7 +123,8 @@ export default function ReportsArchivePage() {
     void load();
   }, [load]);
 
-  // 预览：fetch blob（带 JWT），URL.createObjectURL 给 iframe。
+  // 预览：优先 PDF（docx 经 LibreOffice 转换）；失败（如转换 502）回退 HTML
+  // 近似预览。fetch blob（带 JWT），URL.createObjectURL 给 iframe。
   React.useEffect(() => {
     if (previewId == null) {
       setPreview(null);
@@ -93,21 +135,31 @@ export default function ReportsArchivePage() {
     previewAbortRef.current = ac;
     setPreviewBusy(true);
     setPreviewErr("");
+    const report = findReport(tree, previewId) ?? fallbackReport(previewId);
+    const apply = (blob: Blob, fidelity: "exact" | "approximate", pdf: boolean) => {
+      if (ac.signal.aborted || !mountedRef.current) return;
+      const url = URL.createObjectURL(blob);
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+      previewUrlRef.current = url;
+      setPreview({ id: previewId, url, report, fidelity, pdf });
+    };
     api
-      .reportPreviewBlob(previewId, ac.signal)
-      .then((blob) => {
-        if (ac.signal.aborted) return;
-        const url = URL.createObjectURL(blob);
-        if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
-        previewUrlRef.current = url;
-        setPreview({ id: previewId, url, report: findReport(tree, previewId) ?? fallbackReport(previewId) });
-      })
-      .catch((e) => {
+      .reportPreviewPDFBlob(previewId, ac.signal)
+      .then(({ blob, fidelity }) => apply(blob, fidelity, blob.type === "application/pdf"))
+      .catch(async (e) => {
         if ((e as Error)?.name === "AbortError") return;
-        setPreviewErr((e as Error).message);
+        // PDF 通道失败 → 回退现有 HTML 预览（版式近似），保证仍能看内容。
+        try {
+          const blob = await api.reportPreviewBlob(previewId, ac.signal);
+          apply(blob, "approximate", false);
+          toast.warning(`PDF 预览不可用，已回退近似预览：${(e as Error).message}`, { duration: 6000 });
+        } catch (e2) {
+          if ((e2 as Error)?.name === "AbortError") return;
+          setPreviewErr((e2 as Error).message);
+        }
       })
       .finally(() => {
-        if (!ac.signal.aborted) setPreviewBusy(false);
+        if (!ac.signal.aborted && mountedRef.current) setPreviewBusy(false);
       });
     return () => ac.abort();
     // tree 变化（刷新）时重取同一份报告，保持预览最新。
@@ -154,7 +206,7 @@ export default function ReportsArchivePage() {
   const downloadSelected = async () => {
     const ids = [...checked];
     if (ids.length === 0) {
-      toast.error("请先勾选要下载的报告");
+      toast.error("请先勾选要导出的报告");
       return;
     }
     setDownloading(true);
@@ -162,9 +214,62 @@ export default function ReportsArchivePage() {
       const { filename } = await api.downloadReportsBatch(ids);
       toast.success(`已打包 ${ids.length} 份报告：${filename}`);
     } catch (e) {
-      toast.error(`批量下载失败：${(e as Error).message}`);
+      toast.error(`批量导出失败：${(e as Error).message}`);
     } finally {
       setDownloading(false);
+    }
+  };
+
+  // 批量删除：二次确认后执行；失败项逐条提示原因；随后刷新树与列表。
+  const deleteSelected = async () => {
+    const ids = [...checked];
+    if (ids.length === 0) return;
+    setDeleting(true);
+    try {
+      const res = await api.deleteReportsBatch(ids);
+      if (res.deleted > 0) toast.success(`已删除 ${res.deleted} 份报告`);
+      for (const f of res.failed) toast.error(`#${f.id} 删除失败：${f.error}`);
+      if (previewId != null && ids.includes(previewId)) setPreviewId(null);
+      setChecked(new Set());
+      setConfirmDeleteOpen(false);
+      await load();
+    } catch (e) {
+      toast.error(`批量删除失败：${(e as Error).message}`);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  // 批量重新生成：新 job 入队后刷新（新行显示「生成中」），每 3s 轮询 job
+  // 状态，全部终态或满 2 分钟后再刷新一次。
+  const regenerateSelected = async () => {
+    const ids = [...checked];
+    if (ids.length === 0) {
+      toast.error("请先勾选要重新生成的报告");
+      return;
+    }
+    setRegenerating(true);
+    try {
+      const res = await api.regenerateReportsBatch(ids);
+      for (const f of res.failed) toast.error(`#${f.id} 重新生成失败：${f.error}`);
+      if (res.queued.length === 0) {
+        toast.error("没有可重新生成的报告");
+        return;
+      }
+      toast.success(`已重新排入 ${res.queued.length} 个报告任务`);
+      await load();
+      const deadline = Date.now() + 120_000;
+      while (mountedRef.current && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 3000));
+        if (!mountedRef.current) return;
+        const jobs = await Promise.all(res.queued.map((id) => api.reportJob(id).catch(() => null)));
+        if (jobs.every((j) => !j || j.status === "done" || j.status === "failed")) break;
+      }
+      if (mountedRef.current) await load();
+    } catch (e) {
+      toast.error(`批量重新生成失败：${(e as Error).message}`);
+    } finally {
+      if (mountedRef.current) setRegenerating(false);
     }
   };
 
@@ -272,11 +377,40 @@ export default function ReportsArchivePage() {
               </ScrollArea>
             )}
           </CardContent>
-          <div className="flex items-center justify-between gap-2 border-t p-2">
-            <span className="text-muted-foreground text-xs">已选 {checked.size} 份</span>
-            <Button size="sm" onClick={() => void downloadSelected()} disabled={downloading || checked.size === 0}>
-              {downloading ? <Spinner /> : <DownloadIcon />} 下载所选
-            </Button>
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t p-2">
+            <div className="text-muted-foreground text-xs">
+              <span>已选 {checked.size} 份</span>
+              {regenerating && (
+                <span className="ml-2 inline-flex items-center gap-1 text-sky-600">
+                  <Spinner className="size-3" /> 重新生成中，完成后自动刷新…
+                </span>
+              )}
+              {capability && !capability.pdf && (
+                <span className="ml-2 text-amber-600">未检测到 LibreOffice，预览为近似渲染</span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => void downloadSelected()} disabled={downloading || checked.size === 0}>
+                {downloading ? <Spinner /> : <DownloadIcon />} 导出
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void regenerateSelected()}
+                disabled={regenerating || checked.size === 0}
+              >
+                {regenerating ? <Spinner /> : <RotateCcwIcon />} 重新生成
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="text-rose-600 hover:text-rose-700"
+                onClick={() => setConfirmDeleteOpen(true)}
+                disabled={deleting || checked.size === 0}
+              >
+                {deleting ? <Spinner /> : <Trash2Icon />} 删除
+              </Button>
+            </div>
           </div>
         </Card>
 
@@ -293,8 +427,15 @@ export default function ReportsArchivePage() {
                 </Badge>
               )}
               {preview && (
-                <Badge variant="outline" className="text-muted-foreground">
-                  按当前模板重建 · 交付以 docx 为准
+                <Badge
+                  variant="outline"
+                  className={
+                    preview.fidelity === "exact"
+                      ? "border-emerald-500 text-emerald-600"
+                      : "border-amber-400 text-amber-600"
+                  }
+                >
+                  {preview.fidelity === "exact" ? "与最终 docx 一致（PDF 渲染）" : "近似预览（未安装 LibreOffice）"}
                 </Badge>
               )}
             </div>
@@ -323,12 +464,43 @@ export default function ReportsArchivePage() {
                   <Spinner />
                 </div>
               ) : preview ? (
-                <iframe title={`报告预览 #${preview.id}`} src={preview.url} className="size-full" sandbox="allow-same-origin" />
+                preview.pdf ? (
+                  // PDF 由服务端生成（自有产物），直接交浏览器内置阅读器；
+                  // 加 sandbox 会挡住 PDF viewer，故此处不沙箱。
+                  <iframe title={`报告预览 #${preview.id}`} src={preview.url} className="size-full" />
+                ) : (
+                  <iframe title={`报告预览 #${preview.id}`} src={preview.url} className="size-full" sandbox="allow-same-origin" />
+                )
               ) : null}
             </div>
           </CardContent>
         </Card>
       </div>
+
+      {/* 删除二次确认：显示条数，确认后删行+文件并刷新。 */}
+      <AlertDialog open={confirmDeleteOpen} onOpenChange={(o) => !deleting && setConfirmDeleteOpen(o)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除 {checked.size} 份报告？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将同时删除报告记录与磁盘文件（docx/pdf），此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-rose-600 text-white hover:bg-rose-700"
+              disabled={deleting}
+              onClick={(e) => {
+                e.preventDefault();
+                void deleteSelected();
+              }}
+            >
+              {deleting ? "删除中…" : `确认删除 ${checked.size} 份`}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

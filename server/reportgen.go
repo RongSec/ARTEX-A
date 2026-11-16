@@ -696,8 +696,8 @@ func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
 	if body.Format == "" {
 		body.Format = "docx"
 	}
-	if body.Format != "docx" && body.Format != "md" && body.Format != "html" {
-		writeErr(w, 400, "format 仅支持 docx|md|html")
+	if body.Format != "docx" && body.Format != "md" && body.Format != "html" && body.Format != "pdf" {
+		writeErr(w, 400, "format 仅支持 docx|md|html|pdf")
 		return
 	}
 
@@ -787,7 +787,13 @@ func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
 	} else if tmpl != nil && strings.TrimSpace(tmpl.Name) != "" {
 		tmplName = tmpl.Name
 	}
-	base := report.ReportBaseName("draft-"+tmplName, time.Now(), body.Format)
+	// V9-RPT2：pdf = docx 同源渲染后 LibreOffice 转 PDF（模板页「与最终 docx
+	// 一致」的预览通道）。无 soffice 时明确 502，前端回退 HTML 近似预览。
+	nameExt := body.Format
+	if nameExt == "pdf" {
+		nameExt = "docx" // 先出 docx，再转 pdf；临时文件名沿用 docx
+	}
+	base := report.ReportBaseName("draft-"+tmplName, time.Now(), nameExt)
 
 	tmpDir, err := os.MkdirTemp("", "artex-draft-")
 	if err != nil {
@@ -798,13 +804,38 @@ func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
 	outPath := filepath.Join(tmpDir, base)
 
 	if data, pure := renderDraftBytes(body.Format, in, s.requestOrigin(r)); pure {
-		// md/html 纯 Go 分派（renderDraftBytes 可测）；docx 走下方子进程管线。
+		// md/html 纯 Go 分派（renderDraftBytes 可测）；docx/pdf 走下方子进程管线。
 		if err := os.WriteFile(outPath, data, 0o644); err != nil {
 			writeErr(w, 500, "渲染失败: "+err.Error())
 			return
 		}
 	} else if err := report.GenerateDocx(ctx, in, outPath); err != nil {
 		writeErr(w, 502, "docx 渲染失败（无 python/python-docx？）: "+err.Error())
+		return
+	}
+	if body.Format == "pdf" {
+		if !s.previewCapability().PDF {
+			writeErr(w, 502, "未安装 LibreOffice，无法生成 PDF 预览")
+			return
+		}
+		pdfPath := pdfCachePath(outPath)
+		convert := s.pdfConvert
+		if convert == nil {
+			convert = convertDocxToPDF
+		}
+		stderr, err := convert(ctx, s.sofficePath(), outPath, pdfPath)
+		if err != nil {
+			msg := strings.TrimSpace(stderr)
+			if msg == "" {
+				msg = err.Error()
+			}
+			writeErr(w, 502, "PDF 转换失败: "+truncateUTF8(msg, 600))
+			return
+		}
+		w.Header().Set("X-Preview-Fidelity", "exact")
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Header().Set("Content-Disposition", contentDispositionAttachment(strings.TrimSuffix(base, ".docx")+".pdf"))
+		http.ServeFile(w, r, pdfPath)
 		return
 	}
 	w.Header().Set("Content-Type", reportContentType(outPath))
@@ -1366,9 +1397,6 @@ func (s *Server) reportsDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "报告不存在")
 		return
 	}
-	if job.FilePath != "" {
-		_ = os.Remove(job.FilePath)
-		_ = os.Remove(filepath.Join(s.m.dir, "reports", filepath.Base(job.FilePath)))
-	}
+	s.removeReportFiles(job)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

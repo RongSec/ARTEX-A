@@ -77,11 +77,14 @@ import type {
   ProjectDetail,
   ProjectGraphResp,
   ProjectInsight,
+  PreviewCapability,
   FindingEvidenceImage,
   ReportDraftInput,
+  ReportDeleteBatchResult,
   ReportGenerateInput,
   ReportImportResult,
   ReportJob,
+  ReportRegenerateBatchResult,
   ReportSettings,
   ReportSkillDraft,
   ReportTemplate,
@@ -1454,6 +1457,7 @@ export const api = {
     observer_enabled?: boolean;
     report_template_id?: number | null;
     auto_report?: boolean;
+    auto_report_tasks?: boolean;
     reader_enabled?: boolean;
   }) =>
     post<Project>("/projects", {
@@ -1464,6 +1468,7 @@ export const api = {
       observer_enabled: input.observer_enabled ?? false,
       report_template_id: input.report_template_id ?? null,
       auto_report: input.auto_report ?? false,
+      auto_report_tasks: input.auto_report_tasks ?? false,
       reader_enabled: input.reader_enabled ?? false,
     }),
   updateProject: (
@@ -1479,6 +1484,7 @@ export const api = {
       // 数字=绑定（后端 *int64+Set 语义）。
       report_template_id?: number | null;
       auto_report?: boolean;
+      auto_report_tasks?: boolean;
       reader_enabled?: boolean;
     },
   ) => patch<Project>(`/projects/${id}`, patchBody),
@@ -1628,6 +1634,47 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ report_ids: ids }),
     }),
+  // V9-RPT2：PDF 保真预览能力（LibreOffice 是否可用）。
+  previewCapability: () =>
+    MOCK
+      ? Promise.resolve({ pdf: false, engine: "none", version: "" } as PreviewCapability)
+      : get<PreviewCapability>("/preview/capability"),
+  // V9-RPT2：报告 PDF 预览（docx 经 LibreOffice 转换；无 soffice 时后端回退
+  // HTML 并在响应头标 approximate）。
+  reportPreviewPDFBlob: async (
+    id: number,
+    signal?: AbortSignal,
+  ): Promise<{ blob: Blob; fidelity: "exact" | "approximate" }> => {
+    if (MOCK) {
+      return {
+        blob: new Blob([`（demo）报告 #${id} 的 PDF 预览占位`], { type: "application/pdf" }),
+        fidelity: "exact",
+      };
+    }
+    const token = getToken();
+    const r = await fetch(`/api/reports/${id}/preview.pdf`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      signal,
+    });
+    if (!r.ok) {
+      let message = `报告预览失败: ${r.status}`;
+      try {
+        const p = (await r.json()) as { error?: unknown };
+        if (typeof p.error === "string" && p.error.trim()) message = p.error.trim();
+      } catch {
+        /* 非 JSON 错误体保留状态码文案 */
+      }
+      throw new Error(message);
+    }
+    const fidelity = r.headers.get("X-Preview-Fidelity") === "exact" ? "exact" : "approximate";
+    return { blob: await r.blob(), fidelity };
+  },
+  // V9-RPT2：批量删除（行 + docx/pdf 文件），逐条返回失败原因。
+  deleteReportsBatch: (ids: number[]) =>
+    post<ReportDeleteBatchResult>("/reports/delete-batch", { report_ids: ids }),
+  // V9-RPT2：批量重新生成（复用生成管道；失败报告也允许）。
+  regenerateReportsBatch: (ids: number[]) =>
+    post<ReportRegenerateBatchResult>("/reports/regenerate-batch", { report_ids: ids }),
   // 同步渲染模板调试小样（60s 超时；不落库不进队列）。X-Report-Warning 透传
   // 伪资产剔除提示，调用方解码展示。
   renderReportDraft: (input: ReportDraftInput) =>
@@ -1678,6 +1725,49 @@ export const api = {
       warning = warnRaw;
     }
     return { blob: await r.blob(), warning };
+  },
+  // V9-RPT2：模板页 PDF 保真预览（docx 同源渲染 → LibreOffice 转 PDF）。
+  // 无 soffice 时后端 502，调用方回退 renderReportPreview(HTML)。
+  renderReportPreviewPDF: async (
+    input: ReportDraftInput,
+    signal?: AbortSignal,
+  ): Promise<{ blob: Blob; warning: string; fidelity: "exact" | "approximate" }> => {
+    if (MOCK) {
+      return {
+        blob: new Blob([`（demo）PDF 预览占位`], { type: "application/pdf" }),
+        warning: "",
+        fidelity: "exact",
+      };
+    }
+    const token = getToken();
+    const r = await fetch(`/api/report/render-draft`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ ...input, format: "pdf" }),
+      signal,
+    });
+    if (!r.ok) {
+      let message = `PDF 预览渲染失败: ${r.status}`;
+      try {
+        const p = (await r.json()) as { error?: unknown };
+        if (typeof p.error === "string" && p.error.trim()) message = p.error.trim();
+      } catch {
+        /* 非 JSON 错误体保留状态码文案 */
+      }
+      throw new Error(message);
+    }
+    const warnRaw = r.headers.get("X-Report-Warning") ?? "";
+    let warning = "";
+    try {
+      warning = warnRaw ? decodeURIComponent(warnRaw) : "";
+    } catch {
+      warning = warnRaw;
+    }
+    const fidelity = r.headers.get("X-Preview-Fidelity") === "exact" ? "exact" : "approximate";
+    return { blob: await r.blob(), warning, fidelity };
   },
   // T20 对话调模板（不落库；template=合并补丁后的完整草稿）。400=入参/模板
   // 非法，502=LLM 失败或输出不可解析。

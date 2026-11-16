@@ -1721,7 +1721,8 @@ export interface Project {
   observer_enabled: boolean; // V6-DUAL 跨任务（项目内）阅读开关：项目洞察写/触发/注入
   // T18 项目设置扩展三字段。report_template_id=null → 走默认模板链。
   report_template_id: number | null;
-  auto_report: boolean; // 整项目收官自动写报告（默认关）
+  auto_report: boolean; // 只出一个项目汇总报告（全部任务收官后）
+  auto_report_tasks: boolean; // 子任务都出报告（与 auto_report 可同勾=叠加）
   reader_enabled: boolean; // V6-DUAL 跨项目阅读开关：跨项目聚合/来源校验/注入。与 observer_enabled 互相独立
   created_at: string;
   updated_at: string;
@@ -1879,7 +1880,7 @@ export interface ReportGenerateInput {
   finding_ids?: number[];
   template_id?: number;
   locale?: string;
-  format?: "docx" | "md" | "html";
+  format?: "docx" | "md" | "html" | "pdf";
 }
 
 // ReportTree 是 R6 报告归档页的「项目→任务→报告」树（GET /api/reports/tree）。
@@ -1909,6 +1910,29 @@ export interface ReportTreeProject {
 export interface ReportTree {
   projects: ReportTreeProject[];
   orphans: ReportTreeTask[];
+}
+
+// V9-RPT2：PDF 保真预览能力（GET /api/preview/capability）。
+export interface PreviewCapability {
+  pdf: boolean;
+  engine: "libreoffice" | "none" | string;
+  version: string;
+}
+
+// 批量删除/重新生成的逐条失败原因。
+export interface ReportBatchFailure {
+  id: number;
+  error: string;
+}
+
+export interface ReportDeleteBatchResult {
+  deleted: number;
+  failed: ReportBatchFailure[];
+}
+
+export interface ReportRegenerateBatchResult {
+  queued: number[]; // 新建 job id
+  failed: ReportBatchFailure[];
 }
 
 // ReportDraftInput 是 POST /api/report/render-draft 的入参（同步小样，不落库）。
