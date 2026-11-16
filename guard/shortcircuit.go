@@ -608,6 +608,11 @@ var platformAbsRe *regexp.Regexp
 // host 档之前，RuleName 带 "[代码常量]" 前缀（db 层归类为 shortcircuit）。
 var controlPlaneDetector controlPlaneMatcher
 
+// customShortCircuitRules 是配置文件自定义区编译后的条目（V9-SC）。只 deny，
+// 判定位置在内置工具 deny 之后、ask/allow 之前：自定义条目属于「红线」，
+// 命中即直接拒绝，不被 allow 名单放过。条目增删仍需重启进程才生效。
+var customShortCircuitRules []compiledCustomRule
+
 // remoteRefRe 是"远程目标指代"语境判据：命令串里【任意位置】出现任一形态，
 // 即认为读取指令与远端靶机有关，host 系统凭据档整体豁免。
 //
@@ -924,6 +929,26 @@ const (
 		"请用 ssh/scp/proxychains 等远程目标指代形式执行。已禁止读取。"
 )
 
+// matchCustomShortCircuitRule 在内置工具档之后匹配自定义条目。
+// 与平台凭据档同口径：扫执行面文本（写入类工具丢弃 content 等正文），
+// 并对解码后的文本再扫一遍，避免 \u002f 之类转义绕过。
+func matchCustomShortCircuitRule(toolName string, input []byte) *compiledCustomRule {
+	text := platformExecutionText(toolName, input)
+	for i := range customShortCircuitRules {
+		if customShortCircuitRules[i].regex.Match(text) {
+			return &customShortCircuitRules[i]
+		}
+	}
+	if decoded := decodedInputText(text); decoded != "" {
+		for i := range customShortCircuitRules {
+			if customShortCircuitRules[i].regex.MatchString(decoded) {
+				return &customShortCircuitRules[i]
+			}
+		}
+	}
+	return nil
+}
+
 // shortCircuit 在 applyIntercept 最前面求值。返回非 nil 的 Decision 表示
 // 本表命中，应当直接执行该动作，不再走 DB 规则与 judge。
 //
@@ -958,6 +983,22 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 			Action:   "deny",
 			RuleName: ruleName,
 			Message:  msg,
+		}
+	}
+	// V9-SC：管理员自定义条目（只 deny）。位置在工具 deny 之后、ask/allow
+	// 之前：自定义条目属于红线，不能被 allow 名单放过。纯记录类工具整体
+	// 豁免——它们只写 DB，正文引用被拦命令原文是审计刚需，不算执行。
+	if len(customShortCircuitRules) > 0 && !recordOnlyTools[toolName] {
+		if hit := matchCustomShortCircuitRule(toolName, input); hit != nil {
+			msg := "命中管理员配置的自定义短路条目「" + hit.name + "」（key=" + hit.key + "），按配置直接拒绝。"
+			if hit.note != "" {
+				msg += "说明：" + hit.note
+			}
+			return &intercept.Decision{
+				Action:   "deny",
+				RuleName: "[代码常量] 自定义短路规则：" + hit.name,
+				Message:  msg,
+			}
 		}
 	}
 	// 可配置的 ask 档：代码默认已清空（V6-AUTO 自主优先），仅在管理员显式

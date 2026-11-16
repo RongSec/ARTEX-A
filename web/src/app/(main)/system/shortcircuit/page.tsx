@@ -3,11 +3,14 @@
 import * as React from "react";
 import {
   AlertTriangleIcon,
+  LockIcon,
   PencilIcon,
+  PlusIcon,
   PowerIcon,
   RotateCcwIcon,
   SaveIcon,
   ShieldCheckIcon,
+  Trash2Icon,
   XIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -16,18 +19,43 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import { Switch } from "@/components/ui/switch";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { ShortCircuitConfig, ShortCircuitState, ShortCircuitTools } from "@/lib/types";
+import type {
+  ShortCircuitConfig,
+  ShortCircuitCustomRule,
+  ShortCircuitState,
+  ShortCircuitTools,
+} from "@/lib/types";
 
-// V6-CFG / V9-UI：短路规则页。
+// V6-CFG / V9-UI / V9-SC：短路规则页。
 //
 // 交互模型刻意是「编辑草稿 → 保存文件 → 重启生效」：
-// 保存不会改变正在运行的判定（GET 的 config 始终是生效配置），dirty=true
-// 明确告诉用户"文件已改，重启才生效"。页面不提供任何热加载按钮。
+// 保存不会改变正在运行的判定（GET 的 config 始终是生效配置），页面用改动
+// 计数器（pending）标记「有改动待重启生效」，重启成功后归零。页面不提供
+// 任何热加载按钮。
 //
-// 布局跟拦截规则页对齐：一条规则一行卡片、等宽等高（文本框固定高度、内部滚动，
-// 不随内容撑高），默认只读，点「编辑」只把这一行切到可编辑态，其余行仍只读。
+// 布局跟拦截规则页对齐：内置档一条规则一行卡片、等宽等高（文本框固定高度、内部滚动，
+// 不随内容撑高），默认只读；自定义条目单独分卡，可增删改。
+// 内置区只读、自定义区可写 —— 内置档是代码级红线，不能被页面改写。
 
 type TextField =
   | "platform_paths"
@@ -86,6 +114,26 @@ const TEXT_FIELDS: Array<{ key: TextField; title: string; hint: string }> = [
 const TOOLS_FIELD = "tools";
 
 type EditingKey = TextField | typeof TOOLS_FIELD | null;
+
+// 自定义条目（V9-SC）：key 只允许字母/数字/下划线；上限与后端一致。
+const CUSTOM_KEY_RE = /^[A-Za-z0-9_]+$/;
+const CUSTOM_MAX = 50;
+
+type CustomForm = {
+  key: string;
+  name: string;
+  pattern: string;
+  note: string;
+  enabled: boolean;
+};
+
+const blankCustomForm = (): CustomForm => ({
+  key: "",
+  name: "",
+  pattern: "",
+  note: "",
+  enabled: true,
+});
 
 function linesToArray(v: string): string[] {
   return v
@@ -269,6 +317,16 @@ export default function ShortCircuitPage() {
   const [resetting, setResetting] = React.useState(false);
   const [restarting, setRestarting] = React.useState(false);
   const [error, setError] = React.useState("");
+  // 自定义条目（V9-SC）与改动计数器：pending>0 即「有改动待重启生效」。
+  // 刻意不用后端 dirty（文件比对）：保存/新增/删除/恢复默认都算一次改动，
+  // 重启成功后归零。
+  const [customRules, setCustomRules] = React.useState<ShortCircuitCustomRule[]>([]);
+  const [pending, setPending] = React.useState(0);
+  const [customOpen, setCustomOpen] = React.useState(false);
+  const [editingCustom, setEditingCustom] = React.useState<ShortCircuitCustomRule | null>(null);
+  const [customForm, setCustomForm] = React.useState<CustomForm>(blankCustomForm());
+  const [customErr, setCustomErr] = React.useState("");
+  const [customSaving, setCustomSaving] = React.useState(false);
 
   const hydrate = React.useCallback((cfg: ShortCircuitConfig) => {
     setTools({
@@ -286,6 +344,7 @@ export default function ShortCircuitPage() {
       record_only_tools: arrayToLines(cfg.record_only_tools),
       control_plane_patterns: arrayToLines(cfg.control_plane_patterns),
     });
+    setCustomRules([...(cfg.custom_rules ?? [])]);
     setEditing(null);
   }, []);
 
@@ -305,6 +364,7 @@ export default function ShortCircuitPage() {
   const buildConfig = (
     nextTexts: Record<TextField, string>,
     nextTools: ShortCircuitTools,
+    nextCustom: ShortCircuitCustomRule[],
   ): ShortCircuitConfig => ({
     version: active?.config.version ?? 1,
     tools: nextTools,
@@ -316,24 +376,33 @@ export default function ShortCircuitPage() {
     remote_exempt_patterns: linesToArray(nextTexts.remote_exempt_patterns),
     record_only_tools: linesToArray(nextTexts.record_only_tools),
     control_plane_patterns: linesToArray(nextTexts.control_plane_patterns),
+    custom_rules: nextCustom,
     // 运行时派生值：服务端会忽略（按启动时的 dataDir 重新生成），仅为类型完整回传。
     platform_abs_dir: active?.config.platform_abs_dir ?? "",
   });
 
-  // persist 是唯一的写文件出口：整页保存与单行保存都走它，避免两套语义。
-  const persist = (nextTexts: Record<TextField, string>, nextTools: ShortCircuitTools) => {
+  // persist 是唯一的写文件出口：整页保存、单行保存、自定义条目增删改都走它，
+  // 避免两套语义。成功后 pending+1（有改动待重启生效），失败返回 false。
+  const persist = (
+    nextTexts: Record<TextField, string>,
+    nextTools: ShortCircuitTools,
+    nextCustom: ShortCircuitCustomRule[] = customRules,
+  ): Promise<boolean> => {
     setSaving(true);
     setError("");
-    api
-      .saveShortCircuit(buildConfig(nextTexts, nextTools))
+    return api
+      .saveShortCircuit(buildConfig(nextTexts, nextTools, nextCustom))
       .then(() => {
+        setPending((n) => n + 1);
         toast.success("已保存到文件，需重启服务端才生效");
-        return reload();
+        void reload();
+        return true;
       })
       .catch((e) => {
         const msg = (e as Error).message;
         setError(msg);
         toast.error("保存失败：" + msg);
+        return false;
       })
       .finally(() => setSaving(false));
   };
@@ -377,6 +446,85 @@ export default function ShortCircuitPage() {
     cancelEdit();
   };
 
+  // ---- 自定义条目（V9-SC）：只 deny，保存后同样需重启 ----
+
+  const openNewCustom = () => {
+    setEditingCustom(null);
+    setCustomForm(blankCustomForm());
+    setCustomErr("");
+    setCustomOpen(true);
+  };
+
+  const openEditCustom = (rule: ShortCircuitCustomRule) => {
+    setEditingCustom(rule);
+    setCustomForm({
+      key: rule.key,
+      name: rule.name,
+      pattern: rule.pattern,
+      note: rule.note ?? "",
+      enabled: rule.enabled,
+    });
+    setCustomErr("");
+    setCustomOpen(true);
+  };
+
+  const submitCustom = async () => {
+    const key = customForm.key.trim();
+    const name = customForm.name.trim();
+    const pattern = customForm.pattern.trim();
+    const note = customForm.note.trim();
+    if (!CUSTOM_KEY_RE.test(key)) {
+      setCustomErr("key 只能包含字母、数字、下划线，且不能为空");
+      return;
+    }
+    if (!name) {
+      setCustomErr("显示名不能为空");
+      return;
+    }
+    if (!pattern) {
+      setCustomErr("匹配内容不能为空");
+      return;
+    }
+    const dup = customRules.some(
+      (r) =>
+        r.key.toLowerCase() === key.toLowerCase() &&
+        (!editingCustom || r.key !== editingCustom.key),
+    );
+    if (dup) {
+      setCustomErr(`key「${key}」已存在（不区分大小写）`);
+      return;
+    }
+    if (!editingCustom && customRules.length >= CUSTOM_MAX) {
+      setCustomErr(`自定义条目最多 ${CUSTOM_MAX} 条`);
+      return;
+    }
+    const rule: ShortCircuitCustomRule = { key, name, pattern, note, enabled: customForm.enabled };
+    const next = editingCustom
+      ? customRules.map((r) => (r.key === editingCustom.key ? rule : r))
+      : [...customRules, rule];
+    setCustomErr("");
+    setCustomSaving(true);
+    const ok = await persist(texts, tools, next);
+    setCustomSaving(false);
+    if (ok) {
+      setCustomRules(next);
+      setCustomOpen(false);
+    }
+  };
+
+  const removeCustom = async (rule: ShortCircuitCustomRule) => {
+    if (!window.confirm(`确定删除自定义条目「${rule.name}」？保存后仍需重启服务端才生效。`)) return;
+    const next = customRules.filter((r) => r.key !== rule.key);
+    const ok = await persist(texts, tools, next);
+    if (ok) setCustomRules(next);
+  };
+
+  const toggleCustom = async (rule: ShortCircuitCustomRule, enabled: boolean) => {
+    const next = customRules.map((r) => (r.key === rule.key ? { ...r, enabled } : r));
+    const ok = await persist(texts, tools, next);
+    if (ok) setCustomRules(next);
+  };
+
   const reset = () => {
     if (!window.confirm("确定把短路规则文件恢复为代码内置默认值？仍需重启服务端才生效。")) return;
     setResetting(true);
@@ -386,6 +534,7 @@ export default function ShortCircuitPage() {
       .then(async () => {
         const next = await reload();
         hydrate(next.defaults);
+        setPending((n) => n + 1);
         toast.success("已写入默认值，需重启服务端才生效");
       })
       .catch((e) => {
@@ -427,7 +576,8 @@ export default function ShortCircuitPage() {
       .then(async (r) => {
         toast.info(`已排程重启，约 ${r.delay_seconds}s 后开始…`);
         await waitForHealth();
-        toast.success("服务端已重启，短路规则已生效");
+        setPending(0);
+        toast.success("已重启，规则已生效");
         await reload();
       })
       .catch((e) => {
@@ -463,8 +613,8 @@ export default function ShortCircuitPage() {
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pt-1 text-xs">
             <span>
               状态：
-              {active?.dirty ? (
-                <Badge className="ml-1 bg-amber-600 text-white hover:bg-amber-600">文件已改，待重启生效</Badge>
+              {pending > 0 ? (
+                <Badge className="ml-1 bg-amber-600 text-white hover:bg-amber-600">有改动待重启生效</Badge>
               ) : (
                 <Badge variant="secondary" className="ml-1">
                   与运行配置一致
@@ -494,7 +644,7 @@ export default function ShortCircuitPage() {
           {/* 工具条与拦截规则页一致：说明在左，按钮右对齐、size=sm。 */}
           <div className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-muted-foreground text-xs">
-              默认只读；点某行的「编辑」只改这一行，其余行保持只读。一行一条，保存后仍需重启服务端。
+              内置区默认只读；点某行的「编辑」只改这一行，其余行保持只读。自定义条目在下方单独维护，保存后均需重启服务端。
             </p>
             <div className="flex flex-wrap items-center gap-2">
               <Button size="sm" onClick={save} disabled={busy || !!editing}>
@@ -515,6 +665,15 @@ export default function ShortCircuitPage() {
                 {restarting ? "重启中…" : "重启服务端"}
               </Button>
             </div>
+          </div>
+
+          {/* 内置区：代码内置的 8 个固定档 + 工具名单，只读。 */}
+          <div className="flex items-center gap-2 pt-1">
+            <LockIcon className="text-muted-foreground size-4" />
+            <h2 className="text-sm font-semibold">内置规则（代码内置，只读）</h2>
+            <Badge variant="outline" className="px-1 py-0 text-[10px]">
+              只读
+            </Badge>
           </div>
 
           <div className="flex flex-col gap-2">
@@ -607,11 +766,215 @@ export default function ShortCircuitPage() {
             </RuleRow>
           </div>
 
+          {/* 自定义区：可增删改，只 deny。新增按钮与拦截规则页「新建规则」同一位置（区块右上）。 */}
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <h2 className="text-sm font-semibold">自定义条目</h2>
+                <Badge variant="secondary" className="px-1 py-0 text-[10px] tabular-nums">
+                  {customRules.length}/{CUSTOM_MAX}
+                </Badge>
+              </div>
+              <p className="text-muted-foreground mt-0.5 text-xs">
+                命中即直接拦截（deny），只收紧不放宽；匹配执行面文本（纯记录类工具豁免）。保存后仍需重启服务端。
+              </p>
+            </div>
+            <Button
+              size="sm"
+              onClick={openNewCustom}
+              disabled={busy || !!editing || customRules.length >= CUSTOM_MAX}
+            >
+              <PlusIcon className="size-4" />
+              新增条目
+            </Button>
+          </div>
+
+          <Card>
+            <CardContent className="p-0">
+              {customRules.length === 0 ? (
+                <div className="flex flex-col items-center justify-center gap-2 py-12 text-center">
+                  <p className="text-muted-foreground text-sm">暂无自定义条目</p>
+                  <Button size="sm" variant="outline" onClick={openNewCustom} disabled={busy || !!editing}>
+                    <PlusIcon className="size-4" />
+                    新增第一条
+                  </Button>
+                </div>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow className="hover:bg-transparent">
+                      <TableHead className="w-[180px]">标识 key</TableHead>
+                      <TableHead className="w-[160px]">名称</TableHead>
+                      <TableHead>匹配内容</TableHead>
+                      <TableHead className="w-[180px]">说明</TableHead>
+                      <TableHead className="w-[64px] text-center">启用</TableHead>
+                      <TableHead className="w-[80px]" />
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {customRules.map((rule) => (
+                      <TableRow key={rule.key} className={!rule.enabled ? "opacity-50" : ""}>
+                        <TableCell className="align-top">
+                          <code className="block truncate font-mono text-xs">{rule.key}</code>
+                        </TableCell>
+                        <TableCell className="align-top text-sm">{rule.name}</TableCell>
+                        <TableCell className="align-top">
+                          <code
+                            className="block max-w-[280px] truncate rounded bg-muted px-1.5 py-0.5 font-mono text-xs"
+                            title={rule.pattern}
+                          >
+                            {rule.pattern}
+                          </code>
+                        </TableCell>
+                        <TableCell className="align-top">
+                          <span
+                            className="text-muted-foreground line-clamp-1 text-xs"
+                            title={rule.note || ""}
+                          >
+                            {rule.note || "—"}
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-center align-top">
+                          <Switch
+                            checked={rule.enabled}
+                            disabled={busy || !!editing}
+                            onCheckedChange={(v) => void toggleCustom(rule, v)}
+                          />
+                        </TableCell>
+                        <TableCell className="align-top">
+                          <div className="flex items-center justify-end gap-0.5">
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="h-7 w-7"
+                              onClick={() => openEditCustom(rule)}
+                              disabled={busy || !!editing}
+                              title="编辑"
+                            >
+                              <PencilIcon className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="text-destructive hover:text-destructive h-7 w-7"
+                              onClick={() => void removeCustom(rule)}
+                              disabled={busy || !!editing}
+                              title="删除"
+                            >
+                              <Trash2Icon className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+
           <p className="text-muted-foreground text-xs">
             重启会短暂中断服务；新进程起来后本页会自动确认 /api/health。
           </p>
         </>
       )}
+
+      {/* 自定义条目编辑器：与拦截规则页同样式（右侧 Sheet）。 */}
+      <Sheet
+        open={customOpen}
+        onOpenChange={(open) => {
+          if (!customSaving) setCustomOpen(open);
+        }}
+      >
+        <SheetContent side="right" className="flex flex-col gap-0 p-0 sm:max-w-md">
+          <SheetHeader className="border-b px-6 py-4">
+            <SheetTitle>{editingCustom ? "编辑自定义条目" : "新增自定义条目"}</SheetTitle>
+            <SheetDescription className="text-xs">
+              命中即直接拦截（deny），不能写成 allow。保存后仍需重启服务端才生效。
+            </SheetDescription>
+          </SheetHeader>
+
+          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5">
+            <div className="space-y-1.5">
+              <Label className="text-muted-foreground text-xs font-medium tracking-wide uppercase">
+                唯一标识 key
+              </Label>
+              <Input
+                value={customForm.key}
+                onChange={(e) => setCustomForm((f) => ({ ...f, key: e.target.value }))}
+                disabled={!!editingCustom}
+                placeholder="如 block_forbidden_scan"
+                className="font-mono text-xs"
+              />
+              <p className="text-muted-foreground text-[11px]">
+                只允许字母、数字、下划线；创建后不可修改。
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-muted-foreground text-xs font-medium tracking-wide uppercase">
+                显示名
+              </Label>
+              <Input
+                value={customForm.name}
+                onChange={(e) => setCustomForm((f) => ({ ...f, name: e.target.value }))}
+                placeholder="如 拦截内部扫描脚本"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-muted-foreground text-xs font-medium tracking-wide uppercase">
+                匹配内容（一行）
+              </Label>
+              <Input
+                value={customForm.pattern}
+                onChange={(e) => setCustomForm((f) => ({ ...f, pattern: e.target.value }))}
+                placeholder="如 forbidden_scan|internal_probe"
+                spellCheck={false}
+                className="font-mono text-xs"
+              />
+              <p className="text-muted-foreground text-[11px]">
+                RE2 正则，大小写不敏感；命中执行面文本即拒绝。
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label className="text-muted-foreground text-xs font-medium tracking-wide uppercase">
+                说明（可选）
+              </Label>
+              <Textarea
+                value={customForm.note}
+                onChange={(e) => setCustomForm((f) => ({ ...f, note: e.target.value }))}
+                placeholder="为什么加这条，便于审计时回溯"
+                rows={2}
+                className="resize-none text-xs"
+              />
+            </div>
+
+            <div className="flex items-center gap-3">
+              <Switch
+                id="sc-custom-enabled"
+                checked={customForm.enabled}
+                onCheckedChange={(v) => setCustomForm((f) => ({ ...f, enabled: v }))}
+              />
+              <Label htmlFor="sc-custom-enabled" className="cursor-pointer">
+                启用此条目
+              </Label>
+            </div>
+
+            {customErr ? <p className="text-destructive text-xs">{customErr}</p> : null}
+          </div>
+
+          <SheetFooter className="flex-row justify-end gap-2 border-t px-6 py-4">
+            <Button variant="outline" onClick={() => setCustomOpen(false)} disabled={customSaving}>
+              取消
+            </Button>
+            <Button onClick={() => void submitCustom()} disabled={customSaving}>
+              {customSaving ? "保存中…" : "保存（需重启）"}
+            </Button>
+          </SheetFooter>
+        </SheetContent>
+      </Sheet>
     </div>
   );
 }

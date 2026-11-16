@@ -968,8 +968,20 @@ export interface ShortCircuitConfig {
   remote_exempt_patterns: string[];
   record_only_tools: string[];
   control_plane_patterns: string[];
+  // 管理员自定义条目（V9-SC）。只 deny，可增删改；内置档只读。
+  custom_rules: ShortCircuitCustomRule[];
   // 运行时派生：启动时由 dataDir 绝对路径填充，只读展示（不参与保存）。
   platform_abs_dir: string;
+}
+
+// ShortCircuitCustomRule 是短路规则页「自定义区」的条目。
+// 没有 action 字段：自定义条目只能收紧（命中即 deny），不能写成 allow。
+export interface ShortCircuitCustomRule {
+  key: string; // 唯一标识，字母/数字/下划线
+  name: string; // 显示名
+  pattern: string; // 匹配执行面文本的 RE2 正则（一行）
+  note?: string; // 可选说明
+  enabled: boolean; // 默认 true；关闭后保留条目但不参与匹配
 }
 
 export interface ShortCircuitState {

@@ -1,9 +1,11 @@
 package guard
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -175,5 +177,218 @@ func TestWriteShortCircuitConfigFilePerm(t *testing.T) {
 	}
 	if _, err := ParseShortCircuitConfig(raw); err != nil {
 		t.Fatalf("写出的配置应可重新解析: %v", err)
+	}
+}
+
+// V9-SC：自定义条目新增 → 写盘未重启不生效 → 重载（模拟重启）后 deny →
+// 删除后重载不再命中。enabled 缺省按 true 处理。
+func TestShortCircuitCustomRulesLifecycle(t *testing.T) {
+	restoreDefaultShortCircuit(t)
+	dir := t.TempDir()
+	path := ShortCircuitConfigPath(dir)
+	if err := ReloadShortCircuit(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{
+	  "version": 1,
+	  "custom_rules": [
+	    {"key": "block_forbidden_scan", "name": "拦截 forbidden_scan", "pattern": "forbidden_scan", "enabled": true}
+	  ]
+	}`
+	cfg, err := ParseShortCircuitConfig([]byte(body))
+	if err != nil {
+		t.Fatalf("解析自定义条目失败: %v", err)
+	}
+	if len(cfg.CustomRules) != 1 || !cfg.CustomRules[0].Enabled {
+		t.Fatalf("自定义条目解析异常: %+v", cfg.CustomRules)
+	}
+	if err := WriteShortCircuitConfigFile(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	input := []byte(`{"command":"forbidden_scan --fast"}`)
+	// 只写文件、未重启：运行期仍按旧配置（不热改）。
+	if dec := PreviewShortCircuit("Bash", input); dec != nil {
+		t.Fatalf("写盘未重启不应生效: %+v", dec)
+	}
+	// 模拟重启：重新读文件装入。
+	if err := ReloadShortCircuit(dir); err != nil {
+		t.Fatalf("重载失败: %v", err)
+	}
+	dec := PreviewShortCircuit("Bash", input)
+	if dec == nil || dec.Action != "deny" {
+		t.Fatalf("重载后自定义条目应 deny: %+v", dec)
+	}
+	if !strings.HasPrefix(dec.RuleName, "[代码常量]") || !strings.Contains(dec.RuleName, "拦截 forbidden_scan") {
+		t.Fatalf("RuleName 应带来源前缀与条目名，得到 %q", dec.RuleName)
+	}
+	// 不匹配的命令不受影响。
+	if dec := PreviewShortCircuit("Bash", []byte(`{"command":"ls -la"}`)); dec != nil {
+		t.Fatalf("不匹配的命令不应命中: %+v", dec)
+	}
+
+	// 删除条目 → 重载后不再命中。
+	cfg.CustomRules = nil
+	if err := WriteShortCircuitConfigFile(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReloadShortCircuit(dir); err != nil {
+		t.Fatal(err)
+	}
+	if dec := PreviewShortCircuit("Bash", input); dec != nil {
+		t.Fatalf("删除后重载不应再命中: %+v", dec)
+	}
+}
+
+// V9-SC：enabled 缺省 true；显式 false 的条目不参与匹配。
+func TestShortCircuitCustomRulesEnabledDefault(t *testing.T) {
+	restoreDefaultShortCircuit(t)
+	body := `{"version":1,"custom_rules":[{"key":"k1","name":"默认启用","pattern":"marker_default"}]}`
+	cfg, err := ParseShortCircuitConfig([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.CustomRules[0].Enabled {
+		t.Fatal("enabled 缺省应为 true")
+	}
+
+	cfg.CustomRules[0].Enabled = false
+	if err := ValidateShortCircuitConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := compileShortCircuitRegexes(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compiled.customRules) != 0 {
+		t.Fatalf("disabled 条目不应进入匹配切片: %+v", compiled.customRules)
+	}
+}
+
+// V9-SC：重名 key（不区分大小写）、超上限、空 pattern、非法 key 全部拒绝。
+func TestShortCircuitCustomRulesValidation(t *testing.T) {
+	many := make([]ShortCircuitCustomRule, 0, ShortCircuitMaxCustomRules+1)
+	for i := 0; i <= ShortCircuitMaxCustomRules; i++ {
+		many = append(many, ShortCircuitCustomRule{
+			Key:     "k" + strings.Repeat("x", i),
+			Name:    "name",
+			Pattern: "p",
+			Enabled: true,
+		})
+	}
+	cases := []struct {
+		name  string
+		rules []ShortCircuitCustomRule
+		want  string
+	}{
+		{
+			name: "重复 key",
+			rules: []ShortCircuitCustomRule{
+				{Key: "Dup_Key", Name: "a", Pattern: "a", Enabled: true},
+				{Key: "dup_key", Name: "b", Pattern: "b", Enabled: true},
+			},
+			want: "重复",
+		},
+		{name: "超过上限", rules: many, want: "最多"},
+		{
+			name:  "空 pattern",
+			rules: []ShortCircuitCustomRule{{Key: "empty_pattern", Name: "a", Pattern: "  ", Enabled: true}},
+			want:  "pattern 不能为空",
+		},
+		{
+			name:  "空 name",
+			rules: []ShortCircuitCustomRule{{Key: "empty_name", Name: " ", Pattern: "a", Enabled: true}},
+			want:  "name 不能为空",
+		},
+		{
+			name:  "非法 key",
+			rules: []ShortCircuitCustomRule{{Key: "bad-key", Name: "a", Pattern: "a", Enabled: true}},
+			want:  "key",
+		},
+		{
+			name:  "非法正则",
+			rules: []ShortCircuitCustomRule{{Key: "bad_re", Name: "a", Pattern: "(", Enabled: true}},
+			want:  "非法正则",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.CustomRules = c.rules
+			err := ValidateShortCircuitConfig(cfg)
+			if err == nil {
+				t.Fatalf("应拒绝: %+v", c.rules)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("错误信息应包含 %q，得到 %v", c.want, err)
+			}
+		})
+	}
+}
+
+// V9-SC：配置读写幂等（写→读→写字节一致），含自定义区。
+func TestShortCircuitCustomRulesWriteReadIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ShortCircuitConfigFile)
+	cfg := Defaults()
+	cfg.CustomRules = []ShortCircuitCustomRule{
+		{Key: "rule_one", Name: "规则一", Pattern: `\.secret\b`, Note: "示例说明", Enabled: true},
+		{Key: "rule_two", Name: "规则二", Pattern: "plain_literal", Enabled: false},
+	}
+	if err := WriteShortCircuitConfigFile(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseShortCircuitConfig(first)
+	if err != nil {
+		t.Fatalf("写出的配置应可解析: %v", err)
+	}
+	second, err := MarshalShortCircuitConfig(parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatalf("读写不幂等:\nfirst=%s\nsecond=%s", first, second)
+	}
+	if err := WriteShortCircuitConfigFile(path, parsed); err != nil {
+		t.Fatal(err)
+	}
+	third, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, third) {
+		t.Fatal("重复写盘内容应完全一致")
+	}
+}
+
+// V9-SC：旧配置文件（无 custom_rules）读取不报错；首次保存补出空区。
+func TestShortCircuitConfigLegacyWithoutCustomRules(t *testing.T) {
+	legacy := []byte(`{"version":1,"tools":{"deny":["legacy_tool"]}}`)
+	cfg, err := ParseShortCircuitConfig(legacy)
+	if err != nil {
+		t.Fatalf("旧格式应兼容: %v", err)
+	}
+	if cfg.CustomRules == nil || len(cfg.CustomRules) != 0 {
+		t.Fatalf("旧格式应得到空自定义区（非 nil）: %+v", cfg.CustomRules)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, ShortCircuitConfigFile)
+	if err := WriteShortCircuitConfigFile(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"custom_rules": []`) {
+		t.Fatalf("首次保存应补出 custom_rules 空区:\n%s", raw)
+	}
+	if _, err := ParseShortCircuitConfig(raw); err != nil {
+		t.Fatalf("补区后的文件应可重新解析: %v", err)
 	}
 }

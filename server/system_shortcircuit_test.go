@@ -256,3 +256,55 @@ func TestSystemRestartAudits(t *testing.T) {
 		t.Fatalf("审计 payload 应记录可执行文件: %s", payload)
 	}
 }
+
+// V9-SC：PUT 自定义条目只写文件；模拟重启（ReloadShortCircuit）后规则生效；
+// 删除后重载不再命中；重名 key / 空 pattern 返回 400。
+func TestShortCircuitAPICustomRulesNeedRestart(t *testing.T) {
+	dir := t.TempDir()
+	_, h, tok := newShortCircuitTestServer(t, dir)
+
+	input := []byte(`{"command":"blocked_marker --flag"}`)
+	addBody := `{"config":{"version":1,"custom_rules":[{"key":"blocked_marker","name":"拦截 blocked_marker","pattern":"blocked_marker","note":"测试条目"}]}}`
+	rec := scRequest(h, http.MethodPut, "/api/system/shortcircuit", tok, addBody)
+	if rec.Code != 200 {
+		t.Fatalf("PUT 自定义条目: %d %s", rec.Code, rec.Body.String())
+	}
+	// 写文件但未重启：运行期不生效（不热改）。
+	if dec := guard.PreviewShortCircuit("Bash", input); dec != nil {
+		t.Fatalf("未重启不应生效: %+v", dec)
+	}
+	// 模拟重启：重新读文件装入。
+	if err := guard.ReloadShortCircuit(dir); err != nil {
+		t.Fatalf("模拟重启重载失败: %v", err)
+	}
+	dec := guard.PreviewShortCircuit("Bash", input)
+	if dec == nil || dec.Action != "deny" {
+		t.Fatalf("重启后自定义条目应 deny: %+v", dec)
+	}
+
+	// 重名 key（不区分大小写）→ 400。
+	dupBody := `{"config":{"version":1,"custom_rules":[{"key":"dup","name":"a","pattern":"a"},{"key":"DUP","name":"b","pattern":"b"}]}}`
+	rec = scRequest(h, http.MethodPut, "/api/system/shortcircuit", tok, dupBody)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "重复") {
+		t.Fatalf("重名 key 应 400: %d %s", rec.Code, rec.Body.String())
+	}
+	// 空 pattern → 400。
+	emptyBody := `{"config":{"version":1,"custom_rules":[{"key":"empty","name":"空","pattern":"  "}]}}`
+	rec = scRequest(h, http.MethodPut, "/api/system/shortcircuit", tok, emptyBody)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "pattern 不能为空") {
+		t.Fatalf("空 pattern 应 400: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 删除条目 → 200；重载后不再命中。
+	delBody := `{"config":{"version":1,"custom_rules":[]}}`
+	rec = scRequest(h, http.MethodPut, "/api/system/shortcircuit", tok, delBody)
+	if rec.Code != 200 {
+		t.Fatalf("删除自定义条目: %d %s", rec.Code, rec.Body.String())
+	}
+	if err := guard.ReloadShortCircuit(dir); err != nil {
+		t.Fatalf("删除后重载失败: %v", err)
+	}
+	if dec := guard.PreviewShortCircuit("Bash", input); dec != nil {
+		t.Fatalf("删除后重载不应再命中: %+v", dec)
+	}
+}

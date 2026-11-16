@@ -39,6 +39,32 @@ type ShortCircuitTools struct {
 	Allow []string `json:"allow"`
 }
 
+// ShortCircuitCustomRule 是管理员在 UI 里新增的自定义短路条目（V9-SC）。
+//
+// 语义刻意只有 deny：结构里没有 action 字段，前端/API 都无法把条目写成
+// allow —— 自定义区只能收紧，不能放宽内置档。命中即直接拒绝，优先级高于
+// 代码配置的 ask/allow 档（deny 优先）。
+type ShortCircuitCustomRule struct {
+	// Key 是条目的唯一标识（只允许字母/数字/下划线），用于增删改定位。
+	Key string `json:"key"`
+	// Name 是展示名，进 RuleName 与拒绝文案。
+	Name string `json:"name"`
+	// Pattern 是匹配执行面文本的 RE2 正则（一行）。
+	Pattern string `json:"pattern"`
+	// Note 是可选说明，只用于提示，不参与匹配。
+	Note string `json:"note,omitempty"`
+	// Enabled 为 false 时保留条目但不参与匹配；缺省按 true 处理。
+	Enabled bool `json:"enabled"`
+}
+
+// ShortCircuitMaxCustomRules 是自定义条目上限。上限只防误操作把配置文件
+// 撑成性能负担（每条都是逐请求编译好的正则），不是业务约束。
+const ShortCircuitMaxCustomRules = 50
+
+// customRuleKeyRe 限制 key 的字符集：字母/数字/下划线。key 会进日志与
+// RuleName，限制字符集避免引号/换行破坏审计文本。
+var customRuleKeyRe = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
 // ShortCircuitConfig 是配置文件的稳定 JSON 形状，也是 GET API 回给前端的结构。
 type ShortCircuitConfig struct {
 	Version               int               `json:"version"`
@@ -51,6 +77,10 @@ type ShortCircuitConfig struct {
 	RemoteExemptPatterns  []string          `json:"remote_exempt_patterns"`
 	RecordOnlyTools       []string          `json:"record_only_tools"`
 	ControlPlanePatterns  []string          `json:"control_plane_patterns"`
+	// CustomRules 是管理员自定义区（V9-SC）。与上面 8 个代码内置档分区：
+	// 内置档只读，自定义条目可增删改。旧配置文件没有此字段 → 空列表，
+	// 首次保存时由 normalize 补成 [] 落盘。
+	CustomRules []ShortCircuitCustomRule `json:"custom_rules"`
 	// PlatformAbsDir 是 V6-CP 的运行时字段：启动时由 EffectiveShortCircuitConfig
 	// 填入 dataDir 的绝对路径，供 UI 只读展示；【不落盘、不参与解析】。
 	// 选择「新增字段」而不是「追加到 platform_paths」的理由：追加会随 UI 保存
@@ -150,6 +180,7 @@ var defaultShortCircuitConfig = ShortCircuitConfig{
 		`(?:https?://)?(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):(?:8801|8787)/api/tasks/[^/\s"'` + "`" + `;&|]+/control(?:[/?#\s"'` + "`" + `;&|)>},.]|$)`,
 		`(?:https?://)?(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):(?:8801|8787)/api/tasks/control(?:/batch)?(?:[/?#\s"'` + "`" + `;&|)>},.]|$)`,
 	},
+	CustomRules: []ShortCircuitCustomRule{},
 }
 
 // shortCircuitConfigJSON 用指针字段区分「缺省」与「显式空数组」。
@@ -168,8 +199,21 @@ type shortCircuitConfigJSON struct {
 	RemoteExemptPatterns  *[]string `json:"remote_exempt_patterns"`
 	RecordOnlyTools       *[]string `json:"record_only_tools"`
 	ControlPlanePatterns  *[]string `json:"control_plane_patterns"`
+	// CustomRules 用指针切片区分「缺省」（旧文件）与「显式空列表」（用户删光）。
+	// 两者语义相同（无自定义条目），这里保留区分只为不把缺省当成非法。
+	CustomRules *[]shortCircuitCustomRuleJSON `json:"custom_rules"`
 	// platform_abs_dir 刻意不在此结构里：它是运行时派生值，PUT 传回来也
 	// 必须忽略（否则前端原样回传会把旧机器的绝对路径固化进配置）。
+}
+
+// shortCircuitCustomRuleJSON 用指针字段实现 enabled 缺省 true，并容忍
+// 字段缺省（旧前端/手写文件只写 key+pattern 也能通过）。
+type shortCircuitCustomRuleJSON struct {
+	Key     *string `json:"key"`
+	Name    *string `json:"name"`
+	Pattern *string `json:"pattern"`
+	Note    *string `json:"note"`
+	Enabled *bool   `json:"enabled"`
 }
 
 // ParseShortCircuitConfig 把 JSON 字节解析成配置：缺省字段填默认值，再做校验。
@@ -218,6 +262,28 @@ func ParseShortCircuitConfig(raw []byte) (ShortCircuitConfig, error) {
 	if in.ControlPlanePatterns != nil {
 		cfg.ControlPlanePatterns = *in.ControlPlanePatterns
 	}
+	if in.CustomRules != nil {
+		cfg.CustomRules = make([]ShortCircuitCustomRule, 0, len(*in.CustomRules))
+		for _, item := range *in.CustomRules {
+			rule := ShortCircuitCustomRule{Enabled: true}
+			if item.Key != nil {
+				rule.Key = *item.Key
+			}
+			if item.Name != nil {
+				rule.Name = *item.Name
+			}
+			if item.Pattern != nil {
+				rule.Pattern = *item.Pattern
+			}
+			if item.Note != nil {
+				rule.Note = *item.Note
+			}
+			if item.Enabled != nil {
+				rule.Enabled = *item.Enabled
+			}
+			cfg.CustomRules = append(cfg.CustomRules, rule)
+		}
+	}
 	cfg = normalizeShortCircuitConfig(cfg)
 	if err := ValidateShortCircuitConfig(cfg); err != nil {
 		return ShortCircuitConfig{}, err
@@ -249,8 +315,41 @@ func ValidateShortCircuitConfig(cfg ShortCircuitConfig) error {
 			return fmt.Errorf("%s 不能为空（空列表会让整档防线失效）", c.field)
 		}
 	}
+	// 自定义区先校验：错误信息比「组合正则非法」更贴近用户输入。
+	if err := validateShortCircuitCustomRules(cfg.CustomRules); err != nil {
+		return err
+	}
 	if _, err := compileShortCircuitRegexes(cfg, ""); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateShortCircuitCustomRules 校验自定义区：key 格式/唯一、显示名非空、
+// pattern 非空且可编译、条数上限。禁写 allow 由结构本身保证（无 action 字段）。
+func validateShortCircuitCustomRules(rules []ShortCircuitCustomRule) error {
+	if len(rules) > ShortCircuitMaxCustomRules {
+		return fmt.Errorf("custom_rules 最多 %d 条，当前 %d 条", ShortCircuitMaxCustomRules, len(rules))
+	}
+	seen := make(map[string]string, len(rules))
+	for i, rule := range rules {
+		if !customRuleKeyRe.MatchString(rule.Key) {
+			return fmt.Errorf("custom_rules[%d] key %q 非法：只允许字母、数字、下划线且不能为空", i, rule.Key)
+		}
+		lower := strings.ToLower(rule.Key)
+		if prev, ok := seen[lower]; ok {
+			return fmt.Errorf("custom_rules[%d] key %q 与已有条目 %q 重复（key 不区分大小写）", i, rule.Key, prev)
+		}
+		seen[lower] = rule.Key
+		if strings.TrimSpace(rule.Name) == "" {
+			return fmt.Errorf("custom_rules[%d]（key=%s）name 不能为空", i, rule.Key)
+		}
+		if strings.TrimSpace(rule.Pattern) == "" {
+			return fmt.Errorf("custom_rules[%d]（key=%s）pattern 不能为空", i, rule.Key)
+		}
+		if _, err := regexp.Compile("(?i)(?:" + rule.Pattern + ")"); err != nil {
+			return fmt.Errorf("custom_rules[%d]（key=%s）非法正则 %q: %w", i, rule.Key, rule.Pattern, err)
+		}
 	}
 	return nil
 }
@@ -271,6 +370,17 @@ type compiledShortCircuit struct {
 	// V6-CP：平台 dataDir 绝对路径（按运行时 dataDir 生成）与控制面 API。
 	platformAbs  *regexp.Regexp
 	controlPlane controlPlaneMatcher
+	// V9-SC：管理员自定义条目（只 deny）。
+	customRules []compiledCustomRule
+}
+
+// compiledCustomRule 是编译后的自定义条目。key/name/note 原样保留用于
+// RuleName 与拒绝文案；re 是小写化匹配器。
+type compiledCustomRule struct {
+	key   string
+	name  string
+	note  string
+	regex *regexp.Regexp
 }
 
 // compileShortCircuitRegexes 编译配置。dataDir 用于生成平台绝对路径档；
@@ -307,6 +417,24 @@ func compileShortCircuitRegexes(cfg ShortCircuitConfig, dataDir string) (compile
 	out.platformAsk = toNameSet("tools.ask", cfg.Tools.Ask)
 	out.platformAllow = toNameSet("tools.allow", cfg.Tools.Allow)
 	out.recordOnly = toNameSet("record_only_tools", cfg.RecordOnlyTools)
+	// 自定义条目：禁用条目的语法已在 Validate 阶段校验过，这里只把 enabled
+	// 的放进匹配切片（顺序即配置顺序，首条命中即返回）。
+	out.customRules = make([]compiledCustomRule, 0, len(cfg.CustomRules))
+	for _, rule := range cfg.CustomRules {
+		if !rule.Enabled {
+			continue
+		}
+		re, err := regexp.Compile("(?i)(?:" + rule.Pattern + ")")
+		if err != nil {
+			return out, fmt.Errorf("custom_rules（key=%s）非法正则 %q: %w", rule.Key, rule.Pattern, err)
+		}
+		out.customRules = append(out.customRules, compiledCustomRule{
+			key:   rule.Key,
+			name:  rule.Name,
+			note:  rule.Note,
+			regex: re,
+		})
+	}
 	return out, nil
 }
 
@@ -396,6 +524,16 @@ func normalizeShortCircuitConfig(cfg ShortCircuitConfig) ShortCircuitConfig {
 	cfg.RemoteExemptPatterns = trim(cfg.RemoteExemptPatterns)
 	cfg.RecordOnlyTools = trim(cfg.RecordOnlyTools)
 	cfg.ControlPlanePatterns = trim(cfg.ControlPlanePatterns)
+	// 自定义区始终非 nil：旧文件首次保存时补出 "custom_rules": []。
+	rules := make([]ShortCircuitCustomRule, 0, len(cfg.CustomRules))
+	for _, r := range cfg.CustomRules {
+		r.Key = strings.TrimSpace(r.Key)
+		r.Name = strings.TrimSpace(r.Name)
+		r.Pattern = strings.TrimSpace(r.Pattern)
+		r.Note = strings.TrimSpace(r.Note)
+		rules = append(rules, r)
+	}
+	cfg.CustomRules = rules
 	return cfg
 }
 
@@ -419,6 +557,11 @@ func cloneShortCircuitConfig(cfg ShortCircuitConfig) ShortCircuitConfig {
 	cfg.RemoteExemptPatterns = cp(cfg.RemoteExemptPatterns)
 	cfg.RecordOnlyTools = cp(cfg.RecordOnlyTools)
 	cfg.ControlPlanePatterns = cp(cfg.ControlPlanePatterns)
+	if cfg.CustomRules != nil {
+		out := make([]ShortCircuitCustomRule, len(cfg.CustomRules))
+		copy(out, cfg.CustomRules)
+		cfg.CustomRules = out
+	}
 	return cfg
 }
 
@@ -534,6 +677,7 @@ func applyShortCircuitConfig(cfg ShortCircuitConfig, dataDir string) error {
 	remoteRefRe = c.remote
 	platformAbsRe = c.platformAbs
 	controlPlaneDetector = c.controlPlane
+	customShortCircuitRules = c.customRules
 	return nil
 }
 
