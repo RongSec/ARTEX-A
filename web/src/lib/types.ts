@@ -1815,6 +1815,7 @@ export interface ReportPerson {
 export interface ReportTemplate {
   id: number;
   name: string;
+  version: number; // 骨架版本号；结构变更时 +1（R1）
   is_default: boolean;
   output_lang: string;
   skeleton: ReportSection[];
@@ -1927,6 +1928,21 @@ export interface ReportImportResult {
   };
   degraded: boolean;
   warnings?: string[];
+  // R1：文件名与现有模板归一匹配命中时返回；前端默认走「更新现有模板」。
+  matched_template?: {
+    id: number;
+    name: string;
+    version: number;
+    updated_at: string;
+  };
+  // R1：新旧骨架差异（Major=章节 key 集合不同，仍默认更新但提示差异章节）。
+  structure_diff?: {
+    added: string[];
+    removed: string[];
+    retitled: string[];
+    toggled: string[];
+    major: boolean;
+  };
 }
 
 // ReportSkillDraft 是 GET /api/report-templates/from-skill/{name} 的响应。

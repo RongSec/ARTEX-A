@@ -133,12 +133,32 @@ func (s *Server) reportTemplateImportDocx(w http.ResponseWriter, r *http.Request
 		warnings = append(warnings, "LLM 未配置，已回退规则映射")
 	}
 
-	writeJSON(w, 200, map[string]any{
+	// R1：同名文档重复上传 → 默认走「更新现有模板」。按文件名（去扩展名）与
+	// 现有模板名归一比较；命中时把 id/版本与骨架差异回给前端（前端仍可改选
+	// 「另存为新模板」）。列表读取失败只降级为「未命中」，不影响导入本身。
+	var matched *db.ReportTemplate
+	var structureDiff *reportSkeletonDiff
+	if ts, lerr := s.m.pg.ListReportTemplates(); lerr != nil {
+		warnings = append(warnings, "读取现有模板失败，未做同名匹配: "+lerr.Error())
+	} else if m := matchReportTemplateByName(fallbackName, ts); m != nil {
+		matched = m
+		diff := diffReportSkeletons(db.NormalizeSkeleton(m.Skeleton), db.NormalizeSkeleton(draft.Skeleton))
+		structureDiff = &diff
+	}
+
+	resp := map[string]any{
 		"draft":    templateDraftView(draft),
 		"outline":  outline,
 		"degraded": degraded,
 		"warnings": warnings,
-	})
+	}
+	if matched != nil {
+		resp["matched_template"] = reportTemplateMatchInfo{
+			ID: matched.ID, Name: matched.Name, Version: matched.Version, UpdatedAt: matched.UpdatedAt,
+		}
+		resp["structure_diff"] = structureDiff
+	}
+	writeJSON(w, 200, resp)
 }
 
 // outlinePrompt 把 outline 压成喂 LLM 的紧凑文本（标题层级 + 表头 + 样本截断）。

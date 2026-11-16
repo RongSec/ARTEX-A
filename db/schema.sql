@@ -1671,6 +1671,7 @@ END $$;
 CREATE TABLE IF NOT EXISTS report_templates (
     id           BIGSERIAL PRIMARY KEY,
     name         TEXT NOT NULL,                              -- 模板名（报告中心列表展示）
+    version      INTEGER NOT NULL DEFAULT 1,                 -- 骨架版本号：结构变更（更新导入/编辑骨架）时 +1，旧骨架沉 report_template_versions
     is_default   BOOLEAN NOT NULL DEFAULT false,             -- 全局默认模板（至多一行 true，SetDefaultTemplate 单事务维护）
     output_lang  TEXT NOT NULL DEFAULT 'zh-CN',              -- 默认输出语言（locale；生成入参可覆盖）
     skeleton     JSONB NOT NULL DEFAULT '{}',                -- 章节骨架数组 [{key,title,enabled}]；'{}'=未初始化→读取时归一化为默认
@@ -1688,6 +1689,18 @@ CREATE INDEX IF NOT EXISTS idx_report_tpl_default ON report_templates(is_default
 DROP TRIGGER IF EXISTS trg_report_tpl_upd ON report_templates;
 CREATE TRIGGER trg_report_tpl_upd BEFORE UPDATE ON report_templates
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+-- R1（V9-RPT）重复导入改更新：version 列补旧库；旧骨架按版本沉档，便于
+-- 「同名文档再次上传」时对齐差异/回溯（只增不改，模板行仍以最新版为准）。
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE IF NOT EXISTS report_template_versions (
+    id          BIGSERIAL PRIMARY KEY,
+    template_id BIGINT NOT NULL REFERENCES report_templates(id) ON DELETE CASCADE,
+    version     INTEGER NOT NULL,                     -- 被替换的旧版本号
+    skeleton    JSONB NOT NULL DEFAULT '{}',          -- 旧章节骨架（原样快照）
+    style       JSONB NOT NULL DEFAULT '{}',          -- 旧样式（原样快照）
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_report_tpl_versions ON report_template_versions(template_id, version DESC);
 
 -- 报告生成 job + 交付历史（一体）。状态机 pending→running→done|failed，
 -- 非法迁移由 AdvanceReportStatus 拒绝（矩阵纯函数 CanAdvanceReport 单测覆盖）。

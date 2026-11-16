@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -120,6 +121,7 @@ func isKnownSectionKey(k ReportSectionKey) bool {
 type ReportTemplate struct {
 	ID          int64           `json:"id"`
 	Name        string          `json:"name"`
+	Version     int             `json:"version"` // 骨架版本号；结构变更时 +1（R1）
 	IsDefault   bool            `json:"is_default"`
 	OutputLang  string          `json:"output_lang"`
 	Skeleton    []ReportSection `json:"skeleton"`
@@ -132,6 +134,17 @@ type ReportTemplate struct {
 	Remark      string          `json:"remark"`
 	CreatedAt   time.Time       `json:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at"`
+}
+
+// ReportTemplateVersion 是 report_template_versions 的一行：模板结构变更前的
+// 旧骨架快照（R1：重复上传模板时保留历史，不覆盖丢弃）。
+type ReportTemplateVersion struct {
+	ID         int64           `json:"id"`
+	TemplateID int64           `json:"template_id"`
+	Version    int             `json:"version"`
+	Skeleton   []ReportSection `json:"skeleton"`
+	Style      json.RawMessage `json:"style"`
+	CreatedAt  time.Time       `json:"created_at"`
 }
 
 // ReportTemplateInput is the create/payload-normalized form used by handlers.
@@ -157,7 +170,7 @@ var (
 	ErrReportBadTransition    = errors.New("illegal report status transition")
 )
 
-const reportTemplateCols = `id, name, is_default, output_lang,
+const reportTemplateCols = `id, name, COALESCE(version,1), is_default, output_lang,
 	COALESCE(skeleton, '[]'::jsonb), COALESCE(style, '{}'::jsonb), COALESCE(prompts, '{}'::jsonb),
 	COALESCE(issuer, ''), COALESCE(logo_path, ''), COALESCE(personnel, '[]'::jsonb),
 	COALESCE(cvss_enabled, false), COALESCE(remark, ''), created_at, updated_at`
@@ -165,11 +178,14 @@ const reportTemplateCols = `id, name, is_default, output_lang,
 func scanReportTemplate(row interface{ Scan(...any) error }) (*ReportTemplate, error) {
 	t := &ReportTemplate{}
 	var skel, style, prompts, personnel []byte
-	if err := row.Scan(&t.ID, &t.Name, &t.IsDefault, &t.OutputLang,
+	if err := row.Scan(&t.ID, &t.Name, &t.Version, &t.IsDefault, &t.OutputLang,
 		&skel, &style, &prompts,
 		&t.Issuer, &t.LogoPath, &personnel,
 		&t.CVSSEnabled, &t.Remark, &t.CreatedAt, &t.UpdatedAt); err != nil {
 		return nil, err
+	}
+	if t.Version <= 0 {
+		t.Version = 1
 	}
 	t.Skeleton = ParseSkeletonJSON(skel)
 	t.Style = json.RawMessage(nonEmptyJSON(style, "{}"))
@@ -310,6 +326,9 @@ func (d *DB) GetDefaultReportTemplate() (*ReportTemplate, error) {
 // UpdateReportTemplate overwrites the editable fields of one template. The
 // is_default flag is NOT touched here (single-transaction invariant is only
 // maintainable through SetDefaultTemplate).
+//
+// R1：骨架结构发生变化时在同一事务内 version+1，并把**旧**骨架/样式快照写入
+// report_template_versions（历史可回溯）。名称/样式等非结构改动不动版本号。
 func (d *DB) UpdateReportTemplate(id int64, in ReportTemplateInput) (*ReportTemplate, error) {
 	in, err := normalizeTemplateInput(in)
 	if err != nil {
@@ -319,21 +338,81 @@ func (d *DB) UpdateReportTemplate(id int64, in ReportTemplateInput) (*ReportTemp
 	if err != nil {
 		return nil, err
 	}
-	t, err := scanReportTemplate(d.QueryRow(`
+	tx, err := d.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var oldSkel, oldStyle []byte
+	var oldVersion int
+	if err := tx.QueryRow(`SELECT COALESCE(skeleton,'[]'::jsonb), COALESCE(style,'{}'::jsonb), COALESCE(version,1)
+		FROM report_templates WHERE id=$1 FOR UPDATE`, id).Scan(&oldSkel, &oldStyle, &oldVersion); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ErrReportTemplateNotFound
+		}
+		return nil, err
+	}
+	if oldVersion <= 0 {
+		oldVersion = 1
+	}
+	version := oldVersion
+	if !jsonEqual(oldSkel, skel) {
+		version = oldVersion + 1
+		if _, err := tx.Exec(`INSERT INTO report_template_versions(template_id, version, skeleton, style)
+			VALUES ($1,$2,$3::jsonb,$4::jsonb)`, id, oldVersion, nonEmptyJSON(oldSkel, "[]"), nonEmptyJSON(oldStyle, "{}")); err != nil {
+			return nil, err
+		}
+	}
+	t, err := scanReportTemplate(tx.QueryRow(`
 UPDATE report_templates SET
 	name=$2, output_lang=$3, skeleton=$4::jsonb, style=$5::jsonb, prompts=$6::jsonb,
-	issuer=$7, logo_path=$8, personnel=$9::jsonb, cvss_enabled=$10, remark=$11
+	issuer=$7, logo_path=$8, personnel=$9::jsonb, cvss_enabled=$10, remark=$11, version=$12
 WHERE id=$1
 RETURNING `+reportTemplateCols,
 		id, in.Name, in.OutputLang, skel, in.Style, in.Prompts,
-		in.Issuer, in.LogoPath, in.Personnel, in.CVSSEnabled, in.Remark))
+		in.Issuer, in.LogoPath, in.Personnel, in.CVSSEnabled, in.Remark, version))
 	if err == sql.ErrNoRows {
 		return nil, ErrReportTemplateNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	return t, nil
+}
+
+// jsonEqual 比较两段 JSON 的语义等价（忽略对象键序/空白）。解析失败退回字节
+// 比较——坏数据也能给出稳定判定，不因一侧非法直接 panic。
+func jsonEqual(a, b []byte) bool {
+	var av, bv any
+	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+		return strings.TrimSpace(string(a)) == strings.TrimSpace(string(b))
+	}
+	return reflect.DeepEqual(av, bv)
+}
+
+// ListReportTemplateVersions 返回某模板的历史快照（新→旧）。空列表=无历史。
+func (d *DB) ListReportTemplateVersions(templateID int64) ([]*ReportTemplateVersion, error) {
+	rows, err := d.Query(`SELECT id, template_id, version, COALESCE(skeleton,'[]'::jsonb), COALESCE(style,'{}'::jsonb), created_at
+		FROM report_template_versions WHERE template_id=$1 ORDER BY version DESC, id DESC`, templateID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*ReportTemplateVersion{}
+	for rows.Next() {
+		v := &ReportTemplateVersion{}
+		var skel, style []byte
+		if err := rows.Scan(&v.ID, &v.TemplateID, &v.Version, &skel, &style, &v.CreatedAt); err != nil {
+			return out, err
+		}
+		v.Skeleton = ParseSkeletonJSON(skel)
+		v.Style = json.RawMessage(nonEmptyJSON(style, "{}"))
+		out = append(out, v)
+	}
+	return out, rows.Err()
 }
 
 // DeleteReportTemplate removes a template; returns false when the id was absent.

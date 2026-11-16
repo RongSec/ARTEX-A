@@ -153,6 +153,8 @@ function ReportCenterInner() {
   const [importing, setImporting] = React.useState(false);
   const [importResult, setImportResult] = React.useState<ReportImportResult | null>(null);
   const [importName, setImportName] = React.useState("");
+  // R1：同名命中时默认「更新现有模板」，用户可改选「另存为新模板」。
+  const [importMode, setImportMode] = React.useState<"update" | "new">("new");
   // 导入对话框（skill）。
   const [importSkillOpen, setImportSkillOpen] = React.useState(false);
   const [skills, setSkills] = React.useState<SkillItem[]>([]);
@@ -421,6 +423,7 @@ function ReportCenterInner() {
       const r = await api.importTemplateDocx(file);
       setImportResult(r);
       setImportName(r.draft.name || file.name.replace(/\.(docx|md|markdown|txt)$/i, ""));
+      setImportMode(r.matched_template ? "update" : "new");
       if (r.degraded) toast.warning("LLM 归纳不可用，已按标题结构规则映射（可在详情继续调整）", { duration: 8000 });
     } catch (e) {
       toast.error(`导入失败：${(e as Error).message}`);
@@ -435,7 +438,19 @@ function ReportCenterInner() {
       toast.error("请填写模板名");
       return;
     }
+    const matched = importResult.matched_template;
     try {
+      if (importMode === "update" && matched) {
+        // R1：复用 PATCH（id 不变 → 对话历史/默认标记保留），骨架变化时后端
+        // 版本号 +1 并沉旧骨架。
+        const t = await api.updateReportTemplate(matched.id, { ...importResult.draft, name });
+        await loadTemplates(false);
+        setSelectedId(t.id);
+        setImportDocxOpen(false);
+        setImportResult(null);
+        toast.success(`已更新模板「${t.name}」至 v${t.version}`);
+        return;
+      }
       const t = await api.createReportTemplate({ ...importResult.draft, name });
       await loadTemplates(false);
       setSelectedId(t.id);
@@ -443,7 +458,7 @@ function ReportCenterInner() {
       setImportResult(null);
       toast.success(`模板已导入：${t.name}`);
     } catch (e) {
-      toast.error(`建模板失败：${(e as Error).message}`);
+      toast.error(`导入失败：${(e as Error).message}`);
     }
   };
 
@@ -873,6 +888,35 @@ function ReportCenterInner() {
                 {importResult.draft.skeleton?.some((s) => s.enabled) ? null : (
                   <p className="text-muted-foreground text-xs">未识别出可映射章节，将使用默认骨架。</p>
                 )}
+                {importResult.matched_template && (
+                  <div className="space-y-2 rounded-md border border-amber-400/60 bg-amber-500/5 p-2">
+                    <p className="text-xs">
+                      同名模板已存在：<span className="font-medium">{importResult.matched_template.name}</span>
+                      <span className="text-muted-foreground">（v{importResult.matched_template.version}）</span>
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={importMode === "update" ? "default" : "outline"}
+                        onClick={() => setImportMode("update")}
+                      >
+                        更新现有模板（默认）
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={importMode === "new" ? "default" : "outline"}
+                        onClick={() => setImportMode("new")}
+                      >
+                        另存为新模板
+                      </Button>
+                    </div>
+                    {importMode === "update" && importResult.structure_diff && (
+                      <DiffHint diff={importResult.structure_diff} />
+                    )}
+                  </div>
+                )}
                 <Field label="模板名称">
                   <Input value={importName} onChange={(e) => setImportName(e.target.value)} />
                 </Field>
@@ -884,7 +928,7 @@ function ReportCenterInner() {
               取消
             </Button>
             <Button onClick={() => void confirmImportDocx()} disabled={!importResult || importing}>
-              创建模板
+              {importMode === "update" && importResult?.matched_template ? "更新现有模板" : "创建模板"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -952,6 +996,38 @@ function readIntParam(v: string | null): number | null {
   if (!v) return null;
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// DiffHint 展示重复上传时新旧骨架的差异（R1）。key 集合变化（major）提示
+// 「结构差异极大」，但默认仍选更新——差异章节列出来让用户自己确认。
+function DiffHint({ diff }: { diff: NonNullable<ReportImportResult["structure_diff"]> }) {
+  const label = (k: string) => SECTION_META.find((m) => m.key === k)?.title ?? k;
+  const groups: { label: string; keys: string[]; cls: string }[] = [
+    { label: "新增章节", keys: diff.added, cls: "border-emerald-400 text-emerald-600" },
+    { label: "缺失章节", keys: diff.removed, cls: "border-rose-400 text-rose-600" },
+    { label: "标题变化", keys: diff.retitled, cls: "border-sky-400 text-sky-600" },
+    { label: "启用态变化", keys: diff.toggled, cls: "border-amber-400 text-amber-600" },
+  ];
+  return (
+    <div className="space-y-1 text-xs">
+      {diff.major && <p className="text-amber-600">章节 key 集合不同（结构差异较大），更新将覆盖现有骨架并留存旧版本。</p>}
+      {groups
+        .filter((g) => g.keys.length > 0)
+        .map((g) => (
+          <div key={g.label} className="flex flex-wrap items-center gap-1">
+            <span className="text-muted-foreground">{g.label}：</span>
+            {g.keys.map((k) => (
+              <Badge key={k} variant="outline" className={g.cls}>
+                {label(k)}
+              </Badge>
+            ))}
+          </div>
+        ))}
+      {!diff.major && groups.every((g) => g.keys.length === 0) && (
+        <p className="text-muted-foreground">骨架与现有模板一致，仅内容字段变化。</p>
+      )}
+    </div>
+  );
 }
 
 function IconBtn({
