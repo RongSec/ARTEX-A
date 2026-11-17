@@ -1,2 +1,5 @@
 *.bat text eol=crlf
 *.sh  text eol=lf
+# 随镜像分发的中文字体：二进制，禁止任何换行转换
+*.ttf binary
+*.ttc binary

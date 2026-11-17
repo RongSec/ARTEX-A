@@ -135,13 +135,14 @@ type Server struct {
 	reportRenderer ReportRenderer
 
 	// V9-RPT2：docx 保真预览（LibreOffice → PDF）的能力探测缓存与测试缝。
-	// pdfProbe/pdfConvert 仅测试注入（nil = 真实执行），见 preview_pdf.go。
+	// pdfProbe/pdfConvert/pdfWarmup 仅测试注入（nil = 真实执行），见 preview_pdf.go。
 	pdfCapMu   sync.Mutex
 	pdfCapAt   time.Time
 	pdfCap     previewCapability
 	pdfLocks   sync.Map
 	pdfProbe   func() previewCapability
-	pdfConvert func(ctx context.Context, sofficePath, docxPath, outPDF string) (string, error)
+	pdfConvert func(ctx context.Context, sofficePath, docxPath, outPDF string) convertResult
+	pdfWarmup  func(ctx context.Context, sofficePath string) error
 
 	// 试判（POST /api/intercept/judge/test）的 per-token 限流器：进程内存、
 	// 重启清零。sync.Once 惰性初始化，保证 &Server{} 直构的测试也能用。见

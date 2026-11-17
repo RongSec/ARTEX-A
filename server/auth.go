@@ -205,6 +205,41 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"token": tok})
 }
 
+// SeedInitialPassword 按 ARTEX_INIT_PASSWORD 初始化首次启动的管理员密码。
+// 环境变量为空 / 密码已设置时什么都不做（保留 /setup 首次设置流程）。
+// 容器化部署用它免去手工调 /api/auth/init；密码不满足规则只记日志、不阻断启动。
+func (s *Server) SeedInitialPassword() {
+	pw := strings.TrimSpace(os.Getenv("ARTEX_INIT_PASSWORD"))
+	if pw == "" || s.m == nil || s.m.pg == nil {
+		return
+	}
+	if msg := validatePassword(pw); msg != "" {
+		log.Printf("[auth] ARTEX_INIT_PASSWORD 不合法（%s），跳过自动初始化", msg)
+		return
+	}
+	hash, ok, err := s.m.pg.GetSetting(authPassKey)
+	if err != nil {
+		log.Printf("[auth] 读取密码状态失败，跳过自动初始化: %v", err)
+		return
+	}
+	if ok && hash != "" {
+		return
+	}
+	hashed, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+	if err != nil {
+		log.Printf("[auth] 初始密码加密失败: %v", err)
+		return
+	}
+	inserted, err := s.m.pg.InsertSettingIfAbsent(authPassKey, string(hashed))
+	if err != nil {
+		log.Printf("[auth] 初始密码写入失败: %v", err)
+		return
+	}
+	if inserted {
+		log.Printf("[auth] 已按 ARTEX_INIT_PASSWORD 初始化管理员密码（用户名 ARTEX）")
+	}
+}
+
 // POST /api/auth/change-password — changes the admin password. Requires a valid
 // token (this route is under /api/auth/* which requireAuth exempts, so the token
 // is validated here) AND the current password.

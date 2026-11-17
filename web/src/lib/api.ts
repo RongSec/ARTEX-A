@@ -139,6 +139,25 @@ function getToken(): string | null {
   return localStorage.getItem("artex_token");
 }
 
+// previewErrorDetail 汇总一次非 2xx 的服务端原因：优先 JSON body 的 error，
+// 其次 X-Preview-Error 头（渲染端点专用的可定位摘要），最后退回状态文本。
+// 所有消息都带 HTTP 状态码——端上排查时「502」和「哪一步 502」必须一起看到。
+function previewErrorDetail(r: Response, bodyError?: unknown, prefix = "请求失败"): string {
+  let detail = "";
+  if (typeof bodyError === "string" && bodyError.trim()) detail = bodyError.trim();
+  if (!detail) {
+    const raw = r.headers.get("X-Preview-Error") ?? "";
+    if (raw) {
+      try {
+        detail = decodeURIComponent(raw);
+      } catch {
+        detail = raw;
+      }
+    }
+  }
+  return `${prefix}（HTTP ${r.status}）${detail ? `：${detail}` : ""}`;
+}
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   const token = getToken();
@@ -199,14 +218,14 @@ export async function downloadBlob(
     },
   });
   if (!r.ok) {
-    let message = `${init?.method ?? "GET"} ${path}: ${r.status}`;
+    let bodyError: unknown;
     try {
       const payload = (await r.json()) as { error?: unknown };
-      if (typeof payload.error === "string" && payload.error.trim()) message = payload.error.trim();
+      bodyError = payload.error;
     } catch {
-      /* 空/非 JSON 错误体保留状态码文案 */
+      /* 空/非 JSON 错误体交给状态码文案 */
     }
-    throw new Error(message);
+    throw new Error(previewErrorDetail(r, bodyError, `${init?.method ?? "GET"} ${path}`));
   }
   const disp = r.headers.get("Content-Disposition") ?? "";
   let filename = "";
@@ -1657,14 +1676,14 @@ export const api = {
       signal,
     });
     if (!r.ok) {
-      let message = `报告预览失败: ${r.status}`;
+      let bodyError: unknown;
       try {
         const p = (await r.json()) as { error?: unknown };
-        if (typeof p.error === "string" && p.error.trim()) message = p.error.trim();
+        bodyError = p.error;
       } catch {
-        /* 非 JSON 错误体保留状态码文案 */
+        /* 非 JSON 错误体交给状态码文案 */
       }
-      throw new Error(message);
+      throw new Error(previewErrorDetail(r, bodyError, "报告预览失败"));
     }
     const fidelity = r.headers.get("X-Preview-Fidelity") === "exact" ? "exact" : "approximate";
     return { blob: await r.blob(), fidelity };
@@ -1750,14 +1769,14 @@ export const api = {
       signal,
     });
     if (!r.ok) {
-      let message = `PDF 预览渲染失败: ${r.status}`;
+      let bodyError: unknown;
       try {
         const p = (await r.json()) as { error?: unknown };
-        if (typeof p.error === "string" && p.error.trim()) message = p.error.trim();
+        bodyError = p.error;
       } catch {
-        /* 非 JSON 错误体保留状态码文案 */
+        /* 非 JSON 错误体交给状态码文案 */
       }
-      throw new Error(message);
+      throw new Error(previewErrorDetail(r, bodyError, "PDF 预览渲染失败"));
     }
     const warnRaw = r.headers.get("X-Report-Warning") ?? "";
     let warning = "";

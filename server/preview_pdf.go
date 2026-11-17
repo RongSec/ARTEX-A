@@ -11,16 +11,21 @@ package server
 // X-Preview-Fidelity: approximate 下回退现有 HTML 预览（不硬依赖 LibreOffice）。
 //
 // 转换纪律：每次转换用独占 -env:UserInstallation=file:///tmp/lo-<rand> 临时
-// profile（避免并发锁），60s 超时，失败把 stderr 摘要回给调用方（502），
-// 临时 profile/输出目录 defer 清理。
+// profile（避免并发锁），单次 120s 超时，失败后换新 profile 重试一次，仍失败
+// 才回 502；失败摘要（来源 / 格式 / 命令行 / 退出码 / stderr 前 500 字）同时写
+// <dataDir>/run.log、响应体 error 与 X-Preview-Error 头，端上不再只看到状态码。
+// 启动时后台预热一次 soffice（--terminate_after_init），避开首次请求冷启动。
 
 import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,9 +54,79 @@ var defaultSofficeCandidates = []string{
 const (
 	// previewCapabilityTTL：部署机上「进行中」的安装最多 30s 后自愈，不必重启。
 	previewCapabilityTTL = 30 * time.Second
-	// pdfConvertTimeout 是单次 docx→pdf 的硬上限（派工书要求 60s）。
-	pdfConvertTimeout = 60 * time.Second
+	// pdfConvertTimeout 是单次 docx→pdf 的硬上限；超时后换新 profile 重试一次。
+	pdfConvertTimeout = 120 * time.Second
+	// previewWarmupTimeout 给启动预热兜底（--terminate_after_init 正常 2～10s）。
+	previewWarmupTimeout = 90 * time.Second
+	// pdfConvertAttempts 含首次在内的总尝试次数（失败后重试 1 次）。
+	pdfConvertAttempts = 2
+	// pdfLogStderrLimit 是 run.log / 响应体里 stderr 的截断长度（派工书：前 500 字）。
+	pdfLogStderrLimit = 500
 )
+
+// previewSubject 标识一次转换请求的来源（run.log / 响应体定位用）。
+// report_id 优先；模板调试通道没有报告行时退到 template_id。
+type previewSubject struct {
+	ReportID   int64
+	TemplateID int64
+	Format     string
+}
+
+func (p previewSubject) label() string {
+	if p.ReportID > 0 {
+		return "report_id=" + strconv.FormatInt(p.ReportID, 10)
+	}
+	if p.TemplateID > 0 {
+		return "template_id=" + strconv.FormatInt(p.TemplateID, 10)
+	}
+	return "report_id=0"
+}
+
+// convertResult 是一次转换尝试的可定位结果：命令、退出码、stderr 都留着，
+// 供 run.log / 502 响应体 / X-Preview-Error 复用同一份摘要。
+type convertResult struct {
+	Stderr   string
+	Command  string
+	ExitCode int // -1 = 未拿到真实退出码（超时/启动失败/被取消）
+	Attempts int
+	Err      error
+}
+
+// summary 生成单行可检索摘要：{来源, format, 命令, 退出码, stderr 前 500 字}。
+func (p previewSubject) summary(res convertResult) string {
+	code := "n/a"
+	if res.ExitCode >= 0 {
+		code = strconv.Itoa(res.ExitCode)
+	}
+	stderr := strings.TrimSpace(res.Stderr)
+	if stderr == "" {
+		stderr = "(空)"
+	}
+	return fmt.Sprintf("%s format=%s exit=%s attempts=%d cmd=%q stderr=%q",
+		p.label(), p.Format, code, res.Attempts, res.Command, truncateUTF8(stderr, pdfLogStderrLimit))
+}
+
+// appendRunLog 把一行可定位摘要追加到 <dataDir>/run.log。
+// 写日志失败只打标准日志，绝不影响渲染响应本身。
+func (s *Server) appendRunLog(kind, summary string) {
+	dir := ""
+	if s.m != nil {
+		dir = s.m.dir
+	}
+	if dir == "" {
+		return
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "run.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("[run.log] 打开失败: %v", err)
+		return
+	}
+	defer f.Close()
+	line := fmt.Sprintf("%s %s %s\n", time.Now().Format(time.RFC3339), kind, summary)
+	if _, err := f.WriteString(line); err != nil {
+		log.Printf("[run.log] 写入失败: %v", err)
+	}
+}
 
 // detectSofficePath 在 PATH 与候选路径中定位 soffice。
 func detectSofficePath(lookPath func(string) (string, error), candidates []string) string {
@@ -154,41 +229,90 @@ func buildSofficeArgs(outDir, profileURI, docxPath string) []string {
 }
 
 // convertDocxToPDF 执行一次转换：输出到临时目录 → 复制到 outPDF（同目录缓存）。
-// 返回 stderr 摘要（失败时供 502 响应体使用）。
-func convertDocxToPDF(ctx context.Context, sofficePath, docxPath, outPDF string) (string, error) {
+// 返回的命令/退出码/stderr 摘要供失败路径写 run.log 与响应体。
+func convertDocxToPDF(ctx context.Context, sofficePath, docxPath, outPDF string) convertResult {
+	res := convertResult{ExitCode: -1}
 	outDir, err := os.MkdirTemp("", "artex-pdf-")
 	if err != nil {
-		return "", fmt.Errorf("创建 PDF 临时目录失败: %w", err)
+		res.Err = fmt.Errorf("创建 PDF 临时目录失败: %w", err)
+		return res
 	}
 	defer os.RemoveAll(outDir)
 	profileDir := randomProfileDir()
 	defer os.RemoveAll(profileDir)
 
 	args := buildSofficeArgs(outDir, fileURI(profileDir), docxPath)
+	res.Command = strings.Join(append([]string{sofficePath}, args...), " ")
 	cmd := exec.CommandContext(ctx, sofficePath, args...)
 	var stderr strings.Builder
 	cmd.Stdout = io.Discard
 	cmd.Stderr = &stderr
 	runErr := cmd.Run()
-	stderrText := truncateUTF8(strings.TrimSpace(stderr.String()), 800)
+	res.Stderr = truncateUTF8(strings.TrimSpace(stderr.String()), 800)
 	if runErr != nil {
-		if ctx.Err() != nil {
-			return stderrText, fmt.Errorf("LibreOffice 转换超时或已取消: %w", ctx.Err())
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			res.ExitCode = exitErr.ExitCode()
 		}
-		return stderrText, fmt.Errorf("LibreOffice 转换失败: %v: %s", runErr, stderrText)
+		if ctx.Err() != nil {
+			res.Err = fmt.Errorf("LibreOffice 转换超时或已取消: %w", ctx.Err())
+			return res
+		}
+		res.Err = fmt.Errorf("LibreOffice 转换失败: %w: %s", runErr, res.Stderr)
+		return res
 	}
 	produced := filepath.Join(outDir, strings.TrimSuffix(filepath.Base(docxPath), filepath.Ext(docxPath))+".pdf")
 	if _, err := os.Stat(produced); err != nil {
 		matches, _ := filepath.Glob(filepath.Join(outDir, "*.pdf"))
 		if len(matches) != 1 {
-			return stderrText, fmt.Errorf("LibreOffice 未产出 PDF（stderr: %s）", stderrText)
+			res.Err = fmt.Errorf("LibreOffice 未产出 PDF（stderr: %s）", res.Stderr)
+			return res
 		}
 		produced = matches[0]
 	}
 	if err := copyFile(produced, outPDF); err != nil {
-		return stderrText, fmt.Errorf("写入 PDF 缓存失败: %w", err)
+		res.Err = fmt.Errorf("写入 PDF 缓存失败: %w", err)
+		return res
 	}
-	return stderrText, nil
+	res.ExitCode = 0
+	return res
+}
+
+// convertPDF 是带容错的转换入口：单次 120s 超时；失败后用**全新 profile
+// 目录**重试一次（convertDocxToPDF 每次调用都随机 profile，天然换新），
+// 仍失败返回最后一次结果（Err 非 nil）。请求本身已取消时不再重试。
+func (s *Server) convertPDF(ctx context.Context, docxPath, outPDF string) convertResult {
+	convert := s.pdfConvert
+	if convert == nil {
+		convert = convertDocxToPDF
+	}
+	sofficePath := s.sofficePath()
+	var last convertResult
+	for attempt := 1; attempt <= pdfConvertAttempts; attempt++ {
+		actx, cancel := context.WithTimeout(ctx, pdfConvertTimeout)
+		last = convert(actx, sofficePath, docxPath, outPDF)
+		cancel()
+		if last.Err == nil {
+			last.Attempts = attempt
+			return last
+		}
+		last.Attempts = attempt
+		if ctx.Err() != nil || attempt == pdfConvertAttempts {
+			return last
+		}
+		log.Printf("[preview] PDF 转换失败（第 %d 次，exit=%d），换新 profile 目录重试: %v (stderr=%s)",
+			attempt, last.ExitCode, last.Err, truncateUTF8(last.Stderr, 200))
+	}
+	return last
+}
+
+// failPDFConversion 统一失败出口：run.log 落摘要 → X-Preview-Error 头 →
+// 502 响应体（同一份摘要，端上可原样展示）。
+func (s *Server) failPDFConversion(w http.ResponseWriter, subj previewSubject, res convertResult) {
+	summary := subj.summary(res)
+	s.appendRunLog("preview-convert-failed", summary)
+	w.Header().Set("X-Preview-Error", url.PathEscape(summary))
+	writeErr(w, http.StatusBadGateway, "PDF 转换失败："+summary)
 }
 
 func copyFile(src, dst string) error {
@@ -271,7 +395,17 @@ func (s *Server) serveReportPDF(w http.ResponseWriter, r *http.Request, job *db.
 	artifact, ok := s.reportArtifactPath(job)
 	capability := s.previewCapability()
 	if !ok || !strings.EqualFold(filepath.Ext(artifact), ".docx") || !capability.PDF {
-		// 无 docx / 无 LibreOffice：回退现有 HTML 预览（版式近似）。
+		// 无 docx / 无 LibreOffice：回退现有 HTML 预览（版式近似），并把回退
+		// 原因放进 X-Preview-Error，端上不再只能看到 approximate 标记。
+		reason := "缺少 docx 产物，已回退 HTML 近似预览"
+		switch {
+		case !ok:
+		case !strings.EqualFold(filepath.Ext(artifact), ".docx"):
+			reason = "产物不是 docx，已回退 HTML 近似预览"
+		case !capability.PDF:
+			reason = "未安装 LibreOffice，已回退 HTML 近似预览"
+		}
+		w.Header().Set("X-Preview-Error", url.PathEscape(reason))
 		w.Header().Set("X-Preview-Fidelity", "approximate")
 		s.writeReportHTMLPreview(w, r, job)
 		return
@@ -282,19 +416,9 @@ func (s *Server) serveReportPDF(w http.ResponseWriter, r *http.Request, job *db.
 		mu.Lock()
 		defer mu.Unlock()
 		if _, err := os.Stat(target); err != nil {
-			ctx, cancel := context.WithTimeout(r.Context(), pdfConvertTimeout)
-			defer cancel()
-			convert := s.pdfConvert
-			if convert == nil {
-				convert = convertDocxToPDF
-			}
-			stderr, err := convert(ctx, s.sofficePath(), artifact, target)
-			if err != nil {
-				msg := strings.TrimSpace(stderr)
-				if msg == "" {
-					msg = err.Error()
-				}
-				writeErr(w, 502, "PDF 转换失败: "+truncateUTF8(msg, 600))
+			res := s.convertPDF(r.Context(), artifact, target)
+			if res.Err != nil {
+				s.failPDFConversion(w, previewSubject{ReportID: job.ID, Format: "pdf"}, res)
 				return
 			}
 		}
@@ -317,3 +441,47 @@ func (s *Server) writeReportHTMLPreview(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(html))
 }
+
+// warmupSoffice 初始化一次 LibreOffice（建 profile、载入字体与转换器）。
+// --terminate_after_init 只做初始化后退出，不产文件，最适合启动预热。
+func warmupSoffice(ctx context.Context, sofficePath string) error {
+	profileDir := randomProfileDir()
+	defer os.RemoveAll(profileDir)
+	cmd := exec.CommandContext(ctx, sofficePath,
+		"--headless", "--norestore", "--terminate_after_init",
+		"-env:UserInstallation="+fileURI(profileDir))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("预热失败: %v: %s", err, truncateUTF8(strings.TrimSpace(string(out)), 300))
+	}
+	return nil
+}
+
+// WarmupPreview 在启动时起后台 goroutine 预热 soffice，避免首个 PDF 请求
+// 吃冷启动超时。未装 LibreOffice 时直接跳过（保留 HTML 回退通道）。
+func (s *Server) WarmupPreview() {
+	go s.warmupPreview()
+}
+
+// warmupPreview 是预热同步体（可单测；WarmupPreview 只是异步壳）。
+func (s *Server) warmupPreview() {
+	capability := s.previewCapability()
+	if !capability.PDF {
+		log.Printf("[preview] 未检测到 LibreOffice，跳过预热（PDF 预览回退 HTML）")
+		return
+	}
+	warm := s.pdfWarmup
+	if warm == nil {
+		warm = warmupSoffice
+	}
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), previewWarmupTimeout)
+	defer cancel()
+	if err := warm(ctx, s.sofficePath()); err != nil {
+		log.Printf("[preview] LibreOffice 预热失败（首个 PDF 请求可能更慢）: %v", err)
+		s.appendRunLog("preview-warmup-failed", err.Error())
+		return
+	}
+	log.Printf("[preview] LibreOffice 预热完成（%s，%s）", time.Since(start).Round(time.Millisecond), capability.Version)
+}
+

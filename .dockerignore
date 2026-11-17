@@ -1,8 +1,15 @@
 .git
 **/node_modules
 web/.next
+web/.next_stale_*
+web/.next.bak.*
 web/out
+web/out_stale_*
+web/out.bak.*
 server/webui/dist
+.buildtmp
+.gocache
+docker/data
 /artex
 data
 *.db

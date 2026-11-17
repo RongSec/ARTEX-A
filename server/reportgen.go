@@ -815,21 +815,19 @@ func (s *Server) reportRenderDraft(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Format == "pdf" {
 		if !s.previewCapability().PDF {
-			writeErr(w, 502, "未安装 LibreOffice，无法生成 PDF 预览")
+			reason := "未安装 LibreOffice，无法生成 PDF 预览"
+			w.Header().Set("X-Preview-Error", url.PathEscape(reason))
+			writeErr(w, 502, reason)
 			return
 		}
 		pdfPath := pdfCachePath(outPath)
-		convert := s.pdfConvert
-		if convert == nil {
-			convert = convertDocxToPDF
-		}
-		stderr, err := convert(ctx, s.sofficePath(), outPath, pdfPath)
-		if err != nil {
-			msg := strings.TrimSpace(stderr)
-			if msg == "" {
-				msg = err.Error()
+		res := s.convertPDF(r.Context(), outPath, pdfPath)
+		if res.Err != nil {
+			subj := previewSubject{TemplateID: body.TemplateID, Format: "pdf"}
+			if tmpl != nil && tmpl.ID > 0 {
+				subj.TemplateID = tmpl.ID
 			}
-			writeErr(w, 502, "PDF 转换失败: "+truncateUTF8(msg, 600))
+			s.failPDFConversion(w, subj, res)
 			return
 		}
 		w.Header().Set("X-Preview-Fidelity", "exact")
