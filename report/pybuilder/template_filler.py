@@ -485,6 +485,24 @@ IMAGE_MAX_HEIGHT_CM = 19.0
 CAPTION_SIZE_PT = 10.5  # 五号
 
 
+
+def _detach_to_body_after_table(cell, para):
+    """把单元格里的空段落挪到所属表格之后（正文级），返回挪动后的段落。
+
+    单元格内嵌大图会被排版引擎按单元格可用宽度二次缩放，实测 14cm 只画出
+    约一半宽度、文字挤成一团。移到表格后即按版心渲染，宽度可控。
+    """
+    tbl = cell._tc.getparent()
+    while tbl is not None and tbl.tag != qn("w:tbl"):
+        tbl = tbl.getparent()
+    if tbl is None:
+        return para
+    p_el = para._p
+    p_el.getparent().remove(p_el)
+    tbl.addnext(p_el)
+    return para
+
+
 def _append_images(cell, images):
     """在单元格（漏洞证明）末尾按 images 顺序插图 + 图注。
 
@@ -503,6 +521,10 @@ def _append_images(cell, images):
             continue
         para = cell.add_paragraph()
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        # 单元格内插图会被 Word/LO 二次缩放（实测 14cm 的图只渲染出 ~7cm，
+        # 视觉上就是"压扁 + 文字重叠"）。改为把图片段落插到表格之后的正文层，
+        # 宽度直接用满版心，不再受表格列宽/布局影响。
+        _detach_to_body_after_table(cell, para)
         try:
             pic = para.add_run().add_picture(path, width=Cm(IMAGE_WIDTH_CM))
             # 超高图（长报文合成图）按高度上限等比回缩：否则 Word/LO 会把图
@@ -519,6 +541,10 @@ def _append_images(cell, images):
         if caption:
             cap = cell.add_paragraph()
             cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            # 图注跟图走：插到图片段落之后（正文层），否则会留在单元格里错位。
+            cap_el = cap._p
+            cap_el.getparent().remove(cap_el)
+            para._p.addnext(cap_el)
             run = cap.add_run(caption)
             run.font.size = Pt(CAPTION_SIZE_PT)
         added += 1
