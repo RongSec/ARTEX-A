@@ -3,8 +3,11 @@ package packetshot
 import (
 	"bytes"
 	"image/png"
+	"math"
 	"strings"
 	"testing"
+
+	"golang.org/x/image/font"
 )
 
 const sampleReq = "POST /api/login?next=%2Fhome HTTP/1.1\r\n" +
@@ -94,7 +97,8 @@ func TestRenderSideBySideLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := img.Bounds()
-	const width, pad, sep = 1400, 15, 8 // pad=10*1.5
+	const width, sep = 1400, 8
+	pad := int(math.Round(8 * 1.5)) // V9-SHOT2：内容 padding=8px×Scale
 	panelW := (width - 2*pad - sep) / 2
 	if b.Dx() != width {
 		t.Fatalf("canvas width = %d, want %d", b.Dx(), width)
@@ -129,6 +133,90 @@ func TestRenderSideBySideLayout(t *testing.T) {
 	right := nonWhite(pad+panelW+sep, pad+2*panelW+sep)
 	if left < 50 || right < 50 {
 		t.Fatalf("panel content missing: left=%d right=%d", left, right)
+	}
+}
+
+// testFaces 用与 Render 相同的字号口径建 face（单测复用，便于精确算版式）。
+func testFaces(t *testing.T, s float64) (font.Face, font.Face, bool) {
+	t.Helper()
+	fs := loadFonts()
+	mono := faceOf(fs.mono, 12.0*s)
+	if mono == nil {
+		t.Fatal("mono face unavailable")
+	}
+	var cjk font.Face
+	if fs.cjkOK {
+		cjk = faceOf(fs.cjk, 12.0*s)
+	}
+	return mono, cjk, fs.cjkOK
+}
+
+// TestRenderHeightMatchesRowCount V9-SHOT2：行高=字号×1.35（含 Scale），
+// 画布高 = 上下 padding + 标题带 + 物理行数×行高（不再有固定高度/挤压）。
+func TestRenderHeightMatchesRowCount(t *testing.T) {
+	opt := DefaultOptions()
+	s := opt.Scale
+	mono, cjk, cjkOK := testFaces(t, s)
+	lm := newLayoutMetrics(s, mono)
+	if want := int(math.Round(12.0 * s * 1.35)); lm.lineH != want {
+		t.Fatalf("lineH = %d, want 字号×1.35 = %d", lm.lineH, want)
+	}
+	// 单栏（只请求）：栏宽=画布宽-2×padding。
+	const width = 1400
+	panelW := width - 2*lm.pad
+	maxW := panelW - 2*lm.pad
+	rows := wrapPanelRows(buildPanel(sampleReq, opt), maxW, s, mono, cjk, cjkOK)
+	if len(rows) < 2 {
+		t.Fatalf("unexpected row count %d", len(rows))
+	}
+	out, err := Render(sampleReq, "", opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := png.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantH := 2*lm.pad + contentHeight(lm, len(rows))
+	if got := img.Bounds().Dy(); got != wantH {
+		t.Fatalf("canvas height = %d, want 2*pad(%d)+band(%d)+2*pad(%d)+%d*lineH(%d) = %d",
+			got, lm.pad, lm.bandH, lm.pad, len(rows), lm.lineH, wantH)
+	}
+}
+
+// TestWrapLongLineNoClip V9-SHOT2：120 字符长行折行后每段绘制宽度（含续行
+// 悬垂缩进）≤ 栏宽，且拼回=原文、续行不带行号。
+func TestWrapLongLineNoClip(t *testing.T) {
+	opt := DefaultOptions()
+	s := opt.Scale
+	mono, cjk, cjkOK := testFaces(t, s)
+	lm := newLayoutMetrics(s, mono)
+	const width, sep = 1400, 8
+	panelW := (width - 2*lm.pad - sep) / 2
+	maxW := panelW - 2*lm.pad
+	long := strings.Repeat("abcdefghij0123456789", 6) // 120 字符
+	rows := wrapPanelRows([]panelRow{{kind: rowCode, num: 1, text: long}}, maxW, s, mono, cjk, cjkOK)
+	if len(rows) < 2 {
+		t.Fatalf("120 字符长行未折行: rows=%d maxW=%d", len(rows), maxW)
+	}
+	var joined strings.Builder
+	for i, r := range rows {
+		joined.WriteString(r.text)
+		w := measureMixedWidth(r.text, mono, cjk, cjkOK)
+		if r.indent+w > maxW {
+			t.Fatalf("第 %d 物理行超栏宽: indent=%d + width=%d > maxW=%d", i, r.indent, w, maxW)
+		}
+		if i > 0 {
+			if r.num != 0 {
+				t.Fatalf("续行不得带行号: %+v", r)
+			}
+			if r.indent == 0 {
+				t.Fatalf("续行缩进应与首行不同（行号槽悬垂）")
+			}
+		}
+	}
+	if joined.String() != long {
+		t.Fatalf("折行丢失字符: got %d chars, want %d", joined.Len(), len(long))
 	}
 }
 

@@ -24,6 +24,7 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -182,6 +183,7 @@ type panelRow struct {
 	text   string // 主体文本（rowText=value 段 / rowJSON|Code=行内容）
 	num    int    // 行号（>0 才画）
 	mosaic bool   // 尾部叠马赛克（Mosaic 命中）
+	indent int    // 续行悬垂缩进（px，从内容左边界起；折行与绘制共用）
 }
 
 // ---------- 排版 + 绘制主流程 ----------
@@ -220,17 +222,19 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 	}
 
 	fs := loadFonts()
-	monoFace := faceOf(fs.mono, 12.0*s)
+	fontSize := 12.0 * s
+	monoFace := faceOf(fs.mono, fontSize)
 	defer monoFace.Close()
 	cjkFace := font.Face(nil)
 	if fs.cjkOK {
-		cjkFace = faceOf(fs.cjk, 13.0*s)
-		defer cjkFace.Close()
+		cjkFace = faceOf(fs.cjk, fontSize)
+		if cjkFace != nil {
+			defer cjkFace.Close()
+		}
 	}
 
-	lineH := int(monoFace.Metrics().Height.Ceil()) + int(3*s)
-	bandH := lineH + int(8*s) // 栏顶标题带（深底白字）
-	pad := int(10 * s)
+	lm := newLayoutMetrics(s, monoFace)
+	pad := lm.pad
 	const sep = 8 // 两栏间分隔宽度（px，不随 Scale 放大——版面锚点）
 
 	// 栏宽：两栏等宽、扣掉分隔；单栏占满。maxW=栏内可用文字宽（折行用）。
@@ -245,10 +249,15 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 	if maxW < 20 {
 		maxW = 20
 	}
+
+	// 先按栏宽折行，再按物理行数计高：画布高度 = 两栏内容高的较大者 +
+	// 上下 padding（不再用固定高度，长报文/长行自然长高）。
+	heights := make([]int, len(panels))
 	maxH := 0
 	for i := range panels {
 		panels[i].rows = wrapPanelRows(panels[i].rows, maxW, s, monoFace, cjkFace, fs.cjkOK)
-		h := bandH + len(panels[i].rows)*lineH + pad*2
+		h := contentHeight(lm, len(panels[i].rows))
+		heights[i] = h
 		if h > maxH {
 			maxH = h
 		}
@@ -258,15 +267,15 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 	img := image.NewNRGBA(image.Rect(0, 0, width, total))
 	draw.Draw(img, img.Bounds(), &image.Uniform{colBG}, image.Point{}, draw.Src)
 
-	asc := int(monoFace.Metrics().Ascent.Ceil())
+	asc := lm.asc
 	for i, p := range panels {
 		rows := p.rows
 		x0 := pad + i*(panelW+sep)
 		y := pad
-		h := bandH + len(rows)*lineH + pad*2
+		h := heights[i]
 		// 卡片底 + 标题带（深底）+ 边框。
 		draw.Draw(img, image.Rect(x0, y, x0+panelW, y+h), &image.Uniform{colCard}, image.Point{}, draw.Src)
-		draw.Draw(img, image.Rect(x0, y, x0+panelW, y+bandH), &image.Uniform{colBandTitle}, image.Point{}, draw.Src)
+		draw.Draw(img, image.Rect(x0, y, x0+panelW, y+lm.bandH), &image.Uniform{colBandTitle}, image.Point{}, draw.Src)
 		strokeRect(img, image.Rect(x0, y, x0+panelW-1, y+h-1), colBorder)
 
 		// 标题带文字（居中）：cjk 字体优先，无则英文降级。
@@ -283,12 +292,13 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 			label = "REQUEST"
 		}
 		lw := textWidth(labelFace, label)
-		bandBase := y + (bandH+asc)/2
+		lm2 := labelFace.Metrics()
+		bandBase := y + (lm.bandH-(lm2.Ascent+lm2.Descent).Ceil())/2 + lm2.Ascent.Ceil()
 		drawString(img, label, x0+(panelW-lw)/2, bandBase, colWhite, labelFace)
 
-		ty := y + bandH + pad + asc
+		ty := y + lm.bandH + pad + asc
 		for _, r := range rows {
-			x := x0 + pad
+			x := x0 + pad + r.indent
 			switch r.kind {
 			case rowTitle:
 				badge := r.name // REQ / 2xx 等
@@ -344,7 +354,7 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 					drawMosaicBox(img, x, ty-asc, pad, int(monoFace.Metrics().Height.Ceil()), s)
 				}
 			}
-			ty += lineH
+			ty += lm.lineH
 		}
 	}
 
@@ -355,8 +365,46 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// layoutMetrics 版式尺度（行高/标题带高/内容 padding/基线），按字号×Scale
+// 统一推导，避免各处硬编码导致行距与字号脱钩。
+type layoutMetrics struct {
+	lineH int // 行高 = 字号 × 1.35
+	bandH int // 标题带高（随字号缩放）
+	pad   int // 内容前后 padding（8px × Scale）
+	asc   int // 等宽字体基线抬升
+}
+
+// newLayoutMetrics 由 Scale 与字体度量生成版式尺度。字号 12pt(=px@72dpi) 乘
+// Scale；行高固定取 1.35 倍字号，保证相邻行不重叠（含 CJK 字形上下缘）。
+func newLayoutMetrics(scale float64, monoFace font.Face) layoutMetrics {
+	if scale <= 0 {
+		scale = 1
+	}
+	fontSize := 12.0 * scale
+	lineH := int(math.Round(fontSize * 1.35))
+	if lineH < 1 {
+		lineH = 1
+	}
+	pad := int(math.Round(8 * scale))
+	if pad < 4 {
+		pad = 4
+	}
+	return layoutMetrics{
+		lineH: lineH,
+		bandH: lineH + int(math.Round(6*scale)),
+		pad:   pad,
+		asc:   int(monoFace.Metrics().Ascent.Ceil()),
+	}
+}
+
+// contentHeight 一栏高度 = 标题带 + 内容前后 padding + 物理行数 × 行高。
+func contentHeight(lm layoutMetrics, nRows int) int {
+	return lm.bandH + lm.pad + nRows*lm.lineH + lm.pad
+}
+
 // wrapPanelRows 按栏内可用宽度把每行折成若干物理行（并排半栏后必须折行，
-// 否则右栏文字会盖到左栏）。续行不带行号/头名（保原文可读）；行号只在首行。
+// 否则右栏文字会盖到左栏/被画布裁掉）。续行不带行号与头名，按首行前缀宽度
+// 悬垂缩进（行号槽/头名宽度）对齐，与首行缩进不同。
 func wrapPanelRows(rows []panelRow, maxW int, s float64, mono, cjk font.Face, cjkOK bool) []panelRow {
 	out := make([]panelRow, 0, len(rows))
 	for _, r := range rows {
@@ -369,7 +417,8 @@ func wrapPanelRows(rows []panelRow, maxW int, s float64, mono, cjk font.Face, cj
 			chunks := splitToWidth(r.text, max(1, maxW-badgeW), mono, cjk, cjkOK)
 			out = append(out, panelRow{kind: rowTitle, name: r.name, text: chunks[0]})
 			for _, c := range chunks[1:] {
-				out = append(out, panelRow{kind: rowText, text: c})
+				// 标题续行悬垂到标题文字起点（越过徽标），与首行缩进不同。
+				out = append(out, panelRow{kind: rowText, text: c, indent: badgeW})
 			}
 		case rowText:
 			prefix := 0
@@ -379,17 +428,17 @@ func wrapPanelRows(rows []panelRow, maxW int, s float64, mono, cjk font.Face, cj
 			chunks := splitToWidth(r.text, max(1, maxW-prefix), mono, cjk, cjkOK)
 			out = append(out, panelRow{kind: rowText, name: r.name, text: chunks[0], mosaic: r.mosaic})
 			for _, c := range chunks[1:] {
-				out = append(out, panelRow{kind: rowText, text: c})
+				out = append(out, panelRow{kind: rowText, text: c, indent: prefix})
 			}
 		case rowJSON, rowCode:
-			prefix := 0
+			gutter := 0
 			if r.num > 0 {
-				prefix = textWidth(mono, fmt.Sprintf("%4d ", r.num))
+				gutter = textWidth(mono, fmt.Sprintf("%4d ", r.num))
 			}
-			chunks := splitToWidth(r.text, max(1, maxW-prefix), mono, cjk, cjkOK)
+			chunks := splitToWidth(r.text, max(1, maxW-gutter), mono, cjk, cjkOK)
 			out = append(out, panelRow{kind: r.kind, num: r.num, text: chunks[0], mosaic: r.mosaic})
 			for _, c := range chunks[1:] {
-				out = append(out, panelRow{kind: r.kind, text: c})
+				out = append(out, panelRow{kind: r.kind, text: c, indent: gutter})
 			}
 		default:
 			for _, c := range splitToWidth(r.text, maxW, mono, cjk, cjkOK) {
@@ -402,12 +451,16 @@ func wrapPanelRows(rows []panelRow, maxW int, s float64, mono, cjk font.Face, cj
 
 // splitToWidth 贪心按宽度折行（逐 rune 量宽：ASCII 走 mono，非 ASCII 走 cjk；
 // 未探测到 CJK 时先 degradeText 再按 mono 量）。单 rune 超宽时独占一行。
+//
+// 量宽用上取整累加（Σ ceil(单 rune 宽)）：绘制时按 ASCII/CJK 分段整段取整，
+// 其推进 ≤ 各 rune 上取整之和，因此折行结果绝不会超出 maxW（右栏不被裁）。
 func splitToWidth(s string, maxW int, mono, cjk font.Face, cjkOK bool) []string {
-	if maxW <= 0 {
-		return []string{s}
-	}
 	if !cjkOK || cjk == nil {
 		s = degradeText(s, false)
+		cjk = nil
+	}
+	if maxW <= 0 {
+		return []string{s}
 	}
 	out := make([]string, 0, 1)
 	cur := make([]rune, 0, len(s))
@@ -417,7 +470,7 @@ func splitToWidth(s string, maxW int, mono, cjk font.Face, cjkOK bool) []string 
 		if r > 127 && cjkOK && cjk != nil {
 			f = cjk
 		}
-		rw := int(font.MeasureString(f, string(r)).Round())
+		rw := (int(font.MeasureString(f, string(r))) + 63) / 64 // 26.6 定点→px 上取整
 		if len(cur) > 0 && w+rw > maxW {
 			out = append(out, string(cur))
 			cur = cur[:0]
@@ -433,6 +486,34 @@ func splitToWidth(s string, maxW int, mono, cjk font.Face, cjkOK bool) []string 
 		out = []string{""}
 	}
 	return out
+}
+
+// measureMixedWidth 与 drawMixed 的推进口径一致（ASCII/CJK 分段后整段取整），
+// 用于折行自检与单测断言「绘制宽度不超栏宽」。
+func measureMixedWidth(s string, mono, cjk font.Face, cjkOK bool) int {
+	if s == "" {
+		return 0
+	}
+	if !cjkOK || cjk == nil {
+		return textWidth(mono, s)
+	}
+	w := 0
+	runes := []rune(s)
+	i := 0
+	for i < len(runes) {
+		j := i
+		ascii := runes[i] <= 127
+		for j < len(runes) && (runes[j] <= 127) == ascii {
+			j++
+		}
+		f := mono
+		if !ascii {
+			f = cjk
+		}
+		w += textWidth(f, string(runes[i:j]))
+		i = j
+	}
+	return w
 }
 
 // buildPanel 一段报文 → 行序列（脱敏管线在此）。

@@ -40,15 +40,16 @@ import (
 // settingPacketShotEnabled 全局自动截图闸（V9-SHOT 起默认 true=报告带报文截图）。
 const settingPacketShotEnabled = "packet_shot_enabled"
 
-// packetShotOpts 渲染选项（V3 起默认宽 1400、Scale 1.5、脱敏+行号开、隐藏/
-// 马赛克关——一步 req+resp 合成一张大图，报告内可读。模板 style.packet_shot
-// 覆盖留后续——截图发生在 finding 落库期，与报告模板无绑定，塞 style 里语义
-// 错位；偏差已记交付报告）。
+// packetShotOpts 渲染选项（V3 起默认宽 1400、脱敏+行号开、隐藏/马赛克关——
+// 一步 req+resp 合成一张大图，报告内可读。模板 style.packet_shot 覆盖留后续
+// ——截图发生在 finding 落库期，与报告模板无绑定，塞 style 里语义错位；偏差
+// 已记交付报告）。
 func (s *Server) packetShotOpts() packetshot.Options {
 	o := packetshot.DefaultOptions()
-	// V9-SHOT：改成左右并排后单栏宽度减半，同一 Scale 下字号的相对大小也减半；
-	// 放大到 2.2 使 15cm 插图后正文约 8pt（原 V3 的 1.5 只适合单栏通宽）。
-	o.Scale = 2.2
+	// V9-SHOT2：左右并排后单栏宽度减半，2.4 倍字号在 1400px→15cm 插图
+	// （约 237dpi）下正文约 8.7pt，落进 8–9pt 可读区间；行高由渲染器按
+	// 字号×1.35 自适应，不再受固定画布高度挤压。
+	o.Scale = 2.4
 	return o
 }
 
