@@ -1176,7 +1176,8 @@ func firstTaskName(tasks []report.TaskMeta) string {
 	return tasks[0].DisplayName()
 }
 
-func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.ReportInput, string, error) {	if s.m.pg == nil {
+func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.ReportInput, string, error) {
+	if s.m.pg == nil {
 		return nil, "", errors.New("数据库不可用")
 	}
 	// 1) 来源任务元信息。
