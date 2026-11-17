@@ -590,7 +590,7 @@ func (s *Server) runReportJob(job *db.Report) {
 	}
 	path, warning, err := renderer(ctx, job)
 	if err != nil {
-		s.finishReport(job.ID, "", "", err.Error())
+		s.finishReport(job.ID, "", "", "报告生成失败: "+err.Error())
 		return
 	}
 	if err := s.m.pg.FinishReportDone(job.ID, path, truncateUTF8(warning, reportErrorStoreTruncate)); err != nil {
@@ -1222,7 +1222,9 @@ func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.
 	}
 	fs, err := s.m.pg.FindingsForReport(taskIDs, job.FindingIDs)
 	if err != nil {
-		return nil, "", err
+		// 带上阶段前缀：job.error 只存一行，裸 SQL 错误无法区分是取数、
+		// 资产解析还是模板读取失败（实测踩过一次 "parameter $3" 无从定位）。
+		return nil, "", fmt.Errorf("取漏洞数据失败: %w", err)
 	}
 	if ctx.Err() != nil {
 		return nil, "", ctx.Err()
