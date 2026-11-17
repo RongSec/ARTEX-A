@@ -133,8 +133,11 @@ type ReportTemplate struct {
 	Personnel   json.RawMessage `json:"personnel"` // [{name,role,contact}]
 	CVSSEnabled bool            `json:"cvss_enabled"`
 	Remark      string          `json:"remark"`
-	CreatedAt   time.Time       `json:"created_at"`
-	UpdatedAt   time.Time       `json:"updated_at"`
+	// DocxPath = 用户上传的模板原件（相对 dataDir）。非空且文件存在时报告
+	// 渲染走模板填充（保留原版式）；空=按章节重建。
+	DocxPath  string    `json:"docx_path"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // ReportTemplateVersion 是 report_template_versions 的一行：模板结构变更前的
@@ -162,6 +165,7 @@ type ReportTemplateInput struct {
 	Personnel   json.RawMessage
 	CVSSEnabled bool
 	Remark      string
+	DocxPath    string
 }
 
 var (
@@ -174,7 +178,7 @@ var (
 const reportTemplateCols = `id, name, COALESCE(version,1), is_default, output_lang,
 	COALESCE(skeleton, '[]'::jsonb), COALESCE(style, '{}'::jsonb), COALESCE(prompts, '{}'::jsonb),
 	COALESCE(issuer, ''), COALESCE(logo_path, ''), COALESCE(personnel, '[]'::jsonb),
-	COALESCE(cvss_enabled, false), COALESCE(remark, ''), created_at, updated_at`
+	COALESCE(cvss_enabled, false), COALESCE(remark, ''), COALESCE(docx_path, ''), created_at, updated_at`
 
 func scanReportTemplate(row interface{ Scan(...any) error }) (*ReportTemplate, error) {
 	t := &ReportTemplate{}
@@ -182,7 +186,7 @@ func scanReportTemplate(row interface{ Scan(...any) error }) (*ReportTemplate, e
 	if err := row.Scan(&t.ID, &t.Name, &t.Version, &t.IsDefault, &t.OutputLang,
 		&skel, &style, &prompts,
 		&t.Issuer, &t.LogoPath, &personnel,
-		&t.CVSSEnabled, &t.Remark, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		&t.CVSSEnabled, &t.Remark, &t.DocxPath, &t.CreatedAt, &t.UpdatedAt); err != nil {
 		return nil, err
 	}
 	if t.Version <= 0 {
@@ -306,6 +310,7 @@ func normalizeTemplateInput(in ReportTemplateInput) (ReportTemplateInput, error)
 	in.Issuer = strings.TrimSpace(in.Issuer)
 	in.LogoPath = strings.TrimSpace(in.LogoPath)
 	in.Remark = strings.TrimSpace(in.Remark)
+	in.DocxPath = strings.TrimSpace(in.DocxPath)
 	return in, nil
 }
 
@@ -334,11 +339,11 @@ func (d *DB) CreateReportTemplate(in ReportTemplateInput) (*ReportTemplate, erro
 	}
 	t, err := scanReportTemplate(d.QueryRow(`
 INSERT INTO report_templates(name, is_default, output_lang, skeleton, style, prompts,
-	issuer, logo_path, personnel, cvss_enabled, remark)
-VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9::jsonb, $10, $11)
+	issuer, logo_path, personnel, cvss_enabled, remark, docx_path)
+VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9::jsonb, $10, $11, $12)
 RETURNING `+reportTemplateCols,
 		in.Name, !hasAny, in.OutputLang, skel, in.Style, in.Prompts,
-		in.Issuer, in.LogoPath, in.Personnel, in.CVSSEnabled, in.Remark))
+		in.Issuer, in.LogoPath, in.Personnel, in.CVSSEnabled, in.Remark, in.DocxPath))
 	if err != nil {
 		return nil, err
 	}
@@ -443,11 +448,12 @@ func (d *DB) UpdateReportTemplate(id int64, in ReportTemplateInput) (*ReportTemp
 	t, err := scanReportTemplate(tx.QueryRow(`
 UPDATE report_templates SET
 	name=$2, output_lang=$3, skeleton=$4::jsonb, style=$5::jsonb, prompts=$6::jsonb,
-	issuer=$7, logo_path=$8, personnel=$9::jsonb, cvss_enabled=$10, remark=$11, version=$12
+	issuer=$7, logo_path=$8, personnel=$9::jsonb, cvss_enabled=$10, remark=$11,
+	docx_path=$12, version=$13
 WHERE id=$1
 RETURNING `+reportTemplateCols,
 		id, in.Name, in.OutputLang, skel, in.Style, in.Prompts,
-		in.Issuer, in.LogoPath, in.Personnel, in.CVSSEnabled, in.Remark, version))
+		in.Issuer, in.LogoPath, in.Personnel, in.CVSSEnabled, in.Remark, in.DocxPath, version))
 	if err == sql.ErrNoRows {
 		return nil, ErrReportTemplateNotFound
 	}
@@ -458,6 +464,20 @@ RETURNING `+reportTemplateCols,
 		return nil, err
 	}
 	return t, nil
+}
+
+// SetReportTemplateDocxPath 只更新模板原件路径（导入落盘/替换时用，避免为了
+// 一个路径字段走整行 UpdateReportTemplate 的版本快照逻辑）。
+func (d *DB) SetReportTemplateDocxPath(id int64, path string) error {
+	res, err := d.Exec(`UPDATE report_templates SET docx_path=$2 WHERE id=$1`,
+		id, strings.TrimSpace(path))
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrReportTemplateNotFound
+	}
+	return nil
 }
 
 // jsonEqual 比较两段 JSON 的语义等价（忽略对象键序/空白）。解析失败退回字节

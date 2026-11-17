@@ -74,10 +74,10 @@ func (s *Server) reportTemplateChat(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB：模板 JSON + 会话轮次上限兜底
 	var body struct {
-		Messages     []chatMessage      `json:"messages"`
-		Template     json.RawMessage    `json:"template"`
-		LLMProfileID int64              `json:"llm_profile_id"`
-		Locale       string             `json:"locale"`
+		Messages     []chatMessage   `json:"messages"`
+		Template     json.RawMessage `json:"template"`
+		LLMProfileID int64           `json:"llm_profile_id"`
+		Locale       string          `json:"locale"`
 		// R3：预览上下文（前端把当前预览源带上来：示例/任务/项目）。用户说
 		// 「按现有数据渲染」时服务端据此渲染 HTML 预览随回复返回。
 		Preview *chatPreviewInput `json:"preview"`
@@ -200,16 +200,17 @@ func (s *Server) reportTemplateChat(w http.ResponseWriter, r *http.Request) {
 func templateDraftView(t *db.ReportTemplate) map[string]any {
 	skel, _ := json.Marshal(t.Skeleton)
 	return map[string]any{
-		"id":            t.ID,
-		"name":          t.Name,
-		"output_lang":   t.OutputLang,
-		"skeleton":      json.RawMessage(skel),
-		"style":         t.Style,
-		"prompts":       t.Prompts,
-		"issuer":        t.Issuer,
-		"personnel":     t.Personnel,
-		"cvss_enabled":  t.CVSSEnabled,
-		"remark":        t.Remark,
+		"id":           t.ID,
+		"name":         t.Name,
+		"output_lang":  t.OutputLang,
+		"skeleton":     json.RawMessage(skel),
+		"style":        t.Style,
+		"prompts":      t.Prompts,
+		"issuer":       t.Issuer,
+		"personnel":    t.Personnel,
+		"cvss_enabled": t.CVSSEnabled,
+		"remark":       t.Remark,
+		"docx_path":    t.DocxPath,
 	}
 }
 

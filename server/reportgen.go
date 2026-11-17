@@ -64,6 +64,7 @@ type reportTemplateBody struct {
 	Personnel   json.RawMessage    `json:"personnel"`
 	CVSSEnabled bool               `json:"cvss_enabled"`
 	Remark      string             `json:"remark"`
+	DocxPath    string             `json:"docx_path"`
 }
 
 func (b *reportTemplateBody) toInput() db.ReportTemplateInput {
@@ -71,7 +72,7 @@ func (b *reportTemplateBody) toInput() db.ReportTemplateInput {
 		Name: b.Name, OutputLang: b.OutputLang, Skeleton: b.Skeleton,
 		Style: b.Style, Prompts: b.Prompts,
 		Issuer: b.Issuer, LogoPath: b.LogoPath, Personnel: b.Personnel,
-		CVSSEnabled: b.CVSSEnabled, Remark: b.Remark,
+		CVSSEnabled: b.CVSSEnabled, Remark: b.Remark, DocxPath: b.DocxPath,
 	}
 }
 
@@ -89,6 +90,7 @@ type reportTemplatePatchBody struct {
 	Personnel   json.RawMessage     `json:"personnel"`
 	CVSSEnabled *bool               `json:"cvss_enabled"`
 	Remark      *string             `json:"remark"`
+	DocxPath    *string             `json:"docx_path"`
 }
 
 func (s *Server) pgReportDBGuard(w http.ResponseWriter) bool {
@@ -129,10 +131,37 @@ func (s *Server) reportTemplateCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if rel := strings.TrimSpace(body.DocxPath); rel != "" {
+		abs, rerr := s.resolveTemplateDocx(rel)
+		if rerr == nil {
+			if fi, serr := os.Stat(abs); serr != nil || fi.IsDir() || fi.Size() == 0 {
+				rerr = fmt.Errorf("模板原件不存在或为空: %s", rel)
+			}
+		}
+		if rerr != nil {
+			writeErr(w, 400, rerr.Error())
+			return
+		}
+	}
 	t, err := s.m.pg.CreateReportTemplate(body.toInput())
 	if err != nil {
 		reportTemplateWriteErr(w, err)
 		return
+	}
+	if rel := strings.TrimSpace(t.DocxPath); rel != "" {
+		final, ferr := s.finalizeTemplateDocx(t.ID, rel)
+		if ferr != nil {
+			_, _ = s.m.pg.DeleteReportTemplate(t.ID) // 回滚半成品，不留无原件的模板行
+			writeErr(w, 500, "模板原件落盘失败: "+ferr.Error())
+			return
+		}
+		if final != t.DocxPath {
+			if err := s.m.pg.SetReportTemplateDocxPath(t.ID, final); err != nil {
+				writeErr(w, 500, "写入 docx_path 失败: "+err.Error())
+				return
+			}
+			t.DocxPath = final
+		}
 	}
 	writeJSON(w, 200, t)
 }
@@ -175,6 +204,7 @@ func (s *Server) reportTemplateUpdate(w http.ResponseWriter, r *http.Request) {
 		Personnel:   old.Personnel,
 		CVSSEnabled: old.CVSSEnabled,
 		Remark:      old.Remark,
+		DocxPath:    old.DocxPath,
 	}
 	if body.Name != nil {
 		in.Name = *body.Name
@@ -206,6 +236,22 @@ func (s *Server) reportTemplateUpdate(w http.ResponseWriter, r *http.Request) {
 	if body.Remark != nil {
 		in.Remark = *body.Remark
 	}
+	if body.DocxPath != nil {
+		rel := strings.TrimSpace(*body.DocxPath)
+		if rel != "" {
+			abs, rerr := s.resolveTemplateDocx(rel)
+			if rerr == nil {
+				if fi, serr := os.Stat(abs); serr != nil || fi.IsDir() || fi.Size() == 0 {
+					rerr = fmt.Errorf("模板原件不存在或为空: %s", rel)
+				}
+			}
+			if rerr != nil {
+				writeErr(w, 400, rerr.Error())
+				return
+			}
+		}
+		in.DocxPath = rel
+	}
 	if body.Skeleton != nil {
 		if err := db.ValidateSkeleton(in.Skeleton); err != nil {
 			writeErr(w, 400, err.Error())
@@ -216,6 +262,20 @@ func (s *Server) reportTemplateUpdate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		reportTemplateWriteErr(w, err)
 		return
+	}
+	if rel := strings.TrimSpace(t.DocxPath); rel != "" {
+		final, ferr := s.finalizeTemplateDocx(t.ID, rel)
+		if ferr != nil {
+			writeErr(w, 400, "模板原件不存在或为空: "+ferr.Error())
+			return
+		}
+		if final != t.DocxPath {
+			if err := s.m.pg.SetReportTemplateDocxPath(t.ID, final); err != nil {
+				writeErr(w, 500, "写入 docx_path 失败: "+err.Error())
+				return
+			}
+			t.DocxPath = final
+		}
 	}
 	writeJSON(w, 200, t)
 }
@@ -956,6 +1016,7 @@ func applyTemplateMeta(in *report.ReportInput, tmpl *db.ReportTemplate, dataDir 
 	in.Remark = tmpl.Remark
 	in.Style = tmpl.Style
 	in.Prompts = tmpl.Prompts
+	in.TemplateDocx = report.ResolveDocxTemplatePath(dataDir, tmpl)
 	in.LogoAbs = ""
 	if rel := strings.TrimSpace(tmpl.LogoPath); rel != "" {
 		abs := filepath.Join(dataDir, filepath.FromSlash(rel))
@@ -1118,6 +1179,8 @@ func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.
 		in.Remark = tmpl.Remark
 		in.Style = tmpl.Style
 		in.Prompts = tmpl.Prompts
+		// V9-TPL：模板有可用原件 → docx 走填充渲染（保留上传件版式）。
+		in.TemplateDocx = report.ResolveDocxTemplatePath(s.m.dir, tmpl)
 		// logo 存相对 dataDir 路径；pybuilder 插图只认绝对路径，这里解析并在
 		// 缺文件时留空（封面跳过插图，不影响其余渲染）。
 		if rel := strings.TrimSpace(tmpl.LogoPath); rel != "" {

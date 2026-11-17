@@ -97,6 +97,10 @@ type ReportInput struct {
 	Remark      string          `json:"remark,omitempty"`
 	Style       json.RawMessage `json:"style,omitempty"`   // T16 pybuilder 消费
 	Prompts     json.RawMessage `json:"prompts,omitempty"` // AI 叙述模板（T16 消费）
+	// TemplateDocx 是模板原件的绝对路径（模板有 docx_path 且文件存在时由
+	// server 填）。非空 → docx 走 template_filler.py 在原件上填充；空 → 走
+	// report_builder.py 按章节重建。不进 pybuilder 数据契约（脚本以 argv 收）。
+	TemplateDocx string `json:"template_docx,omitempty"`
 
 	Chapters []db.ReportSection `json:"chapters"` // 章节骨架（含 enabled=false 的关闭章节，渲染端过滤）
 	Tasks    []TaskMeta         `json:"tasks"`    // 来源任务（任务级 1 个；项目级多个）

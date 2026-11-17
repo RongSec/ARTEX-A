@@ -92,6 +92,18 @@ func (s *Server) reportTemplateImportDocx(w http.ResponseWriter, r *http.Request
 	fallbackName = strings.TrimSuffix(fallbackName, ".markdown")
 	fallbackName = strings.TrimSuffix(fallbackName, ".txt")
 
+	// V9-TPL：docx 原件原样落盘（staging），draft.docx_path 透出给前端；用户
+	// 确认保存模板时 CREATE/PATCH 再按 id 归位成 <id>-<safe>.docx。
+	docxRel := ""
+	if strings.HasSuffix(name, ".docx") {
+		rel, werr := s.stageTemplateDocx(hdr.Filename, data)
+		if werr != nil {
+			writeErr(w, 500, werr.Error())
+			return
+		}
+		docxRel = rel
+	}
+
 	// 规则映射兜底草稿（LLM 不可用/输出非法时原样返回它 + degraded:true）。
 	ruleDraft := mapOutlineToTemplate(outline, fallbackName)
 
@@ -136,6 +148,7 @@ func (s *Server) reportTemplateImportDocx(w http.ResponseWriter, r *http.Request
 	// R1：同名文档重复上传 → 默认走「更新现有模板」。按文件名（去扩展名）与
 	// 现有模板名归一比较；命中时把 id/版本与骨架差异回给前端（前端仍可改选
 	// 「另存为新模板」）。列表读取失败只降级为「未命中」，不影响导入本身。
+	draft.DocxPath = docxRel
 	var matched *db.ReportTemplate
 	var structureDiff *reportSkeletonDiff
 	if ts, lerr := s.m.pg.ListReportTemplates(); lerr != nil {

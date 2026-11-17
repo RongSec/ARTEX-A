@@ -1690,6 +1690,7 @@ CREATE TABLE IF NOT EXISTS report_templates (
     personnel    JSONB NOT NULL DEFAULT '[]',                -- 参测人员表 [{name,role,contact}]
     cvss_enabled BOOLEAN NOT NULL DEFAULT false,             -- 报告中是否呈现 CVSS 评分
     remark       TEXT NOT NULL DEFAULT '',                   -- 备注（模板用途说明等）
+    docx_path    TEXT NOT NULL DEFAULT '',                   -- 用户上传的模板原件（相对 dataDir；非空=填充式渲染、保留原版式）
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -1700,6 +1701,10 @@ CREATE TRIGGER trg_report_tpl_upd BEFORE UPDATE ON report_templates
 -- R1（V9-RPT）重复导入改更新：version 列补旧库；旧骨架按版本沉档，便于
 -- 「同名文档再次上传」时对齐差异/回溯（只增不改，模板行仍以最新版为准）。
 ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
+-- V9-TPL：模板原件路径（相对 dataDir，如 templates/12-xx系统渗透测试报告.docx）。
+-- 非空且文件存在 → 渲染走 template_filler.py（以原件为底稿填充，保留页眉页脚/
+-- 封面/版式）；空或文件缺失 → 回退 report_builder.py 按章节重建。
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS docx_path TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS report_template_versions (
     id          BIGSERIAL PRIMARY KEY,
     template_id BIGINT NOT NULL REFERENCES report_templates(id) ON DELETE CASCADE,
