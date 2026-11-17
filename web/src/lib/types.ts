@@ -1828,6 +1828,8 @@ export interface ReportTemplate {
   personnel: ReportPerson[];
   cvss_enabled: boolean;
   remark: string;
+  // 模板原件（用户上传的 docx，相对 dataDir；空=未上传）。渲染以它为底稿填充。
+  docx_path: string;
   created_at: string;
   updated_at: string;
 }
@@ -1844,6 +1846,7 @@ export interface ReportTemplateInput {
   personnel?: ReportPerson[];
   cvss_enabled?: boolean;
   remark?: string;
+  docx_path?: string;
 }
 
 // ReportSettings 是全局单例设置（GET/PATCH /api/report-settings）。

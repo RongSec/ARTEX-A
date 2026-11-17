@@ -60,8 +60,10 @@ export function TemplatePreview(props: {
   projects: { id: number; name: string }[];
   // 对话回合计数：chat 应用补丁后 +1 → 跳过防抖立即重渲。
   chatTick: number;
+  // 工具条右侧追加操作（如「替换模板文件」）。
+  extraActions?: React.ReactNode;
 }) {
-  const { draft, source, setSource, form, setForm, tasks, projects, chatTick } = props;
+  const { draft, source, setSource, form, setForm, tasks, projects, chatTick, extraActions } = props;
 
   const [url, setUrl] = React.useState<string | null>(null);
   // V9-DOCXJS：浏览器渲染通道直接持有 docx 字节交 DocxCanvas。
@@ -259,6 +261,7 @@ export function TemplatePreview(props: {
           <NativeSelectOption value="fast">快速（浏览器）</NativeSelectOption>
         </NativeSelect>
         <div className="ml-auto flex items-center gap-1.5">
+          {extraActions}
           {busy && <Spinner className="size-4" />}
           <Button variant="outline" size="sm" onClick={() => void doRender()} disabled={busy || !targetReady}>
             <RefreshCwIcon /> 预览渲染

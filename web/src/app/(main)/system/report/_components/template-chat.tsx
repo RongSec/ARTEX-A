@@ -27,7 +27,7 @@ import type { ReportTemplateInput, TemplateChatMessage, TemplateChatResponse } f
 export function TemplateChat(props: {
   templateId: number | null; // null=未保存新建，禁用发送
   draft: ReportTemplateInput | null;
-  onApplyTemplate: (t: ReportTemplateInput) => void; // 合并草稿进编辑态（dirty 由父级管）
+  onApplyTemplate: (t: ReportTemplateInput) => void; // 合并结果由父级直接落库
   locale: string;
   // R3：把当前预览数据源带进对话请求——用户说「按现有数据渲染」时服务端用
   // 同一份数据渲染，结果随回复返回。
@@ -97,7 +97,7 @@ export function TemplateChat(props: {
         <SparklesIcon className="text-muted-foreground size-4" />
         <span className="text-sm font-medium">对话调模板</span>
         {disabled && (
-          <span className="text-muted-foreground text-xs">（先保存模板后可用）</span>
+          <span className="text-muted-foreground text-xs">（先新建或选择一个模板）</span>
         )}
       </div>
 
@@ -106,7 +106,7 @@ export function TemplateChat(props: {
           <p className="text-muted-foreground py-6 text-center text-xs">
             用自然语言描述想改的模板设定，例如：把漏洞明细标题改成「发现事项」、正文字体换成宋体、关掉声明章。
             也可以直接说「按现有数据渲染看看效果」——平台会用当前预览数据源渲染一份小样回在这里。
-            改动先进草稿（右侧设置区同步可见），点保存才落库。
+            改动会直接应用到当前模板并保存。
           </p>
         ) : (
           messages.map((m, i) => (
@@ -159,7 +159,7 @@ export function TemplateChat(props: {
           // 默认 min-h-16（≈4行）压掉，让对话区整体更矮、右列免滚动看全。
           rows={1}
           className="max-h-[7.5rem] min-h-8 flex-1"
-          placeholder={disabled ? "模板保存后才能对话调整" : "描述要改的模板设定…（Enter 发送，Shift+Enter 换行）"}
+          placeholder={disabled ? "先新建或选择一个模板" : "描述要改的模板设定…（Enter 发送，Shift+Enter 换行）"}
           value={input}
           disabled={disabled || sending}
           onChange={(e) => setInput(e.target.value)}
