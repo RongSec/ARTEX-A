@@ -18,6 +18,9 @@ const nextConfig = {
   compiler: {
     removeConsole: process.env.NODE_ENV === "production",
   },
+  // 镜像构建可跳过重复的类型检查（SKIP_TSC=1）：tsc --noEmit 在 CI/发布前
+  // 已单独跑过，受限机器上 Next 内联的 tsc 会多花十几分钟。默认不跳过。
+  ...(process.env.SKIP_TSC === "1" ? { typescript: { ignoreBuildErrors: true } } : {}),
   ...(isExport
     ? {
         // 纯静态导出：无 Node 运行时；图片不经优化；每个路由产出 <route>/index.html。

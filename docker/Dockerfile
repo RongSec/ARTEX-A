@@ -23,8 +23,11 @@ WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY web/ ./
+# SKIP_TSC=1：类型检查在 CI/发布前用 `tsc --noEmit` 单独跑；镜像构建不重复
+# 跑一遍（部署机 4C/8G 且负载高时，Next 内联 tsc 会多花 15 分钟）。
 ENV NEXT_EXPORT=1 \
-    NEXT_TELEMETRY_DISABLED=1
+    NEXT_TELEMETRY_DISABLED=1 \
+    SKIP_TSC=1
 RUN npm run build
 
 # ---------- 2. Go 单二进制（内嵌 out/）----------
