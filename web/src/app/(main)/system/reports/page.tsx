@@ -37,6 +37,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import { DocxCanvas } from "@/components/docx-canvas";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -64,10 +65,12 @@ export default function ReportsArchivePage() {
   const [previewId, setPreviewId] = React.useState<number | null>(null);
   const [preview, setPreview] = React.useState<{
     id: number;
-    url: string;
+    url: string | null;
+    // V9-DOCXJS：PDF 失败时的浏览器渲染回退，直接持有 docx 字节。
+    docx: Blob | null;
     report: ReportJob;
     fidelity: "exact" | "approximate";
-    pdf: boolean;
+    kind: "pdf" | "docx";
   } | null>(null);
   const [previewBusy, setPreviewBusy] = React.useState(false);
   const [previewErr, setPreviewErr] = React.useState("");
@@ -123,8 +126,9 @@ export default function ReportsArchivePage() {
     void load();
   }, [load]);
 
-  // 预览：优先 PDF（docx 经 LibreOffice 转换）；失败（如转换 502）回退 HTML
-  // 近似预览。fetch blob（带 JWT），URL.createObjectURL 给 iframe。
+  // 预览：优先 PDF（docx 经 LibreOffice 转换）；失败时拉同一份 docx 交给
+  // DocxCanvas 在浏览器内渲染（V9-DOCXJS，无 Office 依赖）。fetch blob（带
+  // JWT），PDF 走 URL.createObjectURL 给 iframe。
   React.useEffect(() => {
     if (previewId == null) {
       setPreview(null);
@@ -136,34 +140,51 @@ export default function ReportsArchivePage() {
     setPreviewBusy(true);
     setPreviewErr("");
     const report = findReport(tree, previewId) ?? fallbackReport(previewId);
-    const apply = (blob: Blob, fidelity: "exact" | "approximate", pdf: boolean) => {
+    const applyPDF = (blob: Blob, fidelity: "exact" | "approximate") => {
       if (ac.signal.aborted || !mountedRef.current) return;
       const url = URL.createObjectURL(blob);
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
       previewUrlRef.current = url;
-      setPreview({ id: previewId, url, report, fidelity, pdf });
+      setPreview({ id: previewId, url, docx: null, report, fidelity, kind: "pdf" });
     };
+    const applyDocx = (blob: Blob) => {
+      if (ac.signal.aborted || !mountedRef.current) return;
+      if (previewUrlRef.current) {
+        URL.revokeObjectURL(previewUrlRef.current);
+        previewUrlRef.current = null;
+      }
+      setPreview({ id: previewId, url: null, docx: blob, report, fidelity: "approximate", kind: "docx" });
+    };
+    const loadDocx = async (reason?: string) => {
+      try {
+        const blob = await api.reportDocxBlob(previewId, ac.signal);
+        applyDocx(blob);
+        if (reason) toast.warning(`${reason}，已回退浏览器内 docx 渲染`, { duration: 6000 });
+      } catch (e2) {
+        if ((e2 as Error)?.name === "AbortError") return;
+        if (mountedRef.current) setPreviewErr((e2 as Error).message);
+      } finally {
+        if (!ac.signal.aborted && mountedRef.current) setPreviewBusy(false);
+      }
+    };
+    // 能力明确为 false 时不发注定 502 的请求，直接浏览器渲染。
+    if (capability?.pdf === false) {
+      void loadDocx();
+      return () => ac.abort();
+    }
     api
       .reportPreviewPDFBlob(previewId, ac.signal)
-      .then(({ blob, fidelity }) => apply(blob, fidelity, blob.type === "application/pdf"))
+      .then(({ blob, fidelity }) => {
+        applyPDF(blob, fidelity);
+        if (!ac.signal.aborted && mountedRef.current) setPreviewBusy(false);
+      })
       .catch(async (e) => {
         if ((e as Error)?.name === "AbortError") return;
-        // PDF 通道失败 → 回退现有 HTML 预览（版式近似），保证仍能看内容。
-        try {
-          const blob = await api.reportPreviewBlob(previewId, ac.signal);
-          apply(blob, "approximate", false);
-          toast.warning(`PDF 预览不可用，已回退近似预览：${(e as Error).message}`, { duration: 6000 });
-        } catch (e2) {
-          if ((e2 as Error)?.name === "AbortError") return;
-          setPreviewErr((e2 as Error).message);
-        }
-      })
-      .finally(() => {
-        if (!ac.signal.aborted && mountedRef.current) setPreviewBusy(false);
+        await loadDocx(`PDF 预览不可用：${(e as Error).message}`);
       });
     return () => ac.abort();
     // tree 变化（刷新）时重取同一份报告，保持预览最新。
-  }, [previewId, tree]);
+  }, [previewId, tree, capability?.pdf]);
 
   React.useEffect(
     () => () => {
@@ -386,7 +407,7 @@ export default function ReportsArchivePage() {
                 </span>
               )}
               {capability && !capability.pdf && (
-                <span className="ml-2 text-amber-600">未检测到 LibreOffice，预览为近似渲染</span>
+                <span className="ml-2 text-amber-600">未检测到 LibreOffice，预览改用浏览器内 docx 渲染</span>
               )}
             </div>
             <div className="flex items-center gap-2">
@@ -430,12 +451,16 @@ export default function ReportsArchivePage() {
                 <Badge
                   variant="outline"
                   className={
-                    preview.fidelity === "exact"
+                    preview.kind === "pdf" && preview.fidelity === "exact"
                       ? "border-emerald-500 text-emerald-600"
                       : "border-amber-400 text-amber-600"
                   }
                 >
-                  {preview.fidelity === "exact" ? "与最终 docx 一致（PDF 渲染）" : "近似预览（未安装 LibreOffice）"}
+                  {preview.kind === "pdf"
+                    ? preview.fidelity === "exact"
+                      ? "与最终 docx 一致（PDF 渲染）"
+                      : "近似预览（PDF 通道降级）"
+                    : "浏览器渲染（同一份 docx，版式近似）"}
                 </Badge>
               )}
             </div>
@@ -464,13 +489,17 @@ export default function ReportsArchivePage() {
                   <Spinner />
                 </div>
               ) : preview ? (
-                preview.pdf ? (
+                preview.kind === "pdf" && preview.url ? (
                   // PDF 由服务端生成（自有产物），直接交浏览器内置阅读器；
                   // 加 sandbox 会挡住 PDF viewer，故此处不沙箱。
                   <iframe title={`报告预览 #${preview.id}`} src={preview.url} className="size-full" />
-                ) : (
-                  <iframe title={`报告预览 #${preview.id}`} src={preview.url} className="size-full" sandbox="allow-same-origin" />
-                )
+                ) : preview.docx ? (
+                  // V9-DOCXJS：浏览器内 docx 渲染（>20MB 时组件内提示改用 PDF）。
+                  <DocxCanvas
+                    source={preview.docx}
+                    onError={(e) => toast.error(`浏览器渲染 docx 失败：${e.message}`)}
+                  />
+                ) : null
               ) : null}
             </div>
           </CardContent>

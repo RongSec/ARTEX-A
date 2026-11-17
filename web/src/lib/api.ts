@@ -1703,6 +1703,72 @@ export const api = {
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) },
       true,
     ),
+  // V9-DOCXJS：浏览器内 docx 预览专用——同 render-draft 接口，但只取 blob
+  // 不触发下载（docx-preview 在前端解析 OOXML → HTML）。
+  renderReportDocxBlob: async (
+    input: ReportDraftInput,
+    signal?: AbortSignal,
+  ): Promise<{ blob: Blob; warning: string }> => {
+    if (MOCK) {
+      return {
+        blob: new Blob([`（demo）docx 预览占位`], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }),
+        warning: "",
+      };
+    }
+    const token = getToken();
+    const r = await fetch(`/api/report/render-draft`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ ...input, format: "docx" }),
+      signal,
+    });
+    if (!r.ok) {
+      let bodyError: unknown;
+      try {
+        const p = (await r.json()) as { error?: unknown };
+        bodyError = p.error;
+      } catch {
+        /* 非 JSON 错误体交给状态码文案 */
+      }
+      throw new Error(previewErrorDetail(r, bodyError, "docx 预览渲染失败"));
+    }
+    const warnRaw = r.headers.get("X-Report-Warning") ?? "";
+    let warning = "";
+    try {
+      warning = warnRaw ? decodeURIComponent(warnRaw) : "";
+    } catch {
+      warning = warnRaw;
+    }
+    return { blob: await r.blob(), warning };
+  },
+  // V9-DOCXJS：报告中心归档预览回退通道——拉已落库 docx 原始字节交给
+  // DocxCanvas（复用已有的 /report/jobs/{id}/download，不新增后端接口）。
+  reportDocxBlob: async (id: number, signal?: AbortSignal): Promise<Blob> => {
+    if (MOCK) {
+      return new Blob([`（demo）报告 #${id} 的 docx 预览占位`], {
+        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      });
+    }
+    const token = getToken();
+    const r = await fetch(`/api/report/jobs/${id}/download`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      signal,
+    });
+    if (!r.ok) {
+      let bodyError: unknown;
+      try {
+        const p = (await r.json()) as { error?: unknown };
+        bodyError = p.error;
+      } catch {
+        /* 非 JSON 错误体交给状态码文案 */
+      }
+      throw new Error(previewErrorDetail(r, bodyError, "报告 docx 下载失败"));
+    }
+    return r.blob();
+  },
   // T21 实时预览专用：render-draft(format=html) 拉 blob（**不触发浏览器下载**），
   // 调用方 URL.createObjectURL → iframe.src。signal 支持 AbortController 取消
   // in-flight（防抖连发时旧请求作废）。X-Report-Warning 同口径回传。

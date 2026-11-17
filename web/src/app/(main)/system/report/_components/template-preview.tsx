@@ -9,8 +9,11 @@
 // 提供「全屏查看」=近全屏 Dialog iframe（Esc/遮罩关）。无需用户先开开关。
 //
 // V9-RPT2：预览改为 **PDF 优先**——服务端把同一次 docx 渲染产物交给
-// LibreOffice 转 PDF，iframe 内嵌即「与最终 docx 一致」。未安装 LibreOffice
-// 时回退现有 HTML 结构预览，并在顶部标注「近似预览（未安装 LibreOffice）」。
+// LibreOffice 转 PDF，iframe 内嵌即「与最终 docx 一致」。
+//
+// V9-DOCXJS：新增「浏览器内 docx 渲染」轻量通道（docx-preview 纯前端解析）。
+// 三选模式：自动（默认，PDF 失败/无能力时回退浏览器）/ 精确（仅 PDF）/
+// 快速（仅浏览器）。回退数据源 = render-draft(format=docx) 的同一份 docx。
 //
 // 数据源三选一（设计 §1.2A/D）：
 //   demo   = 内置样例（后端 fixture 旁路，跳任务取数与伪资产红线）
@@ -26,6 +29,7 @@ import * as React from "react";
 import { DownloadIcon, EyeIcon, MaximizeIcon, RefreshCwIcon } from "lucide-react";
 import { toast } from "sonner";
 
+import { DocxCanvas } from "@/components/docx-canvas";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -35,6 +39,10 @@ import { api } from "@/lib/api";
 import type { PreviewCapability, ReportDraftInput, ReportTemplateInput, Task } from "@/lib/types";
 
 export type PreviewSource = "demo" | "task" | "project";
+
+// V9-DOCXJS：预览通道三选。auto=PDF 优先、失败回退浏览器；exact=仅 PDF；
+// fast=仅浏览器内 docx（不依赖服务端 Office 能力）。
+export type PreviewMode = "auto" | "exact" | "fast";
 
 export interface PreviewDebugForm {
   task_id: string;
@@ -56,11 +64,14 @@ export function TemplatePreview(props: {
   const { draft, source, setSource, form, setForm, tasks, projects, chatTick } = props;
 
   const [url, setUrl] = React.useState<string | null>(null);
+  // V9-DOCXJS：浏览器渲染通道直接持有 docx 字节交 DocxCanvas。
+  const [docxBlob, setDocxBlob] = React.useState<Blob | null>(null);
+  const [kind, setKind] = React.useState<"pdf" | "docx" | null>(null);
+  const [mode, setMode] = React.useState<PreviewMode>("auto");
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState("");
   const [warning, setWarning] = React.useState("");
   const [fidelity, setFidelity] = React.useState<"exact" | "approximate">("approximate");
-  const [isPDF, setIsPDF] = React.useState(false);
   const [capability, setCapability] = React.useState<PreviewCapability | null>(null);
   // V3-R5：右上角「全屏查看」=近全屏 Dialog iframe（默认预览列已全列高，
   // 这里再给一个更大视口；Esc/遮罩关）。
@@ -114,39 +125,66 @@ export function TemplatePreview(props: {
     const ac = new AbortController();
     abortRef.current = ac;
     setBusy(true);
-    const apply = (blob: Blob, warn: string, f: "exact" | "approximate") => {
+    const applyPDF = (blob: Blob, warn: string, f: "exact" | "approximate") => {
       if (!mountedRef.current || ac.signal.aborted) return;
       const next = URL.createObjectURL(blob);
       if (urlRef.current) URL.revokeObjectURL(urlRef.current);
       urlRef.current = next;
       setUrl(next);
+      setDocxBlob(null);
+      setKind("pdf");
       setWarning(warn);
       setFidelity(f);
-      setIsPDF(blob.type === "application/pdf");
+      setErr("");
+    };
+    const applyDocx = (blob: Blob, warn: string) => {
+      if (!mountedRef.current || ac.signal.aborted) return;
+      // 浏览器渲染不占 blob URL：直接交字节给 DocxCanvas。
+      if (urlRef.current) {
+        URL.revokeObjectURL(urlRef.current);
+        urlRef.current = null;
+      }
+      setUrl(null);
+      setDocxBlob(blob);
+      setKind("docx");
+      setWarning(warn);
+      setFidelity("approximate");
       setErr("");
     };
     try {
-      // 能力已知且支持 PDF → PDF 通道；否则直接 HTML（避免一次注定 502 的请求）。
-      if (capability?.pdf !== false) {
-        try {
-          const { blob, warning: warn, fidelity: f } = await api.renderReportPreviewPDF(input, ac.signal);
-          apply(blob, warn, f);
-          return;
-        } catch (e) {
-          if ((e as Error)?.name === "AbortError") return;
-          // 转换失败（502）→ 回退 HTML 结构预览，仍保证有内容可看。
-          toast.warning(`PDF 预览不可用，已回退近似预览：${(e as Error).message}`, { duration: 6000 });
+      // fast=直接浏览器渲染；auto/exact 先走 PDF（能力明确为 false 时跳过）。
+      if (mode !== "fast") {
+        if (capability?.pdf === false) {
+          if (mode === "exact") {
+            setErr("未检测到 PDF 渲染能力（LibreOffice），请切换到「快速（浏览器）」预览。");
+            return;
+          }
+        } else {
+          try {
+            const { blob, warning: warn, fidelity: f } = await api.renderReportPreviewPDF(input, ac.signal);
+            applyPDF(blob, warn, f);
+            return;
+          } catch (e) {
+            if ((e as Error)?.name === "AbortError") return;
+            // 精确模式只认 PDF，失败如实报错；自动模式回退浏览器渲染。
+            if (mode === "exact") {
+              if (mountedRef.current) setErr((e as Error).message);
+              return;
+            }
+            toast.warning(`PDF 预览不可用，已回退浏览器渲染：${(e as Error).message}`, { duration: 6000 });
+          }
         }
       }
-      const { blob, warning: warn } = await api.renderReportPreview(input, ac.signal);
-      apply(blob, warn, "approximate");
+      // 浏览器渲染：同一份 docx（render-draft format=docx），纯前端解析。
+      const { blob, warning: warn } = await api.renderReportDocxBlob(input, ac.signal);
+      applyDocx(blob, warn);
     } catch (e) {
       if ((e as Error)?.name === "AbortError") return;
       if (mountedRef.current) setErr((e as Error).message);
     } finally {
       if (mountedRef.current && abortRef.current === ac) setBusy(false);
     }
-  }, [buildInput, capability?.pdf]);
+  }, [buildInput, capability?.pdf, mode]);
 
   // 编辑/切源/对话回合 → 800ms 防抖重渲；目标没选就不发（保留上一份内容）。
   React.useEffect(() => {
@@ -209,6 +247,17 @@ export function TemplatePreview(props: {
             ))}
           </NativeSelect>
         )}
+        {/* V9-DOCXJS：预览通道三选（默认自动=PDF 优先，失败回退浏览器）。 */}
+        <NativeSelect
+          className="w-36"
+          value={mode}
+          onChange={(e) => setMode(e.target.value as PreviewMode)}
+          aria-label="预览模式"
+        >
+          <NativeSelectOption value="auto">自动</NativeSelectOption>
+          <NativeSelectOption value="exact">精确（PDF）</NativeSelectOption>
+          <NativeSelectOption value="fast">快速（浏览器）</NativeSelectOption>
+        </NativeSelect>
         <div className="ml-auto flex items-center gap-1.5">
           {busy && <Spinner className="size-4" />}
           <Button variant="outline" size="sm" onClick={() => void doRender()} disabled={busy || !targetReady}>
@@ -217,8 +266,8 @@ export function TemplatePreview(props: {
           <Button variant="outline" size="sm" onClick={() => void renderDocx()} disabled={!targetReady}>
             <DownloadIcon /> docx 交付预览
           </Button>
-          {/* V3-R5：全屏看渲染产物（blob URL 同一份，无需重渲）。 */}
-          <Button variant="outline" size="sm" onClick={() => setFullscreen(true)} disabled={!url}>
+          {/* V3-R5：全屏看渲染产物（PDF blob URL / docx 字节同一份，无需重渲）。 */}
+          <Button variant="outline" size="sm" onClick={() => setFullscreen(true)} disabled={!url && !docxBlob}>
             <MaximizeIcon /> 全屏查看
           </Button>
         </div>
@@ -233,7 +282,11 @@ export function TemplatePreview(props: {
           variant="outline"
           className={fidelity === "exact" ? "border-emerald-500 text-emerald-600" : "border-amber-400 text-amber-600"}
         >
-          {fidelity === "exact" ? "与最终 docx 一致（PDF 渲染）" : "近似预览（未安装 LibreOffice）"}
+          {fidelity === "exact"
+            ? "与最终 docx 一致（PDF 渲染）"
+            : kind === "docx"
+              ? "浏览器渲染（同一份 docx，版式近似）"
+              : "近似预览"}
         </Badge>
         {warning && (
           <span className="text-amber-600 truncate" title={warning}>
@@ -254,14 +307,15 @@ export function TemplatePreview(props: {
           <div className="text-muted-foreground flex h-full items-center justify-center p-6 text-center text-sm">
             选择任务或项目后自动预览。
           </div>
-        ) : url ? (
-          // PDF 交浏览器内置阅读器（加 sandbox 会挡住 viewer）；HTML 是我们
-          // 自己 Go 端转义过的静态页面（无脚本），保留 sandbox 双保险。
-          isPDF ? (
-            <iframe title="报告预览" src={url} className="size-full" />
-          ) : (
-            <iframe title="报告预览" src={url} className="size-full" sandbox="allow-same-origin" />
-          )
+        ) : kind === "docx" && docxBlob ? (
+          // V9-DOCXJS：纯前端 docx 渲染；失败时组件内提示，不白屏。
+          <DocxCanvas
+            source={docxBlob}
+            onError={(e) => toast.error(`浏览器渲染 docx 失败：${e.message}`)}
+          />
+        ) : kind === "pdf" && url ? (
+          // PDF 交浏览器内置阅读器（加 sandbox 会挡住 viewer）。
+          <iframe title="报告预览" src={url} className="size-full" />
         ) : (
           <div className="flex h-full items-center justify-center">
             <Spinner />
@@ -276,18 +330,15 @@ export function TemplatePreview(props: {
           aria-label="报告预览·全屏"
         >
           <DialogTitle className="text-sm text-muted-foreground">报告预览（全屏）</DialogTitle>
-          {url && isPDF ? (
+          {kind === "docx" && docxBlob ? (
+            <DocxCanvas
+              source={docxBlob}
+              className="min-h-0 flex-1 rounded-md border"
+              onError={(e) => toast.error(`浏览器渲染 docx 失败：${e.message}`)}
+            />
+          ) : kind === "pdf" && url ? (
             <iframe title="报告预览（全屏）" src={url} className="min-h-0 w-full flex-1 rounded-md border bg-white" />
-          ) : (
-            url && (
-              <iframe
-                title="报告预览（全屏）"
-                src={url}
-                className="min-h-0 w-full flex-1 rounded-md border bg-white"
-                sandbox="allow-same-origin"
-              />
-            )
-          )}
+          ) : null}
         </DialogContent>
       </Dialog>
     </div>
