@@ -14,8 +14,8 @@ package server
 //     描式主动清理，零迁移成本）。
 //  2. 手动补渲：POST /api/findings/{id}/evidence/auto-generate（存量 finding
 //     一键补图；query ?step_index=N 只渲单步）。全同步、返回 {steps,rendered}。
-//  3. 开关双层：全局 db setting `packet_shot_enabled`（默认 **false**=零
-//     回归，开=新登记漏洞 enrich 成功即自动出图）+ 手动端点**不受全局闸
+//  3. 开关双层：全局 db setting `packet_shot_enabled`（V9-SHOT 起默认
+//     **true**=报告带报文截图；关=不再自动出图）+ 手动端点**不受全局闸
 //     约束**（显式按钮=显式意图）。
 //
 // 旁路纪律全套（reproEnricherFor 同款）：panic recover、失败只 log 一行、
@@ -37,7 +37,7 @@ import (
 	"github.com/Autumn-27/artex/report/packetshot"
 )
 
-// settingPacketShotEnabled 全局自动截图闸（默认 false=零回归）。
+// settingPacketShotEnabled 全局自动截图闸（V9-SHOT 起默认 true=报告带报文截图）。
 const settingPacketShotEnabled = "packet_shot_enabled"
 
 // packetShotOpts 渲染选项（V3 起默认宽 1400、Scale 1.5、脱敏+行号开、隐藏/
@@ -45,12 +45,52 @@ const settingPacketShotEnabled = "packet_shot_enabled"
 // 覆盖留后续——截图发生在 finding 落库期，与报告模板无绑定，塞 style 里语义
 // 错位；偏差已记交付报告）。
 func (s *Server) packetShotOpts() packetshot.Options {
-	return packetshot.DefaultOptions()
+	o := packetshot.DefaultOptions()
+	// V9-SHOT：改成左右并排后单栏宽度减半，同一 Scale 下字号的相对大小也减半；
+	// 放大到 2.2 使 15cm 插图后正文约 8pt（原 V3 的 1.5 只适合单栏通宽）。
+	o.Scale = 2.2
+	return o
 }
 
-// packetShotEnabled 全局闸（GetBool 缺省 false）。
+// packetShotEnabled 全局闸（GetBool 缺省 true——V9-SHOT 起报告默认带报文
+// 截图；关掉即报告不再带图）。
 func (s *Server) packetShotEnabled() bool {
-	return s.m != nil && s.m.pg != nil && s.m.pg.GetBool(settingPacketShotEnabled, false)
+	return s.m != nil && s.m.pg != nil && s.m.pg.GetBool(settingPacketShotEnabled, true)
+}
+
+// packetShotRenderFn 渲染入口（单测注入点：替换即可断言「无图时触发补渲」，
+// 不必起 DB）。生产恒等于 (*Server).renderPacketShots。
+var packetShotRenderFn = (*Server).renderPacketShots
+
+// ensurePacketShots 报告渲染前的补图通道（V9-SHOT）：对**没有既有截图**且
+// reproduction 里确实带 request/response 的 finding，强制就地渲一遍（force=
+// true 不看全局闸——报告要图是显式意图）。返回**实际出图**的 finding 数。
+// 渲染失败只 log（renderPacketShots 内部已吞），不阻断报告。
+func (s *Server) ensurePacketShots(fs []*db.DBFinding, have map[int64][]report.EvidenceImage) int {
+	n := 0
+	for _, f := range fs {
+		if f == nil || f.ID <= 0 || len(have[f.ID]) > 0 || len(f.Reproduction) == 0 {
+			continue
+		}
+		var rp report.Reproduction
+		if json.Unmarshal(f.Reproduction, &rp) != nil || !reproductionHasPacket(rp) {
+			continue
+		}
+		if packetShotRenderFn(s, f.ID, f.Reproduction, true, nil) > 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// reproductionHasPacket 复现步骤里是否有可渲的报文（请求或响应非空）。
+func reproductionHasPacket(rp report.Reproduction) bool {
+	for _, st := range rp.Steps {
+		if strings.TrimSpace(st.Request) != "" || strings.TrimSpace(st.Response) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // renderPacketShots 是 enricher 续渲入口（回填成功后同协程调用）。
@@ -206,13 +246,13 @@ func (s *Server) findingEvidenceAutoGenerate(w http.ResponseWriter, r *http.Requ
 }
 
 // installPacketShot 一次性 seed 设置键（InsertSettingIfAbsent=仅缺时补显式
-// 'false'，已有值不覆——前端设置页读到确定值）。在 server.New 的 PG 分支
+// 'true'，已有值不覆——前端设置页读到确定值）。在 server.New 的 PG 分支
 // 调用（照 installTerminalHooks）。
 func (s *Server) installPacketShot() {
 	if s.m == nil || s.m.pg == nil {
 		return
 	}
-	if _, err := s.m.pg.InsertSettingIfAbsent(settingPacketShotEnabled, "false"); err != nil {
+	if _, err := s.m.pg.InsertSettingIfAbsent(settingPacketShotEnabled, "true"); err != nil {
 		log.Printf("[packetshot] seed setting: %v", err)
 	}
 }

@@ -340,8 +340,10 @@ export default function SystemSettingsPage() {
               漏洞报文自动截图
             </CardTitle>
             <CardDescription id="packet-shot-enabled-description">
-              默认关闭。开启后，新报告漏洞在复现步骤成功关联流量后，自动为每步 HTTP
-              请求/响应生成报文截图（Burp 式 PNG，凭据类头值自动脱敏），进证据条与报告。
+              默认开启。开启后，新报告漏洞在复现步骤成功关联流量后，自动为每步 HTTP
+              请求/响应生成**左请求、右响应**并排的报文截图（Burp 式 PNG，凭据类头值
+              自动脱敏），进证据条与报告；报告渲染前若漏洞还没有截图，也会当场补渲。
+              <b>关闭后报告不再带报文截图</b>。
               <br />
               <b>依赖流量捕获开启</b>：报文↔流量关联（exchange_id
               回填）只在流量捕获开着、库里有候选报文时产出；关闭捕获时自动通道零行为。
@@ -351,7 +353,7 @@ export default function SystemSettingsPage() {
           </CardHeader>
           <CardContent className="flex items-center justify-between gap-4">
             <Label htmlFor="packet-shot-enabled" className="text-sm font-normal text-muted-foreground">
-              {packetShot ? "已开启 · 新漏洞自动出图（需流量捕获在开）" : "已关闭 · 可逐漏洞手动生成截图"}
+              {packetShot ? "已开启 · 报告带左请求/右响应截图（需流量捕获在开）" : "已关闭 · 报告不再带报文截图"}
             </Label>
             <Switch
               id="packet-shot-enabled"

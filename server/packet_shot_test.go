@@ -87,8 +87,8 @@ func TestPacketShotRoutesRegistered(t *testing.T) {
 	}
 }
 
-// TestPacketShotGateOff 无库环境的闸默认值判定（GetBool 缺省 false=零回归
-// 的静态保证；pg=nil 时 packetShotEnabled 必须 false 且不 panic）。
+// TestPacketShotGateOff 无库环境的闸判定（pg=nil 时 packetShotEnabled 必须
+// false 且不 panic；缺省 true 的落库默认由 seed/设置 API 用例覆盖）。
 func TestPacketShotGateOff(t *testing.T) {
 	s := &Server{m: &Manager{}}
 	if s.packetShotEnabled() {
@@ -106,12 +106,12 @@ func TestPacketShotGateOff(t *testing.T) {
 // 后原样保留；V2 遗留的同 step 双 auto 行（旧 -req-/-resp- 命名）在下次重渲
 // 时被 step 粒度删除谓词一并清掉=存量收敛成单图。
 func TestPacketShotAutoIdempotentAndManualUntouched(t *testing.T) {
-	m, err := NewManager(t.TempDir(), "")
+	dataDir := t.TempDir() // Manager.dir 与断言盘目录必须同一（截图落 m.dir）
+	m, err := NewManager(dataDir, "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	defer m.Close()
-	dataDir := t.TempDir()
 	s := New(context.Background(), m, t.TempDir(), dataDir, t.TempDir())
 
 	task, err := m.pg.CreateTask("t22 desc", "t22 goal", nil, 0, 0)
@@ -128,7 +128,10 @@ func TestPacketShotAutoIdempotentAndManualUntouched(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = m.pg.DeleteFinding(fid) })
 
-	// 1) 闸关（默认）：零行为。
+	// 1) 显式关闸（V9-SHOT 起默认开）：零行为。
+	if err := m.pg.SetSetting(settingPacketShotEnabled, "false"); err != nil {
+		t.Fatal(err)
+	}
 	if n := s.renderPacketShots(fid, repro, false, nil); n != 0 {
 		t.Fatalf("default gate off must render 0, got %d", n)
 	}
@@ -237,12 +240,12 @@ func TestPacketShotAutoIdempotentAndManualUntouched(t *testing.T) {
 // TestPacketShotAutoGenerateHandler 手动端点语义（PG）：无复现步骤→400；
 // 有步骤→200 {steps,rendered} 且落 auto 行；step_index 越界→400。
 func TestPacketShotAutoGenerateHandler(t *testing.T) {
-	m, err := NewManager(t.TempDir(), "")
+	dataDir := t.TempDir() // 同上：截图目录 = Manager.dir
+	m, err := NewManager(dataDir, "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	defer m.Close()
-	dataDir := t.TempDir()
 	s := New(context.Background(), m, t.TempDir(), dataDir, t.TempDir())
 	h := s.Handler()
 	tok, err := signJWT(s.jwtKey)
@@ -302,7 +305,7 @@ func TestPacketShotAutoGenerateHandler(t *testing.T) {
 }
 
 // TestPacketShotSettingSeed installPacketShot 的 if-absent 语义：已有值不覆、
-// 缺时补显式 false、再跑幂等。
+// 缺时补显式 true（V9-SHOT 默认开）、再跑幂等。
 func TestPacketShotSettingSeed(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
@@ -312,22 +315,22 @@ func TestPacketShotSettingSeed(t *testing.T) {
 	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
 	// 清掉可能残留的键（本测试独占该键语义，先置空再验）。
 	_, _ = m.pg.Exec(`DELETE FROM settings WHERE key=$1`, settingPacketShotEnabled)
-	// 1) 缺时 seed=false。
+	// 1) 缺时 seed=true。
 	s.installPacketShot()
-	if v, ok, _ := m.pg.GetSetting(settingPacketShotEnabled); !ok || v != "false" {
-		t.Fatalf("seed must write explicit false, got %q ok=%v", v, ok)
+	if v, ok, _ := m.pg.GetSetting(settingPacketShotEnabled); !ok || v != "true" {
+		t.Fatalf("seed must write explicit true, got %q ok=%v", v, ok)
 	}
-	// 2) 用户已改 true 后再 seed 不覆。
-	if err := m.pg.SetSetting(settingPacketShotEnabled, "true"); err != nil {
+	// 2) 用户已改 false 后再 seed 不覆。
+	if err := m.pg.SetSetting(settingPacketShotEnabled, "false"); err != nil {
 		t.Fatal(err)
 	}
 	s.installPacketShot()
-	if v, _, _ := m.pg.GetSetting(settingPacketShotEnabled); v != "true" {
+	if v, _, _ := m.pg.GetSetting(settingPacketShotEnabled); v != "false" {
 		t.Fatalf("seed must not overwrite user value, got %q", v)
 	}
 	// 3) 幂等。
 	s.installPacketShot()
-	if v, _, _ := m.pg.GetSetting(settingPacketShotEnabled); v != "true" {
+	if v, _, _ := m.pg.GetSetting(settingPacketShotEnabled); v != "false" {
 		t.Fatalf("repeat seed changed it: %q", v)
 	}
 }
@@ -363,9 +366,10 @@ func TestPacketShotSettingsRoundTrip(t *testing.T) {
 		return out
 	}
 
-	// 初始态：seed/默认 false。
-	if v, ok := call(http.MethodGet, "")["packet_shot_enabled"]; !ok || v != false {
-		t.Fatalf("GET must echo packet_shot_enabled=false, got %v ok=%v", v, ok)
+	// 初始态：缺键=默认 true（V9-SHOT）。
+	_, _ = m.pg.Exec(`DELETE FROM settings WHERE key=$1`, settingPacketShotEnabled)
+	if v, ok := call(http.MethodGet, "")["packet_shot_enabled"]; !ok || v != true {
+		t.Fatalf("GET must echo packet_shot_enabled=true by default, got %v ok=%v", v, ok)
 	}
 	// PUT true → 响应体回显 true + DB 落值（照 agent_traffic_binding 断言口径）。
 	if v := call(http.MethodPut, `{"packet_shot_enabled":true}`)["packet_shot_enabled"]; v != true {
@@ -382,6 +386,41 @@ func TestPacketShotSettingsRoundTrip(t *testing.T) {
 	call(http.MethodPut, `{"packet_shot_enabled":false}`)
 	if v := call(http.MethodPut, `{"llm_record":false}`)["packet_shot_enabled"]; v != false {
 		t.Fatalf("unrelated partial PUT must keep packet_shot=false, got %v", v)
+	}
+}
+
+// TestEnsurePacketShots 报告渲染前补图（V9-SHOT）：无截图 + 复现有报文 →
+// 触发 renderPacketShots(force=true)；已有截图 / 无报文的 finding 不触发。
+// 用包级注入点替换渲染实现，不需要 DB。
+func TestEnsurePacketShots(t *testing.T) {
+	old := packetShotRenderFn
+	defer func() { packetShotRenderFn = old }()
+	type call struct {
+		fid   int64
+		force bool
+	}
+	var calls []call
+	packetShotRenderFn = func(s *Server, fid int64, repro []byte, force bool, filter []int) int {
+		calls = append(calls, call{fid, force})
+		if filter != nil {
+			t.Errorf("report pre-render must not filter steps, got %v", filter)
+		}
+		return 1
+	}
+
+	fs := []*db.DBFinding{
+		{ID: 1, Reproduction: json.RawMessage(`{"steps":[{"request":"GET /a HTTP/1.1"}]}`)},
+		{ID: 2, Reproduction: json.RawMessage(`{"steps":[{"request":"GET /b HTTP/1.1"}]}`)},
+		{ID: 3, Reproduction: json.RawMessage(`{"steps":[{"proves":"无报文"}]}`)},
+		{ID: 4, Reproduction: nil},
+	}
+	have := map[int64][]report.EvidenceImage{2: {{StepIndex: 1, Path: "/tmp/x.png"}}}
+	n := (&Server{}).ensurePacketShots(fs, have)
+	if n != 1 {
+		t.Fatalf("want 1 finding rendered, got %d", n)
+	}
+	if len(calls) != 1 || calls[0].fid != 1 || !calls[0].force {
+		t.Fatalf("render calls want [{1 true}], got %+v", calls)
 	}
 }
 

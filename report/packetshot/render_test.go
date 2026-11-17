@@ -62,7 +62,7 @@ func TestRenderDefaultOptionsV3(t *testing.T) {
 	}
 }
 
-// TestRenderBothPanels req+resp 同时给=两面板（更高）。
+// TestRenderBothPanels req+resp 同时给=左右并排（总宽不变，高度取两栏较高者）。
 func TestRenderBothPanels(t *testing.T) {
 	one, err := Render(sampleReq, "", DefaultOptions())
 	if err != nil {
@@ -74,8 +74,61 @@ func TestRenderBothPanels(t *testing.T) {
 	}
 	i1, _ := png.Decode(bytes.NewReader(one))
 	i2, _ := png.Decode(bytes.NewReader(two))
-	if i2.Bounds().Dy() <= i1.Bounds().Dy() {
-		t.Fatalf("two panels must be taller: %v vs %v", i1.Bounds(), i2.Bounds())
+	if i1.Bounds().Dx() != i2.Bounds().Dx() {
+		t.Fatalf("both must share canvas width: %v vs %v", i1.Bounds(), i2.Bounds())
+	}
+	if i2.Bounds().Dy() < i1.Bounds().Dy() {
+		t.Fatalf("two-panel canvas shorter than request-only: %v vs %v", i1.Bounds(), i2.Bounds())
+	}
+}
+
+// TestRenderSideBySideLayout V9-SHOT 版式：两栏等宽、中间 8px 分隔、各带深底
+// 白字标题带；左右半区都有非空白内容（不是上下堆叠）。
+func TestRenderSideBySideLayout(t *testing.T) {
+	out, err := Render(sampleReq, sampleResp, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := png.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := img.Bounds()
+	const width, pad, sep = 1400, 15, 8 // pad=10*1.5
+	panelW := (width - 2*pad - sep) / 2
+	if b.Dx() != width {
+		t.Fatalf("canvas width = %d, want %d", b.Dx(), width)
+	}
+	// 标题带：两栏顶部同高深底（R<100），中间分隔带保持白底。
+	for _, x := range []int{pad + 5, pad + panelW + sep + 5} {
+		r, g, bb, _ := img.At(x, pad+5).RGBA()
+		if r>>8 > 100 || g>>8 > 100 || bb>>8 > 100 {
+			t.Fatalf("title band not dark at x=%d: (%d,%d,%d)", x, r>>8, g>>8, bb>>8)
+		}
+	}
+	for y := b.Min.Y + pad; y < b.Dy()-pad; y += 7 {
+		r, g, bb, _ := img.At(pad+panelW+sep/2, y).RGBA()
+		if r>>8 < 240 || g>>8 < 240 || bb>>8 < 240 {
+			t.Fatalf("separator column not blank at y=%d: (%d,%d,%d)", y, r>>8, g>>8, bb>>8)
+		}
+	}
+	// 左右半区各取一片正文区域，必须有非白像素（两栏都画了内容）。
+	nonWhite := func(x0, x1 int) int {
+		n := 0
+		for y := pad + 60; y < b.Dy()-pad-10; y += 3 {
+			for x := x0; x < x1; x += 3 {
+				r, g, bb, _ := img.At(x, y).RGBA()
+				if r>>8 < 245 || g>>8 < 245 || bb>>8 < 245 {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	left := nonWhite(pad, pad+panelW)
+	right := nonWhite(pad+panelW+sep, pad+2*panelW+sep)
+	if left < 50 || right < 50 {
+		t.Fatalf("panel content missing: left=%d right=%d", left, right)
 	}
 }
 

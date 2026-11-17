@@ -33,14 +33,20 @@ ARTEX 报告模板填充器（以用户上传的 docx 为底稿，python-docx）
 """
 import copy
 import json
+import logging
+import os
 import re
 import sys
 from urllib.parse import urlparse
 
 from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
+from docx.shared import Cm, Pt
 from docx.table import Table
 from docx.text.paragraph import Paragraph
+
+logger = logging.getLogger("template_filler")
 
 SEV_LABELS = {
     "critical": "严重", "high": "高危", "medium": "中危", "low": "低危",
@@ -472,6 +478,44 @@ def _take_vuln_prototypes(doc):
     return None, None
 
 
+# 证据图规格（V9-SHOT）：按 15cm 宽插入，高度自适应；说明文字五号居中。
+IMAGE_WIDTH_CM = 15
+CAPTION_SIZE_PT = 10.5  # 五号
+
+
+def _append_images(cell, images):
+    """在单元格（漏洞证明）末尾按 images 顺序插图 + 图注。
+
+    doc.add_picture 只能挂段落级；单元格里改用 `cell.add_paragraph()` 新建
+    段落再 `run.add_picture(path, width=Cm(15))`。路径缺失/损坏只记 warning
+    并跳过（报告不该因为一张图 500）。返回实际插入张数。
+    """
+    added = 0
+    for img in images or []:
+        if not isinstance(img, dict):
+            continue
+        path = str(img.get("path") or "").strip()
+        caption = str(img.get("caption") or "").strip()
+        if not path or not os.path.isfile(path):
+            logger.warning("漏洞证明截图缺失，已跳过: %s", path or "(空路径)")
+            continue
+        para = cell.add_paragraph()
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        try:
+            para.add_run().add_picture(path, width=Cm(IMAGE_WIDTH_CM))
+        except Exception as exc:  # 损坏/非图片文件：跳过，不阻断
+            logger.warning("漏洞证明截图插入失败，已跳过: %s (%s)", path, exc)
+            para._p.getparent().remove(para._p)
+            continue
+        if caption:
+            cap = cell.add_paragraph()
+            cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = cap.add_run(caption)
+            run.font.size = Pt(CAPTION_SIZE_PT)
+        added += 1
+    return added
+
+
 def _fill_vuln_block(heading_el, table_el, finding, index, doc):
     p = Paragraph(heading_el, doc)
     title = "3.2.{0} {1}【{2}】".format(index + 1, finding.get("name") or "未分类",
@@ -492,6 +536,9 @@ def _fill_vuln_block(heading_el, table_el, finding, index, doc):
         label = (cell.text.split("：", 1)[0] or "").strip()
         if label in values:
             _fill_prefixed_cell(cell, values[label])
+            # 报文截图插在「漏洞证明：」单元格文字之后（V9-SHOT）。
+            if label == "漏洞证明":
+                _append_images(cell, finding.get("images"))
 
 
 def _fill_vuln_blocks(doc, findings):

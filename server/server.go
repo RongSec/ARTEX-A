@@ -275,8 +275,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 任务终态→整项目自动报告钩子（artex-hs T18）。nil 守卫在装配内部，
 		// 钩子本体在 Manager.emitTaskTerminal 判空短路=原版零行为。
 		s.installTerminalHooks()
-		// T22 报文自动截图：一次性 seed 全局闸 packet_shot_enabled（默认关
-		// =零回归；渲染入口在 reproEnricher 续渲 + 手动端点，闸判定在使用侧）。
+		// T22 报文自动截图：一次性 seed 全局闸 packet_shot_enabled（V9-SHOT 起
+		// 默认开=报告带左请求/右响应截图；渲染入口在 reproEnricher 续渲 + 手动
+		// 端点 + 报告渲染前补渲，闸判定在使用侧）。
 		s.installPacketShot()
 		go newScheduler(s).Run(s.ctx) // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
@@ -3466,7 +3467,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"agent_traffic_binding": s.m.pg.GetBool(settingAgentTrafficBinding, false),
 		// T22 报文自动截图全局闸（默认关=零回归；开=新报告漏洞 enrich 成功即
 		// 自动为每步报文出图。手动「生成截图」按钮不受此闸约束）。
-		"packet_shot_enabled":      s.m.pg.GetBool(settingPacketShotEnabled, false),
+		"packet_shot_enabled":      s.m.pg.GetBool(settingPacketShotEnabled, true),
 		"llm_record":               s.m.LLMRecordEnabled(),
 		"web_search_enabled":       on,
 		"web_search_backend":       backend,

@@ -245,5 +245,73 @@ class CoverTitleSemanticsTest(unittest.TestCase):
         self.assertEqual(target, self.SYSTEM_NAME)
 
 
+class FindingImagesTest(unittest.TestCase):
+    """V9-SHOT：漏洞证明单元格里的报文截图注入（顺序/图注/缺图降级）。"""
+
+    @staticmethod
+    def make_png(path, rgb):
+        import struct
+        import zlib
+        w = h = 8
+        raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data +
+                    struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+        png = (b"\x89PNG\r\n\x1a\n" +
+               chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+               chunk(b"IDAT", zlib.compress(raw)) +
+               chunk(b"IEND", b""))
+        with open(path, "wb") as f:
+            f.write(png)
+
+    def test_two_images_into_proof_cells_in_order(self):
+        tmp = tempfile.mkdtemp(prefix="artex-tpl-img-")
+        img1 = os.path.join(tmp, "req_resp_1.png")
+        img2 = os.path.join(tmp, "req_resp_2.png")
+        self.make_png(img1, (200, 40, 40))
+        self.make_png(img2, (40, 120, 200))
+        data = sample_data()
+        data["findings"][0]["images"] = [
+            {"step_index": 1, "path": img1, "caption": "图1 登录请求(左)/响应(右)"}]
+        data["findings"][1]["images"] = [
+            {"step_index": 0, "path": img2, "caption": "图2 搜索回显"}]
+        out = os.path.join(tmp, "out.docx")
+        fill(TPL, data, out)
+
+        # 媒体条目：模板自带 2 张 + 新插 2 张。
+        import zipfile
+        with zipfile.ZipFile(out) as z:
+            media = [n for n in z.namelist() if n.startswith("word/media/") and not n.endswith("/")]
+        with zipfile.ZipFile(TPL) as z:
+            base = [n for n in z.namelist() if n.startswith("word/media/") and not n.endswith("/")]
+        self.assertEqual(len(media), len(base) + 2)
+
+        doc = Document(out)
+        blocks = vuln_block_tables(doc)
+        self.assertEqual(len(blocks), 3)
+        # 图按 finding 各进各的「漏洞证明」单元格，顺序 = images 顺序。
+        for block, needle in ((blocks[0], "图1 登录请求"), (blocks[1], "图2 搜索回显")):
+            proof = block.rows[4].cells[0]
+            self.assertEqual(proof._tc.xml.count("<w:drawing"), 1)
+            self.assertIn(needle, "\n".join(p.text for p in proof.paragraphs))
+        # 没有图的第三条 finding 不带 drawing。
+        self.assertEqual(blocks[2].rows[4].cells[0]._tc.xml.count("<w:drawing"), 0)
+
+    def test_missing_image_is_skipped_with_warning(self):
+        tmp = tempfile.mkdtemp(prefix="artex-tpl-noimg-")
+        data = sample_data()
+        data["findings"][0]["images"] = [
+            {"step_index": 1, "path": os.path.join(tmp, "nope.png"), "caption": "缺失"}]
+        out = os.path.join(tmp, "out.docx")
+        with self.assertLogs("template_filler", level="WARNING"):
+            fill(TPL, data, out)  # 不抛异常
+        doc = Document(out)
+        blocks = vuln_block_tables(doc)
+        self.assertEqual(len(blocks), 3)
+        self.assertEqual(blocks[0].rows[4].cells[0]._tc.xml.count("<w:drawing"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

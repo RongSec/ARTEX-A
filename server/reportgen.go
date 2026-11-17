@@ -1247,6 +1247,13 @@ func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.
 	// 合并小节只取「胜者 finding」的图；去重键相同=同一复现，截图通常同源，
 	// 败者分散截图不并入（可接受边界，见 server 报告）。
 	imagesByFinding := s.loadEvidenceImages(fs)
+	// 3.4) V9-SHOT：没有截图但复现有报文的 finding，报告渲染前就地补渲一
+	// 张「左请求/右响应」合成图并落库（复用 renderPacketShots，force=true）。
+	// 失败只 warning（renderPacketShots 内部吞异常），报告照常出。
+	if n := s.ensurePacketShots(fs, imagesByFinding); n > 0 {
+		log.Printf("[reportgen] 补渲报文截图 %d 条 finding（报告 %v）", n, job.ID)
+		imagesByFinding = s.loadEvidenceImages(fs)
+	}
 	for i := range merged {
 		merged[i].Images = imagesByFinding[merged[i].FindingID]
 	}

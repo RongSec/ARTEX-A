@@ -70,6 +70,8 @@ var (
 	colLit     = color.NRGBA{130, 80, 223, 255} // 布尔/null 紫
 	colHdrName = color.NRGBA{9, 105, 218, 255}
 	colWhite   = color.NRGBA{255, 255, 255, 255}
+	// colBandTitle 栏顶「请求/响应」标题带底色（深底白字，两栏同色）。
+	colBandTitle = color.NRGBA{36, 41, 46, 255}
 )
 
 // 徽标底色（按 method 首字母 / 状态码首位）。
@@ -184,8 +186,18 @@ type panelRow struct {
 
 // ---------- 排版 + 绘制主流程 ----------
 
-// Render 把一段报文（请求或响应原文；两者都给=请求在上、响应在下两面板）渲染
-// 成 PNG 字节。脱敏先于排版（截图安全底线）；空输入报错。
+// panelData 一栏（请求或响应）的排版结果与角色。
+type panelData struct {
+	rows []panelRow
+	resp bool
+}
+
+// Render 把一段报文（请求或响应原文；两者都给=**左请求、右响应**两栏并排）
+// 渲染成 PNG 字节。脱敏先于排版（截图安全底线）；空输入报错。
+//
+// 版式：整体宽 opt.Width，两栏等宽、中间 8px 分隔，各栏顶部一条深底白字
+// 标题带（「请求」/「响应」；无 CJK 字体时降级为 REQUEST/RESPONSE）。按
+// 15cm 插入报告后高度自适应：文字按栏宽折行，不跨栏溢出。
 func Render(req, resp string, opt Options) ([]byte, error) {
 	s := opt.Scale
 	if s <= 0 {
@@ -196,12 +208,12 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 		width = 980
 	}
 
-	var panels [][]panelRow
+	var panels []panelData
 	if strings.TrimSpace(req) != "" {
-		panels = append(panels, buildPanel(req, opt))
+		panels = append(panels, panelData{rows: buildPanel(req, opt)})
 	}
 	if strings.TrimSpace(resp) != "" {
-		panels = append(panels, buildPanel(resp, opt))
+		panels = append(panels, panelData{rows: buildPanel(resp, opt), resp: true})
 	}
 	if len(panels) == 0 {
 		return nil, fmt.Errorf("packetshot: 空报文")
@@ -217,31 +229,66 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 	}
 
 	lineH := int(monoFace.Metrics().Height.Ceil()) + int(3*s)
-	titleH := lineH + int(10*s)
+	bandH := lineH + int(8*s) // 栏顶标题带（深底白字）
 	pad := int(10 * s)
-	gap := int(14 * s)
+	const sep = 8 // 两栏间分隔宽度（px，不随 Scale 放大——版面锚点）
 
-	total := pad + gap*(len(panels)-1)
-	for _, rows := range panels {
-		total += titleH + len(rows)*lineH + pad*2
+	// 栏宽：两栏等宽、扣掉分隔；单栏占满。maxW=栏内可用文字宽（折行用）。
+	panelW := width - 2*pad
+	if len(panels) == 2 {
+		panelW = (width - 2*pad - sep) / 2
 	}
+	if panelW < 80 {
+		panelW = 80
+	}
+	maxW := panelW - 2*pad
+	if maxW < 20 {
+		maxW = 20
+	}
+	maxH := 0
+	for i := range panels {
+		panels[i].rows = wrapPanelRows(panels[i].rows, maxW, s, monoFace, cjkFace, fs.cjkOK)
+		h := bandH + len(panels[i].rows)*lineH + pad*2
+		if h > maxH {
+			maxH = h
+		}
+	}
+	total := pad + maxH + pad
 
 	img := image.NewNRGBA(image.Rect(0, 0, width, total))
 	draw.Draw(img, img.Bounds(), &image.Uniform{colBG}, image.Point{}, draw.Src)
 
-	y := pad
 	asc := int(monoFace.Metrics().Ascent.Ceil())
-	for _, rows := range panels {
-		h := titleH + len(rows)*lineH + pad*2
-		// 卡片底 + 边框。
-		draw.Draw(img, image.Rect(0, y, width, y+h), &image.Uniform{colCard}, image.Point{}, draw.Src)
-		strokeRect(img, image.Rect(0, y, width-1, y+h-1), colBorder)
-		// 标题带。
-		draw.Draw(img, image.Rect(1, y+1, width-1, y+titleH), &image.Uniform{colBand}, image.Point{}, draw.Src)
+	for i, p := range panels {
+		rows := p.rows
+		x0 := pad + i*(panelW+sep)
+		y := pad
+		h := bandH + len(rows)*lineH + pad*2
+		// 卡片底 + 标题带（深底）+ 边框。
+		draw.Draw(img, image.Rect(x0, y, x0+panelW, y+h), &image.Uniform{colCard}, image.Point{}, draw.Src)
+		draw.Draw(img, image.Rect(x0, y, x0+panelW, y+bandH), &image.Uniform{colBandTitle}, image.Point{}, draw.Src)
+		strokeRect(img, image.Rect(x0, y, x0+panelW-1, y+h-1), colBorder)
 
-		ty := y + pad + asc
+		// 标题带文字（居中）：cjk 字体优先，无则英文降级。
+		label := "请求"
+		if p.resp {
+			label = "响应"
+		}
+		labelFace := font.Face(monoFace)
+		if fs.cjkOK && cjkFace != nil {
+			labelFace = cjkFace
+		} else if p.resp {
+			label = "RESPONSE"
+		} else {
+			label = "REQUEST"
+		}
+		lw := textWidth(labelFace, label)
+		bandBase := y + (bandH+asc)/2
+		drawString(img, label, x0+(panelW-lw)/2, bandBase, colWhite, labelFace)
+
+		ty := y + bandH + pad + asc
 		for _, r := range rows {
-			x := pad
+			x := x0 + pad
 			switch r.kind {
 			case rowTitle:
 				badge := r.name // REQ / 2xx 等
@@ -299,7 +346,6 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 			}
 			ty += lineH
 		}
-		y += h + gap
 	}
 
 	var buf bytes.Buffer
@@ -307,6 +353,86 @@ func Render(req, resp string, opt Options) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// wrapPanelRows 按栏内可用宽度把每行折成若干物理行（并排半栏后必须折行，
+// 否则右栏文字会盖到左栏）。续行不带行号/头名（保原文可读）；行号只在首行。
+func wrapPanelRows(rows []panelRow, maxW int, s float64, mono, cjk font.Face, cjkOK bool) []panelRow {
+	out := make([]panelRow, 0, len(rows))
+	for _, r := range rows {
+		switch r.kind {
+		case rowTitle:
+			badgeW := 0
+			if r.name != "" {
+				badgeW = textWidth(mono, r.name) + int(10*s) + int(8*s)
+			}
+			chunks := splitToWidth(r.text, max(1, maxW-badgeW), mono, cjk, cjkOK)
+			out = append(out, panelRow{kind: rowTitle, name: r.name, text: chunks[0]})
+			for _, c := range chunks[1:] {
+				out = append(out, panelRow{kind: rowText, text: c})
+			}
+		case rowText:
+			prefix := 0
+			if r.name != "" {
+				prefix = textWidth(mono, r.name)
+			}
+			chunks := splitToWidth(r.text, max(1, maxW-prefix), mono, cjk, cjkOK)
+			out = append(out, panelRow{kind: rowText, name: r.name, text: chunks[0], mosaic: r.mosaic})
+			for _, c := range chunks[1:] {
+				out = append(out, panelRow{kind: rowText, text: c})
+			}
+		case rowJSON, rowCode:
+			prefix := 0
+			if r.num > 0 {
+				prefix = textWidth(mono, fmt.Sprintf("%4d ", r.num))
+			}
+			chunks := splitToWidth(r.text, max(1, maxW-prefix), mono, cjk, cjkOK)
+			out = append(out, panelRow{kind: r.kind, num: r.num, text: chunks[0], mosaic: r.mosaic})
+			for _, c := range chunks[1:] {
+				out = append(out, panelRow{kind: r.kind, text: c})
+			}
+		default:
+			for _, c := range splitToWidth(r.text, maxW, mono, cjk, cjkOK) {
+				out = append(out, panelRow{kind: r.kind, text: c})
+			}
+		}
+	}
+	return out
+}
+
+// splitToWidth 贪心按宽度折行（逐 rune 量宽：ASCII 走 mono，非 ASCII 走 cjk；
+// 未探测到 CJK 时先 degradeText 再按 mono 量）。单 rune 超宽时独占一行。
+func splitToWidth(s string, maxW int, mono, cjk font.Face, cjkOK bool) []string {
+	if maxW <= 0 {
+		return []string{s}
+	}
+	if !cjkOK || cjk == nil {
+		s = degradeText(s, false)
+	}
+	out := make([]string, 0, 1)
+	cur := make([]rune, 0, len(s))
+	w := 0
+	for _, r := range s {
+		f := mono
+		if r > 127 && cjkOK && cjk != nil {
+			f = cjk
+		}
+		rw := int(font.MeasureString(f, string(r)).Round())
+		if len(cur) > 0 && w+rw > maxW {
+			out = append(out, string(cur))
+			cur = cur[:0]
+			w = 0
+		}
+		cur = append(cur, r)
+		w += rw
+	}
+	if len(cur) > 0 {
+		out = append(out, string(cur))
+	}
+	if len(out) == 0 {
+		out = []string{""}
+	}
+	return out
 }
 
 // buildPanel 一段报文 → 行序列（脱敏管线在此）。
