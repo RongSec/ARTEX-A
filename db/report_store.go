@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -201,6 +202,80 @@ func nonEmptyJSON(raw []byte, def string) []byte {
 	return raw
 }
 
+// styleNumericKeys 是样式表里必须是数字的键；字符串键与布尔键分开处理。
+// 键名与 report/pybuilder/report_builder.py 的 DEFAULTS 一一对应，两边
+// 必须同时改（Python 侧 _sanitize_style 是运行时兜底，这里是落库前收口）。
+var styleNumericKeys = map[string]bool{
+	"body_size": true, "h1_size": true, "h2_size": true, "vuln_size": true,
+	"label_size": true, "table_size": true, "code_size": true,
+	"line_spacing": true, "proof_gap_paragraphs": true,
+}
+
+var styleBoolKeys = map[string]bool{"first_line_indent": true}
+
+var styleStringKeys = map[string]bool{
+	"body_font": true, "west_font": true, "head_font": true, "code_font": true,
+	"proof_label": true, "table_style": true, "code_bg": true, "proves_label": true,
+}
+
+// SanitizeStyleJSON 把模板样式表收敛成"只含有效键值"的对象。
+//
+// 背景：模板编辑器的输入框被清空时会提交 `""`，这些键直接覆盖 Python 侧
+// DEFAULTS 后，`Pt("")` 抛 TypeError，整份报告渲染 502（用户实测：导入模板
+// 后预览报"渲染失败"）。纪律与 Python 侧一致：空串/空值=未设置，数字键必须
+// 能解析，布尔键只认真假，未知键丢弃。解析失败时原样返回，交给渲染侧兜底。
+func SanitizeStyleJSON(raw json.RawMessage) json.RawMessage {
+	var in map[string]any
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return raw
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		if v == nil {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			switch {
+			case styleNumericKeys[k]:
+				if f, err := strconv.ParseFloat(s, 64); err == nil {
+					out[k] = f
+				}
+			case styleBoolKeys[k]:
+				switch strings.ToLower(s) {
+				case "1", "true", "yes", "是":
+					out[k] = true
+				case "0", "false", "no", "否":
+					out[k] = false
+				}
+			case styleStringKeys[k]:
+				out[k] = s
+			}
+			continue
+		}
+		switch {
+		case styleNumericKeys[k]:
+			if f, ok := v.(float64); ok {
+				out[k] = f
+			}
+		case styleBoolKeys[k]:
+			if b, ok := v.(bool); ok {
+				out[k] = b
+			}
+		case styleStringKeys[k]:
+			out[k] = v
+		}
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return raw
+	}
+	return json.RawMessage(b)
+}
+
 // normalizeTemplateInput trims whitespace, applies defaults and validates the
 // skeleton. Shared by create/update paths.
 func normalizeTemplateInput(in ReportTemplateInput) (ReportTemplateInput, error) {
@@ -219,6 +294,8 @@ func normalizeTemplateInput(in ReportTemplateInput) (ReportTemplateInput, error)
 	in.Skeleton = NormalizeSkeleton(in.Skeleton)
 	if len(in.Style) == 0 {
 		in.Style = json.RawMessage("{}")
+	} else {
+		in.Style = SanitizeStyleJSON(in.Style)
 	}
 	if len(in.Prompts) == 0 {
 		in.Prompts = json.RawMessage("{}")

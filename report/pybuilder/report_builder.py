@@ -81,13 +81,63 @@ SEV_LABELS = {"critical": "严重", "high": "高危", "medium": "中危", "low":
 # ---------------------------------------------------------------------------
 
 
+_NUMERIC_STYLE_KEYS = {
+    "body_size", "h1_size", "h2_size", "vuln_size", "label_size",
+    "table_size", "code_size", "line_spacing", "proof_gap_paragraphs",
+}
+# 只接受布尔语义的键；空串按"未设置"处理（模板编辑器清空输入框会写 ""）。
+_BOOL_STYLE_KEYS = {"first_line_indent"}
+
+
+def _sanitize_style(raw):
+    """把模板里存的样式表收敛成可用值。
+
+    报告模板编辑器会把未填写的输入框写成空字符串（`body_size: ""`），
+    这些键一旦直接覆盖 DEFAULTS，后面 `Pt("")` 就会抛 TypeError，整份报告
+    渲染 502。这里的纪律：空值=没设置（保留默认），数值键必须能转成数字，
+    布尔键只认真假；未知键丢弃。纯函数，无副作用，便于单测。
+    """
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, val in raw.items():
+        if key not in DEFAULTS:
+            continue
+        if val is None:
+            continue
+        if isinstance(val, str):
+            text = val.strip()
+            if not text:
+                continue
+            if key in _NUMERIC_STYLE_KEYS:
+                try:
+                    out[key] = float(text)
+                except ValueError:
+                    continue
+            elif key in _BOOL_STYLE_KEYS:
+                out[key] = text.lower() in {"1", "true", "yes", "是"}
+            else:
+                out[key] = text
+            continue
+        if key in _NUMERIC_STYLE_KEYS:
+            try:
+                out[key] = float(val)
+            except (TypeError, ValueError):
+                continue
+        elif key in _BOOL_STYLE_KEYS:
+            out[key] = bool(val)
+        elif isinstance(val, (int, float, str)):
+            out[key] = val
+    return out
+
+
 class Builder:
     """渲染上下文：合并后的样式表 + Document。"""
 
     def __init__(self, style_overrides):
         self.s = dict(DEFAULTS)
         if isinstance(style_overrides, dict):
-            self.s.update(style_overrides)
+            self.s.update(_sanitize_style(style_overrides))
         self.doc = Document()
         self._configure_styles()
 
