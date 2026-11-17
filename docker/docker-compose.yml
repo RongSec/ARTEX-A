@@ -32,8 +32,10 @@ services:
       # 仅供镜像内置 HEALTHCHECK 拼 URL（业务端口由 command 的 -addr 决定）。
       ARTEX_LISTEN_ADDR: ${ARTEX_LISTEN_ADDR:-:8787}
     ports:
-      # 宿主机 8801 → 容器内 8787（容器内端口由 ARTEX_LISTEN_ADDR 决定）。
-      - "${ARTEX_HTTP_PORT:-8801}:8787"
+      # 宿主机端口 → 容器内 8787（容器内端口由 ARTEX_LISTEN_ADDR 决定）。
+      # ARTEX_BIND_IP 默认 0.0.0.0；宿主机同名端口已被别的进程占用在
+      # 127.0.0.1 时，可改成网卡 IP（如 192.0.2.10）避让。
+      - "${ARTEX_BIND_IP:-0.0.0.0}:${ARTEX_HTTP_PORT:-8801}:8787"
     volumes:
       # 报告产物 / run.log / jwt.key 等运行数据落在 docker/data。
       - ./data:/app/data
