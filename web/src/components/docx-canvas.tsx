@@ -82,17 +82,27 @@ export function DocxCanvas({ source, className, onError }: DocxCanvasProps) {
     setErr("");
 
     // 窄预览列里把 A4 页按容器宽度等比缩放（zoom 会参与布局，滚动高度正确）。
+    // V9-UI2：先统一归零再量未缩放的页宽，避免 offsetWidth 已带 zoom 时反复
+    // 相除导致缩放值越算越小。
     const fitWidth = () => {
       if (!hostRef.current) return;
-      const first = hostRef.current.querySelector<HTMLElement>("section.docx-view");
+      const pages = Array.from(hostRef.current.querySelectorAll<HTMLElement>("section.docx-view"));
+      const first = pages[0];
       if (!first) return;
-      const pageWidth = first.offsetWidth / (Number(first.style.zoom) || 1);
-      const avail = hostRef.current.clientWidth;
+      for (const page of pages) page.style.zoom = "1";
+      const pageWidth = first.offsetWidth;
+      // 用页面所在容器的内容宽度（wrapper 有 px-2 内边距），否则页会多出
+      // 一个内边距的横向溢出条。
+      const wrap = first.parentElement;
+      const wrapStyle = wrap ? window.getComputedStyle(wrap) : null;
+      const avail = wrap
+        ? wrap.clientWidth -
+          (parseFloat(wrapStyle?.paddingLeft ?? "0") || 0) -
+          (parseFloat(wrapStyle?.paddingRight ?? "0") || 0)
+        : hostRef.current.clientWidth;
       if (!pageWidth || !avail) return;
       const zoom = Math.min(1, avail / pageWidth);
-      for (const page of hostRef.current.querySelectorAll<HTMLElement>("section.docx-view")) {
-        page.style.zoom = String(zoom);
-      }
+      for (const page of pages) page.style.zoom = String(zoom);
     };
 
     void (async () => {
@@ -105,6 +115,9 @@ export function DocxCanvas({ source, className, onError }: DocxCanvasProps) {
           className: "docx-view",
           inWrapper: true,
           breakPages: true,
+          // V9-UI2：保留页宽（A4 版面靠 zoom 等比缩放），表格固定宽度改由
+          // CSS 归一为 100%——只 ignoreWidth 会把页边距留下、正文挤成窄条。
+          ignoreWidth: false,
           ignoreLastRenderedPageBreak: true,
           useBase64URL: false,
         });

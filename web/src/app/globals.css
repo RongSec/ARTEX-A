@@ -282,3 +282,32 @@ html {
     -webkit-print-color-adjust: exact;
   }
 }
+
+/* V9-UI2：浏览器内 docx 预览的宽度归一。
+   docx-preview 按 OOXML 的固定 twip 宽度画表格，窄预览列里会撑出容器；
+   这里对表格/图片做 100% 约束，配合 renderAsync ignoreWidth=true。 */
+.docx-host,
+.docx-host .docx-view-wrapper {
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+.docx-host .docx-view article {
+  width: 100%;
+}
+
+.docx-host .docx-view table {
+  width: 100% !important;
+  max-width: 100% !important;
+  table-layout: auto !important;
+}
+
+.docx-host .docx-view table td,
+.docx-host .docx-view table th {
+  overflow-wrap: anywhere;
+}
+
+.docx-host .docx-view img {
+  max-width: 100% !important;
+  height: auto !important;
+}

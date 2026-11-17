@@ -20,6 +20,7 @@ import {
   FileTextIcon,
   FileUpIcon,
   HistoryIcon,
+  MoreHorizontalIcon,
   PlusIcon,
   RefreshCwIcon,
   SendIcon,
@@ -35,6 +36,12 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
@@ -400,6 +407,38 @@ function ReportTemplatesInner() {
     }
   };
 
+  // V9-UI2：重命名只改 name（PATCH 只提交 name，docx_path/版本号不动、不触发归档）。
+  const [renameTarget, setRenameTarget] = React.useState<ReportTemplate | null>(null);
+  const [renameValue, setRenameValue] = React.useState("");
+  const [renaming, setRenaming] = React.useState(false);
+  const openRename = (t: ReportTemplate) => {
+    setRenameTarget(t);
+    setRenameValue(t.name);
+  };
+  const doRename = async () => {
+    if (!renameTarget) return;
+    const name = renameValue.trim();
+    if (!name) {
+      toast.error("名称不能为空");
+      return;
+    }
+    if (name === renameTarget.name) {
+      setRenameTarget(null);
+      return;
+    }
+    setRenaming(true);
+    try {
+      await api.updateReportTemplate(renameTarget.id, { name });
+      await loadTemplates(true); // 列表 + 选中项名称一起刷新
+      toast.success(`已重命名为「${name}」`);
+      setRenameTarget(null);
+    } catch (e) {
+      toast.error(`重命名失败：${(e as Error).message}`);
+    } finally {
+      setRenaming(false);
+    }
+  };
+
   // ---- 正式生成（建 job→轮询）：对话框确认 ----
   const openGenerate = () => {
     // 默认跟随当前预览上下文；demo 样例不可正式生成→回项目/任务首个。
@@ -556,24 +595,29 @@ function ReportTemplatesInner() {
                               <StarIcon className="size-3.5" />
                             </IconBtn>
                           )}
-                          <IconBtn
-                            title="复制"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void duplicate(t);
-                            }}
-                          >
-                            <CopyIcon className="size-3.5" />
-                          </IconBtn>
-                          <IconBtn
-                            title="删除"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setConfirmDel(t);
-                            }}
-                          >
-                            <Trash2Icon className="size-3.5" />
-                          </IconBtn>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <span
+                                role="button"
+                                tabIndex={-1}
+                                title="更多"
+                                aria-label="更多操作"
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-muted-foreground hover:text-foreground hover:bg-muted inline-flex size-6 items-center justify-center rounded"
+                              >
+                                <MoreHorizontalIcon className="size-4" />
+                              </span>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+                              <DropdownMenuItem onSelect={() => openRename(t)}>重命名</DropdownMenuItem>
+                              <DropdownMenuItem onSelect={() => void duplicate(t)}>
+                                <CopyIcon /> 复制
+                              </DropdownMenuItem>
+                              <DropdownMenuItem variant="destructive" onSelect={() => setConfirmDel(t)}>
+                                <Trash2Icon /> 删除
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                         </span>
                       </button>
                     ))}
@@ -851,6 +895,39 @@ function ReportTemplatesInner() {
             </Button>
             <Button onClick={() => void toSkill()} disabled={toSkillBusy || selectedId == null}>
               {toSkillBusy ? <Spinner /> : null} 再次蒸馏（覆盖同名）
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* V9-UI2：重命名模板（只写 name） */}
+      <Dialog open={renameTarget != null} onOpenChange={(o) => !renaming && !o && setRenameTarget(null)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>重命名模板</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-1.5 py-1">
+            <Label htmlFor="template-rename" className="text-xs">
+              模板名称
+            </Label>
+            <Input
+              id="template-rename"
+              value={renameValue}
+              autoFocus
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void doRename();
+              }}
+              placeholder="请输入模板名称"
+            />
+            <p className="text-muted-foreground text-[11px]">只改名称，模板文件与版本号不变。</p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRenameTarget(null)} disabled={renaming}>
+              取消
+            </Button>
+            <Button onClick={() => void doRename()} disabled={renaming}>
+              {renaming ? <Spinner /> : null} 确定
             </Button>
           </DialogFooter>
         </DialogContent>

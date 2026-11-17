@@ -12,7 +12,7 @@ import { Spinner } from "@/components/ui/spinner";
 export default function LegacyShortCircuitRedirectPage() {
   const router = useRouter();
   React.useEffect(() => {
-    router.replace("/system/intercept");
+    router.replace("/system/intercept?tab=short");
   }, [router]);
   return (
     <div className="text-muted-foreground flex flex-1 items-center justify-center gap-2 p-6 text-sm">
