@@ -869,20 +869,14 @@ func (d *DB) FindingsForReport(taskIDs, ids []int64) ([]*DBFinding, error) {
 	if len(taskIDs) == 0 {
 		return []*DBFinding{}, nil
 	}
-	ph := make([]string, len(taskIDs))
-	args := make([]any, 0, len(taskIDs)+len(ids))
-	for i, id := range taskIDs {
-		ph[i] = fmt.Sprintf("$%d", i+1)
-		args = append(args, id)
-	}
-	where := fmt.Sprintf(`WHERE f.task_id IN (%s)`, strings.Join(ph, ","))
+	// 用 = ANY($n::bigint[]) 而不是逐值展开 IN ($1,$2,...)：库驱动在部分
+	// 环境下无法为展开后的中间参数推断类型，PostgreSQL 直接报
+	// "could not determine data type of parameter $3"（任务级+勾选子集必现）。
+	args := []any{taskIDs}
+	where := `WHERE f.task_id = ANY($1::bigint[])`
 	if len(ids) > 0 {
-		ph2 := make([]string, len(ids))
-		for i, id := range ids {
-			ph2[i] = fmt.Sprintf("$%d", len(args)+i+1)
-			args = append(args, id)
-		}
-		where += fmt.Sprintf(` AND f.id IN (%s)`, strings.Join(ph2, ","))
+		args = append(args, ids)
+		where += ` AND f.id = ANY($2::bigint[])`
 	}
 	q := `SELECT ` + findingDetailCols + `
 		FROM findings f
