@@ -88,6 +88,11 @@ _NUMERIC_STYLE_KEYS = {
 # 只接受布尔语义的键；空串按"未设置"处理（模板编辑器清空输入框会写 ""）。
 _BOOL_STYLE_KEYS = {"first_line_indent"}
 
+# 必须是整数的键：JSON 数字一律解析成 float，直接进 range() 会抛
+# TypeError（"float object cannot be interpreted as an integer"），
+# 所以这几个键单独收敛成 int。
+_INT_STYLE_KEYS = {"proof_gap_paragraphs"}
+
 
 def _sanitize_style(raw):
     """把模板里存的样式表收敛成可用值。
@@ -111,9 +116,10 @@ def _sanitize_style(raw):
                 continue
             if key in _NUMERIC_STYLE_KEYS:
                 try:
-                    out[key] = float(text)
+                    num = float(text)
                 except ValueError:
                     continue
+                out[key] = int(round(num)) if key in _INT_STYLE_KEYS else num
             elif key in _BOOL_STYLE_KEYS:
                 out[key] = text.lower() in {"1", "true", "yes", "是"}
             else:
@@ -121,9 +127,10 @@ def _sanitize_style(raw):
             continue
         if key in _NUMERIC_STYLE_KEYS:
             try:
-                out[key] = float(val)
+                num = float(val)
             except (TypeError, ValueError):
                 continue
+            out[key] = int(round(num)) if key in _INT_STYLE_KEYS else num
         elif key in _BOOL_STYLE_KEYS:
             out[key] = bool(val)
         elif isinstance(val, (int, float, str)):
@@ -240,7 +247,13 @@ class Builder:
         return p
 
     def empty(self, n=1):
-        for _ in range(n):
+        # 防御：样式表里的空段数可能是字符串或 float（JSON 数字解析结果），
+        # range() 只吃 int，这里统一收敛。
+        try:
+            count = int(round(float(n)))
+        except (TypeError, ValueError):
+            count = 0
+        for _ in range(max(0, count)):
             self.doc.add_paragraph()
 
     def page_break(self):
