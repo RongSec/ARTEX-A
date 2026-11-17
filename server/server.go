@@ -885,6 +885,7 @@ func (s *Server) Handler() http.Handler {
 	// 与 settings 同权限：仅需管理员 JWT（requireAuth 统一校验）。
 	mux.HandleFunc("GET /api/system/shortcircuit", s.shortCircuitGet)
 	mux.HandleFunc("PUT /api/system/shortcircuit", s.shortCircuitPut)
+	mux.HandleFunc("PUT /api/system/shortcircuit/rules", s.shortCircuitRulesPut)
 	mux.HandleFunc("POST /api/system/shortcircuit/reset", s.shortCircuitReset)
 	mux.HandleFunc("POST /api/system/restart", s.systemRestart)
 	// 漏洞 IM 推送。渠道是「多实例 + 各自过滤规则」的资源，因此独立成一组
@@ -1059,11 +1060,17 @@ func (s *Server) Handler() http.Handler {
 	// import-skill/{name} 与既有 POST /{id}/set-default 在 Go ServeMux 下
 	// 字面段/通配段交叉冲突（实测 panic），故不注册别名（偏差已报 team-lead）。
 	mux.HandleFunc("POST /api/report-templates/{id}/to-skill", s.reportTemplateToSkill)
-	mux.HandleFunc("GET /api/report-templates/from-skill/{name}", s.reportTemplateFromSkill)
+	// V9-RULE：skill 预览（{id}/skill-preview 与 from-skill/{name} 在 ServeMux
+	// 中互为交叉通配会 panic，故 from-skill 走下方 subtree 分发器）。
+	mux.HandleFunc("GET /api/report-templates/{id}/skill-preview", s.reportTemplateSkillPreview)
+	mux.HandleFunc("GET /api/report-templates/", s.reportTemplatesRootGet)
 	// T20 从文档导入（multipart .docx/.md → LLM 归纳模板草稿，失败回退规则映射）。
 	mux.HandleFunc("POST /api/report-templates/import-docx", s.reportTemplateImportDocx)
 	mux.HandleFunc("GET /api/report-settings", s.reportSettingsGet)
 	mux.HandleFunc("PATCH /api/report-settings", s.reportSettingsPatch)
+	// V9-NAME：/api/report/settings 为同义别名（验收口径；旧路径保留一版兼容）。
+	mux.HandleFunc("GET /api/report/settings", s.reportSettingsGet)
+	mux.HandleFunc("PATCH /api/report/settings", s.reportSettingsPatch)
 	mux.HandleFunc("POST /api/report/generate", s.reportGenerate)
 	mux.HandleFunc("POST /api/report/render-draft", s.reportRenderDraft)
 	mux.HandleFunc("GET /api/report/jobs/{id}", s.reportJobGet)

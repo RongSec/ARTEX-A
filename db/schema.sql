@@ -1748,8 +1748,11 @@ CREATE INDEX IF NOT EXISTS idx_reports_status_time ON reports(status, created_at
 CREATE TABLE IF NOT EXISTS report_settings (
     key            TEXT PRIMARY KEY DEFAULT 'default',  -- 单例哨兵值，恒 'default'
     template_id    BIGINT,                              -- 全局默认报告模板（NULL=回退 is_default 行）
-    default_locale TEXT NOT NULL DEFAULT 'zh-CN'        -- 未显式指定 locale 时的输出语言
+    default_locale TEXT NOT NULL DEFAULT 'zh-CN',       -- 未显式指定 locale 时的输出语言
+    name_template  TEXT NOT NULL DEFAULT ''             -- V9-NAME：报告名占位符模板（空=默认 {system}渗透测试报告-{YYYY-MM-DD}）
 );
+-- V9-NAME：旧库补列（幂等）。
+ALTER TABLE report_settings ADD COLUMN IF NOT EXISTS name_template TEXT NOT NULL DEFAULT '';
 
 -- =====================================================================
 -- Q. 发现证据截图（artex-hs F4，T16(3/3)）：漏洞详情页逐步骤上传的截图

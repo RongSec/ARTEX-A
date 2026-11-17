@@ -811,18 +811,21 @@ func (d *DB) DeleteReport(id int64) (bool, error) {
 // ---------- report_settings（单例） ----------
 
 // ReportSettings is the singleton row in report_settings: the org-wide default
-// template pointer + fallback output locale.
+// template pointer + fallback output locale + report name template.
 type ReportSettings struct {
 	TemplateID    *int64 `json:"template_id,omitempty"`
 	DefaultLocale string `json:"default_locale"`
+	// NameTemplate 是报告名称占位符模板（V9-NAME）；空串=使用默认模板
+	// {system}渗透测试报告-{YYYY-MM-DD}（渲染侧兜底）。
+	NameTemplate string `json:"name_template"`
 }
 
 // GetReportSettings returns the singleton (zero defaults when the row has never
 // been written).
 func (d *DB) GetReportSettings() (*ReportSettings, error) {
 	rs := &ReportSettings{DefaultLocale: "zh-CN"}
-	err := d.QueryRow(`SELECT template_id, default_locale FROM report_settings WHERE key='default'`).
-		Scan(&rs.TemplateID, &rs.DefaultLocale)
+	err := d.QueryRow(`SELECT template_id, default_locale, name_template FROM report_settings WHERE key='default'`).
+		Scan(&rs.TemplateID, &rs.DefaultLocale, &rs.NameTemplate)
 	if err == sql.ErrNoRows {
 		return rs, nil
 	}
@@ -833,8 +836,8 @@ func (d *DB) GetReportSettings() (*ReportSettings, error) {
 }
 
 // SaveReportSettings upserts the singleton. templateID 0 = NULL（回退 is_default
-// 模板解析链）。locale 空值落 'zh-CN'。
-func (d *DB) SaveReportSettings(templateID int64, locale string) (*ReportSettings, error) {
+// 模板解析链）。locale 空值落 'zh-CN'；nameTemplate 原样落库（空串=默认模板）。
+func (d *DB) SaveReportSettings(templateID int64, locale, nameTemplate string) (*ReportSettings, error) {
 	var tid any
 	if templateID > 0 {
 		tid = templateID
@@ -842,12 +845,12 @@ func (d *DB) SaveReportSettings(templateID int64, locale string) (*ReportSetting
 	if strings.TrimSpace(locale) == "" {
 		locale = "zh-CN"
 	}
-	rs := &ReportSettings{DefaultLocale: locale}
+	rs := &ReportSettings{DefaultLocale: locale, NameTemplate: strings.TrimSpace(nameTemplate)}
 	if err := d.QueryRow(`
-INSERT INTO report_settings(key, template_id, default_locale)
-VALUES ('default', $1, $2)
-ON CONFLICT (key) DO UPDATE SET template_id=EXCLUDED.template_id, default_locale=EXCLUDED.default_locale
-RETURNING template_id`, tid, locale).Scan(&rs.TemplateID); err != nil {
+INSERT INTO report_settings(key, template_id, default_locale, name_template)
+VALUES ('default', $1, $2, $3)
+ON CONFLICT (key) DO UPDATE SET template_id=EXCLUDED.template_id, default_locale=EXCLUDED.default_locale, name_template=EXCLUDED.name_template
+RETURNING template_id`, tid, locale, rs.NameTemplate).Scan(&rs.TemplateID); err != nil {
 		return nil, err
 	}
 	return rs, nil

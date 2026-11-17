@@ -368,12 +368,13 @@ func (s *Server) reportSettingsPatch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		TemplateID    *int64  `json:"template_id"`
 		DefaultLocale *string `json:"default_locale"`
+		NameTemplate  *string `json:"name_template"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, "请求格式错误")
 		return
 	}
-	if body.TemplateID == nil && body.DefaultLocale == nil {
+	if body.TemplateID == nil && body.DefaultLocale == nil && body.NameTemplate == nil {
 		writeErr(w, 400, "无可更新字段")
 		return
 	}
@@ -406,7 +407,11 @@ func (s *Server) reportSettingsPatch(w http.ResponseWriter, r *http.Request) {
 	if body.DefaultLocale != nil {
 		locale = strings.TrimSpace(*body.DefaultLocale)
 	}
-	st, err := s.m.pg.SaveReportSettings(tid, locale)
+	nameTemplate := old.NameTemplate
+	if body.NameTemplate != nil {
+		nameTemplate = strings.TrimSpace(*body.NameTemplate)
+	}
+	st, err := s.m.pg.SaveReportSettings(tid, locale, nameTemplate)
 	if err != nil {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
@@ -619,20 +624,19 @@ func (s *Server) renderReportStub(ctx context.Context, job *db.Report) (string, 
 	if err := ctx.Err(); err != nil {
 		return "", "", fmt.Errorf("报告渲染被取消: %w", err)
 	}
-	path, err := s.renderMarkdownArtifact(in, fmt.Sprintf("%d", job.ID), job.CreatedAt)
+	path, err := s.renderMarkdownArtifact(in, job.CreatedAt)
 	return path, warning, err
 }
 
 // renderMarkdownArtifact 把 ReportInput 渲染成 Markdown 落 <dataDir>/reports/
-// （临时文件原子改名）。prefix 拼在交付名前防撞（job 渲染=job id；回退链
-// 附 "-md" 标记）。warning 由调用方保留（回退场景=docx 失败原因）。
-func (s *Server) renderMarkdownArtifact(in *report.ReportInput, prefix string, at time.Time) (string, error) {
+// （临时文件原子改名）。文件名走 V9-NAME 名称模板（渲染后的名称 + .md）。
+func (s *Server) renderMarkdownArtifact(in *report.ReportInput, at time.Time) (string, error) {
 	md := report.MarkdownFromInput(in)
 	dir := filepath.Join(s.m.dir, "reports")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("创建报告目录失败: %w", err)
 	}
-	name := fmt.Sprintf("%s-%s", prefix, report.ReportBaseName(in.Title, at, "md"))
+	name := report.ReportFileName(in.NameTemplate, report.NameDataFromInput(in), at, "md")
 	path := filepath.Join(dir, name)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(md), 0o644); err != nil {
@@ -652,9 +656,8 @@ func (s *Server) renderMarkdownArtifact(in *report.ReportInput, prefix string, a
 //   - format=docx → 组 ReportInput → report.GenerateDocx（pybuilder 子进程）；
 //     渲染失败**不判 job 失败**，回退 Markdown 桩交付、把 docx 失败原因追加进
 //     warning（交付可用性优先；无 python 环境也能拿到报告——验收红线）。
-//     产物名 = <jobID>-<任务名|项目名>-<YYYYMMDD>.<实际ext>（规范⑤交付名
-//     <名称>-<YYYYMMDD>.<ext> 加 job id 防撞前缀；下载端以真实产物后缀命名，
-//     ReportBaseName 防穿越）。
+//     产物名 = <渲染后的名称>.<实际ext>（V9-NAME 名称模板；下载端以真实产物
+//     后缀命名，ReportBaseName 防穿越）。
 func (s *Server) renderReportDispatch(ctx context.Context, job *db.Report) (string, string, error) {
 	in, warning, err := s.buildReportInput(ctx, job)
 	if err != nil {
@@ -664,19 +667,19 @@ func (s *Server) renderReportDispatch(ctx context.Context, job *db.Report) (stri
 		return "", "", fmt.Errorf("报告渲染被取消: %w", err)
 	}
 	if strings.ToLower(strings.TrimSpace(job.Format)) != "docx" {
-		path, err := s.renderMarkdownArtifact(in, fmt.Sprintf("%d", job.ID), job.CreatedAt)
+		path, err := s.renderMarkdownArtifact(in, job.CreatedAt)
 		return path, warning, err
 	}
 	dir := filepath.Join(s.m.dir, "reports")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", warning, fmt.Errorf("创建报告目录失败: %w", err)
 	}
-	// 先写临时名（job 前缀+docx 扩展），成功后原子改名；失败走 md 回退链。
-	path := filepath.Join(dir, fmt.Sprintf("%d-%s", job.ID, report.ReportBaseName(in.Title, job.CreatedAt, "docx")))
+	// 先写临时名，成功后原子改名；失败走 md 回退链。
+	path := filepath.Join(dir, report.ReportFileName(in.NameTemplate, report.NameDataFromInput(in), job.CreatedAt, "docx"))
 	tmp := path + ".tmp"
 	if err := report.GenerateDocx(ctx, in, tmp); err != nil {
 		_ = os.Remove(tmp)
-		mdPath, mdErr := s.renderMarkdownArtifact(in, fmt.Sprintf("%d", job.ID), job.CreatedAt)
+		mdPath, mdErr := s.renderMarkdownArtifact(in, job.CreatedAt)
 		if mdErr != nil {
 			return "", warning, fmt.Errorf("docx 渲染失败: %v；Markdown 回退也失败: %w", err, mdErr)
 		}
@@ -1089,8 +1092,91 @@ func coverTitle(fallback string, targets []string) string {
 	return name + "渗透测试报告"
 }
 
-func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.ReportInput, string, error) {
-	if s.m.pg == nil {
+// reportSystemName 解析 {system}：优先第一个目标的 host（去 scheme/端口/路径）；
+// 否则 task→任务<id>、project→项目<id>。系统名永不为空。
+func reportSystemName(scope string, taskID, projectID int64, targets []string) string {
+	for _, t := range targets {
+		if h := hostOnly(t); h != "" {
+			return h
+		}
+	}
+	switch scope {
+	case db.ReportScopeTask:
+		if taskID > 0 {
+			return fmt.Sprintf("任务%d", taskID)
+		}
+	case db.ReportScopeProject:
+		if projectID > 0 {
+			return fmt.Sprintf("项目%d", projectID)
+		}
+	}
+	return "目标系统"
+}
+
+// hostOnly 从 URL/裸地址里取主机名：去 scheme、端口、路径、query。
+func hostOnly(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.Contains(raw, "://") {
+		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+			return strings.ToLower(u.Hostname())
+		}
+	}
+	if i := strings.IndexAny(raw, "/?#"); i >= 0 {
+		raw = raw[:i]
+	}
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "[") {
+		if j := strings.Index(raw, "]"); j > 0 {
+			return strings.ToLower(raw[1:j])
+		}
+	}
+	// host:port → host（端口段必须全数字）。
+	if strings.Count(raw, ":") == 1 {
+		if i := strings.LastIndex(raw, ":"); i > 0 && isDigits(raw[i+1:]) {
+			raw = raw[:i]
+		}
+	}
+	return strings.ToLower(raw)
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// coverTitleFromSystem 保证封面标题为「系统名+渗透测试报告」，不重复拼接。
+func coverTitleFromSystem(system string) string {
+	name := strings.TrimSpace(system)
+	if name == "" {
+		name = "目标系统"
+	}
+	if strings.HasSuffix(name, "报告") {
+		return name
+	}
+	if strings.HasSuffix(name, "渗透测试") {
+		return name + "报告"
+	}
+	return name + "渗透测试报告"
+}
+
+func firstTaskName(tasks []report.TaskMeta) string {
+	if len(tasks) == 0 {
+		return ""
+	}
+	return tasks[0].DisplayName()
+}
+
+func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.ReportInput, string, error) {	if s.m.pg == nil {
 		return nil, "", errors.New("数据库不可用")
 	}
 	// 1) 来源任务元信息。
@@ -1184,11 +1270,12 @@ func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.
 		warning = "剔除无漏洞证据的目标: " + strings.Join(removed, ", ")
 	}
 
-	// 4.5) 封面标题按模板口径收敛成「<系统名>渗透测试报告」。
-	// 任务 DisplayName 常常是整句任务目标（"对 http://x 上的 Web 应用做授权
-	// 渗透测试：识别…"），直接当 title 会整段顶到封面大标题上（实测 4 行）。
-	// 系统名优先取第一个保留目标的 host，其次退回项目/任务名。
-	title = coverTitle(title, kept)
+	// 4.5) 系统名 + 封面标题。系统名规则（V9-NAME）：能识别资产 host 用 host
+	// （去 scheme/端口/路径）；否则 task 用「任务<id>」、project 用「项目<id>」。
+	// 封面标题恒为「系统名+渗透测试报告」。任务 DisplayName 常是整句目标，
+	// 直接当标题会整段顶到封面。
+	systemName := reportSystemName(job.Scope, valueOr0(job.TaskID), valueOr0(job.ProjectID), kept)
+	title = coverTitleFromSystem(systemName)
 
 	// 5) 模板元信息。
 	var tmpl *db.ReportTemplate
@@ -1212,6 +1299,19 @@ func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.
 		Targets:     kept,
 		Findings:    merged,
 		Personnel:   personnel,
+		SystemName:  systemName,
+		TaskID:      valueOr0(job.TaskID),
+		ProjectID:   valueOr0(job.ProjectID),
+		TaskName:    firstTaskName(tasks),
+	}
+	// 名称模板：settings.name_template（空=渲染侧默认模板）。
+	if st, err := s.m.pg.GetReportSettings(); err == nil && st != nil {
+		in.NameTemplate = st.NameTemplate
+	}
+	if job.Scope == db.ReportScopeProject {
+		if p, err := s.m.pg.GetProject(valueOr0(job.ProjectID)); err == nil && p != nil {
+			in.ProjectName = p.Name
+		}
 	}
 	if tmpl != nil {
 		in.Issuer = tmpl.Issuer
@@ -1402,30 +1502,47 @@ func (s *Server) reportJobDownload(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
-// reportDownloadName 计算交付文件名 <任务名|项目名>-<YYYYMMDD>.<ext>。ext 取
-// 产物文件真实后缀（artpath 扩展名），而非 job.Format：本棒桩即使 format=docx
-// 也产 .md，下载名应如实反映字节内容；T16 docx 实装后产物即 .docx，无需改这里。
-// 任务/项目名解析失败回退「渗透测试报告」。
+// reportDownloadName 计算交付文件名：V9-NAME 名称模板渲染结果 + 产物真实后缀。
+// ext 取产物文件真实后缀（本棒桩即使 format=docx 也产 .md，下载名应如实反映
+// 字节内容）。系统名解析与渲染侧同一规则（host → 任务N/项目N）。
 func (s *Server) reportDownloadName(job *db.Report, artifactPath string) string {
 	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(artifactPath)), ".")
-	title := "渗透测试报告"
+	data := report.ReportNameData{
+		TaskID:    valueOr0(job.TaskID),
+		ProjectID: valueOr0(job.ProjectID),
+	}
+	var hosts []string
 	switch job.Scope {
 	case db.ReportScopeProject:
-		if p, err := s.m.pg.GetProject(valueOr0(job.ProjectID)); err == nil && p != nil && p.Name != "" {
-			title = p.Name
+		if p, err := s.m.pg.GetProject(valueOr0(job.ProjectID)); err == nil && p != nil {
+			data.ProjectName = p.Name
+		}
+		if tasks, err := s.m.pg.ProjectTasks(valueOr0(job.ProjectID)); err == nil {
+			for _, t := range tasks {
+				if hs, err := s.m.pg.Assets().HostsByTask(t.ID); err == nil {
+					hosts = append(hosts, hs...)
+				}
+			}
 		}
 	default:
 		if t, err := s.m.pg.GetTask(valueOr0(job.TaskID)); err == nil && t != nil {
-			if n := taskMetaOf(t).DisplayName(); n != "" {
-				title = n
+			data.TaskName = taskMetaOf(t).DisplayName()
+			if hs, err := s.m.pg.Assets().HostsByTask(t.ID); err == nil {
+				hosts = append(hosts, hs...)
 			}
 		}
 	}
-	day := job.CreatedAt
-	if job.FinishedAt.IsZero() {
-		day = time.Now()
+	data.System = reportSystemName(job.Scope, data.TaskID, data.ProjectID, hosts)
+	data.Title = coverTitleFromSystem(data.System)
+	tmpl := ""
+	if st, err := s.m.pg.GetReportSettings(); err == nil && st != nil {
+		tmpl = st.NameTemplate
 	}
-	return report.ReportBaseName(title, day, ext)
+	at := job.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	return report.ReportFileName(tmpl, data, at, ext)
 }
 
 // reportContentType 按扩展名给下载 MIME（docx/md，T16 交付 zip 预留）。

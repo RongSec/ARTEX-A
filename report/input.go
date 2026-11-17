@@ -86,6 +86,14 @@ type ReportInput struct {
 	Locale      string    `json:"locale"` // 输出语言（入参>模板>zh-CN）
 	GeneratedAt time.Time `json:"generated_at"`
 
+	// V9-NAME：名称模板渲染字段（文件命名/下载名用；pybuilder 忽略）。
+	SystemName   string `json:"system_name,omitempty"`
+	NameTemplate string `json:"name_template,omitempty"`
+	TaskID       int64  `json:"task_id,omitempty"`
+	ProjectID    int64  `json:"project_id,omitempty"`
+	TaskName     string `json:"task_name,omitempty"`
+	ProjectName  string `json:"project_name,omitempty"`
+
 	// 封面/组织元信息（来自模板；模板缺省时为空串/默认值）。
 	Issuer   string `json:"issuer"`
 	LogoPath string `json:"logo_path"`
