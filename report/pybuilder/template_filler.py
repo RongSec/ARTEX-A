@@ -479,7 +479,9 @@ def _take_vuln_prototypes(doc):
 
 
 # 证据图规格（V9-SHOT）：按 15cm 宽插入，高度自适应；说明文字五号居中。
-IMAGE_WIDTH_CM = 15
+IMAGE_WIDTH_CM = 14
+# 单图高度上限：A4 版心高约 23.4cm，留出图注与表格剩余空间。
+IMAGE_MAX_HEIGHT_CM = 19.0
 CAPTION_SIZE_PT = 10.5  # 五号
 
 
@@ -502,7 +504,14 @@ def _append_images(cell, images):
         para = cell.add_paragraph()
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
         try:
-            para.add_run().add_picture(path, width=Cm(IMAGE_WIDTH_CM))
+            pic = para.add_run().add_picture(path, width=Cm(IMAGE_WIDTH_CM))
+            # 超高图（长报文合成图）按高度上限等比回缩：否则 Word/LO 会把图
+            # 塞进一页高度里，视觉上就是"压扁 + 内容挤在一起"。
+            max_h = Cm(IMAGE_MAX_HEIGHT_CM)
+            if pic.height > max_h:
+                ratio = max_h / pic.height
+                pic.height = max_h
+                pic.width = int(pic.width * ratio)
         except Exception as exc:  # 损坏/非图片文件：跳过，不阻断
             logger.warning("漏洞证明截图插入失败，已跳过: %s (%s)", path, exc)
             para._p.getparent().remove(para._p)
