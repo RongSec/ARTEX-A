@@ -50,6 +50,17 @@ def sample_data():
     }
 
 
+def bug_data():
+    """复现实测问题：title 是报告名，system_name 需要从 targets/title 推导。"""
+    return {
+        "title": "demo.example.com 渗透测试报告（样例）",
+        "generated_at": "2026-11-17T10:00:00+08:00",
+        "targets": ["demo.example.com"],
+        "findings": [],
+        "overall": "",
+    }
+
+
 def unique_cells(row):
     seen, out = set(), []
     for cell in row.cells:
@@ -192,6 +203,46 @@ class TemplateFillerTest(unittest.TestCase):
         self.assertEqual([c.text for c in unique_cells(stats.rows[1])], ["0", "0", "0", "0"])
         self.assertTrue(any("本次未发现可复现漏洞" in p.text for p in doc.paragraphs))
         self.assertEqual(vuln_block_tables(doc), [])
+
+
+class CoverTitleSemanticsTest(unittest.TestCase):
+    """封面标题 = 报告名 title；正文/表格的 `xx系统` = 系统名（两者不等价）。"""
+
+    SYSTEM_NAME = "demo.example.com"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.path = os.path.join(tempfile.mkdtemp(prefix="artex-tpl-bug-"), "out.docx")
+        fill(TPL, bug_data(), cls.path)
+        cls.doc = Document(cls.path)
+
+    def test_cover_title_is_title_without_duplicate_report_suffix(self):
+        title = bug_data()["title"]
+        texts = [p.text for p in self.doc.paragraphs]
+        self.assertIn(title, texts)
+        cover = texts[texts.index(title)]
+        self.assertEqual(cover, title)
+        self.assertEqual(cover.count("渗透测试报告"), 1)
+        self.assertNotIn("xx系统", cover)
+
+    def test_body_system_name_has_no_report_suffix(self):
+        p = paragraph_by_contains(self.doc, "为了解")
+        self.assertIsNotNone(p)
+        self.assertIn(self.SYSTEM_NAME + "的安全现状", p.text)
+        self.assertNotIn("渗透测试报告", p.text)
+        self.assertNotIn("（样例）", p.text)
+
+    def test_info_target_equals_system_name(self):
+        target = None
+        for t in self.doc.tables:
+            for row in t.rows:
+                cells = unique_cells(row)
+                if cells and cells[0].text.strip() == "目标":
+                    target = cells[1].text
+                    break
+            if target is not None:
+                break
+        self.assertEqual(target, self.SYSTEM_NAME)
 
 
 if __name__ == "__main__":

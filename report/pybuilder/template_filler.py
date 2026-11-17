@@ -22,7 +22,11 @@ ARTEX 报告模板填充器（以用户上传的 docx 为底稿，python-docx）
   - 总结段落：含 `安全评估后结果为：` 的段落
 
 占位替换纪律：
-  - `xx系统` → data["system_name"]（缺省 title 去报告后缀 → targets[0]）
+  - 封面标题段（首个 Heading 之前的 `^xx系统.*报告$`）**整段**替换为
+    data["title"]；缺省退化为 `system_name + "渗透测试报告"`
+  - 其余 `xx系统` → system_name（system_name → targets[0] → title 去报告/
+    样例/日期后缀 → "目标系统"）。注意 title 是「报告名」，不是「系统名」，
+    二者不可混用，否则封面会重复出现「渗透测试报告」
   - 封面日期段落 → data["generated_at"][:10] 转「YYYY年M月D日」
   - `xx危` 只在漏洞块标题/等级单元格内按实际等级替换（严重/高危/中危/低危）
   - 单独的 `xx` **只在明确单元格/明确 run 内**替换，绝不做全文通配
@@ -31,6 +35,7 @@ import copy
 import json
 import re
 import sys
+from urllib.parse import urlparse
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -160,25 +165,70 @@ def _insert_before(body, anchor, element):
 # 数据归一化
 # ---------------------------------------------------------------------------
 
+def _hostname(url):
+    """从 `http(s)://host/path` 或裸 `host/path` 中取主机名（失败原样返回）。"""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text if "://" in text else "//" + text)
+    return parsed.hostname or text
+
+
+def _target_system_name(target):
+    """targets 元素 → 系统名：字符串直用；对象取 name，再退 url 主机名。"""
+    if isinstance(target, dict):
+        name = str(target.get("name") or "").strip()
+        if name:
+            return name
+        return _hostname(target.get("url") or target.get("domain"))
+    return str(target or "").strip()
+
+
+REPORT_SUFFIXES = ("渗透测试报告", "安全评估报告", "安全检测报告", "报告")
+# title 尾部的样例/示例括注、-YYYYMMDD 与「YYYY年M月D日」式日期。
+TITLE_TAIL_RE = re.compile(r"(?:[-_· ]?\d{8}|[-_· ]?\d{4}年\d{1,2}月\d{1,2}日)$")
+SAMPLE_TAIL_RE = re.compile(r"[（(](?:样例|示例)[)）]$")
+
+
+def _strip_title_suffix(title):
+    """去掉 title 尾部的报告名/样例/日期后缀，得到「系统名」口径。"""
+    text = str(title or "").strip()
+    while True:
+        before = text
+        text = text.rstrip()
+        m = SAMPLE_TAIL_RE.search(text)
+        if m:
+            text = text[: m.start()]
+        else:
+            m = TITLE_TAIL_RE.search(text)
+            if m:
+                text = text[: m.start()]
+            else:
+                for suffix in REPORT_SUFFIXES:
+                    if text.endswith(suffix):
+                        text = text[: -len(suffix)]
+                        break
+        text = text.strip(" -_·")
+        if text == before:
+            return text
+
+
 def _system_name(data):
+    """xx系统占位的值：显式 → targets[0] → title 去后缀 → 目标系统。
+
+    注意 title 是报告名（含「渗透测试报告」「（样例）」），不是系统名；
+    旧实现优先用 title，导致封面与正文出现重复后缀。
+    """
     name = str(data.get("system_name") or "").strip()
     if name:
         return name
-    title = str(data.get("title") or "").strip()
-    for suffix in ("渗透测试报告", "安全评估报告", "安全检测报告", "报告"):
-        if title.endswith(suffix):
-            title = title[: -len(suffix)]
-            break
-    title = title.strip(" -_·")
-    if title:
-        return title
     for t in data.get("targets") or []:
-        if isinstance(t, dict):
-            v = str(t.get("name") or t.get("url") or "").strip()
-        else:
-            v = str(t or "").strip()
-        if v:
-            return v
+        name = _target_system_name(t)
+        if name:
+            return name
+    name = _strip_title_suffix(data.get("title"))
+    if name:
+        return name
     return "目标系统"
 
 
@@ -280,8 +330,26 @@ def _md_to_plain(md):
 # 各区块填充
 # ---------------------------------------------------------------------------
 
+def _fill_cover_title(doc, data, system_name):
+    """封面标题段整段替换为报告名 title（首个 Heading 之前）。
+
+    封面原句 `xx系统渗透测试报告` 中 `xx系统` 是「系统名」占位，而 title 是
+    「报告名」；按占位替换会得到 `系统名渗透测试报告` 与 title 重复。因此这里
+    先按整段覆盖，保留首个 run 的字体/字号/加粗与段落对齐。
+    """
+    title = str(data.get("title") or "").strip()
+    if not title:
+        title = system_name + COVER_TITLE_SUFFIX
+    for p in doc.paragraphs:
+        if p.style.name.startswith("Heading"):
+            break
+        if re.match(r"^xx系统.*报告$", (p.text or "").strip()):
+            _set_para_text(p, title)
+            return
+
+
 def _replace_system_name(doc, system_name):
-    """`xx系统` 是全文统一占位（封面/正文/表格），一次性替换。"""
+    """`xx系统` 是全文统一占位（正文/表格），一次性替换为系统名。"""
     for p in _iter_body_paragraphs(doc):
         for r in p.runs:
             if "xx系统" in r.text:
@@ -466,6 +534,7 @@ def fill(template_path, data, output_path):
     system_name = _system_name(data)
     findings = _findings(data)
 
+    _fill_cover_title(doc, data, system_name)
     _replace_system_name(doc, system_name)
     _fill_cover_date(doc, data.get("generated_at"))
     _fill_info_table(doc, data, system_name)
