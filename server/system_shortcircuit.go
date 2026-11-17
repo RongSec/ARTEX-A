@@ -66,6 +66,10 @@ func (s *Server) shortCircuitGet(w http.ResponseWriter, r *http.Request) {
 		"file_path": path,
 		"loaded_at": loaded.Format(time.RFC3339),
 		"dirty":     guard.ShortCircuitDirty(path),
+		// 旧字段（一版兼容）：老前端/脚本仍可从顶层读取原配置结构。
+		"tools":          cfg.Tools,
+		"platform_paths": cfg.PlatformPaths,
+		"custom_rules":   cfg.CustomRules,
 	})
 }
 
