@@ -24,6 +24,7 @@ import {
   PlusIcon,
   RefreshCwIcon,
   SendIcon,
+  Settings2Icon,
   SparklesIcon,
   StarIcon,
   Trash2Icon,
@@ -52,6 +53,7 @@ import { api } from "@/lib/api";
 import type { ReportJob, ReportSection, ReportTemplate, ReportTemplateInput, Task } from "@/lib/types";
 
 import { TemplateChat } from "./template-chat";
+import { ReportSettingsDialog } from "./report-settings-dialog";
 import { TemplatePreview, type PreviewDebugForm, type PreviewSource } from "./template-preview";
 
 // 章节 key 的展示元数据（顺序=默认骨架序；标题与后端 defaultSectionTitles 一致）。
@@ -143,6 +145,7 @@ function ReportTemplatesInner() {
   const [jobs, setJobs] = React.useState<ReportJob[]>([]);
   const [jobsLoading, setJobsLoading] = React.useState(false);
   const [historyOpen, setHistoryOpen] = React.useState(false);
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
   const pollRef = React.useRef<ReturnType<typeof setInterval> | null>(null);
 
   const selected = React.useMemo(() => templates.find((t) => t.id === selectedId) ?? null, [templates, selectedId]);
@@ -508,6 +511,9 @@ function ReportTemplatesInner() {
               <Button variant="outline" size="sm" onClick={() => setHistoryOpen(true)}>
                 <HistoryIcon /> 生成历史
               </Button>
+              <Button variant="outline" size="sm" onClick={() => setSettingsOpen(true)}>
+                <Settings2Icon /> 报告设置
+              </Button>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
@@ -722,6 +728,13 @@ function ReportTemplatesInner() {
           )}
         </DialogContent>
       </Dialog>
+
+      {/* V9-UI3：报告设置（名称模板） */}
+      <ReportSettingsDialog
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+        onSaved={() => void loadTemplates(true)}
+      />
 
       {/* 正式生成确认 Dialog */}
       <Dialog open={genOpen} onOpenChange={setGenOpen}>

@@ -294,17 +294,26 @@ html {
 
 .docx-host .docx-view article {
   width: 100%;
+  min-width: 0;
 }
 
+/* V9-UI3：docx-preview 会按 OOXML 的 twip 列宽固定 <col>（如 415.3pt），
+   窄预览列里 auto 表格布局撑到内容的 min-content 宽度，把整张表顶出 A4 页。
+   固定表格布局 + 列宽归零后，表格严格吃满页宽，超长内容在单元格内换行。 */
 .docx-host .docx-view table {
   width: 100% !important;
   max-width: 100% !important;
-  table-layout: auto !important;
+  table-layout: fixed !important;
+}
+
+.docx-host .docx-view col {
+  width: auto !important;
 }
 
 .docx-host .docx-view table td,
 .docx-host .docx-view table th {
   overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .docx-host .docx-view img {
