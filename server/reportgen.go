@@ -1054,6 +1054,41 @@ func (s *Server) requestOrigin(r *http.Request) string {
 //     来源任务全保留）；
 //   - 检测目标表：候选地址（任务 Goal/描述抽取 + 任务锚定/资产 host）经
 //     FilterPseudoTargets 伪资产反向校验，剔除项写 warning（用户红线）。
+
+// coverTitle 把报告标题收敛成模板封面的口径：「<系统名>渗透测试报告」。
+//
+// 背景：任务 DisplayName 通常是任务目标整句，直接印上封面会变成四五行大标题。
+// 规则：优先用第一个保留目标的主机名（去掉 scheme/端口/路径），其次退回
+// 传入的项目名或任务名；已有「报告」后缀的不再重复拼接。纯函数，便于单测。
+func coverTitle(fallback string, targets []string) string {
+	name := ""
+	if len(targets) > 0 {
+		raw := strings.TrimSpace(targets[0])
+		if strings.Contains(raw, "://") {
+			raw = hostOfURL(raw)
+		} else if i := strings.IndexAny(raw, "/?#"); i > 0 {
+			raw = raw[:i]
+		}
+		name = strings.TrimSpace(raw)
+	}
+	if name == "" {
+		name = strings.TrimSpace(fallback)
+	}
+	if name == "" {
+		name = "目标系统"
+	}
+	if r := []rune(name); len(r) > 40 {
+		name = string(r[:40])
+	}
+	if strings.HasSuffix(name, "报告") {
+		return name
+	}
+	if strings.HasSuffix(name, "渗透测试") {
+		return name + "报告"
+	}
+	return name + "渗透测试报告"
+}
+
 func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.ReportInput, string, error) {
 	if s.m.pg == nil {
 		return nil, "", errors.New("数据库不可用")
@@ -1148,6 +1183,12 @@ func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.
 	if len(removed) > 0 {
 		warning = "剔除无漏洞证据的目标: " + strings.Join(removed, ", ")
 	}
+
+	// 4.5) 封面标题按模板口径收敛成「<系统名>渗透测试报告」。
+	// 任务 DisplayName 常常是整句任务目标（"对 http://x 上的 Web 应用做授权
+	// 渗透测试：识别…"），直接当 title 会整段顶到封面大标题上（实测 4 行）。
+	// 系统名优先取第一个保留目标的 host，其次退回项目/任务名。
+	title = coverTitle(title, kept)
 
 	// 5) 模板元信息。
 	var tmpl *db.ReportTemplate
