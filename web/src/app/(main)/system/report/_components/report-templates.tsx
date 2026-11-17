@@ -35,6 +35,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
@@ -286,22 +288,76 @@ function ReportTemplatesInner() {
 
   // 蒸馏为 Skill（R4；T20 端点幂等：同哨兵目录覆盖；非哨兵 409 如实报错）。
   const [toSkillBusy, setToSkillBusy] = React.useState(false);
-  const [skillResult, setSkillResult] = React.useState<{ skill_name: string; dir?: string } | null>(null);
+  const [skillResult, setSkillResult] = React.useState<{
+    skill_name: string;
+    dir?: string;
+    checks?: { skill_md: boolean; meta: boolean; size: number };
+  } | null>(null);
   const [skillOpen, setSkillOpen] = React.useState(false);
   const [skillExported, setSkillExported] = React.useState<Record<number, string>>({});
+  // V9-RULE：蒸馏前命名 + SKILL.md 预览。
+  const DISTILL_NAME_RE = /^[a-z0-9][a-z0-9-_]{1,48}$/;
+  const [distillOpen, setDistillOpen] = React.useState(false);
+  const [distillName, setDistillName] = React.useState("");
+  const [distillDisplay, setDistillDisplay] = React.useState("");
+  const [distillErr, setDistillErr] = React.useState("");
+  const [previewBusy, setPreviewBusy] = React.useState(false);
+  const [skillPreview, setSkillPreview] = React.useState<{ content: string; truncated: boolean } | null>(null);
+
+  const openDistill = () => {
+    if (selectedId == null) return;
+    setDistillName(skillExported[selectedId] ?? "");
+    setDistillDisplay(draft?.name ?? "");
+    setDistillErr("");
+    setSkillPreview(null);
+    setDistillOpen(true);
+  };
+
+  const previewDistill = async () => {
+    if (selectedId == null) return;
+    const name = distillName.trim();
+    if (name && !DISTILL_NAME_RE.test(name)) {
+      setDistillErr("名称需以小写字母或数字开头，仅含小写字母/数字/-/_，长度 2-49");
+      return;
+    }
+    setPreviewBusy(true);
+    setDistillErr("");
+    try {
+      const r = await api.reportTemplateSkillPreview(selectedId, {
+        name: name || undefined,
+        display_name: distillDisplay.trim() || undefined,
+      });
+      setSkillPreview({ content: r.content, truncated: r.truncated });
+    } catch (e) {
+      setDistillErr(`预览失败：${(e as Error).message}`);
+    } finally {
+      setPreviewBusy(false);
+    }
+  };
+
   const toSkill = async () => {
     if (selectedId == null) return;
+    const name = distillName.trim();
+    if (name && !DISTILL_NAME_RE.test(name)) {
+      setDistillErr("名称需以小写字母或数字开头，仅含小写字母/数字/-/_，长度 2-49");
+      return;
+    }
     const prior = skillExported[selectedId];
-    if (prior && !window.confirm(`本模板已蒸馏为 Skill「${prior}」，再次蒸馏将覆盖同名 Skill，是否继续？`)) return;
+    if (prior && prior === name && !window.confirm(`本模板已蒸馏为 Skill「${prior}」，再次蒸馏将覆盖同名 Skill，是否继续？`)) return;
     setToSkillBusy(true);
+    setDistillErr("");
     try {
-      const r = await api.reportTemplateToSkill(selectedId);
+      const r = await api.reportTemplateToSkill(selectedId, {
+        name: name || undefined,
+        display_name: distillDisplay.trim() || undefined,
+      });
       setSkillResult(r);
+      setDistillOpen(false);
       setSkillOpen(true);
       setSkillExported((m) => ({ ...m, [selectedId]: r.skill_name }));
       toast.success(`已蒸馏为 Skill：${r.skill_name}`);
     } catch (e) {
-      toast.error(`蒸馏为 Skill 失败：${(e as Error).message}`);
+      setDistillErr(`蒸馏为 Skill 失败：${(e as Error).message}`);
     } finally {
       setToSkillBusy(false);
     }
@@ -418,7 +474,7 @@ function ReportTemplatesInner() {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => void toSkill()}
+                    onClick={openDistill}
                     disabled={selectedId == null || toSkillBusy}
                   >
                     {toSkillBusy ? <Spinner /> : <SendIcon data-icon="inline-start" className="rotate-[-35deg]" />}{" "}
@@ -702,6 +758,67 @@ function ReportTemplatesInner() {
         </DialogContent>
       </Dialog>
 
+      {/* V9-RULE：蒸馏前命名 + 预览 SKILL.md */}
+      <Dialog open={distillOpen} onOpenChange={(o) => !toSkillBusy && setDistillOpen(o)}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>蒸馏为 Skill</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 py-1">
+            <div className="space-y-1.5">
+              <Label htmlFor="distill-name" className="text-xs">
+                Skill 名称
+              </Label>
+              <Input
+                id="distill-name"
+                value={distillName}
+                onChange={(e) => setDistillName(e.target.value)}
+                placeholder="留空自动生成，如 report-mall"
+                className="font-mono text-xs"
+              />
+              <p className="text-muted-foreground text-[11px]">
+                小写字母或数字开头，仅含小写字母/数字/-/_，长度 2-49。
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="distill-display" className="text-xs">
+                显示名（中文名，可选）
+              </Label>
+              <Input
+                id="distill-display"
+                value={distillDisplay}
+                onChange={(e) => setDistillDisplay(e.target.value)}
+                placeholder="如 商城系统渗透测试报告模板"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => void previewDistill()} disabled={previewBusy}>
+                {previewBusy ? <Spinner /> : null} 预览 SKILL.md
+              </Button>
+              {skillPreview ? (
+                <span className="text-muted-foreground text-[11px]">
+                  已预览{skillPreview.truncated ? "（前 2000 字符）" : "全文"}
+                </span>
+              ) : null}
+            </div>
+            {skillPreview ? (
+              <pre className="bg-muted max-h-56 overflow-auto rounded-md p-2 font-mono text-[11px] whitespace-pre-wrap">
+                {skillPreview.content}
+              </pre>
+            ) : null}
+            {distillErr ? <p className="text-destructive text-xs">{distillErr}</p> : null}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDistillOpen(false)} disabled={toSkillBusy}>
+              取消
+            </Button>
+            <Button onClick={() => void toSkill()} disabled={toSkillBusy}>
+              {toSkillBusy ? <Spinner /> : null} 开始蒸馏
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* R4：蒸馏为 Skill 结果（名称 + 磁盘路径 + 再次蒸馏） */}
       <Dialog open={skillOpen} onOpenChange={setSkillOpen}>
         <DialogContent className="sm:max-w-md">
@@ -717,6 +834,13 @@ function ReportTemplatesInner() {
               <span className="text-muted-foreground">存放路径</span>
               <code className="bg-muted block rounded px-1.5 py-0.5 text-xs break-all">{skillResult?.dir}</code>
             </div>
+            {skillResult?.checks ? (
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <Badge variant={skillResult.checks.skill_md ? "secondary" : "destructive"}>SKILL.md</Badge>
+                <Badge variant={skillResult.checks.meta ? "secondary" : "destructive"}>前置元数据</Badge>
+                <Badge variant="outline">{skillResult.checks.size} 字节</Badge>
+              </div>
+            ) : null}
             <p className="text-muted-foreground text-xs">
               该 skill 含 SKILL.md / template.json / manifest.json，可拷贝到其它机器后复用到别处。
             </p>

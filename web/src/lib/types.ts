@@ -988,9 +988,25 @@ export interface ShortCircuitCustomRule {
 export interface ShortCircuitState {
   config: ShortCircuitConfig; // 当前【生效】配置（重启前不会变）
   defaults: ShortCircuitConfig; // 代码内置默认，供「恢复默认」
+  // V9-RULE：内置工具策略 + 平台路径 + 自定义条目合并后的统一规则表
+  // （priority 升序；readonly=true 的内置行只允许切 enabled）。
+  rules?: ShortCircuitRule[];
   file_path: string;
   loaded_at: string;
   dirty: boolean; // 文件内容与生效配置不同 = 需重启
+}
+
+// ShortCircuitRule 是 V9-RULE 统一规则行。
+export interface ShortCircuitRule {
+  id: string;
+  kind: "builtin" | "custom";
+  priority: number;
+  name: string;
+  action: "allow" | "deny" | "ask";
+  pattern: string;
+  description: string;
+  enabled: boolean;
+  readonly: boolean;
 }
 
 // ---- App settings (runtime toggles) ----
@@ -1853,6 +1869,8 @@ export interface ReportTemplateInput {
 export interface ReportSettings {
   template_id?: number | null; // null=回退 is_default 模板
   default_locale: string;
+  // V9-NAME：报告名称占位符模板；空串=默认 {system}渗透测试报告-{YYYY-MM-DD}
+  name_template: string;
 }
 
 // ReportJob 是 reports 行（job+历史一体）。status 状态机

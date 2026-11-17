@@ -100,6 +100,7 @@ import type {
   Settings,
   Severity,
   ShortCircuitConfig,
+  ShortCircuitRule,
   ShortCircuitState,
   SkillCall,
   SkillItem,
@@ -959,6 +960,12 @@ export const api = {
   shortCircuit: () => get<ShortCircuitState>(`/system/shortcircuit`),
   saveShortCircuit: (config: ShortCircuitConfig) =>
     put<{ ok: boolean; need_restart: boolean; file_path: string }>(`/system/shortcircuit`, { config }),
+  // V9-RULE：统一规则表整表保存（内置项只改 enabled，自定义项全字段）。
+  saveShortCircuitRules: (rules: ShortCircuitRule[]) =>
+    put<{ ok: boolean; need_restart: boolean; file_path: string; rules: ShortCircuitRule[] }>(
+      `/system/shortcircuit/rules`,
+      { rules },
+    ),
   resetShortCircuit: () =>
     post<{ ok: boolean; need_restart: boolean; file_path: string }>(`/system/shortcircuit/reset`, {}),
   restartServer: () =>
@@ -1601,8 +1608,11 @@ export const api = {
   deleteReportTemplate: (id: number) => del<{ ok: boolean }>(`/report-templates/${id}`),
   setDefaultReportTemplate: (id: number) => post<{ ok: boolean }>(`/report-templates/${id}/set-default`, {}),
   reportSettings: () => get<ReportSettings>("/report-settings"),
-  patchReportSettings: (input: { template_id?: number | null; default_locale?: string }) =>
-    patch<ReportSettings>("/report-settings", input),
+  patchReportSettings: (input: {
+    template_id?: number | null;
+    default_locale?: string;
+    name_template?: string;
+  }) => patch<ReportSettings>("/report-settings", input),
   // 建 job 异步生成（202 返回 pending 行，前端轮询 reportJob）。
   reportGenerate: (input: ReportGenerateInput) => post<ReportJob>("/report/generate", input),
   reportJob: (id: number) => get<ReportJob>(`/report/jobs/${id}`),
@@ -1859,8 +1869,31 @@ export const api = {
   reportTemplateChat: (id: number, req: TemplateChatRequest) =>
     post<TemplateChatResponse>(`/report-templates/${id}/chat`, req),
   // T20 模板转 skill（幂等：同哨兵目录覆盖，非哨兵 409）。
-  reportTemplateToSkill: (id: number) =>
-    post<{ skill_name: string; dir?: string }>(`/report-templates/${id}/to-skill`, {}),
+  reportTemplateToSkill: (
+    id: number,
+    input?: { name?: string; display_name?: string },
+  ) =>
+    post<{
+      skill_name: string;
+      dir?: string;
+      checks?: { skill_md: boolean; meta: boolean; size: number };
+    }>(`/report-templates/${id}/to-skill`, input ?? {}),
+  // V9-RULE：蒸馏前预览将要写入的 SKILL.md（前 2000 字符，不落盘）。
+  reportTemplateSkillPreview: (
+    id: number,
+    input?: { name?: string; display_name?: string },
+  ) => {
+    const q = new URLSearchParams();
+    if (input?.name) q.set("name", input.name);
+    if (input?.display_name) q.set("display_name", input.display_name);
+    const suffix = q.toString() ? `?${q.toString()}` : "";
+    return get<{
+      skill_name: string;
+      display_name: string;
+      content: string;
+      truncated: boolean;
+    }>(`/report-templates/${id}/skill-preview${suffix}`);
+  },
   // T20 从 skill 读模板预填体（不建模板；前端填进新建表单）。
   reportTemplateFromSkill: (name: string) =>
     get<ReportSkillDraft>(`/report-templates/from-skill/${encodeURIComponent(name)}`),

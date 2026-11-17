@@ -308,3 +308,58 @@ func TestShortCircuitAPICustomRulesNeedRestart(t *testing.T) {
 		t.Fatalf("删除后重载不应再命中: %+v", dec)
 	}
 }
+
+func TestShortCircuitUnifiedRulesMergeAndPut(t *testing.T) {
+	def := guard.Defaults()
+	rules := buildShortCircuitRules(def)
+	if len(rules) == 0 {
+		t.Fatal("rules empty")
+	}
+	for i := 1; i < len(rules); i++ {
+		if rules[i].Priority < rules[i-1].Priority {
+			t.Fatalf("priority not ascending at %d: %d < %d", i, rules[i].Priority, rules[i-1].Priority)
+		}
+	}
+	var denyTool *ShortCircuitRule
+	for i := range rules {
+		r := &rules[i]
+		if r.Kind != "builtin" || !r.Readonly {
+			t.Fatalf("builtin rule not readonly: %+v", r)
+		}
+		if r.Action == "deny" && r.Pattern == "create_mcp" {
+			denyTool = r
+		}
+	}
+	if denyTool == nil {
+		t.Fatal("missing builtin deny create_mcp")
+	}
+
+	// 新建一条自定义 allow 规则 + 关闭 create_mcp。
+	newRules := []ShortCircuitRule{
+		{ID: denyTool.ID, Kind: "builtin", Enabled: false},
+		{
+			ID: "custom:allow_demo", Kind: "custom", Priority: 120, Name: "放行演示",
+			Action: "allow", Pattern: "demo-safe", Description: "演示", Enabled: true,
+		},
+	}
+	cfg, err := applyShortCircuitRules(def, newRules)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if containsString(cfg.Tools.Deny, "create_mcp") {
+		t.Fatal("create_mcp should be disabled")
+	}
+	if len(cfg.CustomRules) != 1 || cfg.CustomRules[0].Action != "allow" {
+		t.Fatalf("custom rules not persisted: %+v", cfg.CustomRules)
+	}
+	merged := buildShortCircuitRules(cfg)
+	foundDisabled := false
+	for _, r := range merged {
+		if r.ID == denyTool.ID && !r.Enabled {
+			foundDisabled = true
+		}
+	}
+	if !foundDisabled {
+		t.Fatal("disabled builtin should be回显 with enabled=false")
+	}
+}

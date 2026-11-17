@@ -49,6 +49,9 @@ type ShortCircuitCustomRule struct {
 	Key string `json:"key"`
 	// Name 是展示名，进 RuleName 与拒绝文案。
 	Name string `json:"name"`
+	// Action 是命中动作：deny（默认）|ask|allow。V9-RULE 起自定义条目与统一
+	// 规则表对齐；空值按 deny（兼容旧配置文件）。
+	Action string `json:"action,omitempty"`
 	// Pattern 是匹配执行面文本的 RE2 正则（一行）。
 	Pattern string `json:"pattern"`
 	// Note 是可选说明，只用于提示，不参与匹配。
@@ -211,6 +214,7 @@ type shortCircuitConfigJSON struct {
 type shortCircuitCustomRuleJSON struct {
 	Key     *string `json:"key"`
 	Name    *string `json:"name"`
+	Action  *string `json:"action"`
 	Pattern *string `json:"pattern"`
 	Note    *string `json:"note"`
 	Enabled *bool   `json:"enabled"`
@@ -271,6 +275,9 @@ func ParseShortCircuitConfig(raw []byte) (ShortCircuitConfig, error) {
 			}
 			if item.Name != nil {
 				rule.Name = *item.Name
+			}
+			if item.Action != nil {
+				rule.Action = *item.Action
 			}
 			if item.Pattern != nil {
 				rule.Pattern = *item.Pattern
@@ -344,6 +351,11 @@ func validateShortCircuitCustomRules(rules []ShortCircuitCustomRule) error {
 		if strings.TrimSpace(rule.Name) == "" {
 			return fmt.Errorf("custom_rules[%d]（key=%s）name 不能为空", i, rule.Key)
 		}
+		switch normalizeCustomAction(rule.Action) {
+		case "deny", "ask", "allow":
+		default:
+			return fmt.Errorf("custom_rules[%d]（key=%s）action %q 非法：只允许 deny/ask/allow", i, rule.Key, rule.Action)
+		}
 		if strings.TrimSpace(rule.Pattern) == "" {
 			return fmt.Errorf("custom_rules[%d]（key=%s）pattern 不能为空", i, rule.Key)
 		}
@@ -377,10 +389,11 @@ type compiledShortCircuit struct {
 // compiledCustomRule 是编译后的自定义条目。key/name/note 原样保留用于
 // RuleName 与拒绝文案；re 是小写化匹配器。
 type compiledCustomRule struct {
-	key   string
-	name  string
-	note  string
-	regex *regexp.Regexp
+	key    string
+	name   string
+	action string
+	note   string
+	regex  *regexp.Regexp
 }
 
 // compileShortCircuitRegexes 编译配置。dataDir 用于生成平台绝对路径档；
@@ -429,10 +442,11 @@ func compileShortCircuitRegexes(cfg ShortCircuitConfig, dataDir string) (compile
 			return out, fmt.Errorf("custom_rules（key=%s）非法正则 %q: %w", rule.Key, rule.Pattern, err)
 		}
 		out.customRules = append(out.customRules, compiledCustomRule{
-			key:   rule.Key,
-			name:  rule.Name,
-			note:  rule.Note,
-			regex: re,
+			key:    rule.Key,
+			name:   rule.Name,
+			action: normalizeCustomAction(rule.Action),
+			note:   rule.Note,
+			regex:  re,
 		})
 	}
 	return out, nil
@@ -502,6 +516,15 @@ func toNameSet(field string, names []string) map[string]bool {
 	return m
 }
 
+// normalizeCustomAction 把空 action 归一为 deny（兼容旧配置/旧前端）。
+func normalizeCustomAction(action string) string {
+	a := strings.ToLower(strings.TrimSpace(action))
+	if a == "" {
+		return "deny"
+	}
+	return a
+}
+
 func normalizeShortCircuitConfig(cfg ShortCircuitConfig) ShortCircuitConfig {
 	trim := func(in []string) []string {
 		out := make([]string, 0, len(in))
@@ -529,6 +552,7 @@ func normalizeShortCircuitConfig(cfg ShortCircuitConfig) ShortCircuitConfig {
 	for _, r := range cfg.CustomRules {
 		r.Key = strings.TrimSpace(r.Key)
 		r.Name = strings.TrimSpace(r.Name)
+		r.Action = normalizeCustomAction(r.Action)
 		r.Pattern = strings.TrimSpace(r.Pattern)
 		r.Note = strings.TrimSpace(r.Note)
 		rules = append(rules, r)

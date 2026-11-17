@@ -990,15 +990,21 @@ func shortCircuit(toolName string, input []byte) *intercept.Decision {
 	// 豁免——它们只写 DB，正文引用被拦命令原文是审计刚需，不算执行。
 	if len(customShortCircuitRules) > 0 && !recordOnlyTools[toolName] {
 		if hit := matchCustomShortCircuitRule(toolName, input); hit != nil {
-			msg := "命中管理员配置的自定义短路条目「" + hit.name + "」（key=" + hit.key + "），按配置直接拒绝。"
+			msg := "命中管理员配置的自定义短路条目「" + hit.name + "」（key=" + hit.key + "），按配置执行 " + hit.action + "。"
 			if hit.note != "" {
 				msg += "说明：" + hit.note
 			}
-			return &intercept.Decision{
-				Action:   "deny",
+			dec := &intercept.Decision{
+				Action:   hit.action,
 				RuleName: "[代码常量] 自定义短路规则：" + hit.name,
 				Message:  msg,
 			}
+			if hit.action == "ask" {
+				dec.TimeoutEnabled = true
+				dec.TimeoutSeconds = 15
+				dec.TimeoutAction = "deny"
+			}
+			return dec
 		}
 	}
 	// 可配置的 ask 档：代码默认已清空（V6-AUTO 自主优先），仅在管理员显式
