@@ -1,5 +1,10 @@
 *.bat text eol=crlf
 *.sh  text eol=lf
+# 镜像构建文件必须 LF（Dockerfile 行尾续行遇 CRLF 会拼错指令）
+docker/Dockerfile text eol=lf
+docker/*.yml text eol=lf
+docker/*.md text eol=lf
+docker/.env.example text eol=lf
 # 随镜像分发的中文字体：二进制，禁止任何换行转换
 *.ttf binary
 *.ttc binary

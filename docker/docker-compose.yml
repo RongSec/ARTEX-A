@@ -1,0 +1,50 @@
+name: artex
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-artex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 docker/.env 设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-artex}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-artex} -d ${POSTGRES_DB:-artex}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  artex:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ${ARTEX_IMAGE:-artex:local}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # 完整 DSN 放 .env（宿主自建 PG 时改成对应地址即可）。
+      ARTEX_PG_DSN: ${ARTEX_PG_DSN:?请在 docker/.env 设置 ARTEX_PG_DSN}
+      # 首次启动自动建管理员密码（用户名固定 ARTEX）；已设置过则忽略。
+      ARTEX_INIT_PASSWORD: ${ARTEX_INIT_PASSWORD:-}
+      # 仅供镜像内置 HEALTHCHECK 拼 URL（业务端口由 command 的 -addr 决定）。
+      ARTEX_LISTEN_ADDR: ${ARTEX_LISTEN_ADDR:-:8787}
+    ports:
+      # 宿主机 8801 → 容器内 8787（容器内端口由 ARTEX_LISTEN_ADDR 决定）。
+      - "${ARTEX_HTTP_PORT:-8801}:8787"
+    volumes:
+      # 报告产物 / run.log / jwt.key 等运行数据落在 docker/data。
+      - ./data:/app/data
+    command:
+      - "-addr"
+      - "${ARTEX_LISTEN_ADDR:-:8787}"
+      - "-data"
+      - "${ARTEX_DATA_DIR:-/app/data}"
+      - "-proxy"
+      - ""
+    restart: unless-stopped
+
+volumes:
+  pgdata:
