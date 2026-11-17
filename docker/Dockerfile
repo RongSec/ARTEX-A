@@ -1,9 +1,10 @@
-# syntax=docker/dockerfile:1
-#
 # V9-DOCKER：自带排版引擎与中文字体的单镜像。
 #   web   → Next 静态导出（web/out）
 #   build → 把 out 嵌进 Go 单二进制（-tags embedui）
 #   final → debian + LibreOffice(Writer) + Noto CJK + Windows 常用中文字体
+#
+# 不声明 `# syntax=` 外部 frontend：部署机 Docker Hub 直连受限，只走
+# daemon.json 的 registry mirror 拉基础镜像，避免额外拉 dockerfile:1。
 #
 # 构建上下文必须是仓库根（本文件在 docker/ 下）：
 #   docker build -f docker/Dockerfile -t artex:local .
