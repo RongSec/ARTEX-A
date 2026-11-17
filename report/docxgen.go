@@ -144,7 +144,7 @@ func GenerateDocx(ctx context.Context, in *ReportInput, outPath string) error {
 		if msg == "" {
 			msg = err.Error()
 		}
-		return fmt.Errorf("python docx 渲染失败: %v: %s", err, truncateUTF8Runes(msg, 600))
+		return fmt.Errorf("python docx 渲染失败: %v: %s", err, tailUTF8Runes(msg, 900))
 	}
 	if fi, err := os.Stat(outPath); err != nil || fi.Size() == 0 {
 		return fmt.Errorf("渲染完成但产物缺失或为空: %s", outPath)
@@ -159,4 +159,17 @@ func truncateUTF8Runes(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
+}
+
+// tailUTF8Runes 保留**尾部** n 个字符。
+//
+// Python traceback 的有效信息在最后：异常类型与消息。旧实现取头部，把真正
+// 的 Traceback 尾巴整个截掉，线上只能看到 "... in build_vuln" 这种无用片段，
+// 排查过一次就无法二次定位。尾部保留 + 前缀省略号，代价是丢掉脚本路径。
+func tailUTF8Runes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return "…" + string(r[len(r)-n:])
 }
