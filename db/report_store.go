@@ -643,15 +643,18 @@ func unmarshalInt64Array(raw []byte) []int64 {
 
 // InsertReport creates a job row in pending state and returns it.
 func (d *DB) InsertReport(scope string, taskID, projectID, templateID int64, locale, format string, findingIDs []int64) (*Report, error) {
-	var tid, pid, tmpl any
+	// 用 sql.NullInt64 而不是 any(nil)：PostgreSQL 无法从无类型 nil 推断
+	// 参数类型，会直接报 "could not determine data type of parameter $3"
+	// （任务级报告 project_id 为空时必现）。
+	var tid, pid, tmpl sql.NullInt64
 	if taskID > 0 {
-		tid = taskID
+		tid = sql.NullInt64{Int64: taskID, Valid: true}
 	}
 	if projectID > 0 {
-		pid = projectID
+		pid = sql.NullInt64{Int64: projectID, Valid: true}
 	}
 	if templateID > 0 {
-		tmpl = templateID
+		tmpl = sql.NullInt64{Int64: templateID, Valid: true}
 	}
 	if locale == "" {
 		locale = "zh-CN"
