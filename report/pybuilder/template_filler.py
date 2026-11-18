@@ -32,6 +32,7 @@ ARTEX 报告模板填充器（以用户上传的 docx 为底稿，python-docx）
   - 单独的 `xx` **只在明确单元格/明确 run 内**替换，绝不做全文通配
 """
 import copy
+import itertools
 import json
 import logging
 import os
@@ -544,13 +545,14 @@ def _lock_table_layout(cell):
         tblW.set(qn("w:w"), str(total))
 
 
-def _add_picture_paragraph(cell, img):
+def _add_picture_paragraph(cell, img, figure_no=0):
     """在单元格末尾插一张图 + 图注，返回可供后续文字继续使用的空段落。
 
     路径缺失/损坏只记 warning 并跳过（报告不因一张图 500）。
     """
     path = str(img.get("path") or "").strip()
-    caption = str(img.get("caption") or "").strip()
+    # 图注统一用全报告递增的「图N」；DB 里的 packet#/步骤号不再透出到报告。
+    caption = "图%d" % figure_no if figure_no > 0 else ""
     if not path or not os.path.isfile(path):
         logger.warning("漏洞证明截图缺失，已跳过: %s", path or "(空路径)")
         return None
@@ -683,7 +685,7 @@ def _add_packet_box(cell, text):
     return cell.add_paragraph()
 
 
-def _fill_proof_cell(cell, finding):
+def _fill_proof_cell(cell, finding, fig):
     """填「漏洞证明」单元格：文字与截图按步骤交错（一步一张图）。
 
     模板该行用「漏洞证明：」+ 空行 run 表达换行，先保留标签 run，再按
@@ -736,17 +738,17 @@ def _fill_proof_cell(cell, finding):
             continue
         if kind == "img":
             for im in by_step.get(int(value), []):
-                nxt = _add_picture_paragraph(cell, im)
+                nxt = _add_picture_paragraph(cell, im, next(fig))
                 if nxt is not None:
                     cur = nxt
     # 漏洞级图（step_index=0）统一补在末尾。
     for im in by_step.get(0, []):
-        nxt = _add_picture_paragraph(cell, im)
+        nxt = _add_picture_paragraph(cell, im, next(fig))
         if nxt is not None:
             cur = nxt
 
 
-def _fill_vuln_block(heading_el, table_el, finding, index, doc):
+def _fill_vuln_block(heading_el, table_el, finding, index, doc, fig):
     p = Paragraph(heading_el, doc)
     title = "3.2.{0} {1}【{2}】".format(index + 1, finding.get("name") or "未分类",
                                        _sev_label(finding.get("severity")))
@@ -768,7 +770,7 @@ def _fill_vuln_block(heading_el, table_el, finding, index, doc):
             continue
         if label == "漏洞证明":
             # 文字与截图按步骤交错：一个步骤一张图，插在该步骤响应之后。
-            _fill_proof_cell(cell, finding)
+            _fill_proof_cell(cell, finding, fig)
         else:
             _fill_prefixed_cell(cell, values[label])
 
@@ -777,6 +779,7 @@ def _fill_vuln_blocks(doc, findings):
     heading_el, table_el = _take_vuln_prototypes(doc)
     if heading_el is None or table_el is None:
         return
+    fig = itertools.count(1)  # 全报告图片连续编号：图1、图2…
     body = doc.element.body
     anchor = table_el.getnext()
     for el in (heading_el, table_el):
@@ -790,7 +793,7 @@ def _fill_vuln_blocks(doc, findings):
         t = copy.deepcopy(table_el)
         _insert_before(body, anchor, h)
         _insert_before(body, anchor, t)
-        _fill_vuln_block(h, t, f, i, doc)
+        _fill_vuln_block(h, t, f, i, doc, fig)
 
 
 def _fill_summary(doc, data, system_name, findings):

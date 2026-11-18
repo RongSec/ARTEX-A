@@ -281,9 +281,9 @@ class FindingImagesTest(unittest.TestCase):
         self.make_png(img2, (40, 120, 200))
         data = sample_data()
         data["findings"][0]["images"] = [
-            {"step_index": 1, "path": img1, "caption": "图1 登录请求(左)/响应(右)"}]
+            {"step_index": 1, "path": img1, "caption": "该文案不应出现在报告里"}]
         data["findings"][1]["images"] = [
-            {"step_index": 0, "path": img2, "caption": "图2 搜索回显"}]
+            {"step_index": 0, "path": img2, "caption": "该文案不应出现在报告里"}]
         out = os.path.join(tmp, "out.docx")
         fill(TPL, data, out)
 
@@ -298,8 +298,8 @@ class FindingImagesTest(unittest.TestCase):
         doc = Document(out)
         blocks = vuln_block_tables(doc)
         self.assertEqual(len(blocks), 3)
-        # 图按 finding 各进各的「漏洞证明」单元格，顺序 = images 顺序。
-        for block, needle in ((blocks[0], "图1 登录请求"), (blocks[1], "图2 搜索回显")):
+        # 图按 finding 进各自「漏洞证明」单元格，图注是全报告连续编号「图N」。
+        for block, needle in ((blocks[0], "图1"), (blocks[1], "图2")):
             proof = block.rows[4].cells[0]
             self.assertEqual(proof._tc.xml.count("<w:drawing"), 1)
             self.assertIn(needle, "\n".join(p.text for p in proof.paragraphs))
@@ -323,7 +323,7 @@ class FindingImagesTest(unittest.TestCase):
             for i in range(3)
         ]
         f["images"] = [
-            {"step_index": i + 1, "path": paths[i], "caption": "图注%d" % (i + 1)}
+            {"step_index": i + 1, "path": paths[i], "caption": "ignored"}
             for i in range(3)
         ]
         out = os.path.join(tmp, "out.docx")
@@ -344,7 +344,7 @@ class FindingImagesTest(unittest.TestCase):
             self.fail("找不到段落: %s（%s）" % (needle, kind))
 
         s1, s2, s3 = idx_of("步骤1"), idx_of("步骤2"), idx_of("步骤3")
-        c1, c2, c3 = idx_of("图注1"), idx_of("图注2"), idx_of("图注3")
+        c1, c2, c3 = idx_of("图1"), idx_of("图2"), idx_of("图3")
         # 步骤1 → 图注1 → 步骤2 → 图注2 → 步骤3 → 图注3，严格递增。
         self.assertLess(s1, c1, "图注1 必须在步骤1 之后")
         self.assertLess(c1, s2, "步骤2 必须在图注1 之后（图不能堆到末尾）")

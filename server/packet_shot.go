@@ -188,10 +188,9 @@ func (s *Server) renderPacketShot(findingID int64, step int, req, resp, exchange
 	if xid == "" {
 		xid = "-"
 	}
-	caption := fmt.Sprintf("请求 / 响应 · 步骤 %d", step)
-	if xid != "-" {
-		caption = fmt.Sprintf("请求 / 响应 · 步骤 %d（packet#%s）", step, xid)
-	}
+	// 图注由报告填充器统一生成「图1、图2…」（全报告连续编号），这里不再写
+	// 步骤号与 packet id——它们会随 exchangeID 变成一长串噪声。
+	caption := ""
 	sortOrder := step * 100
 
 	// 幂等替换该 step 全部 auto 行（含 V2 的 "-req-"/"-resp-" 旧命名形态；
