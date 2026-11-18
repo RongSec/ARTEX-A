@@ -108,6 +108,13 @@ cp config.example.json config.json   # 填 database 连接
 
 ![报告中心](screenshots/report-center.png)
 
+**漏洞情报**
+
+NVD 全量 + CISA KEV 在野利用，两个公开源。快通道每 30 分钟拉一次 KEV 与近两天 CVE；「命中我的资产」拿台账里的技术指纹反查候选。
+
+![漏洞情报](screenshots/intel.png)
+![宿主环境](screenshots/hostenv.png)
+
 **命令拦截**
 
 工具执行前先过规则匹配（按优先级、首条命中生效），未命中才交给模型判决。内置规则覆盖递归删除、磁盘格式化、DROP / TRUNCATE、FLUSHALL、云存储批量删除、数据外泄管道等。
@@ -135,6 +142,7 @@ cp config.example.json config.json   # 填 database 连接
 - 图变更即触发（`on_project_graph`），另加 30 分钟定时兜底；一波图变更合并成一次会话，不会一次变更烧一轮 token。
 - **跨任务阅读者**（scope=project）：读项目投影 `project_index`，按 task_id 下钻被勾连任务的探索图摘要，判定"同一攻击面 / 同一资产 / 同一利用链"后用 `adopt_related_task` 把结论以结构化 hint 暴露给发起方 planner；不相关则 `dismiss_related_task` 留痕。
 - **跨项目阅读者**（scope=cross）：先看 `cross_project_assets`（同一资产出现在 ≥2 个项目的 join 结果），为空直接空转，非空才写 `global_insights`。
+- **采纳即暴露图**：`adopt_related_task` 落 `task_intel_links(adopted)` 后，被勾连任务就成为当前任务的只读来源（与建任务时手选的关联任务同一套渲染与读路径）：`graph_overview.related_tasks` 每轮都在，`node_detail` / `list_facts` / traces 可按 id 下钻，资产锚点与范围一并进入上下文。不是只挂一条 hint。
 - 只读红线：阅读者 `tool_base='none'`，没有任何执行类工具，不调扫描、不发请求。
 
 ### 4. 关联任务只读继承
@@ -149,7 +157,12 @@ cp config.example.json config.json   # 填 database 连接
 - **命名规则**：默认 `{system}渗透测试报告-{YYYY-MM-DD}`，支持 `{system}{title}{task}{project}{date:...}` 等占位符。
 - 另有「报告归档」视图与项目级自动报告（项目收官出一份 / 子任务各出一份，两个开关独立）。
 
-### 6. 三层安全红线
+### 6. 漏洞情报与宿主环境
+
+- **情报**：NVD API 2.0（全量/增量）+ CISA KEV（在野利用目录）。快通道 30 分钟一轮，历史回填手动触发（默认 120 天）。给 agent 两个只读工具：`search_vulns` 按组件/CVSS/KEV 筛，`list_asset_vuln_hits` 拿台账技术指纹反查。**只产出候选**——组件名匹配没有版本，必须实测才能落 finding。
+- **体检**：55 件常用工具按攻击面分类，逐件探测存在性与版本，缺失项可单个或一键安装。安装命令只来自服务端目录白名单，前端传不了任意 shell。
+
+### 7. 三层安全红线
 
 | 层 | 机制 | 作用 |
 | --- | --- | --- |
@@ -159,7 +172,7 @@ cp config.example.json config.json   # 填 database 连接
 
 审批记录全量留痕（含命中规则、模型理由、输入摘要），可回放"这个结论是怎么被允许/拒绝的"。
 
-### 7. 资产图与流量证据
+### 8. 资产图与流量证据
 
 - 资产台账按企业 → 根域 / IP / 子域 / 服务 / 接口分层，支持 ScopeSentry 直接同步。
 - MITM 代理逐请求留存流量，发现可绑定具体请求作为证据，报告引用同一份证据版本。
