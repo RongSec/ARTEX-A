@@ -13,6 +13,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -398,14 +400,53 @@ func (s *Server) projectsUpdate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, p)
 }
 
-// projectsDelete 删项目。tasks.project_id FK=ON DELETE SET NULL：任务保留、
-// 归属自动摘除。其排队中的批量任务由此脱离项目调度（dispatcher 只认
-// project_id 命中 ∧ active 项目），停在队列里等用户显式继续——不会偷偷跑，
-// 也不会被删。
+// deleteProjectRequest 是 DELETE /api/projects/{id} 的可选 body。五个清理开关
+// 与任务删除（DeleteTaskOptions）同名同义；delete_tasks=true 表示连同旗下任务
+// 一起删。
+type deleteProjectRequest struct {
+	DeleteTaskOptions
+	DeleteTasks bool `json:"delete_tasks"`
+}
+
+// projectsDelete 删项目。tasks.project_id FK=ON DELETE SET NULL：默认（不带 body
+// 或 delete_tasks=false）任务保留、归属自动摘除。其排队中的批量任务由此脱离
+// 项目调度（dispatcher 只认 project_id 命中 ∧ active 项目），停在队列里等用户
+// 显式继续——不会偷偷跑，也不会被删。
+//
+// delete_tasks=true 时先逐任务走与 DELETE /api/tasks/{id} 完全相同的拆除流程
+// （排空 agent → 级联删除），单个任务失败不中断整体：错误记入 task_errors，
+// 最后再删项目行；失败的任务因 FK SET NULL 保留为未分组。
 func (s *Server) projectsDelete(w http.ResponseWriter, r *http.Request) {
 	pid, ok := projectIDParam(w, r)
 	if !ok {
 		return
+	}
+	var req deleteProjectRequest
+	if err := decode(r, &req); err != nil && err != io.EOF {
+		writeErr(w, 400, "invalid JSON: "+err.Error())
+		return
+	}
+	tasks, err := s.m.PG().ProjectTasks(pid)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	tasksDeleted := 0
+	taskErrors := []string{}
+	if req.DeleteTasks {
+		for _, t := range tasks {
+			id := strconv.FormatInt(t.ID, 10)
+			if _, err := s.deleteTaskCore(r.Context(), id, req.DeleteTaskOptions); err != nil {
+				var committed *taskDeleteCommittedError
+				if errors.As(err, &committed) {
+					// PostgreSQL 行已删：算删除成功，只是外部清理不完整。
+					tasksDeleted++
+				}
+				taskErrors = append(taskErrors, fmt.Sprintf("task %d: %s", t.ID, err))
+				continue
+			}
+			tasksDeleted++
+		}
 	}
 	if err := s.m.PG().DeleteProject(pid); errors.Is(err, db.ErrProjectNotFound) {
 		writeErr(w, 404, "项目不存在")
@@ -414,7 +455,12 @@ func (s *Server) projectsDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"deleted": pid})
+	writeJSON(w, 200, map[string]any{
+		"deleted":       pid,
+		"tasks_deleted": tasksDeleted,
+		"tasks_kept":    len(tasks) - tasksDeleted,
+		"task_errors":   taskErrors,
+	})
 }
 
 // tasksAttachProject 给任务挂/摘项目：PATCH /api/tasks/{id}/project
