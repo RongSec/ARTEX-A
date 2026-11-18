@@ -1,0 +1,363 @@
+// Package hosttools 是「宿主环境体检」：把渗透常用的外部工具编成一份目录，
+// 逐个探测是否存在、版本是多少，并按需一键安装。
+//
+// 设计取向：
+//   - 目录是**静态白名单**，安装命令只从目录里取，不接受前端传来的任意命令
+//     （否则这就是一个「以 root 执行任意 shell」的接口）。
+//   - 探测用 exec.LookPath + 一次 `--version`（3 秒超时），结果缓存 30 秒：
+//     页面每次刷新都 fork 50 个进程没有意义。
+//   - 安装串行执行，逐条回传输出；安装命令本身失败不影响其他工具。
+package hosttools
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Tool 是目录里的一件工具。Kind: binary（可执行文件）/ dir（目录，如字典）。
+type Tool struct {
+	Key       string   `json:"key"`
+	Name      string   `json:"name"`
+	Bin       string   `json:"bin"`
+	Category  string   `json:"category"`
+	Kind      string   `json:"kind,omitempty"` // 空=binary
+	VersionIn []string `json:"-"`              // version 探测参数，空=--version
+	Install   string   `json:"-"`              // 安装命令（sh -c），空=无自动安装
+	Hint      string   `json:"hint,omitempty"` // 手工安装提示
+	Note      string   `json:"note,omitempty"`
+}
+
+// ToolStatus 是探测结果。
+type ToolStatus struct {
+	Tool
+	Present bool   `json:"present"`
+	Path    string `json:"path,omitempty"`
+	Version string `json:"version,omitempty"`
+	// Installable=false 表示目录里没有自动安装命令，只能手工装。
+	Installable bool `json:"installable"`
+}
+
+// Result 是整轮体检结果。
+type Result struct {
+	Summary   Summary   `json:"summary"`
+	Groups    []Group   `json:"groups"`
+	CheckedAt time.Time `json:"checked_at"`
+	Platform  string    `json:"platform"`
+}
+
+type Summary struct {
+	Total   int `json:"total"`
+	Present int `json:"present"`
+	Missing int `json:"missing"`
+}
+
+type Group struct {
+	Name  string       `json:"name"`
+	Tools []ToolStatus `json:"tools"`
+}
+
+var (
+	cacheMu   sync.Mutex
+	cacheAt   time.Time
+	cacheData *Result
+	cacheTTL  = 30 * time.Second
+)
+
+// Catalog 返回静态目录。安装命令按 Debian/Ubuntu 的 apt 写；其他发行版
+// 只在 Hint 里给方向，不假装能装。
+func Catalog() []Tool {
+	apt := func(pkg string) string { return "apt-get install -y " + pkg }
+	goInstall := func(mod string) string {
+		return "GOBIN=/usr/local/bin go install " + mod + "@latest"
+	}
+	pipx := func(pkg string) string { return "pip3 install --break-system-packages -q " + pkg }
+
+	return []Tool{
+		// ---- 网络与主机 ----
+		{Key: "nmap", Name: "nmap", Bin: "nmap", Category: "网络与主机", Install: apt("nmap"), Note: "端口/服务识别，-sS 需要 root"},
+		{Key: "masscan", Name: "masscan", Bin: "masscan", Category: "网络与主机", Install: apt("masscan"), Note: "大网段快速扫描"},
+		{Key: "nc", Name: "netcat", Bin: "nc", Category: "网络与主机", Install: apt("netcat-openbsd")},
+		{Key: "socat", Name: "socat", Bin: "socat", Category: "网络与主机", Install: apt("socat")},
+		{Key: "curl", Name: "curl", Bin: "curl", Category: "网络与主机", Install: apt("curl")},
+		{Key: "wget", Name: "wget", Bin: "wget", Category: "网络与主机", Install: apt("wget")},
+		{Key: "tcpdump", Name: "tcpdump", Bin: "tcpdump", Category: "网络与主机", Install: apt("tcpdump")},
+		{Key: "tshark", Name: "tshark", Bin: "tshark", Category: "网络与主机", Install: apt("tshark")},
+		{Key: "fping", Name: "fping", Bin: "fping", Category: "网络与主机", Install: apt("fping")},
+		{Key: "arp-scan", Name: "arp-scan", Bin: "arp-scan", Category: "网络与主机", Install: apt("arp-scan")},
+
+		// ---- 子域与 DNS ----
+		{Key: "dig", Name: "dig", Bin: "dig", Category: "子域与 DNS", Install: apt("dnsutils")},
+		{Key: "whois", Name: "whois", Bin: "whois", Category: "子域与 DNS", Install: apt("whois")},
+		{Key: "subfinder", Name: "subfinder", Bin: "subfinder", Category: "子域与 DNS", Install: goInstall("github.com/projectdiscovery/subfinder/v2/cmd/subfinder")},
+		{Key: "amass", Name: "amass", Bin: "amass", Category: "子域与 DNS", Install: goInstall("github.com/owasp-amass/amass/v4/...")},
+		{Key: "dnsx", Name: "dnsx", Bin: "dnsx", Category: "子域与 DNS", Install: goInstall("github.com/projectdiscovery/dnsx/cmd/dnsx")},
+		{Key: "tlsx", Name: "tlsx", Bin: "tlsx", Category: "子域与 DNS", Install: goInstall("github.com/projectdiscovery/tlsx/cmd/tlsx")},
+
+		// ---- Web 与 API ----
+		{Key: "httpx", Name: "httpx", Bin: "httpx", Category: "Web 与 API", Install: goInstall("github.com/projectdiscovery/httpx/cmd/httpx"), Note: "探活/指纹；注意与 python httpx 同名，安装后确认 which"},
+		{Key: "katana", Name: "katana", Bin: "katana", Category: "Web 与 API", Install: goInstall("github.com/projectdiscovery/katana/cmd/katana")},
+		{Key: "ffuf", Name: "ffuf", Bin: "ffuf", Category: "Web 与 API", Install: goInstall("github.com/ffuf/ffuf/v2")},
+		{Key: "gobuster", Name: "gobuster", Bin: "gobuster", Category: "Web 与 API", Install: apt("gobuster")},
+		{Key: "feroxbuster", Name: "feroxbuster", Bin: "feroxbuster", Category: "Web 与 API", Install: apt("feroxbuster")},
+		{Key: "dirsearch", Name: "dirsearch", Bin: "dirsearch", Category: "Web 与 API", Install: pipx("dirsearch")},
+		{Key: "nuclei", Name: "nuclei", Bin: "nuclei", Category: "Web 与 API", Install: goInstall("github.com/projectdiscovery/nuclei/v3/cmd/nuclei")},
+		{Key: "nikto", Name: "nikto", Bin: "nikto", Category: "Web 与 API", Install: apt("nikto")},
+		{Key: "whatweb", Name: "whatweb", Bin: "whatweb", Category: "Web 与 API", Install: apt("whatweb")},
+		{Key: "wafw00f", Name: "wafw00f", Bin: "wafw00f", Category: "Web 与 API", Install: pipx("wafw00f")},
+		{Key: "sqlmap", Name: "sqlmap", Bin: "sqlmap", Category: "Web 与 API", Install: apt("sqlmap")},
+		{Key: "dalfox", Name: "dalfox", Bin: "dalfox", Category: "Web 与 API", Install: goInstall("github.com/hahwul/dalfox/v2")},
+
+		// ---- 注入与利用 ----
+		{Key: "hydra", Name: "hydra", Bin: "hydra", Category: "注入与利用", Install: apt("hydra")},
+		{Key: "medusa", Name: "medusa", Bin: "medusa", Category: "注入与利用", Install: apt("medusa")},
+		{Key: "john", Name: "john", Bin: "john", Category: "注入与利用", Install: apt("john")},
+		{Key: "hashcat", Name: "hashcat", Bin: "hashcat", Category: "注入与利用", Install: apt("hashcat")},
+		{Key: "searchsploit", Name: "searchsploit", Bin: "searchsploit", Category: "注入与利用", Install: apt("exploitdb")},
+		{Key: "msfconsole", Name: "metasploit", Bin: "msfconsole", Category: "注入与利用", Install: "", Hint: "官方源安装：https://docs.metasploit.com/docs/using-metasploit/getting-started/nightly-installers.html"},
+
+		// ---- 后渗透 ----
+		{Key: "impacket", Name: "impacket (secretsdump.py)", Bin: "secretsdump.py", Category: "后渗透", Install: pipx("impacket"), Note: "smbexec/wmiexec/secretsdump 一族"},
+		{Key: "nxc", Name: "netexec", Bin: "nxc", Category: "后渗透", Install: pipx("netexec")},
+		{Key: "evil-winrm", Name: "evil-winrm", Bin: "evil-winrm", Category: "后渗透", Install: apt("evil-winrm")},
+		{Key: "chisel", Name: "chisel", Bin: "chisel", Category: "后渗透", Install: goInstall("github.com/jpillora/chisel")},
+		{Key: "ligolo-ng", Name: "ligolo-ng (proxy)", Bin: "ligolo-proxy", Category: "后渗透", Install: "", Hint: "下载 release：https://github.com/nicocha30/ligolo-ng/releases"},
+		{Key: "proxychains4", Name: "proxychains4", Bin: "proxychains4", Category: "后渗透", Install: apt("proxychains4")},
+		{Key: "sshpass", Name: "sshpass", Bin: "sshpass", Category: "后渗透", Install: apt("sshpass")},
+		{Key: "smbclient", Name: "smbclient", Bin: "smbclient", Category: "后渗透", Install: apt("smbclient")},
+		{Key: "xfreerdp", Name: "xfreerdp", Bin: "xfreerdp", Category: "后渗透", Install: apt("freerdp2-x11")},
+		{Key: "bloodhound-python", Name: "bloodhound-python", Bin: "bloodhound-python", Category: "后渗透", Install: pipx("bloodhound")},
+
+		// ---- 逆向与取证 ----
+		{Key: "strings", Name: "strings", Bin: "strings", Category: "逆向与取证", Install: apt("binutils")},
+		{Key: "file", Name: "file", Bin: "file", Category: "逆向与取证", Install: apt("file")},
+		{Key: "binwalk", Name: "binwalk", Bin: "binwalk", Category: "逆向与取证", Install: apt("binwalk")},
+		{Key: "exiftool", Name: "exiftool", Bin: "exiftool", Category: "逆向与取证", Install: apt("libimage-exiftool-perl")},
+		{Key: "gdb", Name: "gdb", Bin: "gdb", Category: "逆向与取证", Install: apt("gdb")},
+		{Key: "radare2", Name: "radare2", Bin: "r2", Category: "逆向与取证", Install: apt("radare2")},
+
+		// ---- 容器与云 ----
+		{Key: "docker", Name: "docker", Bin: "docker", Category: "容器与云", Install: "", Hint: "按官方文档装 docker-ce；本机若已在容器里跑，可能没有宿主机 docker"},
+		{Key: "kubectl", Name: "kubectl", Bin: "kubectl", Category: "容器与云", Install: "", Hint: "https://kubernetes.io/docs/tasks/tools/"},
+		{Key: "aws", Name: "awscli", Bin: "aws", Category: "容器与云", Install: apt("awscli")},
+
+		// ---- 语料 ----
+		{Key: "seclists", Name: "SecLists 字典", Bin: "/usr/share/seclists", Category: "语料", Kind: "dir", Install: apt("seclists"), Note: "约 2.5G，装之前确认磁盘"},
+		{Key: "nuclei-templates", Name: "nuclei 模板", Bin: filepath.Join(homeDir(), "nuclei-templates"), Category: "语料", Kind: "dir", Install: "nuclei -update-templates", Note: "nuclei 首次运行也会自动拉"},
+	}
+}
+
+func homeDir() string {
+	if h, err := os.UserHomeDir(); err == nil {
+		return h
+	}
+	return "/root"
+}
+
+// Detect 返回体检结果（带 30 秒缓存）。
+func Detect(force bool) *Result {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	if !force && cacheData != nil && time.Since(cacheAt) < cacheTTL {
+		return cacheData
+	}
+	tools := Catalog()
+	// 并发探测：55 件工具里缺失的很快（LookPath 失败），装着的要跑一次
+	// --version（最多 3s）。串行最坏 60s+，页面首屏会等到超时；8 路并发压到 10s 内。
+	type probeResult struct {
+		idx int
+		st  ToolStatus
+	}
+	results := make([]ToolStatus, len(tools))
+	ch := make(chan probeResult, len(tools))
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for i, t := range tools {
+		wg.Add(1)
+		go func(i int, t Tool) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			ch <- probeResult{idx: i, st: probe(t)}
+		}(i, t)
+	}
+	wg.Wait()
+	close(ch)
+	for r := range ch {
+		results[r.idx] = r.st
+	}
+	byCat := map[string][]ToolStatus{}
+	for _, st := range results {
+		byCat[st.Category] = append(byCat[st.Category], st)
+	}
+	res := &Result{CheckedAt: time.Now(), Platform: runtime.GOOS + "/" + runtime.GOARCH}
+	names := make([]string, 0, len(byCat))
+	for name := range byCat {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		list := byCat[name]
+		sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+		res.Groups = append(res.Groups, Group{Name: name, Tools: list})
+		res.Summary.Total += len(list)
+		for _, t := range list {
+			if t.Present {
+				res.Summary.Present++
+			} else {
+				res.Summary.Missing++
+			}
+		}
+	}
+	cacheData, cacheAt = res, time.Now()
+	return res
+}
+
+func probe(t Tool) ToolStatus {
+	st := ToolStatus{Tool: t, Installable: strings.TrimSpace(t.Install) != ""}
+	if t.Kind == "dir" {
+		if info, err := os.Stat(t.Bin); err == nil && info.IsDir() {
+			st.Present, st.Path = true, t.Bin
+		}
+		return st
+	}
+	if path, err := exec.LookPath(t.Bin); err == nil {
+		st.Present, st.Path = true, path
+		st.Version = toolVersion(path, t.VersionIn)
+	}
+	return st
+}
+
+// toolVersion 跑一次 `--version`（或目录里指定的参数）取首行，3 秒超时。
+// 很多工具把版本打到 stderr，两个流都收。
+func toolVersion(path string, args []string) string {
+	if len(args) == 0 {
+		args = []string{"--version"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, args...)
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if text == "" && err != nil {
+		return ""
+	}
+	line := strings.SplitN(text, "\n", 2)[0]
+	if len(line) > 120 {
+		line = line[:120]
+	}
+	return strings.TrimSpace(line)
+}
+
+// InstallItem 是单件工具的安装结果。
+type InstallItem struct {
+	Key    string `json:"key"`
+	Name   string `json:"name"`
+	State  string `json:"state"` // running | done | failed | skipped
+	Output string `json:"output,omitempty"`
+}
+
+// Job 是一次「一键装齐」。串行执行，前端轮询状态。
+type Job struct {
+	ID         string        `json:"id"`
+	State      string        `json:"state"` // running | done
+	Items      []InstallItem `json:"items"`
+	StartedAt  time.Time     `json:"started_at"`
+	FinishedAt time.Time     `json:"finished_at,omitempty"`
+	Err        string        `json:"error,omitempty"`
+}
+
+var (
+	jobsMu sync.Mutex
+	jobs   = map[string]*Job{}
+)
+
+// GetJob 返回任务快照（拷贝，避免调用方与后台协程互相踩）。
+func GetJob(id string) *Job {
+	jobsMu.Lock()
+	defer jobsMu.Unlock()
+	j, ok := jobs[id]
+	if !ok {
+		return nil
+	}
+	cp := *j
+	cp.Items = append([]InstallItem(nil), j.Items...)
+	return &cp
+}
+
+// Install 按 key 串行安装。未知 key、无自动安装命令的都记为 skipped。
+// 安装动作以当前进程身份执行——本平台按 root 部署，这就是「特权运行」的前提；
+// 若以普通用户跑，apt 会失败并在输出里体现。
+func Install(keys []string) *Job {
+	byKey := map[string]Tool{}
+	for _, t := range Catalog() {
+		byKey[t.Key] = t
+	}
+	job := &Job{ID: fmt.Sprintf("ht%d", time.Now().UnixNano()), State: "running", StartedAt: time.Now()}
+	for _, k := range keys {
+		item := InstallItem{Key: k, State: "skipped"}
+		if t, ok := byKey[k]; ok {
+			item.Name = t.Name
+		}
+		job.Items = append(job.Items, item)
+	}
+	jobsMu.Lock()
+	jobs[job.ID] = job
+	jobsMu.Unlock()
+
+	go func() {
+		for i, item := range job.Items {
+			t, ok := byKey[item.Key]
+			if !ok || strings.TrimSpace(t.Install) == "" {
+				jobsMu.Lock()
+				job.Items[i].State = "skipped"
+				if !ok {
+					job.Items[i].Output = "目录里没有这件工具"
+				} else {
+					job.Items[i].Output = "没有自动安装命令，见 hint"
+				}
+				jobsMu.Unlock()
+				continue
+			}
+			jobsMu.Lock()
+			job.Items[i].State = "running"
+			jobsMu.Unlock()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+			cmd := exec.CommandContext(ctx, "sh", "-c", t.Install)
+			cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+			out, err := cmd.CombinedOutput()
+			cancel()
+			text := strings.TrimSpace(string(out))
+			if len(text) > 4000 {
+				text = text[len(text)-4000:]
+			}
+			jobsMu.Lock()
+			if err != nil {
+				job.Items[i].State = "failed"
+				if text == "" {
+					text = err.Error()
+				}
+			} else {
+				job.Items[i].State = "done"
+			}
+			job.Items[i].Output = text
+			jobsMu.Unlock()
+		}
+		jobsMu.Lock()
+		job.State = "done"
+		job.FinishedAt = time.Now()
+		jobsMu.Unlock()
+		cacheMu.Lock()
+		cacheData = nil // 装完让下次体检重新探测
+		cacheMu.Unlock()
+	}()
+	return job
+}
