@@ -6,9 +6,19 @@
 import * as React from "react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { FolderKanbanIcon, InboxIcon, PlusIcon, RefreshCwIcon } from "lucide-react";
+import { ArchiveIcon, ArchiveRestoreIcon, FolderKanbanIcon, InboxIcon, MoreHorizontalIcon, PlusIcon, RefreshCwIcon, Trash2Icon } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -17,6 +27,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -24,8 +41,9 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
+import { DeleteOptionFields, emptyDeleteOptions } from "@/components/delete-option-fields";
 import { api } from "@/lib/api";
-import type { ProjectWithStats } from "@/lib/types";
+import type { DeleteTaskOptions, ProjectWithStats } from "@/lib/types";
 
 // FindingCells finding 分档着色（与任务列表页同一配色口径）。
 function FindingCells({ f }: { f: Record<string, number> }) {
@@ -53,6 +71,8 @@ export default function ProjectsPage() {
   const [loading, setLoading] = React.useState(true);
   const [statusFilter, setStatusFilter] = React.useState<"all" | "active" | "archived">("all");
   const [createOpen, setCreateOpen] = React.useState(false);
+  const [deleteTarget, setDeleteTarget] = React.useState<ProjectWithStats | null>(null);
+  const [archivingId, setArchivingId] = React.useState<number | null>(null);
 
   const load = React.useCallback(() => {
     setLoading(true);
@@ -65,6 +85,24 @@ export default function ProjectsPage() {
   React.useEffect(() => {
     load();
   }, [load]);
+
+  // toggleArchive 归档/恢复：与任务侧一致，只切 status，不动任务与产线。
+  const toggleArchive = React.useCallback(
+    async (p: ProjectWithStats) => {
+      const next = p.status === "active" ? "archived" : "active";
+      setArchivingId(p.id);
+      try {
+        await api.updateProject(p.id, { status: next });
+        toast.success(next === "archived" ? `已归档「${p.name}」` : `已恢复「${p.name}」`);
+        load();
+      } catch (e) {
+        toast.error("操作失败：" + (e as Error).message);
+      } finally {
+        setArchivingId(null);
+      }
+    },
+    [load],
+  );
 
   return (
     <div className="p-4 md:p-6">
@@ -118,6 +156,7 @@ export default function ProjectsPage() {
                 <TableHead className="w-16 text-center">并发</TableHead>
                 <TableHead className="w-24">负责人</TableHead>
                 <TableHead className="w-36">创建时间</TableHead>
+                <TableHead className="w-12 text-right">操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -182,6 +221,32 @@ export default function ProjectsPage() {
                       minute: "2-digit",
                     })}
                   </TableCell>
+                  <TableCell className="text-right">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button size="icon" variant="ghost" aria-label="项目操作" disabled={archivingId === p.id}>
+                          <MoreHorizontalIcon />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem onSelect={() => void toggleArchive(p)}>
+                          {p.status === "active" ? (
+                            <>
+                              <ArchiveIcon /> 归档
+                            </>
+                          ) : (
+                            <>
+                              <ArchiveRestoreIcon /> 取消归档
+                            </>
+                          )}
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem variant="destructive" onSelect={() => setDeleteTarget(p)}>
+                          <Trash2Icon /> 删除项目
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TableCell>
                 </TableRow>
               ))}
               {loading && projects.length === 0 && (
@@ -201,6 +266,17 @@ export default function ProjectsPage() {
         onOpenChange={setCreateOpen}
         onCreated={() => {
           setCreateOpen(false);
+          load();
+        }}
+      />
+
+      <DeleteProjectDialog
+        project={deleteTarget}
+        onOpenChange={(o) => {
+          if (!o) setDeleteTarget(null);
+        }}
+        onDeleted={() => {
+          setDeleteTarget(null);
           load();
         }}
       />
@@ -363,5 +439,108 @@ function CreateProjectDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+// DeleteProjectDialog 永久删除项目：清理项与任务删除完全一致（同一个
+// DeleteOptionFields），另外多一个「同时删除旗下任务」开关——关掉时任务保留，
+// 只是失去项目归属（后端 FK SET NULL），与任务侧的处置动作保持同一套语义。
+function DeleteProjectDialog({
+  project,
+  onOpenChange,
+  onDeleted,
+}: {
+  project: ProjectWithStats | null;
+  onOpenChange: (open: boolean) => void;
+  onDeleted: () => void;
+}) {
+  const [options, setOptions] = React.useState<DeleteTaskOptions>(emptyDeleteOptions);
+  const [deleteTasks, setDeleteTasks] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
+
+  const open = project !== null;
+  const taskCount = project?.stats.task_count ?? 0;
+
+  React.useEffect(() => {
+    if (open) {
+      setOptions(emptyDeleteOptions());
+      setDeleteTasks(false);
+    }
+  }, [open]);
+
+  const submit = async () => {
+    if (!project) return;
+    setDeleting(true);
+    try {
+      const r = await api.deleteProject(project.id, { ...options, delete_tasks: deleteTasks });
+      const parts = [`已删除项目「${project.name}」`];
+      if (r.tasks_deleted > 0) parts.push(`删除 ${r.tasks_deleted} 个任务`);
+      if (r.tasks_kept > 0) parts.push(`${r.tasks_kept} 个任务保留为未分组`);
+      toast.success(parts.join("，"));
+      if (r.task_errors?.length) {
+        toast.warning(`${r.task_errors.length} 个任务未能删除，已保留：${r.task_errors[0]}`);
+      }
+      onDeleted();
+    } catch (e) {
+      toast.error("删除失败：" + (e as Error).message);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <AlertDialog open={open} onOpenChange={(o) => !deleting && onOpenChange(o)}>
+      <AlertDialogContent className="sm:max-w-xl">
+        <AlertDialogHeader>
+          <AlertDialogTitle>永久删除项目「{project?.name}」？</AlertDialogTitle>
+          <AlertDialogDescription className="break-words">
+            该项目下有 {taskCount} 个任务。项目本身删除后不可恢复。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+
+        <div className="max-h-[62vh] space-y-4 overflow-y-auto pr-1">
+          <div className="flex items-start justify-between gap-3 rounded-lg border p-3">
+            <div className="min-w-0">
+              <p className="text-sm font-medium">同时删除旗下 {taskCount} 个任务</p>
+              <p className="text-muted-foreground mt-1 text-xs">
+                关闭时任务会保留，但会失去项目归属（变为未分组），可稍后重新挂到其他项目。
+              </p>
+            </div>
+            <Switch
+              checked={deleteTasks}
+              onCheckedChange={setDeleteTasks}
+              aria-label="同时删除旗下任务"
+              disabled={deleting || taskCount === 0}
+            />
+          </div>
+
+          <DeleteOptionFields
+            idPrefix={`project-${project?.id ?? "x"}`}
+            options={options}
+            onOptionsChange={setOptions}
+            disabled={deleting || (taskCount > 0 && !deleteTasks)}
+          />
+          {taskCount > 0 && !deleteTasks && (
+            <p className="text-muted-foreground text-xs">
+              上面这些清理项只对「同时删除旗下任务」生效；当前任务会全部保留。
+            </p>
+          )}
+        </div>
+
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+          <AlertDialogAction
+            variant="destructive"
+            disabled={deleting}
+            onClick={(event) => {
+              event.preventDefault();
+              void submit();
+            }}
+          >
+            {deleting ? "删除中…" : "永久删除"}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
 }

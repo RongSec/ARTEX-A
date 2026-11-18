@@ -70,6 +70,18 @@ export interface DeleteTaskOptions {
   delete_llm_records: boolean;
 }
 
+/** 删除项目：五个清理开关与任务删除同义；delete_tasks=true 时连旗下任务一起删。 */
+export interface DeleteProjectOptions extends DeleteTaskOptions {
+  delete_tasks: boolean;
+}
+
+export interface DeleteProjectResult {
+  deleted: number;
+  tasks_deleted: number;
+  tasks_kept: number;
+  task_errors: string[];
+}
+
 export interface DeleteTaskResult {
   deleted: string;
   assets_deleted: number;

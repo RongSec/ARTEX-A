@@ -7,6 +7,7 @@ import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
 import type {
+  DeleteProjectResult,
   ActiveFindingRetest,
   Activity,
   Agent,
@@ -1514,7 +1515,10 @@ export const api = {
       reader_enabled?: boolean;
     },
   ) => patch<Project>(`/projects/${id}`, patchBody),
-  deleteProject: (id: number | string) => del<{ deleted: number }>(`/projects/${id}`),
+  // deleteProject 删项目。带 options 时：五个清理开关作用于旗下任务，
+  // delete_tasks=true 表示连任务一起删（否则任务保留、FK SET NULL 变未分组）。
+  deleteProject: (id: number | string, options?: DeleteTaskOptions & { delete_tasks?: boolean }) =>
+    del<DeleteProjectResult>(`/projects/${id}`, options),
   // 批量下发：一行一目标拆 N 任务，全部落 queued 不即跑（项目 dispatcher 按额度放行）。
   batchProjectTasks: (
     id: number | string,

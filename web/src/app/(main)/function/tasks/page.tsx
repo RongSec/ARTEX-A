@@ -64,6 +64,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
+import { DeleteOptionFields, emptyDeleteOptions } from "@/components/delete-option-fields";
+import { FactsPanel } from "@/app/(main)/function/facts/_components/facts-panel";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
   Combobox,
@@ -304,6 +306,23 @@ function compareTasks(left: Task, right: Task, field: TaskSortField, direction: 
 
 export default function TasksPage() {
   const [activeTab, setActiveTab] = React.useState("current");
+
+  // 旧路由 /function/facts 重定向到 ?tab=summary；挂载后按 query 落位，并把
+  // tab 写回 URL（刷新/分享不丢）。用 window 读而不是 useSearchParams，
+  // 避免给静态导出新增 Suspense 边界。
+  React.useEffect(() => {
+    const t = new URLSearchParams(window.location.search).get("tab");
+    if (t === "summary" || t === "archived" || t === "current") setActiveTab(t);
+  }, []);
+
+  const changeTab = React.useCallback((value: string) => {
+    setActiveTab(value);
+    const params = new URLSearchParams(window.location.search);
+    if (value === "current") params.delete("tab");
+    else params.set("tab", value);
+    const qs = params.toString();
+    window.history.replaceState(null, "", qs ? `?${qs}` : window.location.pathname);
+  }, []);
   const [tasks, setTasks] = React.useState<Task[]>([]);
   const [categories, setCategories] = React.useState<TaskCategory[]>([]);
   const [categoriesLoaded, setCategoriesLoaded] = React.useState(false);
@@ -778,10 +797,11 @@ export default function TasksPage() {
   );
 
   return (
-    <Tabs value={activeTab} onValueChange={setActiveTab} className="gap-4">
+    <Tabs value={activeTab} onValueChange={changeTab} className="gap-4">
       <TabsList className="mx-4 lg:mx-6">
         <TabsTrigger value="current">当前任务</TabsTrigger>
         <TabsTrigger value="archived">已归档</TabsTrigger>
+        <TabsTrigger value="summary">任务小结</TabsTrigger>
       </TabsList>
       <TabsContent value="current">
         <Card>
@@ -1011,6 +1031,11 @@ export default function TasksPage() {
       </TabsContent>
       <TabsContent value="archived">
         <TaskArchivesPanel onChanged={load} />
+      </TabsContent>
+      <TabsContent value="summary" className="mx-4 lg:mx-6">
+        <div className="h-[calc(100vh-13rem)] min-h-[480px]">
+          <FactsPanel />
+        </div>
       </TabsContent>
     </Tabs>
   );
@@ -2008,133 +2033,6 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
         />
       </CardContent>
     </Card>
-  );
-}
-
-const emptyDeleteOptions = (): DeleteTaskOptions => ({
-  delete_assets: false,
-  delete_traffic: false,
-  delete_files: false,
-  delete_findings: false,
-  delete_llm_records: false,
-});
-
-const deleteOptionKeys: (keyof DeleteTaskOptions)[] = [
-  "delete_assets",
-  "delete_traffic",
-  "delete_files",
-  "delete_findings",
-  "delete_llm_records",
-];
-
-// DeleteOptionFields renders the「同时清理关联数据」checkbox block shared by the
-// single-task and bulk delete dialogs. idPrefix keeps the label/input ids unique when
-// several dialogs live in the same table.
-function DeleteOptionFields({
-  idPrefix,
-  options,
-  onOptionsChange,
-  disabled,
-}: {
-  idPrefix: string;
-  options: DeleteTaskOptions;
-  onOptionsChange: React.Dispatch<React.SetStateAction<DeleteTaskOptions>>;
-  disabled: boolean;
-}) {
-  const selectedCount = deleteOptionKeys.filter((key) => options[key]).length;
-  let allChecked: boolean | "indeterminate" = false;
-  if (selectedCount === deleteOptionKeys.length) {
-    allChecked = true;
-  } else if (selectedCount > 0) {
-    allChecked = "indeterminate";
-  }
-
-  const updateOption = (key: keyof DeleteTaskOptions, checked: boolean) => {
-    onOptionsChange((current) => ({ ...current, [key]: checked }));
-  };
-
-  const updateAllOptions = (checked: boolean) => {
-    onOptionsChange({
-      delete_assets: checked,
-      delete_traffic: checked,
-      delete_files: checked,
-      delete_findings: checked,
-      delete_llm_records: checked,
-    });
-  };
-
-  return (
-    <FieldSet disabled={disabled}>
-      <FieldLegend variant="label">同时清理关联数据</FieldLegend>
-      <FieldGroup className="gap-3">
-        <Field orientation="horizontal">
-          <Checkbox
-            id={`delete-all-${idPrefix}`}
-            checked={allChecked}
-            onCheckedChange={(checked) => updateAllOptions(checked === true)}
-          />
-          <FieldContent>
-            <FieldLabel htmlFor={`delete-all-${idPrefix}`}>全部删除</FieldLabel>
-            <FieldDescription>选中下方全部关联数据，包括资产、流量、文件、漏洞和 LLM 请求/响应记录。</FieldDescription>
-          </FieldContent>
-        </Field>
-        <Field orientation="horizontal">
-          <Checkbox
-            id={`delete-assets-${idPrefix}`}
-            checked={options.delete_assets}
-            onCheckedChange={(checked) => updateOption("delete_assets", checked === true)}
-          />
-          <FieldContent>
-            <FieldLabel htmlFor={`delete-assets-${idPrefix}`}>关联资产</FieldLabel>
-            <FieldDescription>删除仅属于该任务的资产；共享资产只解除当前任务关联。</FieldDescription>
-          </FieldContent>
-        </Field>
-        <Field orientation="horizontal">
-          <Checkbox
-            id={`delete-traffic-${idPrefix}`}
-            checked={options.delete_traffic}
-            onCheckedChange={(checked) => updateOption("delete_traffic", checked === true)}
-          />
-          <FieldContent>
-            <FieldLabel htmlFor={`delete-traffic-${idPrefix}`}>关联流量</FieldLabel>
-            <FieldDescription>按关联资产的精确主机名删除；仍被其他任务引用的共享主机流量会保留。</FieldDescription>
-          </FieldContent>
-        </Field>
-        <Field orientation="horizontal">
-          <Checkbox
-            id={`delete-files-${idPrefix}`}
-            checked={options.delete_files}
-            onCheckedChange={(checked) => updateOption("delete_files", checked === true)}
-          />
-          <FieldContent>
-            <FieldLabel htmlFor={`delete-files-${idPrefix}`}>任务文件</FieldLabel>
-            <FieldDescription>删除该任务工作目录中的上传文件、命令输出和其他产物。</FieldDescription>
-          </FieldContent>
-        </Field>
-        <Field orientation="horizontal">
-          <Checkbox
-            id={`delete-findings-${idPrefix}`}
-            checked={options.delete_findings}
-            onCheckedChange={(checked) => updateOption("delete_findings", checked === true)}
-          />
-          <FieldContent>
-            <FieldLabel htmlFor={`delete-findings-${idPrefix}`}>关联漏洞</FieldLabel>
-            <FieldDescription>永久删除该任务产生的独立漏洞记录与漏洞报告。</FieldDescription>
-          </FieldContent>
-        </Field>
-        <Field orientation="horizontal">
-          <Checkbox
-            id={`delete-llm-records-${idPrefix}`}
-            checked={options.delete_llm_records}
-            onCheckedChange={(checked) => updateOption("delete_llm_records", checked === true)}
-          />
-          <FieldContent>
-            <FieldLabel htmlFor={`delete-llm-records-${idPrefix}`}>LLM 请求/响应记录</FieldLabel>
-            <FieldDescription>永久删除该任务录制的 LLM 请求、响应、Token 与错误详情。</FieldDescription>
-          </FieldContent>
-        </Field>
-      </FieldGroup>
-    </FieldSet>
   );
 }
 
