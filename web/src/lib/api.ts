@@ -16,6 +16,7 @@ import type {
   ArchiveBatchItem,
   Asset,
   AssetInterceptRule,
+  AssetVulnHit,
   AssetInterceptRuleInput,
   Audit,
   BatchCategoryItem,
@@ -36,6 +37,8 @@ import type {
   DeleteTaskResult,
   Edge,
   EvidenceBodyPreview,
+  HostInstallJob,
+  HostToolsResult,
   ExplorationNodePage,
   ExplorationNodeQuery,
   Fact,
@@ -132,6 +135,8 @@ import type {
   TrafficResp,
   UpdateCheck,
   UsageStats,
+  VulnIntelEntry,
+  VulnIntelStatus,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
@@ -1539,6 +1544,29 @@ export const api = {
       };
     },
   ) => post<BatchTasksResult>(`/projects/${id}/batch-tasks`, input),
+  // ---- V10-INTEL 漏洞情报（NVD + CISA KEV 公开源）----
+  intelStatus: () => get<VulnIntelStatus>("/intel/status"),
+  intelSearch: (p: { q?: string; kev?: boolean; minCvss?: number; since?: string; limit?: number; offset?: number }) => {
+    const qs = new URLSearchParams();
+    if (p.q) qs.set("q", p.q);
+    if (p.kev) qs.set("kev", "1");
+    if (p.minCvss) qs.set("min_cvss", String(p.minCvss));
+    if (p.since) qs.set("since", p.since);
+    qs.set("limit", String(p.limit ?? 50));
+    qs.set("offset", String(p.offset ?? 0));
+    return get<{ items: VulnIntelEntry[]; total: number }>(`/intel/search?${qs.toString()}`);
+  },
+  intelAssetHits: (limit = 100) =>
+    get<{ items: AssetVulnHit[] }>(`/intel/asset-hits?limit=${limit}`).then((r) => ({ items: arr(r.items) })),
+  intelSync: (mode: "kev" | "recent" | "full", days?: number) =>
+    post<{ accepted: boolean; mode: string }>("/intel/sync", { mode, days }),
+
+  // ---- V10-HOSTENV 宿主环境体检 ----
+  hostTools: (refresh = false) =>
+    get<HostToolsResult>(`/system/host-tools${refresh ? "?refresh=1" : ""}`),
+  hostToolsInstall: (keys: string[]) => post<HostInstallJob>("/system/host-tools/install", { keys }),
+  hostToolsInstallStatus: (id: string) => get<HostInstallJob>(`/system/host-tools/install/${id}`),
+
   // ---- 项目大图 / 洞察（artex-hs T13(0)：/projects/{id}/graph*、/insights*）----
   // 数据源=project_index 投影（常开，与 observer_enabled 无关）；重建=全量清旧灌新。
   projectGraph: (id: number | string) => get<ProjectGraphResp>(`/projects/${id}/graph`),

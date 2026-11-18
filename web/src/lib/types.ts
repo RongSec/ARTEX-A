@@ -2238,3 +2238,91 @@ export interface TaskIntelResp {
   groups: TaskIntelGroups;
   hint?: string;
 }
+
+// ---------- V10-INTEL 漏洞情报（NVD + CISA KEV 公开源） ----------
+
+export interface VulnIntelEntry {
+  cve_id: string;
+  source: string;
+  title: string;
+  description: string;
+  severity: string;
+  cvss: number;
+  published_at?: string;
+  modified_at?: string;
+  kev: boolean;
+  kev_due?: string;
+  ransomware?: boolean;
+  cpe?: string[];
+  refs?: string[];
+}
+
+export interface VulnIntelStats {
+  total: number;
+  kev: number;
+  critical: number;
+  last_7_days: number;
+}
+
+export interface VulnIntelStatus {
+  stats: VulnIntelStats;
+  last_kev_sync: string;
+  last_nvd_sync: string;
+  running: string;
+  last_error: string;
+  last_run: string;
+  enabled: boolean;
+  sources: { key: string; name: string; url: string; note: string }[];
+}
+
+export interface AssetVulnHit {
+  cve_id: string;
+  title: string;
+  severity: string;
+  cvss: number;
+  kev: boolean;
+  published_at?: string;
+  technology: string;
+  host: string;
+  asset_id: number;
+  version_in_range: "yes" | "no" | "unknown";
+}
+
+// ---------- V10-HOSTENV 宿主环境体检 ----------
+
+export interface HostTool {
+  key: string;
+  name: string;
+  bin: string;
+  category: string;
+  kind?: string;
+  hint?: string;
+  note?: string;
+  present: boolean;
+  path?: string;
+  version?: string;
+  installable: boolean;
+}
+
+export interface HostToolsResult {
+  summary: { total: number; present: number; missing: number };
+  groups: { name: string; tools: HostTool[] }[];
+  checked_at: string;
+  platform: string;
+}
+
+export interface HostInstallItem {
+  key: string;
+  name: string;
+  state: "running" | "done" | "failed" | "skipped";
+  output?: string;
+}
+
+export interface HostInstallJob {
+  id: string;
+  state: "running" | "done";
+  items: HostInstallItem[];
+  started_at: string;
+  finished_at?: string;
+  error?: string;
+}
