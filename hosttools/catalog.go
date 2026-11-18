@@ -51,6 +51,12 @@ type Result struct {
 	Groups    []Group   `json:"groups"`
 	CheckedAt time.Time `json:"checked_at"`
 	Platform  string    `json:"platform"`
+	// Container 表示 artex 进程跑在容器里。容器里装出来的工具属于「这一层镜像」，
+	// 镜像重建就没了——页面要明确告诉用户，别让人以为是宿主装好了。
+	Container bool `json:"container"`
+	// BinDir 是 go install / pip 实际落地的目录，容器部署建议用 ARTEX_HOSTBIN
+	// 指到挂载卷（如 /app/data/hostbin）。
+	BinDir string `json:"bin_dir"`
 }
 
 type Summary struct {
@@ -71,12 +77,45 @@ var (
 	cacheTTL  = 30 * time.Second
 )
 
+// BinDir 是工具二进制落地的目录。默认 /usr/local/bin（在 PATH 里）；
+// 容器部署可设 ARTEX_HOSTBIN=/app/data/hostbin，把工具落到 data 卷上，
+// 镜像重建也不会丢。
+func BinDir() string {
+	if v := strings.TrimSpace(os.Getenv("ARTEX_HOSTBIN")); v != "" {
+		return v
+	}
+	return "/usr/local/bin"
+}
+
+// inContainer 用 /.dockerenv 判断（docker 与 containerd 都会建这个文件）。
+// 不追求覆盖所有容器运行时，只用来决定页面要不要提示「重建即丢」。
+func inContainer() bool {
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	b, err := os.ReadFile("/proc/1/cgroup")
+	if err != nil {
+		return false
+	}
+	s := string(b)
+	return strings.Contains(s, "docker") || strings.Contains(s, "kubepods") || strings.Contains(s, "containerd")
+}
+
+func init() {
+	// ARTEX_HOSTBIN 指到挂载卷时，把它加进本进程 PATH：之后所有子进程
+	// （agent 的 bash 工具、体检探测）都能直接按名字找到装在那里的工具。
+	if v := strings.TrimSpace(os.Getenv("ARTEX_HOSTBIN")); v != "" {
+		_ = os.MkdirAll(v, 0o755)
+		os.Setenv("PATH", v+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+}
+
 // Catalog 返回静态目录。安装命令按 Debian/Ubuntu 的 apt 写；其他发行版
 // 只在 Hint 里给方向，不假装能装。
 func Catalog() []Tool {
 	apt := func(pkg string) string { return "apt-get install -y " + pkg }
 	goInstall := func(mod string) string {
-		return "GOBIN=/usr/local/bin go install " + mod + "@latest"
+		return "GOBIN=" + BinDir() + " go install " + mod + "@latest"
 	}
 	pipx := func(pkg string) string { return "pip3 install --break-system-packages -q " + pkg }
 
@@ -197,7 +236,12 @@ func Detect(force bool) *Result {
 	for _, st := range results {
 		byCat[st.Category] = append(byCat[st.Category], st)
 	}
-	res := &Result{CheckedAt: time.Now(), Platform: runtime.GOOS + "/" + runtime.GOARCH}
+	res := &Result{
+		CheckedAt: time.Now(),
+		Platform:  runtime.GOOS + "/" + runtime.GOARCH,
+		Container: inContainer(),
+		BinDir:    BinDir(),
+	}
 	names := make([]string, 0, len(byCat))
 	for name := range byCat {
 		names = append(names, name)

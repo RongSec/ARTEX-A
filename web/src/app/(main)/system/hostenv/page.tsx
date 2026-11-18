@@ -115,6 +115,21 @@ export default function HostEnvPage() {
         </div>
       </div>
 
+      {data?.container && (
+        <div className="border-amber-500/40 bg-amber-500/5 flex items-start gap-2 rounded-lg border p-3 text-sm">
+          <TerminalIcon className="mt-0.5 size-4 shrink-0 text-amber-600" />
+          <div>
+            <p className="font-medium">当前运行在容器内</p>
+            <p className="text-muted-foreground text-xs">
+              这里装出来的工具属于容器这一层：<code className="font-mono">docker compose up --build</code> 重建镜像后会消失。
+              apt 安装的包还会带上数据目录（如 nmap 的脚本库），只挂二进制活不下来——要长期可用，把安装项写进 Dockerfile，
+              或用 <code className="font-mono">ARTEX_HOSTBIN</code> 把 go/pip 类工具落到挂载卷（当前落地目录：
+              <code className="font-mono">{data.bin_dir || "/usr/local/bin"}</code>）。
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="grid gap-3 sm:grid-cols-3">
         <Card className="gap-0 py-4">
           <CardHeader className="px-4 pb-1">

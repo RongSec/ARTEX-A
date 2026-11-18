@@ -7,12 +7,13 @@
 
 import * as React from "react";
 
-import { AlertTriangleIcon, CloudDownloadIcon, DatabaseIcon, FlameIcon, RefreshCwIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
+import { AlertTriangleIcon, CloudDownloadIcon, DatabaseIcon, ExternalLinkIcon, FlameIcon, GitBranchIcon, RefreshCwIcon, SaveIcon, SearchIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
@@ -20,7 +21,7 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { AssetVulnHit, VulnIntelEntry, VulnIntelStatus } from "@/lib/types";
+import type { AssetVulnHit, GitHubConfig, VulnIntelEntry, VulnIntelStatus, VulnPoc } from "@/lib/types";
 
 const PAGE_SIZE = 50;
 
@@ -51,10 +52,23 @@ export default function IntelPage() {
   const [syncing, setSyncing] = React.useState(false);
   const [hits, setHits] = React.useState<AssetVulnHit[]>([]);
   const [hitsLoaded, setHitsLoaded] = React.useState(false);
+  // GitHub PoC 聚合：token 只在保存时上送，读回只有末四位。
+  const [gh, setGh] = React.useState<GitHubConfig | null>(null);
+  const [ghToken, setGhToken] = React.useState("");
+  const [ghEnabled, setGhEnabled] = React.useState(true);
+  const [savingCfg, setSavingCfg] = React.useState(false);
+  const [pocCVE, setPocCVE] = React.useState<string | null>(null);
+  const [pocItems, setPocItems] = React.useState<VulnPoc[]>([]);
+  const [pocLoading, setPocLoading] = React.useState(false);
 
   const loadStatus = React.useCallback(async () => {
     try {
-      setStatus(await api.intelStatus());
+      const s = await api.intelStatus();
+      setStatus(s);
+      if (s.github) {
+        setGh(s.github);
+        setGhEnabled(s.github.enabled);
+      }
     } catch (e) {
       toast.error("读取情报状态失败：" + (e as Error).message);
     }
@@ -98,18 +112,56 @@ export default function IntelPage() {
     return () => clearInterval(t);
   }, [status?.running, loadStatus, loadPage, page, q, kevOnly, minCvss]);
 
-  async function sync(mode: "kev" | "recent" | "full") {
+  async function sync(mode: "kev" | "recent" | "full" | "poc") {
     setSyncing(true);
     try {
       await api.intelSync(mode, mode === "full" ? 120 : undefined);
       toast.success(
-        mode === "full" ? "已开始回填最近 120 天（后台执行，可继续用页面）" : "已触发同步（后台执行）",
+        mode === "full"
+          ? "已开始回填最近 120 天（后台执行，可继续用页面）"
+          : mode === "poc"
+            ? "已开始聚合 PoC 线索（后台按配额逐条查，star 高的先入库）"
+            : "已触发同步（后台执行）",
       );
       setTimeout(() => void loadStatus(), 1500);
     } catch (e) {
       toast.error("触发失败：" + (e as Error).message);
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function saveGitHub(next?: { enabled?: boolean; token?: string }) {
+    setSavingCfg(true);
+    try {
+      const cfg = await api.intelConfigSave(next ?? {
+        enabled: ghEnabled,
+        // 空输入 = 不改（避免误清空已存的 token）；显式清空要走「清除」按钮。
+        ...(ghToken.trim() ? { token: ghToken.trim() } : {}),
+      });
+      setGh(cfg);
+      setGhEnabled(cfg.enabled);
+      setGhToken("");
+      toast.success("GitHub 配置已保存，下一轮同步生效");
+      void loadStatus();
+    } catch (e) {
+      toast.error("保存失败：" + (e as Error).message);
+    } finally {
+      setSavingCfg(false);
+    }
+  }
+
+  async function openPocs(cve: string) {
+    setPocCVE(cve);
+    setPocItems([]);
+    setPocLoading(true);
+    try {
+      const r = await api.intelPocs(cve);
+      setPocItems(r.items);
+    } catch (e) {
+      toast.error("读取 PoC 线索失败：" + (e as Error).message);
+    } finally {
+      setPocLoading(false);
     }
   }
 
@@ -132,7 +184,7 @@ export default function IntelPage() {
         <div>
           <h1 className="text-xl font-semibold">漏洞情报</h1>
           <p className="text-muted-foreground text-sm">
-            NVD 全量 + CISA KEV 在野利用，都是公开数据；情报只给候选，可利用性必须在授权目标上实测。
+            NVD 全量 + CISA KEV 在野利用 + GitHub 公开仓库线索，都是公开数据；情报只给候选，可利用性必须在授权目标上实测。
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -144,6 +196,9 @@ export default function IntelPage() {
           </Button>
           <Button variant="outline" size="sm" onClick={() => void sync("recent")} disabled={syncing || Boolean(status?.running)}>
             <CloudDownloadIcon /> 同步近 7 天
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => void sync("poc")} disabled={syncing || Boolean(status?.running)}>
+            <GitBranchIcon /> 聚合 PoC
           </Button>
           <Button size="sm" onClick={() => void sync("full")} disabled={syncing || Boolean(status?.running)}>
             {status?.running ? <Spinner data-icon="inline-start" /> : <DatabaseIcon />}
@@ -162,12 +217,17 @@ export default function IntelPage() {
         </div>
       )}
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         {[
           { label: "情报条目", value: stats?.total ?? 0, hint: "NVD + KEV 去重后" },
           { label: "KEV 在野利用", value: stats?.kev ?? 0, hint: "CISA 已确认被利用" },
           { label: "CVSS ≥ 9", value: stats?.critical ?? 0, hint: "严重" },
           { label: "近 7 天新增", value: stats?.last_7_days ?? 0, hint: "按发布时间" },
+          {
+            label: "PoC 线索",
+            value: status?.poc?.repos ?? 0,
+            hint: `覆盖 ${status?.poc?.cves ?? 0} 个 CVE · 待查 ${status?.poc?.queue ?? 0}`,
+          },
         ].map((c) => (
           <Card key={c.label} className="gap-0 py-4">
             <CardHeader className="px-4 pb-1">
@@ -187,6 +247,7 @@ export default function IntelPage() {
           <TabsTrigger value="hits" onClick={() => { if (!hitsLoaded) void loadHits(); }}>
             命中我的资产
           </TabsTrigger>
+          <TabsTrigger value="github">GitHub 配置</TabsTrigger>
         </TabsList>
 
         <TabsContent value="library" className="flex flex-col gap-3">
@@ -237,12 +298,13 @@ export default function IntelPage() {
                   <TableHead>标题</TableHead>
                   <TableHead className="w-28">发布</TableHead>
                   <TableHead className="w-20">KEV</TableHead>
+                  <TableHead className="w-20">PoC</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {items.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={6} className="text-muted-foreground py-10 text-center text-sm">
+                    <TableCell colSpan={7} className="text-muted-foreground py-10 text-center text-sm">
                       {loading ? "查询中…" : "还没有情报。点右上角「同步 KEV」先拉一份在野利用目录（约 1800 条，几秒）。"}
                     </TableCell>
                   </TableRow>
@@ -267,6 +329,19 @@ export default function IntelPage() {
                         <Badge variant="outline" className="border-red-500/40 bg-red-500/10 text-red-600 dark:text-red-400">
                           在野
                         </Badge>
+                      ) : (
+                        <span className="text-muted-foreground text-xs">—</span>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {e.poc_count ? (
+                        <button
+                          type="button"
+                          className="text-primary text-xs font-medium underline-offset-2 hover:underline"
+                          onClick={() => void openPocs(e.cve_id)}
+                        >
+                          {e.poc_count} 个
+                        </button>
                       ) : (
                         <span className="text-muted-foreground text-xs">—</span>
                       )}
@@ -353,7 +428,122 @@ export default function IntelPage() {
             </Table>
           </div>
         </TabsContent>
+
+        <TabsContent value="github" className="flex flex-col gap-3">
+          <Card className="max-w-3xl">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <GitBranchIcon className="size-4" /> GitHub PoC 线索
+              </CardTitle>
+              <CardDescription>
+                拿 CVE 编号在 GitHub 公开搜索里查仓库名/描述，只落元数据（repo、star、描述、URL），
+                不克隆、不执行、不托管任何代码。带 token 时 30 次/分钟，匿名 10 次/分钟。
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-4">
+              <div className="flex items-center justify-between rounded-lg border p-3">
+                <div>
+                  <p className="text-sm font-medium">自动聚合</p>
+                  <p className="text-muted-foreground text-xs">
+                    每 30 分钟随 KEV/NVD 快通道补一批（KEV 与 CVSS ≥ 9 优先，只查没查过的）。
+                  </p>
+                </div>
+                <Switch
+                  checked={ghEnabled}
+                  onCheckedChange={(v) => {
+                    setGhEnabled(v === true);
+                    void saveGitHub({ enabled: v === true });
+                  }}
+                  disabled={savingCfg}
+                />
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <label htmlFor="gh-token" className="text-sm font-medium">
+                  Personal access token
+                </label>
+                <div className="flex gap-2">
+                  <Input
+                    id="gh-token"
+                    className="min-w-0 flex-1"
+                    type="password"
+                    autoComplete="off"
+                    placeholder={gh?.token_set ? `已配置 ${gh.token_tip}（留空 = 不修改）` : "ghp_… 或 github_pat_…（可留空，匿名也能跑但更慢）"}
+                    value={ghToken}
+                    onChange={(e) => setGhToken(e.target.value)}
+                  />
+                  <Button onClick={() => void saveGitHub()} disabled={savingCfg}>
+                    {savingCfg ? <Spinner data-icon="inline-start" /> : <SaveIcon />} 保存
+                  </Button>
+                  {gh?.token_set && (
+                    <Button
+                      variant="outline"
+                      onClick={() => void saveGitHub({ token: "" })}
+                      disabled={savingCfg}
+                    >
+                      清除
+                    </Button>
+                  )}
+                </div>
+                <p className="text-muted-foreground text-[11px]">
+                  只需 public_repo 读权限（fine-grained token 勾 Public repositories 即可）。token 存库、只在服务端使用，
+                  页面上只回显末四位。上次聚合：{gh?.last_sync || "从未"}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+                <Button variant="outline" onClick={() => void sync("poc")} disabled={syncing || Boolean(status?.running)}>
+                  <GitBranchIcon /> 立即聚合一批
+                </Button>
+                <span className="text-muted-foreground text-xs">
+                  待查 {status?.poc?.queue ?? 0} 个 CVE · 已有线索 {status?.poc?.repos ?? 0} 条（覆盖{" "}
+                  {status?.poc?.cves ?? 0} 个 CVE）
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
       </Tabs>
+
+      <Dialog open={pocCVE !== null} onOpenChange={(v) => { if (!v) setPocCVE(null); }}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="font-mono text-base">{pocCVE}</DialogTitle>
+            <DialogDescription>
+              公开仓库线索，按 star 排序。这是「别人写了 EXP」的信号，不是可利用性结论；陌生代码不要直接执行。
+            </DialogDescription>
+          </DialogHeader>
+          {pocLoading ? (
+            <div className="text-muted-foreground flex items-center gap-2 py-6 text-sm">
+              <Spinner /> 加载中…
+            </div>
+          ) : pocItems.length === 0 ? (
+            <p className="text-muted-foreground py-6 text-sm">没有查到公开仓库线索（或还没聚合到这条）。</p>
+          ) : (
+            <ul className="flex flex-col gap-2">
+              {pocItems.map((p) => (
+                <li key={p.repo} className="rounded-lg border p-3">
+                  <div className="flex items-center gap-2">
+                    <a
+                      href={p.url}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      className="text-primary flex items-center gap-1 font-mono text-sm hover:underline"
+                    >
+                      {p.repo} <ExternalLinkIcon className="size-3" />
+                    </a>
+                    <Badge variant="outline" className="text-[10px]">★ {p.stars}</Badge>
+                    {p.lang && <span className="text-muted-foreground text-[11px]">{p.lang}</span>}
+                  </div>
+                  {p.description && (
+                    <p className="text-muted-foreground mt-1 text-xs">{p.description}</p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </DialogContent>
+      </Dialog>
 
       {status && (
         <p className="text-muted-foreground text-[11px]">

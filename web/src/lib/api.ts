@@ -135,8 +135,10 @@ import type {
   TrafficResp,
   UpdateCheck,
   UsageStats,
+  GitHubConfig,
   VulnIntelEntry,
   VulnIntelStatus,
+  VulnPoc,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
@@ -1558,8 +1560,12 @@ export const api = {
   },
   intelAssetHits: (limit = 100) =>
     get<{ items: AssetVulnHit[] }>(`/intel/asset-hits?limit=${limit}`).then((r) => ({ items: arr(r.items) })),
-  intelSync: (mode: "kev" | "recent" | "full", days?: number) =>
+  intelSync: (mode: "kev" | "recent" | "full" | "poc", days?: number) =>
     post<{ accepted: boolean; mode: string }>("/intel/sync", { mode, days }),
+  // GitHub 配置：token 只回末四位；保存时省略 token = 不改，"" = 清空。
+  intelConfig: () => get<GitHubConfig>("/intel/config"),
+  intelConfigSave: (p: { enabled?: boolean; token?: string }) => post<GitHubConfig>("/intel/config", p),
+  intelPocs: (cve: string) => get<{ cve_id: string; items: VulnPoc[] }>(`/intel/pocs?cve=${encodeURIComponent(cve)}`),
 
   // ---- V10-HOSTENV 宿主环境体检 ----
   hostTools: (refresh = false) =>

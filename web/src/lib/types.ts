@@ -2255,6 +2255,8 @@ export interface VulnIntelEntry {
   ransomware?: boolean;
   cpe?: string[];
   refs?: string[];
+  /** GitHub 公开仓库线索数（只存元数据，不存代码） */
+  poc_count?: number;
 }
 
 export interface VulnIntelStats {
@@ -2264,8 +2266,27 @@ export interface VulnIntelStats {
   last_7_days: number;
 }
 
+export interface VulnPoc {
+  cve_id: string;
+  repo: string;
+  url: string;
+  description: string;
+  stars: number;
+  lang: string;
+  pushed_at?: string;
+}
+
+export interface GitHubConfig {
+  enabled: boolean;
+  token_set: boolean;
+  token_tip: string;
+  last_sync: string;
+}
+
 export interface VulnIntelStatus {
   stats: VulnIntelStats;
+  poc?: { repos: number; cves: number; queue: number };
+  github?: GitHubConfig;
   last_kev_sync: string;
   last_nvd_sync: string;
   running: string;
@@ -2309,6 +2330,10 @@ export interface HostToolsResult {
   groups: { name: string; tools: HostTool[] }[];
   checked_at: string;
   platform: string;
+  /** 进程是否跑在容器里：容器内装的工具随镜像重建丢失 */
+  container?: boolean;
+  /** go install / pip 实际落地目录 */
+  bin_dir?: string;
 }
 
 export interface HostInstallItem {
