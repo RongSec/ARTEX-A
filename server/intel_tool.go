@@ -53,6 +53,13 @@ func (s *Server) toolSearchVulns() actool.CoreTool {
 				return actool.Errorf(err.Error()), nil
 			}
 			out := make([]map[string]any, 0, len(items))
+			ids := make([]string, 0, len(items))
+			for _, e := range items {
+				ids = append(ids, e.CVEID)
+			}
+			// PoC 线索一次批量取（每 CVE 最多 2 条）：全量查询会给 planner 塞几百行，
+			// 它只想知道「有没有现成 EXP」，具体仓库让它自己按 url 看。
+			pocs, _ := s.m.PG().PoCByCVE(ctx, ids, 2)
 			for _, e := range items {
 				row := map[string]any{
 					"cve_id": e.CVEID, "severity": e.Severity, "cvss": e.CVSS,
@@ -64,11 +71,20 @@ func (s *Server) toolSearchVulns() actool.CoreTool {
 				if len(e.Refs) > 0 {
 					row["refs"] = e.Refs[:min(3, len(e.Refs))]
 				}
+				if e.PocCount > 0 {
+					row["poc_count"] = e.PocCount
+					top := make([]map[string]any, 0, 2)
+					for _, p := range pocs[e.CVEID] {
+						top = append(top, map[string]any{"repo": p.Repo, "url": p.URL, "stars": p.Stars})
+					}
+					row["poc_top"] = top
+				}
 				out = append(out, row)
 			}
 			return jsonResult(map[string]any{
 				"total": total, "returned": len(out), "items": out,
-				"note": "候选不等于可利用：情报库无你的目标版本，必须实测确认后再 report_finding。",
+				"note": "候选不等于可利用：情报库无你的目标版本，必须实测确认后再 report_finding。" +
+					" poc_count/poc_top 是 GitHub 公开仓库线索（别人写的 EXP），只作参考，不要直接跑陌生代码。",
 			})
 		})
 }

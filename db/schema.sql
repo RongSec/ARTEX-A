@@ -1887,3 +1887,21 @@ CREATE INDEX IF NOT EXISTS idx_vuln_intel_published ON vuln_intel(published_at D
 CREATE INDEX IF NOT EXISTS idx_vuln_intel_cvss ON vuln_intel(cvss DESC);
 CREATE INDEX IF NOT EXISTS idx_vuln_intel_kev ON vuln_intel(kev) WHERE kev;
 CREATE INDEX IF NOT EXISTS idx_vuln_intel_cpe ON vuln_intel USING gin(cpe);
+
+-- ---------- GitHub PoC 聚合（V10-POC） ----------
+-- 只存公开仓库元数据（repo/URL/star/描述），不克隆不托管代码。
+ALTER TABLE vuln_intel ADD COLUMN IF NOT EXISTS poc_count INT NOT NULL DEFAULT 0;
+ALTER TABLE vuln_intel ADD COLUMN IF NOT EXISTS poc_checked_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS vuln_pocs (
+    cve_id      TEXT NOT NULL,
+    repo        TEXT NOT NULL,
+    url         TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    stars       INT  NOT NULL DEFAULT 0,
+    lang        TEXT NOT NULL DEFAULT '',
+    pushed_at   TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (cve_id, repo)
+);
+CREATE INDEX IF NOT EXISTS idx_vuln_pocs_cve ON vuln_pocs(cve_id);
+CREATE INDEX IF NOT EXISTS idx_vuln_pocs_stars ON vuln_pocs(stars DESC);

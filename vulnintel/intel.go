@@ -1,12 +1,12 @@
 // Package vulnintel 是漏洞情报同步：从公开源拉 CVE 条目入库，供资产指纹反查。
 //
-// 数据来源只有两个，都是互联网公开数据，没有任何私有仓库：
+// 数据来源三个，都是互联网公开数据，没有任何私有仓库：
 //   - NVD API 2.0（NIST，公开 REST，无 key 时限速 5 次/30s）
 //   - CISA KEV（已知在野利用目录，单个 JSON）
+//   - GitHub 公开搜索（按 CVE 编号匹配仓库名/描述，只存元数据，见 github.go）
 //
-// GHSA / ExploitDB 之类的 PoC 聚合没有接：它们要么需要 token，要么属于第三方
-// 仓库的二次整理，接进来会引入来源合规问题。refs 里只保留 NVD 自己给出的参考
-// URL，平台不抓取、不托管 PoC 内容。
+// PoC 线索只保留仓库的元数据（repo / URL / star / 描述），平台不克隆、不执行、
+// 不托管任何 PoC 代码；refs 里只保留 NVD 自己给出的参考 URL。
 package vulnintel
 
 import (
@@ -95,6 +95,13 @@ func (s *Service) fastLane(ctx context.Context) {
 	if _, err := s.SyncNVD(ctx, since, time.Now()); err != nil {
 		log.Printf("[vulnintel] NVD 增量同步失败: %v", err)
 	}
+	// PoC 聚合搭同一班车：每 30 分钟补一小批（认证 25 / 匿名 8），
+	// 队列是「KEV 或 CVSS≥9 且没查过」，几千条靠日积月累而不是一次打爆配额。
+	if n, added, err := s.SyncPoc(ctx, 0); err != nil {
+		log.Printf("[vulnintel] PoC 聚合失败: %v", err)
+	} else if n > 0 {
+		log.Printf("[vulnintel] PoC 聚合：查了 %d 个 CVE，命中 %d 条线索", n, added)
+	}
 }
 
 func (s *Service) enabled() bool {
@@ -125,11 +132,17 @@ func (s *Service) Status(ctx context.Context) map[string]any {
 	}
 	kevAt, _, _ := s.pg.GetSetting(settingLastKEV)
 	nvdAt, _, _ := s.pg.GetSetting(settingLastNVD)
+	pocStats, err := s.pg.VulnPocStats(ctx)
+	if err != nil {
+		pocStats = db.VulnPocStats{}
+	}
 	s.mu.Lock()
 	running, lastErr, lastRun := s.running, s.lastErr, s.lastRun
 	s.mu.Unlock()
 	return map[string]any{
 		"stats":         stats,
+		"poc":           pocStats,
+		"github":        s.GitHubConfig(),
 		"last_kev_sync": kevAt,
 		"last_nvd_sync": nvdAt,
 		"running":       running,
@@ -139,6 +152,7 @@ func (s *Service) Status(ctx context.Context) map[string]any {
 		"sources": []map[string]string{
 			{"key": "nvd", "name": "NVD API 2.0", "url": nvdEndpoint, "note": "全量 CVE（含 CVSS / CPE / 参考链接）"},
 			{"key": "kev", "name": "CISA KEV", "url": kevEndpoint, "note": "已知在野利用目录，含修复截止日"},
+			{"key": "github", "name": "GitHub 公开搜索", "url": githubSearchAPI, "note": "按 CVE 编号匹配仓库名/描述，只存元数据不存代码"},
 		},
 	}
 }

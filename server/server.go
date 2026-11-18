@@ -903,6 +903,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intel/search", s.intelSearch)
 	mux.HandleFunc("GET /api/intel/asset-hits", s.intelAssetHits)
 	mux.HandleFunc("POST /api/intel/sync", s.intelSync)
+	mux.HandleFunc("GET /api/intel/config", s.intelConfig)
+	mux.HandleFunc("POST /api/intel/config", s.intelConfigSave)
+	mux.HandleFunc("GET /api/intel/pocs", s.intelPocs)
 	// V10-HOSTENV：宿主环境体检 + 一键安装（目录白名单，安装命令只由服务端决定）
 	mux.HandleFunc("GET /api/system/host-tools", s.hostToolsStatus)
 	mux.HandleFunc("POST /api/system/host-tools/install", s.hostToolsInstall)

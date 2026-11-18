@@ -109,9 +109,81 @@ func (s *Server) intelSync(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[vulnintel] 手动全量同步失败: %v", err)
 			}
 		}()
+	case "poc":
+		// PoC 聚合：一次最多 200 个 CVE（认证 25/轮，靠多轮补齐）；前端点一次
+		// 「聚合 PoC」就把这一轮跑满，比等后台快很多。
+		n := 200
+		if s.intel.GitHubConfig().TokenSet == false {
+			n = 40 // 匿名 10 次/分钟，200 个要跑 20 分钟，别让用户以为点坏了
+		}
+		go func() {
+			checked, added, err := s.intel.SyncPoc(ctx, n)
+			if err != nil {
+				log.Printf("[vulnintel] 手动 PoC 聚合失败: %v", err)
+				return
+			}
+			log.Printf("[vulnintel] 手动 PoC 聚合完成：查 %d，命中 %d", checked, added)
+		}()
 	default:
-		writeErr(w, 400, "mode 只能是 kev / recent / full")
+		writeErr(w, 400, "mode 只能是 kev / recent / full / poc")
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "mode": mode})
+}
+
+// GET /api/intel/config —— GitHub 配置回显（token 只给末四位）
+func (s *Server) intelConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.intelReady(w) {
+		return
+	}
+	writeJSON(w, 200, s.intel.GitHubConfig())
+}
+
+// POST /api/intel/config {enabled?: bool, token?: string}
+// token 省略 = 不改；空串 = 清空。保存后下一轮同步即生效，无需重启。
+func (s *Server) intelConfigSave(w http.ResponseWriter, r *http.Request) {
+	if !s.intelReady(w) {
+		return
+	}
+	var req struct {
+		Enabled *bool   `json:"enabled"`
+		Token   *string `json:"token"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "请求格式错误")
+		return
+	}
+	if req.Token != nil {
+		tok := strings.TrimSpace(*req.Token)
+		// 只做最基本的形状校验：GitHub token 有 ghp_/github_pat_ 前缀，但用户也可能
+		// 粘贴 fine-grained token（github_pat_）。长度过短多半是误粘贴。
+		if tok != "" && len(tok) < 20 {
+			writeErr(w, 400, "token 看起来不完整（长度 < 20）")
+			return
+		}
+		req.Token = &tok
+	}
+	if err := s.intel.SetGitHubConfig(req.Enabled, req.Token); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, s.intel.GitHubConfig())
+}
+
+// GET /api/intel/pocs?cve=CVE-2024-3094
+func (s *Server) intelPocs(w http.ResponseWriter, r *http.Request) {
+	if !s.intelReady(w) {
+		return
+	}
+	cve := strings.TrimSpace(r.URL.Query().Get("cve"))
+	if cve == "" {
+		writeErr(w, 400, "cve 必填")
+		return
+	}
+	items, err := s.m.PG().ListVulnPocs(r.Context(), strings.ToUpper(cve))
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"cve_id": strings.ToUpper(cve), "items": items})
 }

@@ -29,6 +29,9 @@ type VulnIntelEntry struct {
 	Ransomware  bool      `json:"ransomware,omitempty"`
 	CPE         []string  `json:"cpe,omitempty"`
 	Refs        []string  `json:"refs,omitempty"`
+	// PocCount 是 GitHub 公开仓库线索数（V10-POC）。0 有两种含义：没查过、查过没结果；
+	// 需要区分时看 poc_checked_at（只在库里，不下发）。
+	PocCount int `json:"poc_count"`
 }
 
 // VulnIntelSearch 是检索条件。全部字段可选，零值=不过滤。
@@ -146,13 +149,13 @@ updated_at=now()`)
 const vulnIntelCols = `cve_id, source, title, description, severity, cvss,
 COALESCE(published_at, 'epoch'::timestamptz), COALESCE(modified_at, 'epoch'::timestamptz),
 kev, COALESCE(to_char(kev_due,'YYYY-MM-DD'), ''), ransomware,
-array_to_json(cpe)::text, array_to_json(refs)::text`
+array_to_json(cpe)::text, array_to_json(refs)::text, poc_count`
 
 func scanVulnIntel(sc interface{ Scan(...any) error }) (*VulnIntelEntry, error) {
 	var e VulnIntelEntry
 	var cpeJSON, refsJSON string
 	if err := sc.Scan(&e.CVEID, &e.Source, &e.Title, &e.Description, &e.Severity, &e.CVSS,
-		&e.PublishedAt, &e.ModifiedAt, &e.KEV, &e.KEVDue, &e.Ransomware, &cpeJSON, &refsJSON); err != nil {
+		&e.PublishedAt, &e.ModifiedAt, &e.KEV, &e.KEVDue, &e.Ransomware, &cpeJSON, &refsJSON, &e.PocCount); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(cpeJSON), &e.CPE)
