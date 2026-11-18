@@ -13,6 +13,7 @@ import tempfile
 import unittest
 
 from docx import Document
+from docx.oxml.ns import qn
 
 from template_filler import fill
 
@@ -174,11 +175,17 @@ class TemplateFillerTest(unittest.TestCase):
             self.assertIn("漏洞名称：", block.rows[0].cells[0].text)
         headings = [p.text for p in self.doc.paragraphs if p.text.startswith("3.2.")]
         self.assertEqual(headings, ["3.2.1 SQL注入【严重】", "3.2.2 反射XSS【中危】", "3.2.3 弱口令【低危】"])
-        proof = blocks[0].rows[4].cells[0].text
+        # 报文现在放在嵌套表格（文本框）里，cell.text 只含直接段落，
+        # 取整棵 tc 的文本才能覆盖到框内报文。
+        cell = blocks[0].rows[4].cells[0]
+        proof = "\n".join(cell._tc.itertext())
         self.assertIn("入口点：https://shop.example.com/login", proof)
         self.assertIn("步骤1", proof)
         self.assertIn("POST /login", proof)
         self.assertIn("HTTP/1.1 200 OK", proof)
+        # 请求/响应各一个文本框：本 finding 只有 1 步，所以是 2 个。
+        self.assertEqual(len(cell._tc.findall(qn("w:tbl"))), 2)
+        self.assertIn("F6F7F9", cell._tc.xml, "文本框必须带浅灰底纹")
 
     def test_summary_replaced(self):
         p = paragraph_by_contains(self.doc, "安全评估后结果为：")
