@@ -553,6 +553,8 @@ def _add_picture_paragraph(cell, img):
         return None
     para = cell.add_paragraph()
     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # 图与图注绑定同页：否则图片会被排到页底、图注被推到下一页。
+    para.paragraph_format.keep_with_next = True
     try:
         pic = para.add_run().add_picture(path, width=Cm(IMAGE_WIDTH_CM))
         # 超高图按高度上限等比回缩，避免被排版引擎塞进一页高度里压扁。
