@@ -184,12 +184,8 @@ func (s *Server) renderPacketShot(findingID int64, step int, req, resp, exchange
 		log.Printf("[packetshot] rename: %v", err)
 		return false
 	}
-	xid := strings.TrimSpace(exchangeID)
-	if xid == "" {
-		xid = "-"
-	}
 	// 图注由报告填充器统一生成「图1、图2…」（全报告连续编号），这里不再写
-	// 步骤号与 packet id——它们会随 exchangeID 变成一长串噪声。
+	// 步骤号与 packet id——exchangeID 是一长串数字，会顶出半行图注。
 	caption := ""
 	sortOrder := step * 100
 
