@@ -275,10 +275,10 @@ def _fmt_date(raw):
 def _proof_blocks(finding):
     """漏洞证明的**分块序列**：[(kind, value)]。
 
-    kind="text" → 一段文本（含换行）；kind="img" → 该步骤的插图锚点（value=步骤号，
-    1-based，与 finding_evidence_images.step_index 同口径）。插图在对应步骤的
-    请求/响应之后，做到「一个步骤一张图」；漏洞级图（step_index=0）由调用方
-    追加在末尾。
+    kind="text" → 一段文本（含换行）；kind="packet" → 一段原始报文（填充时套
+    文本框样式）；kind="img" → 该步骤的插图锚点（value=步骤号，1-based，与
+    finding_evidence_images.step_index 同口径）。插图在对应步骤的请求/响应
+    之后，做到「一个步骤一张图」；漏洞级图（step_index=0）由调用方追加在末尾。
 
     无结构化复现时整段回退 report_md 纯文本（单块，无插图锚点）。
     """
@@ -306,11 +306,14 @@ def _proof_blocks(finding):
             buf.append("预期：{0}\n".format(st["expected"]))
         if st.get("proves"):
             buf.append("证明：{0}\n".format(st["proves"]))
-        if st.get("request"):
-            buf.append("请求：\n{0}\n".format(st["request"]))
-        if st.get("response"):
-            buf.append("响应：\n{0}\n".format(st["response"]))
         blocks.append(("text", "".join(buf)))
+        # 报文单独成块：填充时套浅灰底细边框的「文本框」，与正文区分开。
+        if str(st.get("request") or "").strip():
+            blocks.append(("text", "请求：\n"))
+            blocks.append(("packet", str(st["request"]).strip()))
+        if str(st.get("response") or "").strip():
+            blocks.append(("text", "响应：\n"))
+            blocks.append(("packet", str(st["response"]).strip()))
         blocks.append(("img", no))
     return blocks
 
@@ -578,6 +581,108 @@ def _add_picture_paragraph(cell, img):
     return cell.add_paragraph()
 
 
+# 报文文本框（V9-SHOT5）：浅灰底 + 0.5pt 细边框 + 等宽字体，和正文区分开。
+PACKET_FILL = "F6F7F9"
+PACKET_BORDER = "D5DBE3"
+PACKET_FONT = "Consolas"
+PACKET_SIZE_PT = 9.0
+
+# w:tblPr 子元素的 schema 顺序：乱序 Word 会判为损坏文档。
+_TBLPR_SEQ = [
+    "tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize",
+    "tblStyleColBandSize", "tblW", "jc", "tblCellSpacing", "tblInd",
+    "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook",
+    "tblCaption", "tblDescription",
+]
+
+
+def _insert_tblpr(tblPr, el):
+    """按 schema 顺序把 el 插进 tblPr。"""
+    tag = el.tag.split("}")[-1]
+    idx = _TBLPR_SEQ.index(tag) if tag in _TBLPR_SEQ else len(_TBLPR_SEQ)
+    for child in list(tblPr):
+        ctag = child.tag.split("}")[-1]
+        if ctag in _TBLPR_SEQ and _TBLPR_SEQ.index(ctag) > idx:
+            child.addprevious(el)
+            return
+    tblPr.append(el)
+
+
+def _add_packet_box(cell, text):
+    """把一个 1x1 嵌套表格当「文本框」放报文，返回其后可续写文字的段落。
+
+    用嵌套表格而不是形状/文本框：Word 与 LibreOffice 都能稳定渲染，边框和
+    底纹不会因为跨页而断开，也不会随页面缩放错位。
+    """
+    from docx.oxml import OxmlElement
+
+    tbl = cell.add_table(rows=1, cols=1)
+    tblPr = tbl._tbl.tblPr
+
+    tblW = tblPr.find(qn("w:tblW"))
+    if tblW is None:
+        tblW = OxmlElement("w:tblW")
+        _insert_tblpr(tblPr, tblW)
+    tblW.set(qn("w:type"), "pct")
+    tblW.set(qn("w:w"), "5000")
+
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        e = OxmlElement("w:" + edge)
+        e.set(qn("w:val"), "single")
+        e.set(qn("w:sz"), "4")
+        e.set(qn("w:space"), "0")
+        e.set(qn("w:color"), PACKET_BORDER)
+        borders.append(e)
+    _insert_tblpr(tblPr, borders)
+
+    layout = OxmlElement("w:tblLayout")
+    layout.set(qn("w:type"), "fixed")
+    _insert_tblpr(tblPr, layout)
+
+    mar = OxmlElement("w:tblCellMar")
+    for edge, width in (("top", 80), ("left", 120), ("bottom", 80), ("right", 120)):
+        e = OxmlElement("w:" + edge)
+        e.set(qn("w:w"), str(width))
+        e.set(qn("w:type"), "dxa")
+        mar.append(e)
+    _insert_tblpr(tblPr, mar)
+
+    box = tbl.cell(0, 0)
+    tcPr = box._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), PACKET_FILL)
+    tcPr.append(shd)
+
+    para = box.paragraphs[0]
+    pf = para.paragraph_format
+    pf.first_line_indent = Pt(0)   # 正文样式带「首行缩进 2 字符」，必须清掉
+    pf.left_indent = Pt(0)
+    pf.right_indent = Pt(0)
+    pf.space_before = Pt(2)
+    pf.space_after = Pt(2)
+    pf.line_spacing = 1.0
+    para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    run = para.add_run(text)
+    run.font.size = Pt(PACKET_SIZE_PT)
+    rpr = run._element.get_or_add_rPr()
+    rfonts = rpr.find(qn("w:rFonts"))
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.insert(0, rfonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        rfonts.set(qn(attr), PACKET_FONT)
+
+    # 表格后面需要一段可继续写字的段落（单元格必须以段落收尾）。
+    for tail in reversed(cell.paragraphs):
+        if tail._p.getprevious() is tbl._tbl:
+            return tail
+    return cell.add_paragraph()
+
+
 def _fill_proof_cell(cell, finding):
     """填「漏洞证明」单元格：文字与截图按步骤交错（一步一张图）。
 
@@ -625,6 +730,9 @@ def _fill_proof_cell(cell, finding):
     for kind, value in _proof_blocks(finding):
         if kind == "text":
             add_text(cur, str(value))
+            continue
+        if kind == "packet":
+            cur = _add_packet_box(cell, str(value))
             continue
         if kind == "img":
             for im in by_step.get(int(value), []):
