@@ -51,10 +51,10 @@ type Options struct {
 	KeepHeaders      []string // 从折叠清单豁免的头名
 }
 
-// DefaultOptions 报告用默认值：宽 1680、Scale 2.9（14cm 宽插图后正文约
-// 8pt）、不脱敏、不折叠头、不画行号。
+// DefaultOptions 报告用默认值：宽 1680、Scale 2.4（14cm 宽插图后正文约
+// 6.8pt）、不脱敏、不折叠头、不画行号。
 func DefaultOptions() Options {
-	return Options{Width: 1680, Scale: 2.9}
+	return Options{Width: 1680, Scale: 2.4}
 }
 
 // 深色主题调色板。

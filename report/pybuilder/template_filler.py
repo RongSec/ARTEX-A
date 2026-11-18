@@ -272,9 +272,16 @@ def _fmt_date(raw):
     return "{0}年{1}月{2}日".format(int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
-def _proof_text(finding):
-    """漏洞证明纯文本：与 report_builder.py 的口径一致（入口点/步骤N/
-    逐字请求响应），无结构化复现时回退 report_md 纯文本。"""
+def _proof_blocks(finding):
+    """漏洞证明的**分块序列**：[(kind, value)]。
+
+    kind="text" → 一段文本（含换行）；kind="img" → 该步骤的插图锚点（value=步骤号，
+    1-based，与 finding_evidence_images.step_index 同口径）。插图在对应步骤的
+    请求/响应之后，做到「一个步骤一张图」；漏洞级图（step_index=0）由调用方
+    追加在末尾。
+
+    无结构化复现时整段回退 report_md 纯文本（单块，无插图锚点）。
+    """
     rp = finding.get("reproduction")
     if isinstance(rp, str):
         try:
@@ -283,27 +290,34 @@ def _proof_text(finding):
             rp = None
     rp = rp or {}
     steps = rp.get("steps") or []
-    if steps:
-        lines = []
-        if rp.get("entry_point"):
-            lines.append("入口点：{0}".format(rp["entry_point"]))
-        for pre in rp.get("prerequisites") or []:
-            lines.append("前置条件：{0}".format(pre))
-        for i, st in enumerate(steps):
-            desc = st.get("expected") or st.get("proves") or ""
-            head = "步骤{0}".format(i + 1)
-            if desc:
-                head += "：{0}".format(desc)
-            lines.append(head)
-            if st.get("request"):
-                lines.append("请求：\n{0}".format(st["request"]))
-            if st.get("response"):
-                lines.append("响应：\n{0}".format(st["response"]))
-        return "\n".join(lines)
-    md = str(finding.get("report_md") or "").strip()
-    if md:
-        return _md_to_plain(md)
-    return "（暂无逐字复现证据，请补充后重新生成）"
+    if not steps:
+        md = str(finding.get("report_md") or "").strip()
+        return [("text", _md_to_plain(md) if md else "（暂无逐字复现证据，请补充后重新生成）")]
+
+    blocks = []
+    if rp.get("entry_point"):
+        blocks.append(("text", "入口点：{0}\n".format(rp["entry_point"])))
+    for pre in rp.get("prerequisites") or []:
+        blocks.append(("text", "前置条件：{0}\n".format(pre)))
+    for i, st in enumerate(steps):
+        no = i + 1
+        buf = ["步骤{0}\n".format(no)]
+        if st.get("expected"):
+            buf.append("预期：{0}\n".format(st["expected"]))
+        if st.get("proves"):
+            buf.append("证明：{0}\n".format(st["proves"]))
+        if st.get("request"):
+            buf.append("请求：\n{0}\n".format(st["request"]))
+        if st.get("response"):
+            buf.append("响应：\n{0}\n".format(st["response"]))
+        blocks.append(("text", "".join(buf)))
+        blocks.append(("img", no))
+    return blocks
+
+
+def _proof_text(finding):
+    """漏洞证明纯文本（不含插图）：块序列里 text 段的拼接。"""
+    return "".join(str(v) for k, v in _proof_blocks(finding) if k == "text").strip()
 
 
 def _md_to_plain(md):
@@ -527,47 +541,95 @@ def _lock_table_layout(cell):
         tblW.set(qn("w:w"), str(total))
 
 
-def _append_images(cell, images):
-    """在单元格（漏洞证明）末尾按 images 顺序插图 + 图注。
+def _add_picture_paragraph(cell, img):
+    """在单元格末尾插一张图 + 图注，返回可供后续文字继续使用的空段落。
 
-    doc.add_picture 只能挂段落级；单元格里改用 `cell.add_paragraph()` 新建
-    段落再 `run.add_picture(path, width=Cm(15))`。路径缺失/损坏只记 warning
-    并跳过（报告不该因为一张图 500）。返回实际插入张数。
+    路径缺失/损坏只记 warning 并跳过（报告不因一张图 500）。
     """
-    added = 0
-    for img in images or []:
-        if not isinstance(img, dict):
+    path = str(img.get("path") or "").strip()
+    caption = str(img.get("caption") or "").strip()
+    if not path or not os.path.isfile(path):
+        logger.warning("漏洞证明截图缺失，已跳过: %s", path or "(空路径)")
+        return None
+    para = cell.add_paragraph()
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    try:
+        pic = para.add_run().add_picture(path, width=Cm(IMAGE_WIDTH_CM))
+        # 超高图按高度上限等比回缩，避免被排版引擎塞进一页高度里压扁。
+        max_h = Cm(IMAGE_MAX_HEIGHT_CM)
+        if pic.height > max_h:
+            ratio = max_h / pic.height
+            pic.height = max_h
+            pic.width = int(pic.width * ratio)
+    except Exception as exc:
+        logger.warning("漏洞证明截图插入失败，已跳过: %s (%s)", path, exc)
+        para._p.getparent().remove(para._p)
+        return None
+    if caption:
+        cap = cell.add_paragraph()
+        cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        cap.add_run(caption).font.size = Pt(CAPTION_SIZE_PT)
+    return cell.add_paragraph()
+
+
+def _fill_proof_cell(cell, finding):
+    """填「漏洞证明」单元格：文字与截图按步骤交错（一步一张图）。
+
+    模板该行用「漏洞证明：」+ 空行 run 表达换行，先保留标签 run，再按
+    _proof_blocks 的顺序追加文本块与图片段落。图片放在对应步骤的响应之后。
+    """
+    p = cell.paragraphs[0]
+    runs = list(p.runs)
+    keep = [runs[0]] if runs else []
+    for r in runs[1:]:
+        if r.text.strip() == "" and "\n" in r.text:
+            keep.append(r)
+        else:
+            break
+    value_rpr = None
+    for r in runs[len(keep):]:
+        rpr = r._element.find(qn("w:rPr"))
+        if rpr is not None:
+            value_rpr = copy.deepcopy(rpr)
+            break
+    for r in runs[len(keep):]:
+        r._element.getparent().remove(r._element)
+
+    by_step = {}
+    for im in finding.get("images") or []:
+        if not isinstance(im, dict):
             continue
-        path = str(img.get("path") or "").strip()
-        caption = str(img.get("caption") or "").strip()
-        if not path or not os.path.isfile(path):
-            logger.warning("漏洞证明截图缺失，已跳过: %s", path or "(空路径)")
-            continue
-        # 图片必须留在「漏洞证明」单元格内（用户口径：截图属于该条漏洞的证明
-        # 内容）。先锁表宽，再把图按 14cm 宽插进单元格末尾。
-        _lock_table_layout(cell)
-        para = cell.add_paragraph()
-        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
         try:
-            pic = para.add_run().add_picture(path, width=Cm(IMAGE_WIDTH_CM))
-            # 超高图（长报文合成图）按高度上限等比回缩：否则 Word/LO 会把图
-            # 塞进一页高度里，视觉上就是"压扁 + 内容挤在一起"。
-            max_h = Cm(IMAGE_MAX_HEIGHT_CM)
-            if pic.height > max_h:
-                ratio = max_h / pic.height
-                pic.height = max_h
-                pic.width = int(pic.width * ratio)
-        except Exception as exc:  # 损坏/非图片文件：跳过，不阻断
-            logger.warning("漏洞证明截图插入失败，已跳过: %s (%s)", path, exc)
-            para._p.getparent().remove(para._p)
+            step = int(im.get("step_index") or 0)
+        except (TypeError, ValueError):
+            step = 0
+        by_step.setdefault(step, []).append(im)
+
+    def add_text(para, text):
+        if not text:
+            return
+        run = para.add_run(text)
+        if value_rpr is not None:
+            run._element.insert(0, copy.deepcopy(value_rpr))
+
+    cur = p
+    # 锁一次表宽：LibreOffice 对 autofit 表会按内容重算列宽，把图压到一半。
+    if any(by_step.values()):
+        _lock_table_layout(cell)
+    for kind, value in _proof_blocks(finding):
+        if kind == "text":
+            add_text(cur, str(value))
             continue
-        if caption:
-            cap = cell.add_paragraph()
-            cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = cap.add_run(caption)
-            run.font.size = Pt(CAPTION_SIZE_PT)
-        added += 1
-    return added
+        if kind == "img":
+            for im in by_step.get(int(value), []):
+                nxt = _add_picture_paragraph(cell, im)
+                if nxt is not None:
+                    cur = nxt
+    # 漏洞级图（step_index=0）统一补在末尾。
+    for im in by_step.get(0, []):
+        nxt = _add_picture_paragraph(cell, im)
+        if nxt is not None:
+            cur = nxt
 
 
 def _fill_vuln_block(heading_el, table_el, finding, index, doc):
@@ -588,11 +650,13 @@ def _fill_vuln_block(heading_el, table_el, finding, index, doc):
     for row in table.rows:
         cell = row.cells[0]
         label = (cell.text.split("：", 1)[0] or "").strip()
-        if label in values:
+        if label not in values:
+            continue
+        if label == "漏洞证明":
+            # 文字与截图按步骤交错：一个步骤一张图，插在该步骤响应之后。
+            _fill_proof_cell(cell, finding)
+        else:
             _fill_prefixed_cell(cell, values[label])
-            # 报文截图插在「漏洞证明：」单元格文字之后（V9-SHOT）。
-            if label == "漏洞证明":
-                _append_images(cell, finding.get("images"))
 
 
 def _fill_vuln_blocks(doc, findings):

@@ -299,6 +299,52 @@ class FindingImagesTest(unittest.TestCase):
         # 没有图的第三条 finding 不带 drawing。
         self.assertEqual(blocks[2].rows[4].cells[0]._tc.xml.count("<w:drawing"), 0)
 
+    def test_images_follow_their_own_step(self):
+        """多步骤：图必须落在对应步骤的响应之后，不能全部堆在单元格末尾。"""
+        tmp = tempfile.mkdtemp(prefix="artex-tpl-steps-")
+        paths = []
+        for i in range(3):
+            p = os.path.join(tmp, "s%d.png" % (i + 1))
+            self.make_png(p, (40 + i * 60, 80, 160))
+            paths.append(p)
+        data = sample_data()
+        f = data["findings"][0]
+        f["reproduction"]["steps"] = [
+            {"expected": "预期%d" % (i + 1), "proves": "证明%d" % (i + 1),
+             "request": "GET /s%d HTTP/1.1" % (i + 1),
+             "response": "HTTP/1.1 200 OK\r\n\r\nok%d" % (i + 1)}
+            for i in range(3)
+        ]
+        f["images"] = [
+            {"step_index": i + 1, "path": paths[i], "caption": "图注%d" % (i + 1)}
+            for i in range(3)
+        ]
+        out = os.path.join(tmp, "out.docx")
+        fill(TPL, data, out)
+
+        doc = Document(out)
+        proof = vuln_block_tables(doc)[0].rows[4].cells[0]
+        seq = []
+        for idx, para in enumerate(proof.paragraphs):
+            has_pic = "w:drawing" in para._p.xml
+            seq.append((idx, "pic" if has_pic else "txt", para.text or ""))
+        self.assertEqual(sum(1 for x in seq if x[1] == "pic"), 3, "三张图必须都在单元格内")
+
+        def idx_of(needle, kind=None):
+            for idx, k, text in seq:
+                if needle in text and (kind is None or k == kind):
+                    return idx
+            self.fail("找不到段落: %s（%s）" % (needle, kind))
+
+        s1, s2, s3 = idx_of("步骤1"), idx_of("步骤2"), idx_of("步骤3")
+        c1, c2, c3 = idx_of("图注1"), idx_of("图注2"), idx_of("图注3")
+        # 步骤1 → 图注1 → 步骤2 → 图注2 → 步骤3 → 图注3，严格递增。
+        self.assertLess(s1, c1, "图注1 必须在步骤1 之后")
+        self.assertLess(c1, s2, "步骤2 必须在图注1 之后（图不能堆到末尾）")
+        self.assertLess(s2, c2)
+        self.assertLess(c2, s3, "步骤3 必须在图注2 之后")
+        self.assertLess(s3, c3)
+
     def test_missing_image_is_skipped_with_warning(self):
         tmp = tempfile.mkdtemp(prefix="artex-tpl-noimg-")
         data = sample_data()
