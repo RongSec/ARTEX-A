@@ -51,6 +51,8 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	// V5-A：planner 的洞察否决工具（host 工具，需 pg；tools 表 seed 时只绑 planner，
 	// 故装配层对其他 agent 会按绑定丢弃——worker/mainagent 看不到）。
 	tools = append(tools, s.toolRejectInsight())
+	// V10-INTEL：漏洞情报两工具（只读，公开源）。绑定见 seedOrchestrationTools。
+	tools = append(tools, s.intelTools()...)
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)
@@ -517,6 +519,13 @@ func (s *Server) seedOrchestrationTools() {
 	for _, t := range s.platformTools() {
 		schema, _ := json.Marshal(t.InputSchema())
 		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
+	}
+	// 漏洞情报工具绑给真正干活的三类 agent：planner 判断方向、worker 挖洞、
+	// auto 做编排决策。SeedTool 首插入生效，新库首次起来就带好绑定。
+	intelAgents := json.RawMessage(`["planner","worker","mainagent","auto","pentest"]`)
+	for _, t := range s.intelTools() {
+		schema, _ := json.Marshal(t.InputSchema())
+		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, intelAgents)
 	}
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()

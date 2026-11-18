@@ -1862,3 +1862,28 @@ CREATE TABLE IF NOT EXISTS task_foreign_assets (
 );
 CREATE INDEX IF NOT EXISTS idx_task_foreign_assets_task ON task_foreign_assets(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_foreign_assets_source ON task_foreign_assets(task_id, source_task_id);
+
+-- ---------- 漏洞情报（V10-INTEL） ----------
+-- 只存公开源（NVD API 2.0 + CISA KEV）拉下来的条目；不含任何私有 PoC 仓库内容。
+-- cpe 存 "vendor:product" 归一后的片段，用于「资产技术指纹 → CVE」反向匹配。
+CREATE TABLE IF NOT EXISTS vuln_intel (
+    cve_id       TEXT PRIMARY KEY,
+    source       TEXT NOT NULL DEFAULT 'nvd',
+    title        TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    severity     TEXT NOT NULL DEFAULT '',
+    cvss         REAL NOT NULL DEFAULT 0,
+    published_at TIMESTAMPTZ,
+    modified_at  TIMESTAMPTZ,
+    kev          BOOLEAN NOT NULL DEFAULT false,
+    kev_due      DATE,
+    ransomware   BOOLEAN NOT NULL DEFAULT false,
+    cpe          TEXT[] NOT NULL DEFAULT '{}',
+    refs         TEXT[] NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_vuln_intel_published ON vuln_intel(published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vuln_intel_cvss ON vuln_intel(cvss DESC);
+CREATE INDEX IF NOT EXISTS idx_vuln_intel_kev ON vuln_intel(kev) WHERE kev;
+CREATE INDEX IF NOT EXISTS idx_vuln_intel_cpe ON vuln_intel USING gin(cpe);

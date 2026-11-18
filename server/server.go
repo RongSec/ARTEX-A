@@ -26,6 +26,7 @@ import (
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/artex/vulnintel"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
@@ -50,6 +51,9 @@ type Server struct {
 	jwtKey   []byte
 	jwtKeyMu sync.RWMutex
 	keyDir   string // jwt.key 落盘目录（项目根，不在可浏览的工作区里）
+
+	// intel 是漏洞情报同步器（NVD + CISA KEV）。nil=未启用（无 PG 时）。
+	intel *vulnintel.Service
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -277,6 +281,10 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// OnGraphChange 回调。无 PG 时恒 nil=整条链路惰性（原版零回归）。
 		m.projectIndexer = newProjectIndexer(m.pg)
 		m.projectIndexer.Start(s.ctx)
+		// 漏洞情报（V10-INTEL）：NVD + CISA KEV 公开源同步。默认开：只读公开
+		// 数据、无副作用；首次 30 秒后跑快通道，历史回填由页面手动触发。
+		s.intel = vulnintel.New(m.pg)
+		s.intel.Start(s.ctx)
 		// 任务终态→整项目自动报告钩子（artex-hs T18）。nil 守卫在装配内部，
 		// 钩子本体在 Manager.emitTaskTerminal 判空短路=原版零行为。
 		s.installTerminalHooks()
@@ -890,6 +898,15 @@ func (s *Server) Handler() http.Handler {
 	// 短路规则（V6-CFG）：文件级配置，保存后必须重启才生效（不提供热改）。
 	// 与 settings 同权限：仅需管理员 JWT（requireAuth 统一校验）。
 	mux.HandleFunc("GET /api/system/shortcircuit", s.shortCircuitGet)
+	// V10-INTEL：漏洞情报（NVD + CISA KEV 公开源）
+	mux.HandleFunc("GET /api/intel/status", s.intelStatus)
+	mux.HandleFunc("GET /api/intel/search", s.intelSearch)
+	mux.HandleFunc("GET /api/intel/asset-hits", s.intelAssetHits)
+	mux.HandleFunc("POST /api/intel/sync", s.intelSync)
+	// V10-HOSTENV：宿主环境体检 + 一键安装（目录白名单，安装命令只由服务端决定）
+	mux.HandleFunc("GET /api/system/host-tools", s.hostToolsStatus)
+	mux.HandleFunc("POST /api/system/host-tools/install", s.hostToolsInstall)
+	mux.HandleFunc("GET /api/system/host-tools/install/{id}", s.hostToolsInstallStatus)
 	mux.HandleFunc("PUT /api/system/shortcircuit", s.shortCircuitPut)
 	mux.HandleFunc("PUT /api/system/shortcircuit/rules", s.shortCircuitRulesPut)
 	mux.HandleFunc("POST /api/system/shortcircuit/reset", s.shortCircuitReset)
