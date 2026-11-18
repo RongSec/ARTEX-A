@@ -568,9 +568,11 @@ def _add_picture_paragraph(cell, img):
         para._p.getparent().remove(para._p)
         return None
     if caption:
-        cap = cell.add_paragraph()
-        cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        cap.add_run(caption).font.size = Pt(CAPTION_SIZE_PT)
+        # 图注并进图片段落（换行 + 五号字）：拆成独立段落时 LibreOffice 会在
+        # 表格里忽略 keepNext，把图注甩到下一页；同一段落物理上无法分开。
+        para.add_run().add_break()
+        cap_run = para.add_run(caption)
+        cap_run.font.size = Pt(CAPTION_SIZE_PT)
     return cell.add_paragraph()
 
 
