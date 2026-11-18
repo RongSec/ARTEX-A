@@ -1,21 +1,21 @@
 package packetshot
 
-// T22（N3）报文→PNG 自绘渲染器（Burp Suite 式）：纯 Go + x/image，单二进制
-// 零外部运行时依赖（选型 A，设计 §3.2——chromium/html2canvas 全放弃）。
+// HTTP 报文 → PNG 自绘渲染器（深色编辑器风格，左请求 / 右响应并排）。
 //
-// 布局：标题栏（请求=method+path / 响应=状态码彩色徽标）→ Headers 区（冗余
-// 头按清单折叠）→ Body 区（可选行号；JSON 逐 token 着色 key蓝/串绿/数橙，
-// 非 JSON 单色）。等宽字体（gofont gomono）。
+// 版式对齐参考稿（用户提供）：纯深色底，两栏各一段标题（Request /
+// Response）+ 下划线分隔；首行是「方法徽标 + 路径 + 协议」/「协议 + 状态码
+// 徽标」；请求头名蓝色、值浅灰；正文按 JSON / HTML / 表单做语法高亮；
+// 不折行的长行按栏宽硬折，续行悬垂缩进。
 //
-// 字体策略（team-lead 拍板的 CJK 探测增强，覆盖设计稿"接受方框降级"）：
-//   - 探测系统常见 CJK 字体（Windows msyh/simhei/simsun；Linux wqy/noto-cjk
-//     路径候选），命中则 ASCII 段走等宽、非 ASCII 段走 CJK face 混排绘制；
-//   - 未命中：回退纯 gofont 等宽 + 非 ASCII 字符转写 '?'（degradeText，设计
-//     §3.2 已知边界——DejaVu 无中文字形，直画会出空白）；
-//   - 探测 sync.Once 缓存（进程一次，不逐图扫盘）；解析失败=等同未命中，
-//     全程不 panic、不报错（降级是预期行为）。
+// 两条硬约束：
+//  1. 默认**不改写报文**：不脱敏、不折叠冗余头、不截断 body（用户口径：
+//     截图必须完整反映请求响应）。仍保留 MaskHeaders / Desensitize 开关，
+//     需要对外分享时才打开。
+//  2. 内容高度自适应，超出 MaxHeight 时先缩字号（最多 8 档），仍超才截断
+//     并在末尾标注 (truncated)，绝不静默丢行。
 //
-// 脱敏默认全开（MaskPacket：头值打码+体键值打码）——截图会进报告/分享链路。
+// 字体：ASCII 走内嵌 gofont 等宽；探测到系统 CJK 字体时非 ASCII 段混排，
+// 未探测到则降级为 '?'（不 panic）。
 
 import (
 	"bytes"
@@ -37,58 +37,59 @@ import (
 	"golang.org/x/image/math/fixed"
 )
 
-// Options 渲染开关。零值可用（Width=0→980，Scale=0→1，全 bool 关=原文）。
-// 默认建议值见 DefaultOptions（脱敏+行号开）。
+// Options 渲染开关。零值可用（Width=0→980，Scale=0→1）。
 type Options struct {
-	Width            int      // 画布宽 px（默认 980）
-	Scale            float64  // 全局缩放（0=1）；字号/行高/边距同乘
-	HideHeaders      bool     // 整个 Headers 区不画（标题+Body 直排）
-	MaskHeaders      bool     // 头值脱敏（Authorization/Cookie/X-*-Key…）
-	Desensitize      bool     // Body 表单/JSON 键值脱敏
-	Mosaic           bool     // 形似密钥的值再叠块状马赛克（打码之上再糊）
-	LineNumbers      bool     // Body 区画行号
-	ExtraHideHeaders []string // 追加折叠的头名（小写不敏感）
-	KeepHeaders      []string // 从默认冗余清单豁免的头名
+	Width            int      // 画布宽 px（默认 1680）
+	Scale            float64  // 字号倍率（0=1；默认 2.5）
+	MaxHeight        int      // 画布高上限 px（0=不限；超出先缩字号再截断）
+	HideHeaders      bool     // 整个 Headers 区不画
+	MaskHeaders      bool     // 头值脱敏（默认关：报告要完整报文）
+	Desensitize      bool     // Body 键值脱敏（默认关）
+	Mosaic           bool     // 形似密钥的值再叠马赛克
+	LineNumbers      bool     // Body 区画行号（默认关）
+	ExtraHideHeaders []string // 追加折叠的头名（默认不折叠任何头）
+	KeepHeaders      []string // 从折叠清单豁免的头名
 }
 
-// DefaultOptions 默认（V3 起）：宽 1400、Scale 1.5（字号/行高/边距同乘，
-// 报告里截图放大可读）、脱敏全开、行号开、隐藏/马赛克关。
+// DefaultOptions 报告用默认值：宽 1680、Scale 2.5（14cm 宽插图后正文约
+// 7pt）、不脱敏、不折叠头、不画行号。
 func DefaultOptions() Options {
-	return Options{Width: 1400, Scale: 1.5, MaskHeaders: true, Desensitize: true, LineNumbers: true}
+	return Options{Width: 1680, Scale: 2.5}
 }
 
-// 调色板（浅色，近 Burp 报文视图）。
+// 深色主题调色板。
 var (
-	colBG      = color.NRGBA{255, 255, 255, 255}
-	colCard    = color.NRGBA{246, 248, 250, 255}
-	colBand    = color.NRGBA{236, 240, 244, 255}
-	colBorder  = color.NRGBA{208, 215, 222, 255}
-	colText    = color.NRGBA{31, 35, 40, 255}
-	colMuted   = color.NRGBA{110, 119, 129, 255}
-	colKey     = color.NRGBA{9, 105, 218, 255}  // JSON key 蓝
-	colStr     = color.NRGBA{10, 128, 67, 255}  // 串绿
-	colNum     = color.NRGBA{154, 103, 0, 255}  // 数橙
-	colLit     = color.NRGBA{130, 80, 223, 255} // 布尔/null 紫
-	colHdrName = color.NRGBA{9, 105, 218, 255}
-	colWhite   = color.NRGBA{255, 255, 255, 255}
-	// colBandTitle 栏顶「请求/响应」标题带底色（深底白字，两栏同色）。
-	colBandTitle = color.NRGBA{36, 41, 46, 255}
+	colBG      = color.NRGBA{0x0F, 0x10, 0x12, 0xFF} // 画布底
+	colTitle   = color.NRGBA{0xF0, 0xF3, 0xF6, 0xFF} // 栏标题
+	colRule    = color.NRGBA{0x2A, 0x2D, 0x31, 0xFF} // 标题下横线 / 分栏竖线
+	colText    = color.NRGBA{0xC9, 0xD1, 0xD9, 0xFF} // 普通文字
+	colStrong  = color.NRGBA{0xE6, 0xED, 0xF3, 0xFF} // 路径等强调
+	colMuted   = color.NRGBA{0x6E, 0x76, 0x81, 0xFF} // 协议版本 / 提示
+	colHdrName = color.NRGBA{0x79, 0xC0, 0xFF, 0xFF} // 头名 / JSON key
+	colPunct   = color.NRGBA{0x8B, 0x94, 0x9E, 0xFF} // 冒号等标点
+	colStr     = color.NRGBA{0xCE, 0x91, 0x78, 0xFF} // 字符串值
+	colNum     = color.NRGBA{0xB5, 0xCE, 0xA8, 0xFF} // 数字
+	colLit     = color.NRGBA{0x56, 0x9C, 0xD6, 0xFF} // true/false/null
+	colTag     = color.NRGBA{0x56, 0x9C, 0xD6, 0xFF} // HTML 标签名
+	colAttr    = color.NRGBA{0x9C, 0xDC, 0xFE, 0xFF} // HTML 属性名
+	colComment = color.NRGBA{0x6A, 0x99, 0x55, 0xFF} // 注释
+	colWhite   = color.NRGBA{0xFF, 0xFF, 0xFF, 0xFF}
 )
 
-// 徽标底色（按 method 首字母 / 状态码首位）。
+// 徽标底色。
 var (
-	colBadgeReq = color.NRGBA{9, 105, 218, 255}
-	colBadge2xx = color.NRGBA{26, 127, 55, 255}
-	colBadge3xx = color.NRGBA{4, 108, 192, 255}
-	colBadge4xx = color.NRGBA{154, 103, 0, 255}
-	colBadge5xx = color.NRGBA{207, 34, 46, 255}
+	colBadgeReq = color.NRGBA{0xB4, 0x23, 0x33, 0xFF} // 方法：红
+	colBadge2xx = color.NRGBA{0x23, 0x86, 0x36, 0xFF} // 2xx：绿
+	colBadge3xx = color.NRGBA{0x1F, 0x6F, 0xEB, 0xFF} // 3xx：蓝
+	colBadge4xx = color.NRGBA{0x9E, 0x6A, 0x03, 0xFF} // 4xx：橙
+	colBadge5xx = color.NRGBA{0xDA, 0x36, 0x33, 0xFF} // 5xx：红
 )
 
 // ---------- 字体：CJK 探测（sync.Once）+ 加载 ----------
 
 type fontSet struct {
-	mono  *opentype.Font // gofont 等宽（内嵌，恒可得）
-	cjk   *opentype.Font // 系统 CJK（探测命中才非 nil）
+	mono  *opentype.Font
+	cjk   *opentype.Font
 	cjkOK bool
 }
 
@@ -97,8 +98,6 @@ var (
 	fontCache *fontSet
 )
 
-// cjkFontCandidates 常见 CJK 字体绝对路径（Windows 盘符 + Linux 发行版常
-// 见目录；%WINDIR% 变体在 probe 时再拼）。加载失败逐个跳过=可接受。
 var cjkFontCandidates = []string{
 	`C:\Windows\Fonts\msyh.ttc`,
 	`C:\Windows\Fonts\msyh.ttf`,
@@ -114,7 +113,6 @@ var cjkFontCandidates = []string{
 	"/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
 }
 
-// cjkProbePaths 显式候选 + %WINDIR% 拼装（任务书点名 Windows 环境变量路径）。
 func cjkProbePaths() []string {
 	out := append([]string(nil), cjkFontCandidates...)
 	if wd := strings.TrimSpace(os.Getenv("WINDIR")); wd != "" {
@@ -125,8 +123,6 @@ func cjkProbePaths() []string {
 	return out
 }
 
-// loadFonts 探测一次缓存。ttc 是字体集合→ParseCollection 取第 0 个（雅黑/
-// 思源中黑首选族）；单 ttf→Parse。任何失败都只影响 cjk 字段（=降级路径）。
 func loadFonts() *fontSet {
 	fontOnce.Do(func() {
 		fs := &fontSet{}
@@ -155,7 +151,6 @@ func loadFonts() *fontSet {
 // HasCJK 当前进程是否探测到可用 CJK 字体（首调触发探测）。
 func HasCJK() bool { return loadFonts().cjkOK }
 
-// face 按磅号实例化 face；字体不可用返回 nil（调用方处理）。
 func faceOf(f *opentype.Font, size float64) font.Face {
 	if f != nil {
 		if ff, err := opentype.NewFace(f, &opentype.FaceOptions{Size: size, DPI: 72, Hinting: font.HintingFull}); err == nil {
@@ -165,265 +160,315 @@ func faceOf(f *opentype.Font, size float64) font.Face {
 	return nil
 }
 
-// ---------- 行模型（layout 与 draw 共享） ----------
+// ---------- 行模型 ----------
 
 type rowKind int8
 
 const (
-	rowTitle rowKind = iota // 带徽标的标题行
-	rowText                 // 普通文本（头行=name 蓝 + value 黑）
-	rowMuted                // 区段标签/提示（灰）
-	rowJSON                 // Body JSON 着色行（可带行号）
-	rowCode                 // Body 非 JSON 行（可带行号）
+	rowTitle rowKind = iota // 首行：徽标 + 报文行
+	rowText                 // 头行（name 蓝 + value 灰）
+	rowMuted                // 提示（灰）
+	rowJSON                 // JSON 行
+	rowCode                 // 正文行（按语言高亮）
+	rowRule                 // 分隔线（body 前的一条细线）
 )
 
 type panelRow struct {
 	kind   rowKind
-	name   string // 头行的 Name（rowText 且有值时着色区分）
-	text   string // 主体文本（rowText=value 段 / rowJSON|Code=行内容）
-	num    int    // 行号（>0 才画）
-	mosaic bool   // 尾部叠马赛克（Mosaic 命中）
-	indent int    // 续行悬垂缩进（px，从内容左边界起；折行与绘制共用）
+	name   string // 头名 或 徽标文字
+	text   string
+	proto  string // 首行协议段（HTTP/1.1），灰色排在同侧
+	resp   bool   // 首行是否为响应（决定协议与徽标的左右顺序）
+	num    int
+	mosaic bool
+	indent int
 }
 
-// ---------- 排版 + 绘制主流程 ----------
+// hlLang 正文语法高亮语言。
+type hlLang int8
 
-// panelData 一栏（请求或响应）的排版结果与角色。
+const (
+	hlPlain hlLang = iota
+	hlJSON
+	hlHTML
+	hlForm
+)
+
 type panelData struct {
 	rows []panelRow
 	resp bool
+	lang hlLang
 }
 
-// Render 把一段报文（请求或响应原文；两者都给=**左请求、右响应**两栏并排）
-// 渲染成 PNG 字节。脱敏先于排版（截图安全底线）；空输入报错。
+// layout 版式尺度（全部由字号推导，改 Scale 即整体等比）。
+type layout struct {
+	font   float64
+	lineH  int
+	padX   int
+	padY   int
+	titleH int
+	asc    int
+	desc   int
+}
+
+func newLayout(scale float64, face font.Face) layout {
+	if scale <= 0 {
+		scale = 1
+	}
+	fontSize := 12.0 * scale
+	lm := layout{
+		font:   fontSize,
+		lineH:  int(math.Round(fontSize * 1.42)),
+		padX:   int(math.Round(12 * scale)),
+		padY:   int(math.Round(10 * scale)),
+		titleH: int(math.Round(fontSize*1.7)) + int(math.Round(10*scale)),
+	}
+	if lm.lineH < 6 {
+		lm.lineH = 6
+	}
+	if lm.padX < 6 {
+		lm.padX = 6
+	}
+	if lm.padY < 6 {
+		lm.padY = 6
+	}
+	m := face.Metrics()
+	lm.asc = m.Ascent.Ceil()
+	lm.desc = m.Descent.Ceil()
+	return lm
+}
+
+// Render 把请求/响应渲染成 PNG。两者都给 = 左请求、右响应并排。
 //
-// 版式：整体宽 opt.Width，两栏等宽、中间 8px 分隔，各栏顶部一条深底白字
-// 标题带（「请求」/「响应」；无 CJK 字体时降级为 REQUEST/RESPONSE）。按
-// 15cm 插入报告后高度自适应：文字按栏宽折行，不跨栏溢出。
+// 内容完整优先：先按给定 Scale 排版，超出 MaxHeight 时逐档缩字号（×0.9，
+// 最多 8 档），仍超出才截断行并在末行标注 (truncated)。
 func Render(req, resp string, opt Options) ([]byte, error) {
-	s := opt.Scale
-	if s <= 0 {
-		s = 1
+	if strings.TrimSpace(req) == "" && strings.TrimSpace(resp) == "" {
+		return nil, fmt.Errorf("packetshot: 空报文")
 	}
 	width := opt.Width
 	if width < 420 {
 		width = 980
 	}
-
-	var panels []panelData
-	if strings.TrimSpace(req) != "" {
-		panels = append(panels, panelData{rows: buildPanel(req, opt)})
-	}
-	if strings.TrimSpace(resp) != "" {
-		panels = append(panels, panelData{rows: buildPanel(resp, opt), resp: true})
-	}
-	if len(panels) == 0 {
-		return nil, fmt.Errorf("packetshot: 空报文")
-	}
-
-	fs := loadFonts()
-	fontSize := 12.0 * s
-	monoFace := faceOf(fs.mono, fontSize)
-	defer monoFace.Close()
-	cjkFace := font.Face(nil)
-	if fs.cjkOK {
-		cjkFace = faceOf(fs.cjk, fontSize)
-		if cjkFace != nil {
-			defer cjkFace.Close()
-		}
-	}
-
-	lm := newLayoutMetrics(s, monoFace)
-	pad := lm.pad
-	const sep = 8 // 两栏间分隔宽度（px，不随 Scale 放大——版面锚点）
-
-	// 栏宽：两栏等宽、扣掉分隔；单栏占满。maxW=栏内可用文字宽（折行用）。
-	panelW := width - 2*pad
-	if len(panels) == 2 {
-		panelW = (width - 2*pad - sep) / 2
-	}
-	if panelW < 80 {
-		panelW = 80
-	}
-	maxW := panelW - 2*pad
-	if maxW < 20 {
-		maxW = 20
-	}
-
-	// 先按栏宽折行，再按物理行数计高：画布高度 = 两栏内容高的较大者 +
-	// 上下 padding（不再用固定高度，长报文/长行自然长高）。
-	heights := make([]int, len(panels))
-	maxH := 0
-	for i := range panels {
-		panels[i].rows = wrapPanelRows(panels[i].rows, maxW, s, monoFace, cjkFace, fs.cjkOK)
-		h := contentHeight(lm, len(panels[i].rows))
-		heights[i] = h
-		if h > maxH {
-			maxH = h
-		}
-	}
-	total := pad + maxH + pad
-
-	img := image.NewNRGBA(image.Rect(0, 0, width, total))
-	draw.Draw(img, img.Bounds(), &image.Uniform{colBG}, image.Point{}, draw.Src)
-
-	asc := lm.asc
-	for i, p := range panels {
-		rows := p.rows
-		x0 := pad + i*(panelW+sep)
-		y := pad
-		h := heights[i]
-		// 卡片底 + 标题带（深底）+ 边框。
-		draw.Draw(img, image.Rect(x0, y, x0+panelW, y+h), &image.Uniform{colCard}, image.Point{}, draw.Src)
-		draw.Draw(img, image.Rect(x0, y, x0+panelW, y+lm.bandH), &image.Uniform{colBandTitle}, image.Point{}, draw.Src)
-		strokeRect(img, image.Rect(x0, y, x0+panelW-1, y+h-1), colBorder)
-
-		// 标题带文字（居中）：cjk 字体优先，无则英文降级。
-		label := "请求"
-		if p.resp {
-			label = "响应"
-		}
-		labelFace := font.Face(monoFace)
-		if fs.cjkOK && cjkFace != nil {
-			labelFace = cjkFace
-		} else if p.resp {
-			label = "RESPONSE"
-		} else {
-			label = "REQUEST"
-		}
-		lw := textWidth(labelFace, label)
-		lm2 := labelFace.Metrics()
-		bandBase := y + (lm.bandH-(lm2.Ascent+lm2.Descent).Ceil())/2 + lm2.Ascent.Ceil()
-		drawString(img, label, x0+(panelW-lw)/2, bandBase, colWhite, labelFace)
-
-		ty := y + lm.bandH + pad + asc
-		for _, r := range rows {
-			x := x0 + pad + r.indent
-			switch r.kind {
-			case rowTitle:
-				badge := r.name // REQ / 2xx 等
-				bg := badgeColor(badge)
-				bw := textWidth(monoFace, badge) + int(10*s)
-				draw.Draw(img, image.Rect(x, ty-asc-int(2*s), x+bw, ty+int(3*s)), &image.Uniform{bg}, image.Point{}, draw.Src)
-				drawString(img, badge, x+int(5*s), ty, colWhite, monoFace)
-				x += bw + int(8*s)
-				drawString(img, r.text, x, ty, colText, monoFace)
-			case rowMuted:
-				drawString(img, r.text, x, ty, colMuted, monoFace)
-			case rowText:
-				if r.name != "" {
-					nw := textWidth(monoFace, r.name)
-					drawString(img, r.name, x, ty, colHdrName, monoFace)
-					x += nw
-				}
-				x = drawMixed(img, r.text, x, ty, colText, monoFace, cjkFace, fs.cjkOK)
-				if r.mosaic {
-					drawMosaicBox(img, x, ty-asc, pad, int(monoFace.Metrics().Height.Ceil()), s)
-				}
-			case rowJSON:
-				if r.num > 0 {
-					nstr := fmt.Sprintf("%4d ", r.num)
-					drawString(img, nstr, x, ty, colMuted, monoFace)
-					x += textWidth(monoFace, nstr)
-				}
-				for _, t := range tokenizeJSONLine(r.text) {
-					c := colText
-					switch t.kind {
-					case tokKey:
-						c = colKey
-					case tokString:
-						c = colStr
-					case tokNumber:
-						c = colNum
-					case tokLit:
-						c = colLit
-					}
-					x = drawMixed(img, t.text, x, ty, c, monoFace, cjkFace, fs.cjkOK)
-				}
-				if r.mosaic {
-					drawMosaicBox(img, x, ty-asc, pad, int(monoFace.Metrics().Height.Ceil()), s)
-				}
-			case rowCode:
-				if r.num > 0 {
-					nstr := fmt.Sprintf("%4d ", r.num)
-					drawString(img, nstr, x, ty, colMuted, monoFace)
-					x += textWidth(monoFace, nstr)
-				}
-				x = drawMixed(img, r.text, x, ty, colText, monoFace, cjkFace, fs.cjkOK)
-				if r.mosaic {
-					drawMosaicBox(img, x, ty-asc, pad, int(monoFace.Metrics().Height.Ceil()), s)
-				}
-			}
-			ty += lm.lineH
-		}
-	}
-
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-// layoutMetrics 版式尺度（行高/标题带高/内容 padding/基线），按字号×Scale
-// 统一推导，避免各处硬编码导致行距与字号脱钩。
-type layoutMetrics struct {
-	lineH int // 行高 = 字号 × 1.35
-	bandH int // 标题带高（随字号缩放）
-	pad   int // 内容前后 padding（8px × Scale）
-	asc   int // 等宽字体基线抬升
-}
-
-// newLayoutMetrics 由 Scale 与字体度量生成版式尺度。字号 12pt(=px@72dpi) 乘
-// Scale；行高固定取 1.35 倍字号，保证相邻行不重叠（含 CJK 字形上下缘）。
-func newLayoutMetrics(scale float64, monoFace font.Face) layoutMetrics {
+	scale := opt.Scale
 	if scale <= 0 {
 		scale = 1
 	}
-	fontSize := 12.0 * scale
-	lineH := int(math.Round(fontSize * 1.35))
-	if lineH < 1 {
-		lineH = 1
+
+	panels := make([]panelData, 0, 2)
+	if strings.TrimSpace(req) != "" {
+		panels = append(panels, panelData{rows: buildPanel(req, opt), lang: detectLang(req)})
 	}
-	pad := int(math.Round(8 * scale))
-	if pad < 4 {
-		pad = 4
+	if strings.TrimSpace(resp) != "" {
+		panels = append(panels, panelData{rows: buildPanel(resp, opt), resp: true, lang: detectLang(resp)})
 	}
-	return layoutMetrics{
-		lineH: lineH,
-		bandH: lineH + int(math.Round(6*scale)),
-		pad:   pad,
-		asc:   int(monoFace.Metrics().Ascent.Ceil()),
+
+	fs := loadFonts()
+	for attempt := 0; ; attempt++ {
+		img, total := paint(width, scale, panels, fs)
+		if opt.MaxHeight <= 0 || total <= opt.MaxHeight || attempt >= 7 {
+			if opt.MaxHeight > 0 && total > opt.MaxHeight {
+				img = truncateToHeight(img, opt.MaxHeight)
+			}
+			var buf bytes.Buffer
+			if err := png.Encode(&buf, img); err != nil {
+				return nil, err
+			}
+			return buf.Bytes(), nil
+		}
+		scale *= 0.9
 	}
 }
 
-// contentHeight 一栏高度 = 标题带 + 内容前后 padding + 物理行数 × 行高。
-func contentHeight(lm layoutMetrics, nRows int) int {
-	return lm.bandH + lm.pad + nRows*lm.lineH + lm.pad
+// paint 按给定尺度渲染一版，返回图像与实际高度。
+func paint(width int, scale float64, panels []panelData, fs *fontSet) (*image.NRGBA, int) {
+	mono := faceOf(fs.mono, 12.0*scale)
+	defer mono.Close()
+	var cjk font.Face
+	if fs.cjkOK {
+		cjk = faceOf(fs.cjk, 12.0*scale)
+		if cjk != nil {
+			defer cjk.Close()
+		}
+	}
+	titleFace := faceOf(fs.mono, 17.0*scale)
+	defer titleFace.Close()
+
+	lm := newLayout(scale, mono)
+
+	const gutter = 14 // 两栏之间的空白 + 1px 竖线
+	n := len(panels)
+	panelW := width
+	if n == 2 {
+		panelW = (width - gutter) / 2
+	}
+	innerW := panelW - 2*lm.padX
+	if innerW < 40 {
+		innerW = 40
+	}
+
+	// 先折行，算出各栏行数。
+	rowsByPanel := make([][]panelRow, n)
+	maxRows := 0
+	for i := range panels {
+		rowsByPanel[i] = wrapPanelRows(panels[i].rows, innerW, scale, mono, cjk, fs.cjkOK)
+		if l := len(rowsByPanel[i]); l > maxRows {
+			maxRows = l
+		}
+	}
+	contentH := lm.titleH + lm.padY + maxRows*lm.lineH + lm.padY
+	total := contentH
+
+	img := image.NewNRGBA(image.Rect(0, 0, width, total))
+	draw.Draw(img, img.Bounds(), &image.Uniform{colBG}, image.Point{}, draw.Src)
+	if n == 2 {
+		x := panelW + gutter/2
+		draw.Draw(img, image.Rect(x, 0, x+1, total), &image.Uniform{colRule}, image.Point{}, draw.Src)
+	}
+
+	for i := range panels {
+		x0 := 0
+		if i == 1 {
+			x0 = panelW + gutter
+		}
+		// 栏标题：粗体 + 下划线。
+		label := "Request"
+		if panels[i].resp {
+			label = "Response"
+		}
+		titleBase := lm.padY + lm.titleH - int(8*scale)
+		drawBold(img, label, x0+lm.padX, titleBase, colTitle, titleFace, scale)
+		ruleY := lm.padY + lm.titleH - int(2*scale)
+		draw.Draw(img, image.Rect(x0+lm.padX, ruleY, x0+panelW-lm.padX, ruleY+1),
+			&image.Uniform{colRule}, image.Point{}, draw.Src)
+
+		y := lm.titleH + lm.padY + lm.asc
+		for _, r := range rowsByPanel[i] {
+			x := x0 + lm.padX + r.indent
+			switch r.kind {
+			case rowTitle:
+				x = drawTitleRow(img, r, x, y, lm, mono, cjk, fs.cjkOK, scale)
+			case rowMuted:
+				drawMixed(img, r.text, x, y, colMuted, mono, cjk, fs.cjkOK)
+			case rowText:
+				if r.name != "" {
+					x = drawString(img, r.name, x, y, colHdrName, mono)
+					x = drawString(img, ":", x, y, colPunct, mono)
+					x = drawString(img, " ", x, y, colPunct, mono)
+				}
+				x = drawMixed(img, r.text, x, y, colText, mono, cjk, fs.cjkOK)
+			case rowJSON, rowCode:
+				lang := panels[i].lang
+				if r.kind == rowJSON {
+					lang = hlJSON
+				}
+				if r.num > 0 {
+					ns := fmt.Sprintf("%4d ", r.num)
+					x = drawString(img, ns, x, y, colMuted, mono)
+				}
+				if r.mosaic {
+					x = drawMixed(img, r.text, x, y, colText, mono, cjk, fs.cjkOK)
+					drawMosaicBox(img, x, y-lm.asc, lm.padX, lm.lineH, scale)
+				} else {
+					x = drawHighlighted(img, r.text, lang, x, y, mono, cjk, fs.cjkOK)
+				}
+			}
+			y += lm.lineH
+		}
+	}
+	return img, total
 }
 
-// wrapPanelRows 按栏内可用宽度把每行折成若干物理行（并排半栏后必须折行，
-// 否则右栏文字会盖到左栏/被画布裁掉）。续行不带行号与头名，按首行前缀宽度
-// 悬垂缩进（行号槽/头名宽度）对齐，与首行缩进不同。
+// drawTitleRow 报文首行：请求=[方法徽标][路径][协议灰]；响应=[协议灰][状态徽标]。
+func drawTitleRow(img *image.NRGBA, r panelRow, x, y int, lm layout, mono, cjk font.Face, cjkOK bool, scale float64) int {
+	if r.resp && r.proto != "" {
+		x = drawMixed(img, r.proto, x, y, colMuted, mono, cjk, cjkOK)
+		x += int(float64(lm.padX) * 0.5)
+	}
+	if r.name != "" {
+		bg := badgeColor(r.name)
+		bw := textWidth(mono, r.name) + int(float64(lm.padX)*1.5)
+		bh := lm.lineH - int(4*scale)
+		top := y - lm.asc - int(3*scale)
+		fillRoundRect(img, image.Rect(x, top, x+bw, top+bh), int(5*scale), bg)
+		drawString(img, r.name, x+(bw-textWidth(mono, r.name))/2, y, colWhite, mono)
+		x += bw + int(float64(lm.padX)*0.55)
+	}
+	if r.text != "" {
+		x = drawMixed(img, r.text, x, y, colStrong, mono, cjk, cjkOK)
+	}
+	if !r.resp && r.proto != "" {
+		x += int(float64(lm.padX) * 0.55)
+		x = drawMixed(img, r.proto, x, y, colMuted, mono, cjk, cjkOK)
+	}
+	return x
+}
+
+// drawHighlighted 按语言逐 token 着色。tokenize 只影响颜色，不增删字符。
+func drawHighlighted(img *image.NRGBA, line string, lang hlLang, x, y int, mono, cjk font.Face, cjkOK bool) int {
+	var toks []jsonToken
+	switch lang {
+	case hlJSON:
+		toks = tokenizeJSONLine(line)
+	case hlHTML:
+		toks = tokenizeHTMLLine(line)
+	case hlForm:
+		toks = tokenizeFormLine(line)
+	default:
+		return drawMixed(img, line, x, y, colText, mono, cjk, cjkOK)
+	}
+	for _, t := range toks {
+		c := colText
+		switch t.kind {
+		case tokKey:
+			c = colHdrName
+		case tokString:
+			c = colStr
+		case tokNumber:
+			c = colNum
+		case tokLit:
+			c = colLit
+		case tokTag:
+			c = colTag
+		case tokAttr:
+			c = colAttr
+		case tokComment:
+			c = colComment
+		}
+		x = drawMixed(img, t.text, x, y, c, mono, cjk, cjkOK)
+	}
+	return x
+}
+
+// ---------- 折行 ----------
+
 func wrapPanelRows(rows []panelRow, maxW int, s float64, mono, cjk font.Face, cjkOK bool) []panelRow {
-	out := make([]panelRow, 0, len(rows))
+	out := make([]panelRow, 0, len(rows)+8)
 	for _, r := range rows {
 		switch r.kind {
 		case rowTitle:
-			badgeW := 0
-			if r.name != "" {
-				badgeW = textWidth(mono, r.name) + int(10*s) + int(8*s)
+			// 首行前缀 = 徽标（+ 响应侧协议）宽度，续行悬垂到正文起点。
+			gap := int(12 * s)
+			prefix := 0
+			if r.resp && r.proto != "" {
+				prefix += textWidth(mono, r.proto) + gap/2
 			}
-			chunks := splitToWidth(r.text, max(1, maxW-badgeW), mono, cjk, cjkOK)
-			out = append(out, panelRow{kind: rowTitle, name: r.name, text: chunks[0]})
+			if r.name != "" {
+				prefix += textWidth(mono, r.name) + int(float64(gap)*1.5) + int(float64(gap)*0.55)
+			}
+			if r.text == "" {
+				out = append(out, panelRow{kind: rowTitle, name: r.name, proto: r.proto, resp: r.resp})
+				continue
+			}
+			chunks := splitToWidth(r.text, max(1, maxW-prefix), mono, cjk, cjkOK)
+			out = append(out, panelRow{kind: rowTitle, name: r.name, text: chunks[0], proto: r.proto, resp: r.resp})
 			for _, c := range chunks[1:] {
-				// 标题续行悬垂到标题文字起点（越过徽标），与首行缩进不同。
-				out = append(out, panelRow{kind: rowText, text: c, indent: badgeW})
+				out = append(out, panelRow{kind: rowText, text: c, indent: prefix})
 			}
 		case rowText:
 			prefix := 0
 			if r.name != "" {
-				prefix = textWidth(mono, r.name)
+				prefix = textWidth(mono, r.name+": ")
 			}
 			chunks := splitToWidth(r.text, max(1, maxW-prefix), mono, cjk, cjkOK)
 			out = append(out, panelRow{kind: rowText, name: r.name, text: chunks[0], mosaic: r.mosaic})
@@ -449,11 +494,7 @@ func wrapPanelRows(rows []panelRow, maxW int, s float64, mono, cjk font.Face, cj
 	return out
 }
 
-// splitToWidth 贪心按宽度折行（逐 rune 量宽：ASCII 走 mono，非 ASCII 走 cjk；
-// 未探测到 CJK 时先 degradeText 再按 mono 量）。单 rune 超宽时独占一行。
-//
-// 量宽用上取整累加（Σ ceil(单 rune 宽)）：绘制时按 ASCII/CJK 分段整段取整，
-// 其推进 ≤ 各 rune 上取整之和，因此折行结果绝不会超出 maxW（右栏不被裁）。
+// splitToWidth 贪心折行（逐 rune 量宽，上取整累加，保证不越界）。
 func splitToWidth(s string, maxW int, mono, cjk font.Face, cjkOK bool) []string {
 	if !cjkOK || cjk == nil {
 		s = degradeText(s, false)
@@ -470,7 +511,7 @@ func splitToWidth(s string, maxW int, mono, cjk font.Face, cjkOK bool) []string 
 		if r > 127 && cjkOK && cjk != nil {
 			f = cjk
 		}
-		rw := (int(font.MeasureString(f, string(r))) + 63) / 64 // 26.6 定点→px 上取整
+		rw := (int(font.MeasureString(f, string(r))) + 63) / 64
 		if len(cur) > 0 && w+rw > maxW {
 			out = append(out, string(cur))
 			cur = cur[:0]
@@ -488,8 +529,6 @@ func splitToWidth(s string, maxW int, mono, cjk font.Face, cjkOK bool) []string 
 	return out
 }
 
-// measureMixedWidth 与 drawMixed 的推进口径一致（ASCII/CJK 分段后整段取整），
-// 用于折行自检与单测断言「绘制宽度不超栏宽」。
 func measureMixedWidth(s string, mono, cjk font.Face, cjkOK bool) int {
 	if s == "" {
 		return 0
@@ -516,22 +555,15 @@ func measureMixedWidth(s string, mono, cjk font.Face, cjkOK bool) int {
 	return w
 }
 
-// buildPanel 一段报文 → 行序列（脱敏管线在此）。
+// ---------- 报文 → 行序列 ----------
+
+// buildPanel 一段报文 → 行序列。默认原文直出（不脱敏、不折叠头）。
 func buildPanel(packet string, o Options) []panelRow {
-	rows := []panelRow{}
-	title, host, isResp := PacketTitle(packet)
-	badge := "REQ"
-	if isResp {
-		badge = statusCodeOf(title)
-	}
-	titleText := title
-	if !isResp && host != "" && !strings.HasPrefix(strings.ToLower(title), strings.ToLower(host)) {
-		titleText = title + " — " + host
-	}
-	rows = append(rows, panelRow{kind: rowTitle, name: badge, text: titleText})
+	rows := make([]panelRow, 0, 64)
+	badge, first, proto, isResp := splitFirstLine(packet)
+	rows = append(rows, panelRow{kind: rowTitle, name: badge, text: first, proto: proto, resp: isResp})
 
 	lines := strings.Split(strings.ReplaceAll(packet, "\r\n", "\n"), "\n")
-	// 空行前=头区（第 0 行是请求/状态行，已进标题）。
 	bodyStart := -1
 	for i := 1; i < len(lines); i++ {
 		if strings.TrimSpace(lines[i]) == "" {
@@ -547,38 +579,31 @@ func buildPanel(packet string, o Options) []panelRow {
 	if o.HideHeaders {
 		rows = append(rows, panelRow{kind: rowMuted, text: "—— Headers 已隐藏 ——"})
 	} else {
-		// 脱敏：MaskHeaders 开 → 逐头行打码；关 → 原文。
-		hidden := 0
 		for _, ln := range headerLines {
 			if strings.TrimSpace(ln) == "" {
 				continue
 			}
 			name, val, ok := headerLineSplit(ln)
-			if ok {
-				if shouldHideHeader(name, o) {
-					hidden++
-					continue
-				}
-				if o.MaskHeaders {
-					val = MaskHeaderLine(name + ":" + val)
-					if i := strings.Index(val, ":"); i >= 0 {
-						val = val[i+1:]
-					}
-				}
-				rows = append(rows, panelRow{
-					kind: rowText, name: name + ":", text: strings.TrimLeft(val, " "),
-					mosaic: o.Mosaic && ShouldMosaic(val),
-				})
-			} else {
+			if !ok {
 				rows = append(rows, panelRow{kind: rowText, text: ln})
+				continue
 			}
-		}
-		if hidden > 0 {
-			rows = append(rows, panelRow{kind: rowMuted, text: fmt.Sprintf("（%d 个冗余头已折叠）", hidden)})
+			if shouldHideHeader(name, o) {
+				continue
+			}
+			if o.MaskHeaders {
+				masked := MaskHeaderLine(name + ":" + val)
+				if i := strings.Index(masked, ":"); i >= 0 {
+					val = masked[i+1:]
+				}
+			}
+			rows = append(rows, panelRow{
+				kind: rowText, name: name, text: strings.TrimLeft(val, " "),
+				mosaic: o.Mosaic && ShouldMosaic(val),
+			})
 		}
 	}
 
-	// Body（Desensitize 控制键值打码）。
 	if bodyStart >= 0 && bodyStart < len(lines) {
 		body := lines[bodyStart:]
 		bodyText := strings.Join(body, "\n")
@@ -587,19 +612,28 @@ func buildPanel(packet string, o Options) []panelRow {
 				bodyText = MaskBodySecrets(bodyText)
 				body = strings.Split(bodyText, "\n")
 			}
+			// 去掉尾部纯空行（报文常以 CRLF 结尾），不制造无意义空白行。
+			for len(body) > 0 && strings.TrimSpace(body[len(body)-1]) == "" {
+				body = body[:len(body)-1]
+			}
 			isJSON := looksJSON(bodyText)
-			maxLines := 120
+			const maxLines = 400 // 安全阀：单条报文超 400 行才截断（并在末行标注）
 			for i, ln := range body {
 				if i >= maxLines {
-					rows = append(rows, panelRow{kind: rowMuted, text: fmt.Sprintf("... (共 %d 行, 超出已截断)", len(body))})
+					rows = append(rows, panelRow{kind: rowMuted,
+						text: fmt.Sprintf("... (共 %d 行，超出部分已截断)", len(body))})
 					break
 				}
 				kind := rowCode
 				if isJSON {
 					kind = rowJSON
 				}
+				num := 0
+				if o.LineNumbers {
+					num = i + 1
+				}
 				rows = append(rows, panelRow{
-					kind: kind, num: i + 1, text: ln,
+					kind: kind, num: num, text: ln,
 					mosaic: o.Mosaic && ShouldMosaic(ln),
 				})
 			}
@@ -608,19 +642,186 @@ func buildPanel(packet string, o Options) []panelRow {
 	return rows
 }
 
-// ---------- 绘制小工具 ----------
+// detectLang 正文语言判定（只影响着色）。
+func detectLang(packet string) hlLang {
+	lines := strings.Split(strings.ReplaceAll(packet, "\r\n", "\n"), "\n")
+	bodyStart := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "" {
+			bodyStart = i + 1
+			break
+		}
+	}
+	if bodyStart < 0 || bodyStart >= len(lines) {
+		return hlPlain
+	}
+	body := strings.TrimSpace(strings.Join(lines[bodyStart:], "\n"))
+	if body == "" {
+		return hlPlain
+	}
+	if looksJSON(body) {
+		return hlJSON
+	}
+	if strings.HasPrefix(body, "<") {
+		return hlHTML
+	}
+	first := body
+	if i := strings.IndexByte(first, '\n'); i >= 0 {
+		first = first[:i]
+	}
+	if strings.Contains(first, "=") && !strings.ContainsAny(first, "<>{}") {
+		return hlForm
+	}
+	return hlPlain
+}
 
-// drawMixed 混排：ASCII 段走等宽 face，非 ASCII 段走 CJK face；未探测到
-// CJK（cjkOK=false）时整段 degradeText→'?' 后走等宽。返回推进后的 x。
+// ---------- 语法 tokenizers ----------
+
+// tokenizeHTMLLine 简易 HTML/XML 着色：注释、标签名、属性名、属性值、文本。
+// 非严格解析，只保证不丢字符（拼接 == 原文）。
+func tokenizeHTMLLine(line string) []jsonToken {
+	rs := []rune(line)
+	var out []jsonToken
+	i := 0
+	for i < len(rs) {
+		// 注释
+		if i+3 < len(rs) && string(rs[i:i+4]) == "<!--" {
+			end := strings.Index(string(rs[i:]), "-->")
+			if end < 0 {
+				out = append(out, jsonToken{tokComment, string(rs[i:])})
+				return out
+			}
+			out = append(out, jsonToken{tokComment, string(rs[i : i+end+3])})
+			i += end + 3
+			continue
+		}
+		if rs[i] == '<' {
+			j := i
+			// 标签段到 '>' 或行尾
+			for j < len(rs) && rs[j] != '>' {
+				j++
+			}
+			if j < len(rs) {
+				j++
+			}
+			out = append(out, tokenizeTag(string(rs[i:j]))...)
+			i = j
+			continue
+		}
+		j := i
+		for j < len(rs) && rs[j] != '<' {
+			j++
+		}
+		out = append(out, jsonToken{tokPlain, string(rs[i:j])})
+		i = j
+	}
+	return out
+}
+
+// tokenizeTag 一段 `<...>` 拆成 标签名 / 属性名 / 属性值 / 标点。
+func tokenizeTag(tag string) []jsonToken {
+	rs := []rune(tag)
+	var out []jsonToken
+	i := 0
+	// 前导 < 或 </
+	start := i
+	for i < len(rs) && (rs[i] == '<' || rs[i] == '/' || rs[i] == '!') {
+		i++
+	}
+	if i > start {
+		out = append(out, jsonToken{tokPlain, string(rs[start:i])})
+	}
+	// 标签名
+	start = i
+	for i < len(rs) && !isTagDelim(rs[i]) {
+		i++
+	}
+	if i > start {
+		out = append(out, jsonToken{tokTag, string(rs[start:i])})
+	}
+	for i < len(rs) {
+		c := rs[i]
+		switch {
+		case c == '>' || c == '/' || c == '=' || c == '"' || c == '\'':
+			if c == '"' || c == '\'' {
+				q := c
+				j := i + 1
+				for j < len(rs) && rs[j] != q {
+					j++
+				}
+				if j < len(rs) {
+					j++
+				}
+				out = append(out, jsonToken{tokString, string(rs[i:j])})
+				i = j
+				continue
+			}
+			out = append(out, jsonToken{tokPlain, string(c)})
+			i++
+		case c == ' ' || c == '\t':
+			start = i
+			for i < len(rs) && (rs[i] == ' ' || rs[i] == '\t') {
+				i++
+			}
+			out = append(out, jsonToken{tokPlain, string(rs[start:i])})
+		default:
+			start = i
+			for i < len(rs) && !isTagDelim(rs[i]) {
+				i++
+			}
+			out = append(out, jsonToken{tokAttr, string(rs[start:i])})
+		}
+	}
+	return out
+}
+
+func isTagDelim(r rune) bool {
+	return r == ' ' || r == '\t' || r == '>' || r == '/' || r == '=' || r == '"' || r == '\''
+}
+
+// tokenizeFormLine 表单/查询串着色：key 蓝、= 灰、value 橙、& 灰。
+func tokenizeFormLine(line string) []jsonToken {
+	var out []jsonToken
+	parts := strings.Split(line, "&")
+	for idx, part := range parts {
+		if idx > 0 {
+			out = append(out, jsonToken{tokPlain, "&"})
+		}
+		if k, v, ok := strings.Cut(part, "="); ok {
+			out = append(out, jsonToken{tokKey, k})
+			out = append(out, jsonToken{tokPlain, "="})
+			out = append(out, jsonToken{tokString, v})
+			continue
+		}
+		if part != "" {
+			out = append(out, jsonToken{tokPlain, part})
+		}
+	}
+	return out
+}
+
+// ---------- 绘制原语 ----------
+
+func drawBold(dst *image.NRGBA, s string, x, baselineY int, c color.Color, f font.Face, scale float64) {
+	if s == "" || f == nil {
+		return
+	}
+	drawString(dst, s, x, baselineY, c, f)
+	// 等宽字体无粗体字重：本体右移 1px 再画一遍模拟半粗（scale≥1.5 才做）。
+	if scale >= 1.5 {
+		drawString(dst, s, x+1, baselineY, c, f)
+	}
+}
+
 func drawMixed(dst *image.NRGBA, s string, x, baselineY int, c color.Color, mono, cjk font.Face, cjkOK bool) int {
 	if s == "" {
 		return x
 	}
 	if !cjkOK || cjk == nil {
-		drawString(dst, degradeText(s, false), x, baselineY, c, mono)
-		return x + textWidth(mono, degradeText(s, false))
+		d := degradeText(s, false)
+		drawString(dst, d, x, baselineY, c, mono)
+		return x + textWidth(mono, d)
 	}
-	// 按 ASCII/非 ASCII 分段。
 	runes := []rune(s)
 	i := 0
 	for i < len(runes) {
@@ -641,23 +842,56 @@ func drawMixed(dst *image.NRGBA, s string, x, baselineY int, c color.Color, mono
 	return x
 }
 
-func drawString(dst *image.NRGBA, s string, x, baselineY int, c color.Color, f font.Face) {
-	if s == "" {
-		return
+func drawString(dst *image.NRGBA, s string, x, baselineY int, c color.Color, f font.Face) int {
+	if s == "" || f == nil {
+		return x
 	}
 	d := &font.Drawer{Dst: dst, Src: image.NewUniform(c), Face: f, Dot: fixed.P(x, baselineY)}
 	d.DrawString(s)
+	return x + textWidth(f, s)
 }
 
 func textWidth(f font.Face, s string) int {
-	if s == "" {
+	if s == "" || f == nil {
 		return 0
 	}
 	return int(font.MeasureString(f, s).Round())
 }
 
+// fillRoundRect 填充圆角矩形（radius 为角半径 px）。
+func fillRoundRect(dst *image.NRGBA, r image.Rectangle, radius int, c color.Color) {
+	if r.Dx() <= 0 || r.Dy() <= 0 {
+		return
+	}
+	if radius <= 0 {
+		draw.Draw(dst, r, &image.Uniform{c}, image.Point{}, draw.Src)
+		return
+	}
+	if radius*2 > r.Dy() {
+		radius = r.Dy() / 2
+	}
+	if radius*2 > r.Dx() {
+		radius = r.Dx() / 2
+	}
+	if radius <= 0 {
+		draw.Draw(dst, r, &image.Uniform{c}, image.Point{}, draw.Src)
+		return
+	}
+	// 中段整行填充；上下 radius 行按圆内缩。
+	draw.Draw(dst, image.Rect(r.Min.X, r.Min.Y+radius, r.Max.X, r.Max.Y-radius), &image.Uniform{c}, image.Point{}, draw.Src)
+	for dy := 0; dy < radius; dy++ {
+		inset := radius - int(math.Sqrt(float64(radius*radius-(radius-dy)*(radius-dy)))+0.5)
+		if inset < 0 {
+			inset = 0
+		}
+		draw.Draw(dst, image.Rect(r.Min.X+inset, r.Min.Y+dy, r.Max.X-inset, r.Min.Y+dy+1), &image.Uniform{c}, image.Point{}, draw.Src)
+		yy := r.Max.Y - 1 - dy
+		draw.Draw(dst, image.Rect(r.Min.X+inset, yy, r.Max.X-inset, yy+1), &image.Uniform{c}, image.Point{}, draw.Src)
+	}
+}
+
 func badgeColor(badge string) color.NRGBA {
-	if badge == "REQ" {
+	if badge == "REQ" || badge == "RSP" {
 		return colBadgeReq
 	}
 	switch {
@@ -672,9 +906,6 @@ func badgeColor(badge string) color.NRGBA {
 	}
 }
 
-// drawMosaicBox 在 (x0,y0) 起画 6px（×scale）交替块遮罩（宽度=后续未画区，
-// 此处覆盖到 pad 宽即可——调用点在文本画完后，x 已是文本尾，矩形取文本右侧
-// 一小段与行高；简化：从 x 往左回盖整行的做法更稳——取 x-420·scale..x 区间）。
 func drawMosaicBox(dst *image.NRGBA, xEnd, yTop, pad, h int, scale float64) {
 	if scale <= 0 {
 		scale = 1
@@ -690,18 +921,16 @@ func drawMosaicBox(dst *image.NRGBA, xEnd, yTop, pad, h int, scale float64) {
 	}
 }
 
-func strokeRect(dst *image.NRGBA, r image.Rectangle, c color.Color) {
-	for x := r.Min.X; x < r.Max.X; x++ {
-		dst.Set(x, r.Min.Y, c)
-		dst.Set(x, r.Max.Y-1, c)
+// truncateToHeight 兜底：极度超长时按高度硬裁（末行留提示由 buildPanel 负责）。
+func truncateToHeight(img *image.NRGBA, h int) *image.NRGBA {
+	if h <= 0 || img.Bounds().Dy() <= h {
+		return img
 	}
-	for y := r.Min.Y; y < r.Max.Y; y++ {
-		dst.Set(r.Min.X, y, c)
-		dst.Set(r.Max.X-1, y, c)
-	}
+	out := image.NewNRGBA(image.Rect(0, 0, img.Bounds().Dx(), h))
+	draw.Draw(out, out.Bounds(), img, image.Point{}, draw.Src)
+	return out
 }
 
-// degradeText CJK 未命中时非 ASCII→'?'（保结构可读）。cjkOK=true 原样。
 func degradeText(s string, cjkOK bool) string {
 	if cjkOK {
 		return s
@@ -728,7 +957,7 @@ func degradeText(s string, cjkOK bool) string {
 	return b.String()
 }
 
-// ---------- 报文结构小解析（纯函数，单测覆盖） ----------
+// ---------- 报文结构小解析（纯函数） ----------
 
 var (
 	reReqLine    = regexp.MustCompile(`^([A-Z]+)\s+(\S+)(?:\s+HTTP/\d(?:\.\d)?)?\s*$`)
@@ -737,9 +966,35 @@ var (
 	reProtoVer   = regexp.MustCompile(`HTTP/\d(?:\.\d)?\s+(\d{3})`)
 )
 
-// PacketTitle 提炼标题栏信息：请求→(METHOD /path, host, false)；响应→
-// (HTTP/1.1 200 OK, "", true)。绝对形式 URL（GET http://h/p）剥出 host+path。
-// host 取 Host 头兜底。全假数据/畸形报文：原样首行，不报错。
+var (
+	reFirstReq  = regexp.MustCompile(`^([A-Z]+)\s+(\S+)(?:\s+(HTTP/\d(?:\.\d)?))?\s*$`)
+	reFirstResp = regexp.MustCompile(`^(HTTP/\d(?:\.\d)?)\s+(\d{3})\s*(.*)$`)
+)
+
+// splitFirstLine 把首行拆成「徽标 / 正文 / 协议」三段：
+//   GET /path HTTP/1.1        → ("GET", "/path", "HTTP/1.1", false)
+//   HTTP/1.1 200 OK           → ("200 OK", "", "HTTP/1.1", true)
+// 畸形报文原样进正文，不报错。
+func splitFirstLine(packet string) (badge, text, proto string, isResp bool) {
+	first := packet
+	if i := strings.IndexByte(packet, '\n'); i >= 0 {
+		first = packet[:i]
+	}
+	first = strings.TrimSpace(strings.TrimRight(first, "\r"))
+	if m := reFirstResp.FindStringSubmatch(first); m != nil {
+		badge = m[2]
+		if r := strings.TrimSpace(m[3]); r != "" {
+			badge = m[2] + " " + r
+		}
+		return badge, "", m[1], true
+	}
+	if m := reFirstReq.FindStringSubmatch(first); m != nil {
+		return m[1], m[2], m[3], false
+	}
+	return "", first, "", false
+}
+
+// PacketTitle 提炼首行信息：请求→(METHOD /path, host)；响应→(HTTP/1.1 200 OK)。
 func PacketTitle(packet string) (title, host string, isResponse bool) {
 	first := packet
 	if i := strings.IndexByte(packet, '\n'); i >= 0 {
@@ -781,7 +1036,6 @@ func PacketTitle(packet string) (title, host string, isResponse bool) {
 	return title, host, false
 }
 
-// statusCodeOf 响应标题里的三位状态码；没有给 "RSP"。
 func statusCodeOf(title string) string {
 	if m := reProtoVer.FindStringSubmatch(title); m != nil {
 		return m[1]
@@ -789,8 +1043,6 @@ func statusCodeOf(title string) string {
 	return "RSP"
 }
 
-// headerLineSplit 安全地拆 "Name: value"。Name 限可见字符且 ≤60，防把
-// JSON 体里的 "key":"v" 误当头。
 var reHdrName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]*$`)
 
 func headerLineSplit(line string) (name, value string, found bool) {
@@ -805,17 +1057,13 @@ func headerLineSplit(line string) (name, value string, found bool) {
 	return name, line[i+1:], true
 }
 
-// shouldHideHeader 默认冗余清单 + Extra − Keep（大小写不敏感）。
+// shouldHideHeader 只按显式清单折叠（ExtraHideHeaders − KeepHeaders）。
+// 默认不折叠任何头：报告要完整反映真实请求。
 func shouldHideHeader(name string, o Options) bool {
 	lname := strings.ToLower(strings.TrimSpace(name))
 	for _, k := range o.KeepHeaders {
 		if strings.ToLower(strings.TrimSpace(k)) == lname {
 			return false
-		}
-	}
-	for _, d := range defaultRedundantReq {
-		if d == lname {
-			return true
 		}
 	}
 	for _, e := range o.ExtraHideHeaders {
@@ -826,7 +1074,6 @@ func shouldHideHeader(name string, o Options) bool {
 	return false
 }
 
-// looksJSON Body 粗判（首尾括号）。
 func looksJSON(body string) bool {
 	t := strings.TrimSpace(body)
 	if t == "" {

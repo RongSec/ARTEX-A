@@ -16,11 +16,14 @@ type jsonToken struct {
 }
 
 const (
-	tokPlain  = int8(iota) // 标点/结构
-	tokKey                 // "…": 的键
-	tokString              // 字符串值
-	tokNumber              // 数字
-	tokLit                 // true/false/null
+	tokPlain   = int8(iota) // 标点/结构
+	tokKey                  // "…": 的键
+	tokString               // 字符串值
+	tokNumber               // 数字
+	tokLit                  // true/false/null
+	tokTag                  // HTML 标签名
+	tokAttr                 // HTML 属性名
+	tokComment              // 注释
 )
 
 var (

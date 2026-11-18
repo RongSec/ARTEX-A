@@ -478,29 +478,53 @@ def _take_vuln_prototypes(doc):
     return None, None
 
 
-# 证据图规格（V9-SHOT）：按 15cm 宽插入，高度自适应；说明文字五号居中。
+# 证据图规格：版心 14.65cm，单元格左右内边距各约 0.19cm，14cm 是安全上限。
 IMAGE_WIDTH_CM = 14
-# 单图高度上限：A4 版心高约 23.4cm，留出图注与表格剩余空间。
+# 单图高度上限：A4 版心高约 23.4cm，留出图注与上方文字空间。
 IMAGE_MAX_HEIGHT_CM = 19.0
 CAPTION_SIZE_PT = 10.5  # 五号
 
 
+def _lock_table_layout(cell):
+    """把图片所在表格锁成固定列宽。
 
-def _detach_to_body_after_table(cell, para):
-    """把单元格里的空段落挪到所属表格之后（正文级），返回挪动后的段落。
-
-    单元格内嵌大图会被排版引擎按单元格可用宽度二次缩放，实测 14cm 只画出
-    约一半宽度、文字挤成一团。移到表格后即按版心渲染，宽度可控。
+    LibreOffice 对 `tblLayout=autofit` 的表格会按内容重算列宽：单元格里塞进
+    一张 14cm 的图后，它会把列宽压回正文文字宽度，图片随即被按列宽缩放到
+    约一半——这就是"图表被压扁、文字挤成一团"的真因。改成 fixed 并显式写
+    死表格宽度（与 tblGrid 一致）后，列宽不再由内容决定，图片按原尺寸渲染。
     """
     tbl = cell._tc.getparent()
     while tbl is not None and tbl.tag != qn("w:tbl"):
         tbl = tbl.getparent()
     if tbl is None:
-        return para
-    p_el = para._p
-    p_el.getparent().remove(p_el)
-    tbl.addnext(p_el)
-    return para
+        return
+    tblPr = tbl.find(qn("w:tblPr"))
+    if tblPr is None:
+        return
+    layout = tblPr.find(qn("w:tblLayout"))
+    if layout is None:
+        from docx.oxml import OxmlElement
+        layout = OxmlElement("w:tblLayout")
+        tblPr.append(layout)
+    layout.set(qn("w:type"), "fixed")
+    # 表格总宽取 tblGrid 的列宽之和（模板里 = 版心宽 8306 twips），
+    # 避免 pct/auto 在 fixed 布局下被解释成"按内容自适应"。
+    grid = tbl.find(qn("w:tblGrid"))
+    total = 0
+    if grid is not None:
+        for gc in grid.findall(qn("w:gridCol")):
+            try:
+                total += int(gc.get(qn("w:w")) or 0)
+            except (TypeError, ValueError):
+                pass
+    if total > 0:
+        tblW = tblPr.find(qn("w:tblW"))
+        if tblW is None:
+            from docx.oxml import OxmlElement
+            tblW = OxmlElement("w:tblW")
+            tblPr.append(tblW)
+        tblW.set(qn("w:type"), "dxa")
+        tblW.set(qn("w:w"), str(total))
 
 
 def _append_images(cell, images):
@@ -519,12 +543,11 @@ def _append_images(cell, images):
         if not path or not os.path.isfile(path):
             logger.warning("漏洞证明截图缺失，已跳过: %s", path or "(空路径)")
             continue
+        # 图片必须留在「漏洞证明」单元格内（用户口径：截图属于该条漏洞的证明
+        # 内容）。先锁表宽，再把图按 14cm 宽插进单元格末尾。
+        _lock_table_layout(cell)
         para = cell.add_paragraph()
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        # 单元格内插图会被 Word/LO 二次缩放（实测 14cm 的图只渲染出 ~7cm，
-        # 视觉上就是"压扁 + 文字重叠"）。改为把图片段落插到表格之后的正文层，
-        # 宽度直接用满版心，不再受表格列宽/布局影响。
-        _detach_to_body_after_table(cell, para)
         try:
             pic = para.add_run().add_picture(path, width=Cm(IMAGE_WIDTH_CM))
             # 超高图（长报文合成图）按高度上限等比回缩：否则 Word/LO 会把图
@@ -541,10 +564,6 @@ def _append_images(cell, images):
         if caption:
             cap = cell.add_paragraph()
             cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            # 图注跟图走：插到图片段落之后（正文层），否则会留在单元格里错位。
-            cap_el = cap._p
-            cap_el.getparent().remove(cap_el)
-            para._p.addnext(cap_el)
             run = cap.add_run(caption)
             run.font.size = Pt(CAPTION_SIZE_PT)
         added += 1

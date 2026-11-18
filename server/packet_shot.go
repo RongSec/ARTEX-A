@@ -40,16 +40,12 @@ import (
 // settingPacketShotEnabled 全局自动截图闸（V9-SHOT 起默认 true=报告带报文截图）。
 const settingPacketShotEnabled = "packet_shot_enabled"
 
-// packetShotOpts 渲染选项（V3 起默认宽 1400、脱敏+行号开、隐藏/马赛克关——
-// 一步 req+resp 合成一张大图，报告内可读。模板 style.packet_shot 覆盖留后续
-// ——截图发生在 finding 落库期，与报告模板无绑定，塞 style 里语义错位；偏差
-// 已记交付报告）。
+// packetShotOpts 渲染选项：深色编辑器风格、左请求右响应并排、**不脱敏不改写**
+// 报文（用户口径：截图必须完整反映原始请求响应），高度上限 2600px（约
+// 22cm@300dpi，插入报告时按 19cm 等比收缩）。
 func (s *Server) packetShotOpts() packetshot.Options {
-	o := packetshot.DefaultOptions()
-	// V9-SHOT2：左右并排后单栏宽度减半，2.4 倍字号在 1400px→15cm 插图
-	// （约 237dpi）下正文约 8.7pt，落进 8–9pt 可读区间；行高由渲染器按
-	// 字号×1.35 自适应，不再受固定画布高度挤压。
-	o.Scale = 2.4
+	o := packetshot.DefaultOptions() // 宽 1680 / Scale 2.5 / 不脱敏 / 无行号
+	o.MaxHeight = 2600
 	return o
 }
 
@@ -150,7 +146,7 @@ func (s *Server) renderPacketShots(findingID int64, repro []byte, force bool, st
 }
 
 // renderPacketShot 渲一步的 req+resp **单张**合成 PNG（render.go 的双面板
-// 布局：请求在上、响应在下），幂等替换该 finding step 的全部 auto 行。
+// 布局：左请求、右响应并排），幂等替换该 finding step 的全部 auto 行。
 // 先渲染→临时文件→改名→删旧行+旧文件→插新行：任一步失败=清理半途文件、
 // 旧行保留（宁缺毋滥）。删除谓词只按 step（V2 的 req/resp 旧双图行一并
 // 清掉=存量自动收敛成单图）；手工行 source 不同天然躲开。

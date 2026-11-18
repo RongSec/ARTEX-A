@@ -36,16 +36,17 @@ func TestRenderRequestPNG(t *testing.T) {
 		t.Fatalf("not a valid PNG: %v", err)
 	}
 	b := img.Bounds()
-	if b.Dx() != 1400 || b.Dy() < 100 {
+	if b.Dx() != 1680 || b.Dy() < 100 {
 		t.Fatalf("canvas size wrong: %v", b)
 	}
 }
 
-// TestRenderDefaultOptionsV3 V3 拍板默认：宽 1400、Scale 1.5、脱敏+行号开。
+// TestRenderDefaultOptionsV3 报告用默认口径：宽 1680、Scale 2.5、**不脱敏**
+// （用户要求截图完整反映报文）、不折叠头、不画行号。
 func TestRenderDefaultOptionsV3(t *testing.T) {
 	o := DefaultOptions()
-	if o.Width != 1400 || o.Scale != 1.5 || !o.MaskHeaders || !o.Desensitize || !o.LineNumbers {
-		t.Fatalf("V3 defaults changed: %+v", o)
+	if o.Width != 1680 || o.Scale != 2.5 || o.MaskHeaders || o.Desensitize || o.LineNumbers {
+		t.Fatalf("defaults changed: %+v", o)
 	}
 	// Scale 放大可感知：同一单报文，默认(1.5) 比 1.0 高。
 	base := o
@@ -85,8 +86,8 @@ func TestRenderBothPanels(t *testing.T) {
 	}
 }
 
-// TestRenderSideBySideLayout V9-SHOT 版式：两栏等宽、中间 8px 分隔、各带深底
-// 白字标题带；左右半区都有非空白内容（不是上下堆叠）。
+// TestRenderSideBySideLayout 两栏等宽、中间 1px 竖线、各自顶部有标题；
+// 左右半区都有内容（不是上下堆叠）。深色底。
 func TestRenderSideBySideLayout(t *testing.T) {
 	out, err := Render(sampleReq, sampleResp, DefaultOptions())
 	if err != nil {
@@ -97,40 +98,38 @@ func TestRenderSideBySideLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := img.Bounds()
-	const width, sep = 1400, 8
-	pad := int(math.Round(8 * 1.5)) // V9-SHOT2：内容 padding=8px×Scale
-	panelW := (width - 2*pad - sep) / 2
+	const width, gutter = 1680, 14
 	if b.Dx() != width {
 		t.Fatalf("canvas width = %d, want %d", b.Dx(), width)
 	}
-	// 标题带：两栏顶部同高深底（R<100），中间分隔带保持白底。
-	for _, x := range []int{pad + 5, pad + panelW + sep + 5} {
-		r, g, bb, _ := img.At(x, pad+5).RGBA()
-		if r>>8 > 100 || g>>8 > 100 || bb>>8 > 100 {
-			t.Fatalf("title band not dark at x=%d: (%d,%d,%d)", x, r>>8, g>>8, bb>>8)
+	panelW := (width - gutter) / 2
+	// 画布底应为深色（<40）。
+	for _, pt := range [][2]int{{2, 2}, {width - 3, b.Dy() - 3}, {width / 2, b.Dy() / 2}} {
+		r, g, bb, _ := img.At(pt[0], pt[1]).RGBA()
+		if r>>8 > 60 || g>>8 > 60 || bb>>8 > 60 {
+			t.Fatalf("背景不是深色 at %v: (%d,%d,%d)", pt, r>>8, g>>8, bb>>8)
 		}
 	}
-	for y := b.Min.Y + pad; y < b.Dy()-pad; y += 7 {
-		r, g, bb, _ := img.At(pad+panelW+sep/2, y).RGBA()
-		if r>>8 < 240 || g>>8 < 240 || bb>>8 < 240 {
-			t.Fatalf("separator column not blank at y=%d: (%d,%d,%d)", y, r>>8, g>>8, bb>>8)
-		}
+	// 中间竖线：整列颜色比背景亮（分隔线），且两栏内都有浅色文字像素。
+	sepX := panelW + gutter/2
+	r, g, bb, _ := img.At(sepX, b.Dy()/2).RGBA()
+	if r>>8 < 20 && g>>8 < 20 && bb>>8 < 20 {
+		t.Fatalf("分栏竖线缺失 at x=%d", sepX)
 	}
-	// 左右半区各取一片正文区域，必须有非白像素（两栏都画了内容）。
-	nonWhite := func(x0, x1 int) int {
+	bright := func(x0, x1 int) int {
 		n := 0
-		for y := pad + 60; y < b.Dy()-pad-10; y += 3 {
+		for y := 0; y < b.Dy(); y += 3 {
 			for x := x0; x < x1; x += 3 {
 				r, g, bb, _ := img.At(x, y).RGBA()
-				if r>>8 < 245 || g>>8 < 245 || bb>>8 < 245 {
+				if r>>8 > 150 || g>>8 > 150 || bb>>8 > 150 {
 					n++
 				}
 			}
 		}
 		return n
 	}
-	left := nonWhite(pad, pad+panelW)
-	right := nonWhite(pad+panelW+sep, pad+2*panelW+sep)
+	left := bright(0, panelW)
+	right := bright(panelW+gutter, width)
 	if left < 50 || right < 50 {
 		t.Fatalf("panel content missing: left=%d right=%d", left, right)
 	}
@@ -151,21 +150,19 @@ func testFaces(t *testing.T, s float64) (font.Face, font.Face, bool) {
 	return mono, cjk, fs.cjkOK
 }
 
-// TestRenderHeightMatchesRowCount V9-SHOT2：行高=字号×1.35（含 Scale），
-// 画布高 = 上下 padding + 标题带 + 物理行数×行高（不再有固定高度/挤压）。
+// TestRenderHeightMatchesRowCount 画布高 = 标题区 + 上下 padding + 物理行数×
+// 行高（内容自适应，无固定高度）。
 func TestRenderHeightMatchesRowCount(t *testing.T) {
 	opt := DefaultOptions()
 	s := opt.Scale
 	mono, cjk, cjkOK := testFaces(t, s)
-	lm := newLayoutMetrics(s, mono)
-	if want := int(math.Round(12.0 * s * 1.35)); lm.lineH != want {
-		t.Fatalf("lineH = %d, want 字号×1.35 = %d", lm.lineH, want)
+	lm := newLayout(s, mono)
+	if want := int(math.Round(12.0 * s * 1.42)); lm.lineH != want {
+		t.Fatalf("lineH = %d, want 字号×1.42 = %d", lm.lineH, want)
 	}
-	// 单栏（只请求）：栏宽=画布宽-2×padding。
-	const width = 1400
-	panelW := width - 2*lm.pad
-	maxW := panelW - 2*lm.pad
-	rows := wrapPanelRows(buildPanel(sampleReq, opt), maxW, s, mono, cjk, cjkOK)
+	const width = 1680
+	innerW := width - 2*lm.padX
+	rows := wrapPanelRows(buildPanel(sampleReq, opt), innerW, s, mono, cjk, cjkOK)
 	if len(rows) < 2 {
 		t.Fatalf("unexpected row count %d", len(rows))
 	}
@@ -177,34 +174,34 @@ func TestRenderHeightMatchesRowCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantH := 2*lm.pad + contentHeight(lm, len(rows))
+	wantH := lm.titleH + lm.padY + len(rows)*lm.lineH + lm.padY
 	if got := img.Bounds().Dy(); got != wantH {
-		t.Fatalf("canvas height = %d, want 2*pad(%d)+band(%d)+2*pad(%d)+%d*lineH(%d) = %d",
-			got, lm.pad, lm.bandH, lm.pad, len(rows), lm.lineH, wantH)
+		t.Fatalf("canvas height = %d, want %d（title %d + 2*padY %d + %d*lineH %d）",
+			got, wantH, lm.titleH, lm.padY, len(rows), lm.lineH)
 	}
 }
 
-// TestWrapLongLineNoClip V9-SHOT2：120 字符长行折行后每段绘制宽度（含续行
-// 悬垂缩进）≤ 栏宽，且拼回=原文、续行不带行号。
+// TestWrapLongLineNoClip 120 字符长行折行后每段绘制宽度（含续行悬垂缩进）
+// ≤ 栏宽，拼回=原文、续行不带行号。
 func TestWrapLongLineNoClip(t *testing.T) {
 	opt := DefaultOptions()
 	s := opt.Scale
 	mono, cjk, cjkOK := testFaces(t, s)
-	lm := newLayoutMetrics(s, mono)
-	const width, sep = 1400, 8
-	panelW := (width - 2*lm.pad - sep) / 2
-	maxW := panelW - 2*lm.pad
+	lm := newLayout(s, mono)
+	const width, gutter = 1680, 14
+	panelW := (width - gutter) / 2
+	innerW := panelW - 2*lm.padX
 	long := strings.Repeat("abcdefghij0123456789", 6) // 120 字符
-	rows := wrapPanelRows([]panelRow{{kind: rowCode, num: 1, text: long}}, maxW, s, mono, cjk, cjkOK)
+	rows := wrapPanelRows([]panelRow{{kind: rowCode, num: 1, text: long}}, innerW, s, mono, cjk, cjkOK)
 	if len(rows) < 2 {
-		t.Fatalf("120 字符长行未折行: rows=%d maxW=%d", len(rows), maxW)
+		t.Fatalf("120 字符长行未折行: rows=%d maxW=%d", len(rows), innerW)
 	}
 	var joined strings.Builder
 	for i, r := range rows {
 		joined.WriteString(r.text)
 		w := measureMixedWidth(r.text, mono, cjk, cjkOK)
-		if r.indent+w > maxW {
-			t.Fatalf("第 %d 物理行超栏宽: indent=%d + width=%d > maxW=%d", i, r.indent, w, maxW)
+		if r.indent+w > innerW {
+			t.Fatalf("第 %d 物理行超栏宽: indent=%d + width=%d > maxW=%d", i, r.indent, w, innerW)
 		}
 		if i > 0 {
 			if r.num != 0 {
@@ -281,23 +278,23 @@ func TestHeaderLineSplit(t *testing.T) {
 	}
 }
 
-// TestShouldHideHeaderDefault 默认冗余清单命中 + Keep 豁免 + Extra 追加。
+// TestShouldHideHeaderDefault 默认**不折叠任何头**（报文要完整）；只有显式
+// ExtraHideHeaders 才隐藏，KeepHeaders 可豁免。
 func TestShouldHideHeaderDefault(t *testing.T) {
 	o := DefaultOptions()
-	if !shouldHideHeader("Accept-Language", o) {
-		t.Fatal("accept-language should hide")
+	if shouldHideHeader("Accept-Language", o) {
+		t.Fatal("默认不得折叠 accept-language")
 	}
-	if shouldHideHeader("Content-Type", o) {
-		t.Fatal("content-type must never hide")
+	if shouldHideHeader("Connection", o) {
+		t.Fatal("默认不得折叠 connection")
+	}
+	o.ExtraHideHeaders = []string{"accept-language"}
+	if !shouldHideHeader("Accept-Language", o) {
+		t.Fatal("extra hide broken")
 	}
 	o.KeepHeaders = []string{"accept-language"}
 	if shouldHideHeader("Accept-Language", o) {
 		t.Fatal("keep override broken")
-	}
-	o2 := DefaultOptions()
-	o2.ExtraHideHeaders = []string{"x-trace-id"}
-	if !shouldHideHeader("X-Trace-Id", o2) {
-		t.Fatal("extra hide broken")
 	}
 }
 
@@ -342,36 +339,36 @@ func TestTokenizeJSONLine(t *testing.T) {
 	}
 }
 
-// TestMaskPipelineInRender 渲染前脱敏管线生效：请求体/头经过打码（PNG 里查
-// 不到原文=间接验证；同时暴露 MaskPacket 被 buildPanel 调用）。
+// TestMaskPipelineInRender 默认原文直出（不脱敏、不折叠）；只有显式打开
+// MaskHeaders/Desensitize 才打码——报告要完整报文是用户口径。
 func TestMaskPipelineInRender(t *testing.T) {
-	// buildPanel 是纯数据结构，直接断言行内容已脱敏。
 	rows := buildPanel(sampleReq, DefaultOptions())
 	all := ""
 	for _, r := range rows {
-		all += r.name + r.text + "\n"
+		all += r.name + " " + r.text + "\n"
 	}
-	if strings.Contains(all, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.secret") {
-		t.Fatal("bearer token must be masked in panel rows")
+	if !strings.Contains(all, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.secret") {
+		t.Fatal("默认必须保留 Authorization 原文")
 	}
-	if strings.Contains(all, "SuperSecret123456") {
-		t.Fatal("form/json secret must be masked in panel rows")
+	if !strings.Contains(all, "SuperSecret123456") {
+		t.Fatal("默认必须保留 body 原文")
 	}
-	if !strings.Contains(all, "Authorization:") {
-		t.Fatal("header name must survive masking")
+	if !strings.Contains(all, "Accept-Language:") && !strings.Contains(all, "Accept-Language") {
+		t.Fatal("默认不得折叠 accept-language")
 	}
-	// 冗余头已折叠提示。
-	if !strings.Contains(all, "冗余头已折叠") {
-		t.Fatalf("redundant headers not collapsed: %q", all)
+	// 显式开关=老的打码通道仍可用（对外分享场景）。
+	o := DefaultOptions()
+	o.MaskHeaders, o.Desensitize = true, true
+	masked := buildPanel(sampleReq, o)
+	mall := ""
+	for _, r := range masked {
+		mall += r.name + " " + r.text + "\n"
 	}
-	// MaskHeaders=false+Desensitize=false=原文通道（显式调试用）。
-	plain := buildPanel(sampleReq, Options{Width: 980})
-	pall := ""
-	for _, r := range plain {
-		pall += r.name + r.text + "\n"
+	if strings.Contains(mall, "SuperSecret123456") {
+		t.Fatal("显式 Desensitize=true 时 body 必须打码")
 	}
-	if !strings.Contains(pall, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.secret") {
-		t.Fatal("no-mask option must keep original")
+	if strings.Contains(mall, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.secret") {
+		t.Fatal("显式 MaskHeaders=true 时 header 值必须打码")
 	}
 }
 
