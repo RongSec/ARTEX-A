@@ -51,10 +51,10 @@ type Options struct {
 	KeepHeaders      []string // 从折叠清单豁免的头名
 }
 
-// DefaultOptions 报告用默认值：宽 1680、Scale 2.5（14cm 宽插图后正文约
-// 7pt）、不脱敏、不折叠头、不画行号。
+// DefaultOptions 报告用默认值：宽 1680、Scale 2.9（14cm 宽插图后正文约
+// 8pt）、不脱敏、不折叠头、不画行号。
 func DefaultOptions() Options {
-	return Options{Width: 1680, Scale: 2.5}
+	return Options{Width: 1680, Scale: 2.9}
 }
 
 // 深色主题调色板。
@@ -221,7 +221,7 @@ func newLayout(scale float64, face font.Face) layout {
 		lineH:  int(math.Round(fontSize * 1.42)),
 		padX:   int(math.Round(12 * scale)),
 		padY:   int(math.Round(10 * scale)),
-		titleH: int(math.Round(fontSize*1.7)) + int(math.Round(10*scale)),
+		titleH: int(math.Round(fontSize*1.45)) + int(math.Round(6*scale)),
 	}
 	if lm.lineH < 6 {
 		lm.lineH = 6
@@ -494,7 +494,11 @@ func wrapPanelRows(rows []panelRow, maxW int, s float64, mono, cjk font.Face, cj
 	return out
 }
 
-// splitToWidth 贪心折行（逐 rune 量宽，上取整累加，保证不越界）。
+// splitToWidth 按宽度折行（逐 rune 量宽、上取整累加，保证不越界）。
+//
+// 带**软断点**回溯：优先在空白、逗号、分号、&、/、?、<>、引号、冒号、等号
+// 之后断行，避免把 `application` 切成 `appl`/`ication`。断点太靠前（不足本行
+// 已排宽度的 2/3）时放弃回溯，防止出现过短行。
 func splitToWidth(s string, maxW int, mono, cjk font.Face, cjkOK bool) []string {
 	if !cjkOK || cjk == nil {
 		s = degradeText(s, false)
@@ -503,30 +507,50 @@ func splitToWidth(s string, maxW int, mono, cjk font.Face, cjkOK bool) []string 
 	if maxW <= 0 {
 		return []string{s}
 	}
-	out := make([]string, 0, 1)
-	cur := make([]rune, 0, len(s))
-	w := 0
-	for _, r := range s {
-		f := mono
-		if r > 127 && cjkOK && cjk != nil {
-			f = cjk
-		}
-		rw := (int(font.MeasureString(f, string(r))) + 63) / 64
-		if len(cur) > 0 && w+rw > maxW {
-			out = append(out, string(cur))
-			cur = cur[:0]
-			w = 0
-		}
-		cur = append(cur, r)
-		w += rw
+	rs := []rune(s)
+	if len(rs) == 0 {
+		return []string{""}
 	}
-	if len(cur) > 0 {
-		out = append(out, string(cur))
-	}
-	if len(out) == 0 {
-		out = []string{""}
+	out := make([]string, 0, len(rs)/16+1)
+	start := 0
+	for start < len(rs) {
+		w := 0
+		end := start
+		lastBreak := -1
+		for end < len(rs) {
+			f := mono
+			if rs[end] > 127 && cjk != nil {
+				f = cjk
+			}
+			rw := (int(font.MeasureString(f, string(rs[end]))) + 63) / 64
+			if w+rw > maxW && end > start {
+				break
+			}
+			w += rw
+			end++
+			if isSoftBreak(rs[end-1]) {
+				lastBreak = end
+			}
+		}
+		if end == start { // 单 rune 超宽：独占一行，防死循环
+			end = start + 1
+		}
+		if end < len(rs) && lastBreak > start && lastBreak >= start+(end-start)*2/3 {
+			end = lastBreak
+		}
+		out = append(out, string(rs[start:end]))
+		start = end
 	}
 	return out
+}
+
+// isSoftBreak 软断点字符（在其后断行不影响语义）。
+func isSoftBreak(r rune) bool {
+	switch r {
+	case ' ', '\t', ',', ';', '&', '/', '?', '>', '<', '"', '\'', ':', '=', ')', ']', '}':
+		return true
+	}
+	return false
 }
 
 func measureMixedWidth(s string, mono, cjk font.Face, cjkOK bool) int {

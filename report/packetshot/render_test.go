@@ -45,7 +45,7 @@ func TestRenderRequestPNG(t *testing.T) {
 // （用户要求截图完整反映报文）、不折叠头、不画行号。
 func TestRenderDefaultOptionsV3(t *testing.T) {
 	o := DefaultOptions()
-	if o.Width != 1680 || o.Scale != 2.5 || o.MaskHeaders || o.Desensitize || o.LineNumbers {
+	if o.Width != 1680 || o.Scale != 2.9 || o.MaskHeaders || o.Desensitize || o.LineNumbers {
 		t.Fatalf("defaults changed: %+v", o)
 	}
 	// Scale 放大可感知：同一单报文，默认(1.5) 比 1.0 高。

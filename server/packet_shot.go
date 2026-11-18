@@ -188,7 +188,10 @@ func (s *Server) renderPacketShot(findingID int64, step int, req, resp, exchange
 	if xid == "" {
 		xid = "-"
 	}
-	caption := fmt.Sprintf("packet#%s step%d", xid, step)
+	caption := fmt.Sprintf("请求 / 响应 · 步骤 %d", step)
+	if xid != "-" {
+		caption = fmt.Sprintf("请求 / 响应 · 步骤 %d（packet#%s）", step, xid)
+	}
 	sortOrder := step * 100
 
 	// 幂等替换该 step 全部 auto 行（含 V2 的 "-req-"/"-resp-" 旧命名形态；
