@@ -9,6 +9,10 @@ import (
 
 // directTaskContextCTE is the current task plus exactly its explicitly related
 // source tasks. It is deliberately non-recursive.
+//
+// 第三段是阅读者 adopt 的任务：采纳之后，被勾连任务的资产锚点与范围也和
+// 静态关联一样进入当前任务的上下文（同项目内才生效）。不这样做的话，
+// 规划者能看到被勾连任务的漏洞，却看不到它碰过哪些主机，读起来是断的。
 const directTaskContextCTE = `
 context_tasks AS (
   SELECT t.id AS task_id, t.exploration_id
@@ -19,6 +23,13 @@ context_tasks AS (
   FROM task_relations relation
   JOIN tasks source ON source.id=relation.source_task_id AND source.deleted_at IS NULL
   WHERE relation.task_id=$1
+  UNION ALL
+  SELECT related.id, related.exploration_id
+  FROM task_intel_links link
+  JOIN tasks owner ON owner.id=link.task_id AND owner.deleted_at IS NULL
+  JOIN tasks related ON related.id=link.related_task_id AND related.deleted_at IS NULL
+  WHERE link.task_id=$1 AND link.decision='adopted'
+    AND related.project_id IS NOT DISTINCT FROM owner.project_id
 )`
 
 const contextCoverageCTE = directTaskContextCTE + `,

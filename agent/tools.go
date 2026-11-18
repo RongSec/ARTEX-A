@@ -590,8 +590,10 @@ func relatedOverviewBudgetForSources(sourceCount int) int {
 	if sourceCount <= 0 {
 		return 0
 	}
-	if sourceCount > db.MaxTaskSourceCount {
-		sourceCount = db.MaxTaskSourceCount
+	// 上限用 MaxRelatedSourceTasks（静态关联 + 阅读者采纳合并后的上限），
+	// 不是 MaxTaskSourceCount：只按静态上限算会让 8+ 个来源时总字数超预算。
+	if sourceCount > db.MaxRelatedSourceTasks {
+		sourceCount = db.MaxRelatedSourceTasks
 	}
 	perSource := relatedOverviewTotalTextRunes / sourceCount
 	if perSource > relatedOverviewMaxTextPerSource {
@@ -672,8 +674,8 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 	if err != nil {
 		return []map[string]any{}
 	}
-	if len(sources) > db.MaxTaskSourceCount {
-		sources = sources[:db.MaxTaskSourceCount]
+	if len(sources) > db.MaxRelatedSourceTasks {
+		sources = sources[:db.MaxRelatedSourceTasks]
 	}
 	perSourceTextBudget := relatedOverviewBudgetForSources(len(sources))
 	out := make([]map[string]any, 0, len(sources))
