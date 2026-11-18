@@ -31,6 +31,19 @@ import (
 // 项目（补该任务存量图投影）、摘除/换挂时含旧项目（清该任务残留行）。调用方
 // （tasksAttachProject handler）据此后台异步 RebuildProjectIndex——见小项 X。
 // 归属写入本身成功即返回，重建异步进行、失败不回传给本函数。
+// DetachProjectTasks 项目被删除后同步内存视图：DB 侧 tasks.project_id 由 FK
+// SET NULL 置空，但常驻内存的 Task 对象仍持有旧 project_id，接口会继续返回
+// 已不存在的项目（实测踩过）。这里只清内存，不再写库。
+func (m *Manager) DetachProjectTasks(projectID int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range m.tasks {
+		if t.ProjectID != nil && *t.ProjectID == projectID {
+			t.ProjectID = nil
+		}
+	}
+}
+
 func (m *Manager) AttachTaskProject(id string, projectID *int64) (changed []int64, err error) {
 	m.taskStateMu.Lock()
 	defer m.taskStateMu.Unlock()
@@ -455,6 +468,9 @@ func (s *Server) projectsDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// 保留分支：FK 已把库里的 project_id 置空，内存对象要同步，否则任务列表
+	// 还会显示一个不存在的项目。
+	s.m.DetachProjectTasks(pid)
 	writeJSON(w, 200, map[string]any{
 		"deleted":       pid,
 		"tasks_deleted": tasksDeleted,
