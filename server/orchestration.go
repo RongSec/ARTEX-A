@@ -248,6 +248,25 @@ func (s *Server) toolListLLMProfiles() actool.CoreTool {
 		})
 }
 
+// defaultTaskProjectID 决定「程序里创建的任务」该挂哪个项目：优先继承
+// parentRef 指向的父任务，其次落「未分类」。返回 nil 只在未分类项目创建
+// 也失败时出现（数据库不可用），此时建任务本身也会失败，不必另设分支。
+func (s *Server) defaultTaskProjectID(parentRef string) *int64 {
+	if parentRef != "" {
+		if pt, ok := s.m.Task(parentRef); ok && pt.ProjectID != nil {
+			id := *pt.ProjectID
+			return &id
+		}
+	}
+	p, err := s.m.PG().EnsureUncategorizedProject()
+	if err != nil {
+		log.Printf("[task] 取未分类项目失败: %v", err)
+		return nil
+	}
+	id := p.ID
+	return &id
+}
+
 func (s *Server) toolSpawnTask() actool.CoreTool {
 	return wrTool("spawn_task",
 		"新建一个子任务并启动探索引擎，返回 task_id。用于把一件事(如一道题/一个目标)派成独立任务。parent_ref 可选：填当前编排关联的父任务 id 做父子关联。",
@@ -316,6 +335,9 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 				llmIDs = []int64{*pin}
 			}
 			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
+				// 子任务跟父任务同一个项目；没有父项目就落「未分类」——不允许
+				// 再建出 project_id=NULL 的孤儿任务（与 HTTP 建任务同一条不变量）。
+				ProjectID:            s.defaultTaskProjectID(a.ParentRef),
 				SourceTaskIDs:        sourceIDs,
 				LLMProfileIDs:        llmIDs,
 				TimeoutSeconds:       a.TimeoutSeconds,

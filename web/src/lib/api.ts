@@ -369,6 +369,7 @@ export const api = {
   createTask: (input: {
     name?: string;
     categoryId?: number;
+    projectId?: number;
     description: string;
     goal: string;
     llmProfileIds?: number[];
@@ -384,6 +385,7 @@ export const api = {
     post<Task>("/tasks", {
       name: input.name ?? "",
       category_id: input.categoryId ?? null,
+      project_id: input.projectId ?? null, // null/缺省 = 后端落「未分类」项目
       description: input.description,
       goal: input.goal,
       llm_profile_ids: input.llmProfileIds ?? [],

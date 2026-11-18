@@ -130,6 +130,7 @@ import type {
   DeleteTaskOptions,
   DeleteTaskResult,
   LLMProfile,
+  Project,
   Task,
   TaskArchive,
   TaskArchiveState,
@@ -165,6 +166,9 @@ function appendUploads(desc: string, atts: ChatAttachment[]): string {
 // worker), so the list has to be pulled; 10s is plenty for status / 进度 / token 变化.
 const POLL_MS = 10_000;
 const MAX_SOURCE_TASKS = 8;
+// 建任务时的「未分类」占位值：真实项目 id 从 1 起，字符串占位不会与之冲突。
+const UNCATEGORIZED_PROJECT_VALUE = "__uncategorized__";
+const UNCATEGORIZED_PROJECT_NAME = "未分类";
 
 // fmtTokens renders a compact token count (1234 → 1.2k, 2_000_000 → 2M).
 function fmtTokens(n: number): string {
@@ -2972,6 +2976,10 @@ function CreateTaskSheet({
   const [open, setOpen] = React.useState(false);
   const [name, setName] = React.useState("");
   const [categoryID, setCategoryID] = React.useState<number | undefined>(undefined);
+  // 归属项目：undefined = 未选择 → 后端落「未分类」项目。任务必须挂在项目下，
+  // 不再产生无项目的孤儿任务。
+  const [projectID, setProjectID] = React.useState<number | undefined>(undefined);
+  const [projects, setProjects] = React.useState<Project[]>([]);
   const [description, setDescription] = React.useState("");
   const [goal, setGoal] = React.useState("");
   const [selectedTemplateID, setSelectedTemplateID] = React.useState<number | null>(null);
@@ -3004,6 +3012,12 @@ function CreateTaskSheet({
       .companies()
       .then(setCompanies)
       .catch(() => setCompanies([]));
+    // 项目列表建任务时要选；只在打开抽屉/首次加载时拉一次，失败按空列表降级
+    // （空列表时只能选「未分类」，仍然能建出任务）。
+    api
+      .projects("active")
+      .then((r) => setProjects(r.projects))
+      .catch(() => setProjects([]));
   }, []);
 
   // pickFiles uploads the chosen files into this draft's staging dir and appends their
@@ -3044,6 +3058,7 @@ function CreateTaskSheet({
       await api.createTask({
         name: name.trim(),
         categoryId: categoryID,
+        projectId: projectID,
         description: description.trim(),
         goal: goal.trim(),
         llmProfileIds: llmProfileIDs.map(Number),
@@ -3061,6 +3076,7 @@ function CreateTaskSheet({
       toast.success("任务已创建");
       setName("");
       setCategoryID(undefined);
+      setProjectID(undefined);
       setDescription("");
       setGoal("");
       setSelectedTemplateID(null);
@@ -3130,6 +3146,32 @@ function CreateTaskSheet({
                 onChange={(e) => setName(e.target.value)}
               />
             </div>
+            <Field>
+              <FieldLabel htmlFor="task-project">归属项目</FieldLabel>
+              <Select
+                value={projectID === undefined ? UNCATEGORIZED_PROJECT_VALUE : String(projectID)}
+                onValueChange={(v) => setProjectID(v === UNCATEGORIZED_PROJECT_VALUE ? undefined : Number(v))}
+              >
+                <SelectTrigger id="task-project" className="w-full">
+                  <SelectValue placeholder="未分类" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value={UNCATEGORIZED_PROJECT_VALUE}>未分类（默认）</SelectItem>
+                    {projects
+                      .filter((p) => p.name !== UNCATEGORIZED_PROJECT_NAME)
+                      .map((p) => (
+                        <SelectItem key={p.id} value={String(p.id)}>
+                          {p.name}
+                        </SelectItem>
+                      ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <FieldDescription>
+                任务必须归属项目。不选就进「未分类」，之后可在项目页重新归类；项目的并发数决定批量下发的节奏。
+              </FieldDescription>
+            </Field>
             <Field>
               <FieldLabel htmlFor="task-category">任务分类</FieldLabel>
               <CategoryPicker

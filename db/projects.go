@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -398,4 +399,68 @@ RETURNING id`, projectID).Scan(&id)
 		return 0, nil
 	}
 	return id, err
+}
+
+// ---------- 未分类项目（创建任务必须归属项目） ----------
+
+// UncategorizedProjectName 是「创建任务时没选项目」的兜底归属项目名。
+// 用户口径：任务必须挂在项目下，不选就进未分类，而不是留成 project_id=NULL 的
+// 孤儿行——孤儿行在项目视图里既看不见也管不到。
+const UncategorizedProjectName = "未分类"
+
+// uncategorizedProjectKey 记住兜底项目的 id。记 id 而不是每次按名字找：
+// 用户把「未分类」改名后，下次建任务仍然要落回同一个项目，不能又建一个新的。
+const uncategorizedProjectKey = "project.uncategorized_id"
+
+// EnsureUncategorizedProject 返回「未分类」项目，缺失时创建。
+//
+// 并发安全靠事务级 advisory lock：建任务是多入口（页面、编排 spawn_task、
+// 批量下发）都会走的路，两个请求同时发现「没有未分类项目」就会各建一个。
+// 锁内重查 settings 与同名项目，把「查-建-记」压成一个不交错的动作。
+func (d *DB) EnsureUncategorizedProject() (*Project, error) {
+	if v, ok, err := d.GetSetting(uncategorizedProjectKey); err == nil && ok {
+		if id, cerr := strconv.ParseInt(strings.TrimSpace(v), 10, 64); cerr == nil && id > 0 {
+			if p, perr := d.GetProject(id); perr == nil && p.Status == "active" {
+				return p, nil
+			}
+		}
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtext('artex.uncategorized_project'))`); err != nil {
+		return nil, err
+	}
+	// 锁内重查：等锁期间别的请求可能已经建好并写库。
+	var stored string
+	if err := tx.QueryRow(`SELECT value FROM settings WHERE key=$1`, uncategorizedProjectKey).Scan(&stored); err == nil {
+		if id, cerr := strconv.ParseInt(strings.TrimSpace(stored), 10, 64); cerr == nil && id > 0 {
+			if p, perr := scanProject(tx.QueryRow(`SELECT `+projectCols+` FROM projects WHERE id=$1 AND status='active'`, id)); perr == nil {
+				return p, tx.Commit()
+			}
+		}
+	}
+	p, err := scanProject(tx.QueryRow(`SELECT `+projectCols+` FROM projects
+WHERE name=$1 AND status='active' ORDER BY id LIMIT 1`, UncategorizedProjectName))
+	if errors.Is(err, sql.ErrNoRows) {
+		p, err = scanProject(tx.QueryRow(`
+INSERT INTO projects(name, description, owner, concurrency)
+VALUES ($1, $2, '', 2)
+RETURNING `+projectCols, UncategorizedProjectName, "创建任务时未选择项目的默认归属"))
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`
+INSERT INTO settings(key, value) VALUES ($1, $2)
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+		uncategorizedProjectKey, strconv.FormatInt(p.ID, 10)); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return p, nil
 }

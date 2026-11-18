@@ -44,7 +44,12 @@ type Server struct {
 	ctx    context.Context
 
 	skillDir string // root directory for skill subdirectories
-	jwtKey   []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
+	// jwtKey 是 HS256 签名 key（loadOrCreateJWTKey 生成/读取）。改密码时
+	// rotateJWTKey 会换掉它让全部旧 token 失效，所以读写一律走
+	// currentJWTKey()/jwtKeyMu，不要直接字段读。
+	jwtKey   []byte
+	jwtKeyMu sync.RWMutex
+	keyDir   string // jwt.key 落盘目录（项目根，不在可浏览的工作区里）
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -181,7 +186,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, keyDir: keyDir, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -1610,6 +1615,7 @@ func truncateReply(s string) string {
 type createTaskReq struct {
 	Name                 string   `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
 	CategoryID           *int64   `json:"category_id,omitempty"`
+	ProjectID            *int64   `json:"project_id,omitempty"` // 归属项目;省略/0=落「未分类」项目
 	Description          string   `json:"description"`
 	Goal                 string   `json:"goal"`
 	LLMProfileID         *int64   `json:"llm_profile_id,omitempty"`    // 指定运行本任务的 LLM 配置;省略/null=用激活配置
@@ -1669,13 +1675,24 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.CompanyIDs = companyIDs
+	// 任务必须归属项目：没选就落「未分类」，不再留 project_id=NULL 的孤儿任务。
+	// 未分类项目缺失时按需建（并发安全见 db.EnsureUncategorizedProject）。
+	projectID, err := s.resolveCreateTaskProject(req.ProjectID)
+	if err != nil {
+		if errors.Is(err, db.ErrProjectNotFound) || errors.Is(err, db.ErrTaskProjectNotFound) {
+			writeErr(w, 400, "项目不存在")
+			return
+		}
+		writeErr(w, 500, err.Error())
+		return
+	}
 	interceptRules, err := buildTaskInterceptRules(req.InterceptRules)
 	if err != nil {
 		writeErr(w, 400, "任务级拦截规则无效："+err.Error())
 		return
 	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
-		Name: strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
+		Name: strings.TrimSpace(req.Name), CategoryID: req.CategoryID, ProjectID: projectID,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled: req.CoverageEnabled,
@@ -1699,6 +1716,24 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
 	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
 	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
+}
+
+// resolveCreateTaskProject 决定新任务归属的项目：显式传了就用（校验存在性），
+// 没传/传 0 就落「未分类」。返回的指针永远非 nil——建任务不再产生无项目的孤儿。
+func (s *Server) resolveCreateTaskProject(raw *int64) (*int64, error) {
+	if raw != nil && *raw > 0 {
+		if _, err := s.m.PG().GetProject(*raw); err != nil {
+			return nil, err // ErrProjectNotFound → 调用方转 400
+		}
+		id := *raw
+		return &id, nil
+	}
+	p, err := s.m.PG().EnsureUncategorizedProject()
+	if err != nil {
+		return nil, err
+	}
+	id := p.ID
+	return &id, nil
 }
 
 func (s *Server) validateTaskProfileIDs(ids []int64) error {
