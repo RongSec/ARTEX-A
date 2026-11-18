@@ -1536,6 +1536,23 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 		return result, err
 	}
 	if registered == nil {
+		// 任务行已经不在了（重复删除、或有人直接删库）。以前这里直接返回，
+		// 工作区目录与 transcript 就永远留在盘上——线上出现过 41 个无主任务
+		// 目录正是这个分支造成的。现在按 taskID 尽力清掉工作区（transcript
+		// 需要 exploration_id，没有行就拿不到，只能留给人工/巡检）。
+		if opts.DeleteFiles {
+			if dir := filepath.Join(m.dir, "tasks", id); dir != "" {
+				if _, statErr := os.Lstat(dir); statErr == nil {
+					if rmErr := os.RemoveAll(dir); rmErr != nil {
+						log.Printf("[task-delete] task %s 行已不存在，清理工作区失败: %v", id, rmErr)
+					} else {
+						result.FilesDeleted = true
+						log.Printf("[task-delete] task %s 行已不存在，已按 id 清理孤儿工作区 %s", id, dir)
+					}
+				}
+			}
+		}
+		log.Printf("[task-delete] task %s 不存在（可能已被删除）；options=%+v 未做级联清理", id, opts)
 		m.forgetTask(id, n)
 		return result, nil
 	}
@@ -1592,6 +1609,11 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 		}
 	}
 	m.forgetTask(id, n)
+	// 一行审计：删除是破坏性操作，事后要能回答「勾了哪些、实际删了多少」。
+	// 线上那次「勾了全部却只掉了 DB 行」正是因为这条日志不存在。
+	log.Printf("[task-delete] task %s options=%+v → assets=%d(detach %d) traffic=%d files=%v findings=%d llm=%d",
+		id, opts, result.AssetsDeleted, result.AssetsDetached, result.TrafficDeleted,
+		result.FilesDeleted, result.FindingsDeleted, result.LLMRecordsDeleted)
 	if err := errors.Join(finalizeErrs...); err != nil {
 		return result, &taskDeleteCommittedError{err: err}
 	}
