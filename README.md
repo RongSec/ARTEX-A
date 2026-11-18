@@ -90,7 +90,10 @@ cp config.example.json config.json   # 填 database 连接
 
 项目是批量任务的调度单位：项目并发数决定同时在跑几个，排队中的任务按队首逐个认领；项目级「观察者 / 阅读者」两个开关分别管跨任务与跨项目的情报复用。
 
+新建任务必须归属项目：不选就落「未分类」，之后可在项目页重新归类，不再产生无归属的孤儿任务。
+
 ![项目](screenshots/projects.png)
+![新建任务](screenshots/new-task.png)
 
 **发现与证据**
 
