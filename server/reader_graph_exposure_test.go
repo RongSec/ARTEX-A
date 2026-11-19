@@ -1,16 +1,21 @@
 package server
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
 )
 
-// TestAdoptedReaderLinkExposesSourceGraph 验证「阅读者采纳 → 图暴露」：
-// task_intel_links(decision=adopted) 一旦写入，被勾连任务就和不变量一样进入
-// DirectSourceStores（graph_overview.related_tasks 与 inherited 读工具的共同来源），
-// 而不仅仅是一条 hint。跨项目采纳不暴露整图。
-func TestAdoptedReaderLinkExposesSourceGraph(t *testing.T) {
+// TestAdoptedReaderLinkIsNotScopeInheritance 验证新的阅读者暴露口径：
+//
+//   - 采纳（task_intel_links.decision=adopted）**不**进入 DirectSourceStores：
+//     对方整张图（含资产上下文）不会被当前任务继承；
+//   - 但进入 ReaderRefs：给出概览 + 接口表（无 host）+ 可下钻 id；
+//   - 下钻只对被采纳的任务开放，未采纳的任务取不到；
+//   - 跨项目不暴露。
+func TestAdoptedReaderLinkIsNotScopeInheritance(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
@@ -31,54 +36,100 @@ func TestAdoptedReaderLinkExposesSourceGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	other, err := m.CreateTaskWithOptions("other", "other goal", db.TaskCreateOptions{ProjectID: &proj.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		_, _ = m.DeleteTask(owner.ID, DeleteTaskOptions{})
 		_, _ = m.DeleteTask(source.ID, DeleteTaskOptions{})
+		_, _ = m.DeleteTask(other.ID, DeleteTaskOptions{})
 	})
 
 	ownerID := mustTaskID(t, owner.ID)
 	sourceID := mustTaskID(t, source.ID)
+	otherID := mustTaskID(t, other.ID)
 
+	// 来源任务写一条含 host 的 finding + 一条接口情报，用来验证「脱敏可见」。
+	findingID, err := source.Store.AddNode(db.KindFinding, map[string]any{
+		"summary":  "OA 登录口 SQL 注入",
+		"severity": "high",
+		"evidence": "GET http://oa.example-corp.com:8080/api/login?user=admin 返回 200，password=Passw0rd!",
+	}, 0, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.pg.Exec(`INSERT INTO task_intel(project_id, task_id, kind, key, value, source)
+VALUES ($1,$2,'endpoint','post /api/login','POST https://oa.example-corp.com/api/login','finding')`,
+		proj.ID, sourceID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.pg.SaveTaskIntelLink(t.Context(), db.TaskIntelLink{
+		ProjectID: proj.ID, TaskID: ownerID, RelatedTaskID: sourceID,
+		Decision: "adopted", Reason: "接口重合 1/1",
+		Matched:   json.RawMessage(`[{"kind":"endpoint","key":"post /api/login","value":"POST https://oa.example-corp.com/api/login"}]`),
+		DecidedBy: "reader",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1) 不再进入静态来源（不继承图/资产范围）。
 	sources, err := owner.Store.DirectSourceStores()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(sources) != 0 {
-		t.Fatalf("没有静态关联时不该有来源，got %d", len(sources))
+		t.Fatalf("采纳不应升级为静态来源（否则等于继承对方整张图），got %d", len(sources))
 	}
 
-	if _, err := m.pg.SaveTaskIntelLink(t.Context(), db.TaskIntelLink{
-		ProjectID: proj.ID, TaskID: ownerID, RelatedTaskID: sourceID,
-		Decision: "adopted", Reason: "同一接口 /api/user/{id}", DecidedBy: "reader",
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	sources, err = owner.Store.DirectSourceStores()
+	// 2) ReaderRefs 给出概览 + 接口表（无 host）+ 可下钻 id。
+	refs, err := owner.Store.ReaderRefs(4)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sources) != 1 || sources[0].Task.TaskID != sourceID {
-		t.Fatalf("adopt 后应把被勾连任务暴露为来源，got %+v", sources)
+	if len(refs) != 1 || refs[0].TaskID != sourceID {
+		t.Fatalf("adopt 后应出现在 reader_refs，got %+v", refs)
 	}
-	if sources[0].Store == nil || sources[0].Task.ExplorationID != source.ExpID {
-		t.Fatal("被勾连任务应绑定到自己的探索图 store（继承读路径靠它）")
+	if len(refs[0].Endpoints) != 1 || refs[0].Endpoints[0].Path != "/api/login" {
+		t.Fatalf("应暴露接口表的 path，got %+v", refs[0].Endpoints)
+	}
+	if len(refs[0].Overlap) != 1 || strings.Contains(refs[0].Overlap[0], "example-corp") {
+		t.Fatalf("重合键只能是 METHOD /path，不能带 host：%+v", refs[0].Overlap)
+	}
+	found := false
+	for _, n := range refs[0].Nodes {
+		if n.ID == findingID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("finding 节点应可下钻，got %+v", refs[0].Nodes)
 	}
 
-	// 跨项目：换到另一个项目后，该采纳不应再暴露整图。
-	other, err := m.pg.CreateProject(db.CreateProjectInput{Name: "_reader_exposure_other", Concurrency: 1})
+	// 3) 下钻：被采纳的任务可读，未采纳的读不到。
+	n, err := owner.Store.ReaderTaskNode(sourceID, findingID)
+	if err != nil || n == nil {
+		t.Fatalf("被采纳任务的节点应可下钻: n=%v err=%v", n, err)
+	}
+	if n, _ := owner.Store.ReaderTaskNode(otherID, 1); n != nil {
+		t.Fatal("未采纳的任务不应被下钻（否则就是跨任务读取后门）")
+	}
+
+	// 4) 跨项目：不暴露。
+	otherProj, err := m.pg.CreateProject(db.CreateProjectInput{Name: "_reader_exposure_other", Concurrency: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = m.pg.Exec(`DELETE FROM projects WHERE id=$1`, other.ID) })
-	if _, err := m.pg.Exec(`UPDATE tasks SET project_id=$1 WHERE id=$2`, other.ID, sourceID); err != nil {
+	t.Cleanup(func() { _, _ = m.pg.Exec(`DELETE FROM projects WHERE id=$1`, otherProj.ID) })
+	if _, err := m.pg.Exec(`UPDATE tasks SET project_id=$1 WHERE id=$2`, otherProj.ID, sourceID); err != nil {
 		t.Fatal(err)
 	}
-	sources, err = owner.Store.DirectSourceStores()
+	refs, err = owner.Store.ReaderRefs(4)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sources) != 0 {
-		t.Fatalf("跨项目采纳不应暴露整图，got %d", len(sources))
+	if len(refs) != 0 {
+		t.Fatalf("跨项目采纳不应暴露，got %d", len(refs))
 	}
 }

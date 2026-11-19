@@ -13,10 +13,9 @@ type DirectSourceStore struct {
 	Store *ExplorationStore
 }
 
-// MaxRelatedSourceTasks 是一次任务上下文里最多带几张「只读外挂图」：
-// 静态关联（task_relations，上限 MaxTaskSourceCount=8）+ 阅读者采纳的
-// （task_intel_links.decision='adopted'）合并后取前 12 个。上限存在的理由
-// 是提示词预算：related_tasks 的总字数固定，来源越多每个分到的越少。
+// MaxRelatedSourceTasks 是一次任务上下文里最多带几张「只读外挂图」。
+// 只算静态关联（task_relations，上限 MaxTaskSourceCount=8）：阅读者采纳的
+// 任务不走这条路径（见 ReaderRefs），自然也不会和静态来源抢名额。
 const MaxRelatedSourceTasks = 12
 
 // DirectSourceStores resolves the live, direct task relations for this
@@ -24,40 +23,24 @@ const MaxRelatedSourceTasks = 12
 // a source task is deleted, and inherited context must not retain stale rows.
 // Sources of a source are never expanded.
 //
-// 来源有两类，合并成同一份只读视图：
-//  1. 建任务时静态勾选的 task_relations（用户显式关联）；
-//  2. 阅读者判定相关后 adopt 的 task_intel_links.decision='adopted'。
-//
-// 这就是「阅读者把图暴露给当前任务」的落点：采纳一旦发生，被勾连任务的
-// goals/facts/findings/意图/资产锚点就和不变量一样进入 graph_overview 的
-// related_tasks，并在 node_detail/list_facts 等读工具里按 id 可读——不是只
-// 挂一条 hint。静态关联优先占名额，剩下的给最近采纳的。
+// 只认建任务时静态勾选的 task_relations。阅读者采纳（task_intel_links）**不**
+// 并进来——用户口径：采纳不等于把对方整张图（含 host / 资产范围）永久暴露给
+// 当前任务；采纳只给「概览 + id」，细节由 ask_reader 找阅读者代理下钻。
 func (s *ExplorationStore) DirectSourceStores() ([]DirectSourceStore, error) {
 	rows, err := s.db.Query(`
 WITH direct AS (
-    SELECT relation.source_task_id AS id, MIN(relation.created_at) AS at, 0 AS pri
+    SELECT relation.source_task_id AS id, MIN(relation.created_at) AS at
     FROM tasks owner
     JOIN task_relations relation ON relation.task_id = owner.id
     WHERE owner.exploration_id = $1 AND owner.deleted_at IS NULL
     GROUP BY 1
-    UNION ALL
-    SELECT link.related_task_id AS id, MIN(link.created_at) AS at, 1 AS pri
-    FROM tasks owner
-    JOIN task_intel_links link ON link.task_id = owner.id AND link.decision = 'adopted'
-    JOIN tasks related ON related.id = link.related_task_id AND related.deleted_at IS NULL
-    WHERE owner.exploration_id = $1 AND owner.deleted_at IS NULL
-      -- 只暴露同项目内的图：跨项目的结论走 global_insights，不整图外溢。
-      AND related.project_id IS NOT DISTINCT FROM owner.project_id
-    GROUP BY 1
-), merged AS (
-    SELECT id, MIN(pri) AS pri, MIN(at) AS at FROM direct GROUP BY id
-    ORDER BY pri, at, id
+    ORDER BY at, id
     LIMIT $2
 )
 SELECT source.id, source.exploration_id, source.description, source.goal, source.status
-FROM merged
-JOIN tasks source ON source.id = merged.id AND source.deleted_at IS NULL
-ORDER BY merged.pri, merged.at, source.id`, s.expID, MaxRelatedSourceTasks)
+FROM direct
+JOIN tasks source ON source.id = direct.id AND source.deleted_at IS NULL
+ORDER BY direct.at, source.id`, s.expID, MaxRelatedSourceTasks)
 	if err != nil {
 		return nil, err
 	}

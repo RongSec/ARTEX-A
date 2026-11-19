@@ -452,7 +452,8 @@ func aggregateReaderLinkCandidates(matches []db.IntelTaskMatch, limit int) []rea
 func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 	return wrTool("adopt_related_task",
 		"阅读者专用：你读完【发起方任务】与【被勾连任务】两边上下文（get_task_graph_digest，读摘要不读全文）后，判定两者相关（同一攻击面/同一资产可复用/同一利用链）时调用。"+
-			"记 decision=adopted，并把被勾连任务的可复用要点写成结构化 hint 写进发起方任务图，唤醒其规划者直接采信（规划者不再下钻）。"+
+			"记 decision=adopted，并把被勾连任务的可复用要点写成结构化 hint 写进发起方任务图，唤醒其规划者。"+
+			"注意：hint 只在发起方一轮上下文里有效；后续细节由规划者用 ask_reader 向你下钻（你只回脱敏后的测试方法）。"+
 			"无关的候选请用 dismiss_related_task；重复采纳同一对任务是幂等的（不重复写 hint）。",
 		objSchema(map[string]any{
 			"task_id":         strParam("发起方任务 id：本轮图变更消息里的 task_id（要被暴露情报、被唤醒规划者的任务）"),
@@ -694,6 +695,9 @@ func renderReaderAdoptHint(h readerAdoptHint) string {
 			b.WriteString(f)
 		}
 	}
+	b.WriteString("\n这条 hint 只在你这一轮上下文里（下一轮就会淡出）。要细节时用 ask_reader(related_task_id=")
+	b.WriteString(strconv.FormatInt(h.SourceTaskID, 10))
+	b.WriteString(", query=…)：它只回脱敏后的测试方法（方法+路径/参数/payload/工具），不含 host 与凭据。")
 	b.WriteString("\n经验参考：reference_only=true，以上内容仅用于借鉴打法，来源任务的资产不属于本任务授权范围。")
 	if len(h.ForeignHosts) > 0 {
 		b.WriteString("禁止对以下地址发起任何请求/扫描/利用：")

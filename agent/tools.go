@@ -525,6 +525,14 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// summaries in a separate field so their intents never enter this task's
 	// frontier or get mistaken for locally claimable work.
 	out["related_tasks"] = t.relatedTaskOverviews()
+	// reader_refs：阅读者采纳的参考任务，只给「概览 + 接口表(无 host) + 可下钻 id」。
+	// 不是继承：对方整张图（资产锚点/范围/evidence 里的 host）不进来，细节要
+	// planner 用 ask_reader 向阅读者要。留空时不写这个字段，老任务提示词零变化。
+	if t.ts != nil {
+		if refs, err := t.ts.ReaderRefs(4); err == nil && len(refs) > 0 {
+			out["reader_refs"] = refs
+		}
+	}
 	// coverage：粗略的资产测试覆盖度参考——范围(task_scope)内的资产里，被 fact 碰过的
 	// 占比 + by_type(按类型的 总数/已测)。要看未测的具体资产由 agent 按需调 list_untested_assets 自行判断。仅任务上下文有。
 	// 资产覆盖度功能关闭时(coverageDisabled)：只保留 host_count(目标主机数的感知信息)，
@@ -2081,6 +2089,9 @@ func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 func (t *ToolSet) PlannerTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
+		// ask_reader：阅读者采纳的参考任务只能「按需下钻」——拿到的是脱敏后的
+		// 测试方法（无 host/凭据），不是对方整张图。
+		t.askReader(),
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
