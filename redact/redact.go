@@ -62,3 +62,7 @@ func RequestsIn(s string) []string {
 	}
 	return out
 }
+
+// 说明：TestMethod 的顺序是「先整段 URL、再 IP、再域名、最后凭据」。中文正文里
+// 的「资产 10.0.0.5:8080」依赖 \b 在中文与数字之间成立（Go 的 \b 是 ASCII 词界，
+// 中文按非词字符处理），单测锁住这个行为，避免日后换实现时漏掉带端口的形态。

@@ -1863,6 +1863,10 @@ CREATE TABLE IF NOT EXISTS task_foreign_assets (
 CREATE INDEX IF NOT EXISTS idx_task_foreign_assets_task ON task_foreign_assets(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_foreign_assets_source ON task_foreign_assets(task_id, source_task_id);
 
+-- 情报表增量构建水位（V10-INTEL-LIVE）：运行中的任务每 5 分钟重抽一次，
+-- 让 endpoints 在任务跑的过程中就参与比对，而不是等终态。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS intel_built_at TIMESTAMPTZ;
+
 -- ---------- 漏洞情报（V10-INTEL） ----------
 -- 只存公开源（NVD API 2.0 + CISA KEV）拉下来的条目；不含任何私有 PoC 仓库内容。
 -- cpe 存 "vendor:product" 归一后的片段，用于「资产技术指纹 → CVE」反向匹配。

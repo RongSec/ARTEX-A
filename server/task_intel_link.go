@@ -29,6 +29,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
+	"github.com/Autumn-27/artex/redact"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -635,15 +636,15 @@ func (s *Server) writeReaderAdoptHint(taskID int64, h readerAdoptHint) (int64, e
 		"text":                text,
 		"decided_by":          readerLinkDecidedBy,
 		"reference_only":      true,
-		"foreign_hosts":       nonNilStrings(h.ForeignHosts),
+		"foreign_host_count":  len(h.ForeignHosts),
 		"source_task_id":      h.SourceTaskID,
 		"source_task_name":    h.SourceTaskName,
 		"source_project_id":   h.SourceProjectID,
 		"source_project_name": h.SourceProjectName,
 		"strength":            h.Strength,
-		"reason":              h.Reason,
-		"reusable_points":     h.Points,
-		"key_facts":           h.Facts,
+		"reason":              redact.TestMethod(h.Reason),
+		"reusable_points":     redactStrings(h.Points),
+		"key_facts":           redactStrings(h.Facts),
 		"link_id":             h.LinkID,
 	}
 	id, err := t.Store.AddNode(db.KindHint, payload, 0, "active", "reader", nil)
@@ -678,21 +679,23 @@ func renderReaderAdoptHint(h readerAdoptHint) string {
 	b.WriteString("；关联强度：")
 	b.WriteString(h.Strength)
 	b.WriteString("。理由：")
-	b.WriteString(h.Reason)
+	b.WriteString(redact.TestMethod(h.Reason))
 	if len(h.Points) > 0 {
 		b.WriteString("\n可复用要点：")
 		for i, p := range h.Points {
 			b.WriteString("\n")
 			b.WriteString(strconv.Itoa(i + 1))
 			b.WriteString(". ")
-			b.WriteString(p)
+			// 要点来自情报表原文（「资产 10.0.0.5:8080」「凭据 …@host」），
+			// 必须与 facts 同口径脱敏；漏这一处就等于把 host 随要点发给规划者。
+			b.WriteString(redact.TestMethod(p))
 		}
 	}
 	if len(h.Facts) > 0 {
 		b.WriteString("\n关键事实：")
 		for _, f := range h.Facts {
 			b.WriteString("\n- ")
-			b.WriteString(f)
+			b.WriteString(redact.TestMethod(f))
 		}
 	}
 	b.WriteString("\n这条 hint 只在你这一轮上下文里（下一轮就会淡出）。要细节时用 ask_reader(related_task_id=")
@@ -700,20 +703,21 @@ func renderReaderAdoptHint(h readerAdoptHint) string {
 	b.WriteString(", query=…)：它只回脱敏后的测试方法（方法+路径/参数/payload/工具），不含 host 与凭据。")
 	b.WriteString("\n经验参考：reference_only=true，以上内容仅用于借鉴打法，来源任务的资产不属于本任务授权范围。")
 	if len(h.ForeignHosts) > 0 {
-		b.WriteString("禁止对以下地址发起任何请求/扫描/利用：")
-		const maxShown = 20
-		shown := h.ForeignHosts
-		if len(shown) > maxShown {
-			shown = shown[:maxShown]
-		}
-		b.WriteString(strings.Join(shown, "、"))
-		if len(h.ForeignHosts) > maxShown {
-			b.WriteString(fmt.Sprintf(" 等 %d 个", len(h.ForeignHosts)))
-		}
-		b.WriteString("。要把经验用到本任务已有资产上；确需扩到新资产，先由本任务正常登记资产后再打。")
+		// 不列 host：跨项目采纳时，列出来等于把另一个项目的资产清单塞进本任务
+		// 上下文。禁打由执行层按 task_foreign_assets 硬拦，这里只给数量。
+		b.WriteString(fmt.Sprintf("\n被勾连任务另有 %d 个资产，已加入本任务的禁止访问清单（不在本任务授权范围，故不列出地址）。要把经验用到本任务已有资产上；确需扩到新资产，先由本任务正常登记资产后再打。", len(h.ForeignHosts)))
 	}
 	b.WriteString("\n直接采信以上结论，不要再重读来源任务；若要验证，按上述要点在当前任务执行。")
 	return b.String()
+}
+
+// redactStrings 对切片逐条脱敏（hint payload 与规划者上下文同口径）。
+func redactStrings(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		out = append(out, redact.TestMethod(s))
+	}
+	return out
 }
 
 // nonNilStrings 保证 JSON 里是 [] 而不是 null（前端/模型都按数组消费）。
@@ -1150,6 +1154,8 @@ func (s *Server) taskIntelReaderTools() []actool.CoreTool {
 		s.toolReadTaskIntel(),
 		s.toolLinkTasks(),
 		s.toolRequestReaderLinks(),
+		// 读双方完整图：判相关性时不能只看投影摘要（V10-READER-2）。
+		s.toolReadTaskGraph(),
 		s.toolAdoptRelatedTask(),
 		s.toolDismissRelatedTask(),
 	}

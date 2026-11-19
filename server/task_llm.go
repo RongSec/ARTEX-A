@@ -582,6 +582,11 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
+	// V10-READER：ask_reader 的「总结成测试方法论」走任务 planner 链（同一套模型配置），
+	// 失败只是退回脱敏证据，不影响规划者本轮。
+	pl.SetReaderAnswer(func(ctx context.Context, req agent.ReaderDrillRequest) (string, error) {
+		return s.readerDrillAnswer(ctx, plannerRuntime, req)
+	})
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner)           // 操作约束注入 planner(可配置,默认开)

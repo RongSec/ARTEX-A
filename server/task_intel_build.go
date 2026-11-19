@@ -179,6 +179,8 @@ func (s *Server) buildTaskIntelMode(ctx context.Context, taskID int64, replace, 
 			}
 		}
 	}
+	// 水位：运行中的增量构建（V10-INTEL-LIVE）按它判「5 分钟到了没」。
+	s.markIntelBuilt(ctx, taskID)
 	// 信号：只报「新增」——重复生成没有新攻击面，不该反复唤醒 reader。
 	if summary := db.IntelDeltaSummary(taskID, delta); summary != "" {
 		if err := pg.InsertGraphEvent(ctx, pid, taskID, 0, "intel", summary); err != nil {

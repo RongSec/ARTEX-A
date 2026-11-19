@@ -143,7 +143,9 @@ NVD 全量 + CISA KEV 在野利用，两个公开源。快通道每 30 分钟拉
 - 图变更即触发（`on_project_graph`），另加 30 分钟定时兜底；一波图变更合并成一次会话，不会一次变更烧一轮 token。
 - **跨任务阅读者**（scope=project）：读项目投影 `project_index`，按 task_id 下钻被勾连任务的探索图摘要，判定"同一攻击面 / 同一资产 / 同一利用链"后用 `adopt_related_task` 把结论以结构化 hint 暴露给发起方 planner；不相关则 `dismiss_related_task` 留痕。
 - **跨项目阅读者**（scope=cross）：先看 `cross_project_assets`（同一资产出现在 ≥2 个项目的 join 结果），为空直接空转，非空才写 `global_insights`。
-- **采纳即暴露图**：`adopt_related_task` 落 `task_intel_links(adopted)` 后，被勾连任务就成为当前任务的只读来源（与建任务时手选的关联任务同一套渲染与读路径）：`graph_overview.related_tasks` 每轮都在，`node_detail` / `list_facts` / traces 可按 id 下钻，资产锚点与范围一并进入上下文。不是只挂一条 hint。
+- **采纳 ≠ 继承**：`adopt_related_task` 落 `task_intel_links(adopted)` 后，只给发起方一份**收窄的索引**（`graph_overview.reader_refs`）：任务概述、情报表五类计数、**接口表的 method+path**（不含 host）、以及可下钻的 finding/fact/intent id。对方整张图、资产锚点和 scope **不进来**——静态关联才是继承，采纳只是参考。
+- **阅读者判案要看完整图**：判定相关性时用只绑给阅读者的 `read_task_graph(task_id, with_trace=true)` 把**发起方与候选双方**的节点正文、意图执行过程和情报表各读一遍，再决定 adopt/dismiss；只看投影摘要不算判过。跨项目候选同样可以采纳（`reader_refs` 不再按 project 过滤），是否外溢由阅读者的判定控制。
+- **细节走代理下钻**：规划者要细节时调 `ask_reader(related_task_id, node_ids|query)`：服务端按 id 取节点并**确定性脱敏**（URL 只留路径、IP/域名占位符、凭据值 `<redacted>`），再把证据交给阅读者做一次**单次模型总结**，返回结构化的「接口测试方法论」（怎么构造请求、前置条件、判据、常见坑、已验证/待验证），证据只留 id+摘要索引。方法论输出再脱敏一遍，防模型把 host 补回来。
 - 只读红线：阅读者 `tool_base='none'`，没有任何执行类工具，不调扫描、不发请求。
 
 ### 4. 关联任务只读继承
@@ -161,6 +163,7 @@ NVD 全量 + CISA KEV 在野利用，两个公开源。快通道每 30 分钟拉
 
 ### 6. 漏洞情报与宿主环境
 
+- **小结表在跑的过程中就更新**：运行中任务每 5 分钟增量重抽一次 `task_intel`（只 upsert，不删行），抽到新接口就发图变更事件唤醒阅读者——这样「SQL 比对 → 阅读者判案」不必等任务收官。终态仍会做一次完整重建。
 - **情报**：NVD API 2.0（全量/增量）+ CISA KEV（在野利用目录）。快通道 30 分钟一轮，历史回填手动触发（默认 120 天）。给 agent 两个只读工具：`search_vulns` 按组件/CVSS/KEV 筛（带 `poc_count` 与 top 仓库），`list_asset_vuln_hits` 拿台账技术指纹反查。**只产出候选**——组件名匹配没有版本，必须实测才能落 finding。
 - **PoC 线索**：拿 CVE 编号打 GitHub 公开搜索（`in:name,description`），只落仓库元数据（repo / star / 描述 / URL），不克隆、不执行、不托管代码。只查 KEV 或 CVSS ≥ 9 且没查过的，查过就打标记不重复；带 token 30 次/分钟，匿名 10 次/分钟。token 在「漏洞情报 → GitHub 配置」里填，页面只回显末四位。
 - **体检**：55 件常用工具按攻击面分类，逐件探测存在性与版本，缺失项可单个或一键安装。安装命令只来自服务端目录白名单，前端传不了任意 shell。**装在进程所在的运行环境**：宿主直跑就装宿主；容器里跑就装容器那层，镜像重建即丢（页面会提示，`ARTEX_HOSTBIN` 可把 go/pip 类工具落到挂载卷）。

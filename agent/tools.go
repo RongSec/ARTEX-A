@@ -81,6 +81,10 @@ type ToolSet struct {
 	// enrich, if set, receives async auto-completion triggers (DNS resolve for a
 	// domain, HTTP probe for a site). nil = no engine enrichment.
 	enrich EnrichTrigger
+	// readerAnswer, if set, asks the reader role to turn drilled evidence into a
+	// test methodology (one LLM call). nil = deterministic redacted dump only.
+	// Wired by the server (task LLM chain) via Planner.SetReaderAnswer.
+	readerAnswer func(ctx context.Context, req ReaderDrillRequest) (string, error)
 	// notify, if set, wakes the task's planner after a graph change that should be
 	// re-planned promptly (currently: a new hint). nil = no wake (the hint is still
 	// stored and read on the next round triggered by other events). debounced.

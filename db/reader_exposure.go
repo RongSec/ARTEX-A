@@ -58,8 +58,10 @@ const (
 	readerRefMaxNodes     = 10
 )
 
-// ReaderRefs 返回当前任务被采纳的参考任务（adopted）。同项目内才返回——
-// 跨项目仍走 global_insights，不在这里外溢。
+// ReaderRefs 返回当前任务被采纳的参考任务（adopted），**不按项目过滤**：
+// 用户口径是「跨项目也要能返回」——同一个组件/同一类接口出现在别的项目里，
+// 恰恰是阅读者最该发现的东西。是否外溢由阅读者的判定（adopt）控制，不在这里
+// 再按 project_id 拦一道；host 仍在字段层脱敏。
 func (s *ExplorationStore) ReaderRefs(limit int) ([]ReaderTaskRef, error) {
 	owner, err := s.TaskID()
 	if err != nil || owner <= 0 {
@@ -73,9 +75,8 @@ SELECT link.related_task_id, COALESCE(t.name,''), COALESCE(t.goal,''), COALESCE(
        COALESCE(link.reason,''), COALESCE(link.matched::text,'[]')
 FROM task_intel_links link
 JOIN tasks t ON t.id = link.related_task_id AND t.deleted_at IS NULL
-JOIN tasks owner ON owner.id = link.task_id AND owner.deleted_at IS NULL
+JOIN tasks owner ON owner.id = link.task_id AND owner.deleted_at IS NULL -- 发起方已删则 refs 为空
 WHERE link.task_id = $1 AND link.decision = 'adopted'
-  AND t.project_id IS NOT DISTINCT FROM owner.project_id
 ORDER BY link.created_at DESC, link.id DESC
 LIMIT $2`, owner, limit)
 	if err != nil {

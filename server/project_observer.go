@@ -496,6 +496,29 @@ const readerUnifiedPromptV9 = "你同时承担两个只读视角：项目内【�
 	"  3) 确有串联价值才 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
 	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。"
 
+// readerUnifiedPromptV10 是 V10-READER-2 的当前默认正文：判定前必须读【双方完整图】，
+// 不再只看投影摘要；跨项目候选同样可采纳；采纳后规划者只看脱敏索引，细节由
+// ask_reader 找阅读者下钻、由阅读者总结成测试方法论。
+// V9 保留为升级比对基准。
+const readerUnifiedPromptV10 = "你同时承担两个只读视角：项目内【跨任务阅读者】（scope=project）、跨项目【跨项目阅读者】（scope=cross）。只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
+	"触发时机：项目探索图变更（图变更触发）或定时兜底（每 30 分钟一轮）；一条触发器同时挂这两个条件。\n" +
+	"【先看触发消息前缀判别本轮作用域】\n" +
+	"· 【scope=project】（项目图变更，消息里还带本批变更清单 kind/摘要/task_id）：做项目内跨任务阅读（你是跨任务阅读者），核心职责是【替规划者读图判定勾连】——\n" +
+	"  1) read_task_intel 读增量情报表（since_id 传上一轮返回的 next_since_id）；用触发消息里的 task_id 定位本轮变更任务（发起方）；\n" +
+	"  2) 找候选：request_reader_links(surface=发起方新出现的接口/组件/资产, project_id=发起方项目, exclude_task_id=发起方, scope=project)；\n" +
+	"  3) 每次最多判定 3 个候选。对每个候选，必须用 read_task_graph 各读一次【发起方】与【候选】的完整图（kinds=[\"all\"]、limit 80、with_trace=true）——读节点正文、意图执行过程与情报表接口，不许只看 get_task_graph_digest 摘要就下结论；\n" +
+	"  4) 判据（按强度排序）：接口 method+path 重合 ≥2 条且测法同构；同一利用链（前一步的产出正好是后一步的输入）；同一组件版本且有在野利用/已验证漏洞；同一凭据类型可复用登录态。仅组件名相同不算；\n" +
+	"  5) 高置信度（满足上面任一条且证据能在两边图里指出来）→ adopt_related_task(task_id=发起方, related_task_id=候选, strength, reason)。reason 必须写「在两边读到了什么」——点名重合的接口/组件/利用链，不能只写「键相同」；\n" +
+	"  6) 中等置信度（只有一条弱信号）→ 不采纳，可写 dismiss_related_task 说明还缺什么证据；无关 → dismiss；\n" +
+	"  7) 采纳后：规划者只会看到脱敏后的 reader_refs（任务概述、接口 method+path、计数、可下钻 id）。它需要细节时会用 ask_reader 找你下钻，你只回【测试方法论】——不要把整图、host、凭据写进 reason 或洞察。\n" +
+	"  ★跨项目候选同样可以采纳：request_reader_links(scope=cross) 返回的候选（仅覆盖开启 reader_enabled 的项目）与项目内候选同等对待，采纳不按项目设限；是否外溢由你的判定控制。\n" +
+	"  ★不要把未判定的候选丢给规划者：它不读旧任务、不做下钻，只采信你 adopt 后写入的 hint；你判完才轮到它。\n" +
+	"· 【scope=cross】（定时触发）：做跨项目串联（你是跨项目阅读者）——\n" +
+	"  1) read_all_project_insights 拿本轮输入，【先看 cross_project_assets】——它已 join 好「同一资产/组件出现在 ≥2 个项目」；为空即无跨项目信号，直接空转结束；\n" +
+	"  2) 非空时围绕这些行核实：用 read_task_graph 读涉及任务的完整图（接口/组件/漏洞），确认真实可复用；\n" +
+	"  3) 若某个正在运行的任务明显可复用另一项目的打法，用 adopt_related_task 把它关联到该运行中任务（task_id=运行中任务），reason 写清重合证据；否则 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
+	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。"
+
 // seedObserverAgent 是 V6 之前的「跨任务观察者」seed（回退路径保留）。
 // V6-U3 起 observer 退化为只读别名：收敛完成后（reader_unified_v1 置位）
 // 一律早退，不再新建 agent/触发器；收官 nudge 硬编码的主 key 是 reader，
@@ -566,7 +589,7 @@ func (s *Server) seedReaderAgent() {
 		log.Printf("[reader] 创建 agent 失败: %v", err)
 		return
 	}
-	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV9); err != nil {
+	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV10); err != nil {
 		log.Printf("[reader] seed prompt 失败: %v", err)
 	}
 	// serial+merge=all：整波图变更合并成一次会话（observer 原策略），max_parallel=2。
@@ -791,11 +814,11 @@ func (s *Server) reconcileReaderAgentNames() {
 	}
 }
 
-// readerPromptUpgradeFlag 是「默认正文已切换到 V9-READER 下钻判定版」的一次性
+// readerPromptUpgradeFlag 是「默认正文已切换到 V10-READER 读图判定版」的一次性
 // 标记。V8-NAME 的旧 flag（reader_prompt_names_v8）在存量库已置位，继续用它
 // 会让新流程永远到不了 reader；换 flag 即再执行一次「逐字节比对旧默认才升级」
 // 的幂等收编。
-const readerPromptUpgradeFlag = "reader_prompt_drill_v9"
+const readerPromptUpgradeFlag = "reader_prompt_graph_v10"
 
 // readerPromptUpgrade 是 upgradeReaderPrompt 的纯判定结果（无库可单测）。
 type readerPromptUpgrade int
@@ -818,7 +841,7 @@ func readerPromptUpgradeFor(cur string) readerPromptUpgrade {
 	switch strings.TrimSpace(cur) {
 	case "":
 		return readerPromptSeed
-	case readerPromptV1, readerPrompt, readerUnifiedPromptV6, readerUnifiedPrompt, readerUnifiedPromptNames:
+	case readerPromptV1, readerPrompt, readerUnifiedPromptV6, readerUnifiedPrompt, readerUnifiedPromptNames, readerUnifiedPromptV9:
 		return readerPromptReplace
 	default:
 		return readerPromptKeep
@@ -855,17 +878,17 @@ func (s *Server) upgradeReaderPrompt() {
 	}
 	switch readerPromptUpgradeFor(cur) {
 	case readerPromptSeed:
-		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV9); err != nil {
+		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV10); err != nil {
 			log.Printf("[reader] 播种新默认 prompt 失败: %v", err)
 			return
 		}
 		log.Printf("[reader] 已播种 V9-READER 默认 prompt")
 	case readerPromptReplace:
-		if _, err := pg.SavePrompt(a.ID, readerUnifiedPromptV9, "V9-READER 默认正文升级：阅读者下钻判定勾连，规划者直接采信 hint", "system"); err != nil {
+		if _, err := pg.SavePrompt(a.ID, readerUnifiedPromptV10, "V10-READER 默认正文升级：判定前读双方完整图，跨项目候选同等采纳，细节由 ask_reader 总结", "system"); err != nil {
 			log.Printf("[reader] 升级默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已把未编辑的默认 prompt 升级为 V9-READER 下钻判定版（历史版本保留）")
+		log.Printf("[reader] 已把未编辑的默认 prompt 升级为 V10-READER 读图判定版（历史版本保留）")
 	default:
 		log.Printf("[reader] 当前 prompt 已是新版或被用户编辑，跳过默认正文升级（如需新流程请手动恢复内置默认）")
 	}

@@ -285,6 +285,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 数据、无副作用；首次 30 秒后跑快通道，历史回填由页面手动触发。
 		s.intel = vulnintel.New(m.pg)
 		s.intel.Start(s.ctx)
+		// 运行中任务的情报增量构建：让 endpoints 在跑的过程中就参与比对。
+		s.startTaskIntelTicker(s.ctx)
 		// 任务终态→整项目自动报告钩子（artex-hs T18）。nil 守卫在装配内部，
 		// 钩子本体在 Manager.emitTaskTerminal 判空短路=原版零行为。
 		s.installTerminalHooks()

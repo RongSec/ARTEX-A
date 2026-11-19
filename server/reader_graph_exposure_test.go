@@ -119,7 +119,8 @@ VALUES ($1,$2,'endpoint','post /api/login','POST https://oa.example-corp.com/api
 		t.Fatal("未采纳的任务不应被下钻（否则就是跨任务读取后门）")
 	}
 
-	// 4) 跨项目：不暴露。
+	// 4) 跨项目：仍然可见（用户口径：跨项目也要返回；是否外溢由阅读者的 adopt
+	//    判定控制，不再按 project_id 拦一道）。
 	otherProj, err := m.pg.CreateProject(db.CreateProjectInput{Name: "_reader_exposure_other", Concurrency: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -132,8 +133,8 @@ VALUES ($1,$2,'endpoint','post /api/login','POST https://oa.example-corp.com/api
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(refs) != 0 {
-		t.Fatalf("跨项目采纳不应暴露，got %d", len(refs))
+	if len(refs) != 1 || refs[0].TaskID != sourceID {
+		t.Fatalf("跨项目采纳也应暴露，got %+v", refs)
 	}
 }
 

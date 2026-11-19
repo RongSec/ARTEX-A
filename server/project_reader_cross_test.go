@@ -30,7 +30,8 @@ func TestReaderPromptUpgradeFor(t *testing.T) {
 		{"V6 统一版旧默认", readerUnifiedPromptV6, readerPromptReplace},
 		{"V7-LINK 旧默认", readerUnifiedPrompt, readerPromptReplace},      // V8-NAME 起升级到新称谓版
 		{"V8-NAME 旧默认", readerUnifiedPromptNames, readerPromptReplace}, // V9-READER 起升级到下钻判定版
-		{"V9-READER 当前默认", readerUnifiedPromptV9, readerPromptKeep},
+		{"V9-READER 旧默认", readerUnifiedPromptV9, readerPromptReplace}, // V10 起升级到读图判定版
+		{"V10-READER 当前默认", readerUnifiedPromptV10, readerPromptKeep},
 		{"用户编辑过", readerPromptV1 + "\n补充：只看 443 端口。", readerPromptKeep},
 		{"用户全新正文", "自定义阅读者", readerPromptKeep},
 	}
