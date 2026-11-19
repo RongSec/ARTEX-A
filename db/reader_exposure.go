@@ -16,6 +16,8 @@ import (
 	"encoding/json"
 	"sort"
 	"strings"
+
+	"github.com/Autumn-27/artex/redact"
 )
 
 // ReaderEndpointRef 是一条可借鉴的接口：只有方法/路径/用途/参数，没有 host。
@@ -99,8 +101,11 @@ LIMIT $2`, owner, limit)
 	}
 	for _, r := range pending {
 		ref := ReaderTaskRef{
-			TaskID: r.id, Name: truncRunes(r.name, 80), Goal: truncRunes(r.goal, 300),
-			Status: r.status, Reason: truncRunes(r.reason, 200),
+			// 概览也不能带 host：任务名/目标/理由都是 agent 或人写的原文，
+			// 一行 "对 oa.example.com 做测试" 就把资产漏了。
+			TaskID: r.id, Name: truncRunes(redact.TestMethod(r.name), 80),
+			Goal:   truncRunes(redact.TestMethod(r.goal), 300),
+			Status: r.status, Reason: truncRunes(redact.TestMethod(r.reason), 200),
 			Overlap: overlapEndpoints(r.matched),
 			Counts:  map[string]int{},
 		}
@@ -153,12 +158,12 @@ ORDER BY key LIMIT $2`, taskID, readerRefMaxEndpoints)
 			StatusCodes []int    `json:"status_codes"`
 		}
 		_ = json.Unmarshal([]byte(detail), &d)
-		ep := ReaderEndpointRef{Method: method, Path: path, Purpose: truncRunes(d.Purpose, 60), Status: d.StatusCodes}
+		ep := ReaderEndpointRef{Method: method, Path: path, Purpose: truncRunes(redact.TestMethod(d.Purpose), 60), Status: d.StatusCodes}
 		for _, p := range d.Params {
 			if len(ep.Params) >= 12 {
 				break
 			}
-			ep.Params = append(ep.Params, truncRunes(p, 40))
+			ep.Params = append(ep.Params, truncRunes(redact.TestMethod(p), 40))
 		}
 		eps = append(eps, ep)
 	}
@@ -187,7 +192,7 @@ LIMIT $2`, expID, readerRefMaxNodes)
 		if rows.Scan(&n.ID, &n.Kind, &n.State, &n.Summary) != nil {
 			continue
 		}
-		n.Summary = truncRunes(n.Summary, 160)
+		n.Summary = truncRunes(redact.TestMethod(n.Summary), 160)
 		out = append(out, n)
 	}
 	return out
@@ -239,7 +244,7 @@ ORDER BY id DESC LIMIT $2`, expID, limit)
 		if rows.Scan(&n.ID, &n.State, &n.Summary) != nil {
 			continue
 		}
-		n.Summary = truncRunes(n.Summary, 160)
+		n.Summary = truncRunes(redact.TestMethod(n.Summary), 160)
 		out = append(out, n)
 	}
 	return out, rows.Err()
@@ -272,7 +277,7 @@ ORDER BY (kind='finding') DESC, id DESC LIMIT $3`, expID, like, limit)
 		if rows.Scan(&n.ID, &n.Kind, &n.State, &n.Summary) != nil {
 			continue
 		}
-		n.Summary = truncRunes(n.Summary, 160)
+		n.Summary = truncRunes(redact.TestMethod(n.Summary), 160)
 		out = append(out, n)
 	}
 	return out, rows.Err()

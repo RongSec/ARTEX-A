@@ -19,66 +19,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
-	"regexp"
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/redact"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
-// 脱敏用的正则。顺序很重要：先整段 URL（保路径）、再 IP、再域名、最后凭据。
-var (
-	reAnyURL  = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>\)\]]+`)
-	reIPv4    = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b`)
-	reDomains = regexp.MustCompile(`(?i)\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+(?:com|cn|net|org|io|co|cc|top|xyz|info|biz|edu|gov|mil|local|lan|corp|internal|intra|test|dev|cloud|site|online)(?::\d{1,5})?\b`)
-	reSecrets = regexp.MustCompile(`(?i)\b(password|passwd|pwd|pass|secret|token|api[_-]?key|access[_-]?key|authorization|cookie|session(?:id)?)\b\s*[:=]\s*("[^"]*"|'[^']*'|\S+)`)
-	reReqLine = regexp.MustCompile(`(?i)\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+([^\s"'<>]+)`)
-)
+// 脱敏统一走 redact 包（与 db 层暴露索引同一套规则）。
+func redactTestMethod(s string) string { return redact.TestMethod(s) }
 
-// redactTestMethod 把一段可能含 host / 凭据的文本压成「测试方法」。
-func redactTestMethod(s string) string {
-	if s == "" {
-		return ""
-	}
-	// URL → 只保留 path?query。解析失败的退化成整段替换。
-	s = reAnyURL.ReplaceAllStringFunc(s, func(raw string) string {
-		u, err := url.Parse(raw)
-		if err != nil || u.Path == "" {
-			return "<url>"
-		}
-		out := u.Path
-		if u.RawQuery != "" {
-			out += "?" + u.RawQuery
-		}
-		return out
-	})
-	s = reIPv4.ReplaceAllString(s, "<ip>")
-	s = reDomains.ReplaceAllString(s, "<host>")
-	s = reSecrets.ReplaceAllString(s, "$1=<redacted>")
-	return s
-}
-
-// requestsIn 从文本里抽请求行，去重保序（method 大写 + 路径）。
-func requestsIn(s string) []string {
-	seen := map[string]bool{}
-	out := []string{}
-	for _, m := range reReqLine.FindAllStringSubmatch(s, 20) {
-		k := strings.ToUpper(m[1]) + " " + m[2]
-		k = reAnyURL.ReplaceAllStringFunc(k, func(raw string) string {
-			if u, err := url.Parse(raw); err == nil && u.Path != "" {
-				return u.Path
-			}
-			return "<url>"
-		})
-		if seen[k] {
-			continue
-		}
-		seen[k] = true
-		out = append(out, k)
-	}
-	return out
-}
+func requestsIn(s string) []string { return redact.RequestsIn(s) }
 
 // readerDrillNode 是一个节点脱敏后的可读视图。
 type readerDrillNode struct {

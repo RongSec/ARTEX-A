@@ -20,7 +20,9 @@ func TestAdoptedReaderLinkIsNotScopeInheritance(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
-	defer m.Close()
+	// Cleanup 在测试函数返回后才跑，defer m.Close() 会先关库导致清理全部失败
+	// （实测：每跑一次就在库里多三条空任务）。注册成 Cleanup 让它最后执行。
+	t.Cleanup(func() { _ = m.Close() })
 
 	proj, err := m.pg.CreateProject(db.CreateProjectInput{Name: "_reader_exposure_probe", Concurrency: 1})
 	if err != nil {
@@ -40,11 +42,9 @@ func TestAdoptedReaderLinkIsNotScopeInheritance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = m.DeleteTask(owner.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(source.ID, DeleteTaskOptions{})
-		_, _ = m.DeleteTask(other.ID, DeleteTaskOptions{})
-	})
+	// 用 SQL 清理：DeleteTask(空 options) 对 created 状态的任务不落删除，会在
+	// 生产库里留下 owner/source/other 三条空任务（实测踩过）。
+	t.Cleanup(func() { purgeTestProject(m, proj.ID) })
 
 	ownerID := mustTaskID(t, owner.ID)
 	sourceID := mustTaskID(t, source.ID)
@@ -52,7 +52,7 @@ func TestAdoptedReaderLinkIsNotScopeInheritance(t *testing.T) {
 
 	// 来源任务写一条含 host 的 finding + 一条接口情报，用来验证「脱敏可见」。
 	findingID, err := source.Store.AddNode(db.KindFinding, map[string]any{
-		"summary":  "OA 登录口 SQL 注入",
+		"summary":  "OA 登录口 SQL 注入 @ oa.example-corp.com",
 		"severity": "high",
 		"evidence": "GET http://oa.example-corp.com:8080/api/login?user=admin 返回 200，password=Passw0rd!",
 	}, 0, "confirmed", "worker", nil)
@@ -101,6 +101,9 @@ VALUES ($1,$2,'endpoint','post /api/login','POST https://oa.example-corp.com/api
 	for _, n := range refs[0].Nodes {
 		if n.ID == findingID {
 			found = true
+			if strings.Contains(n.Summary, "example-corp") {
+				t.Fatalf("节点摘要也要脱敏（概览不能带 host）：%q", n.Summary)
+			}
 		}
 	}
 	if !found {
@@ -121,7 +124,7 @@ VALUES ($1,$2,'endpoint','post /api/login','POST https://oa.example-corp.com/api
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = m.pg.Exec(`DELETE FROM projects WHERE id=$1`, otherProj.ID) })
+	t.Cleanup(func() { purgeTestProject(m, otherProj.ID) })
 	if _, err := m.pg.Exec(`UPDATE tasks SET project_id=$1 WHERE id=$2`, otherProj.ID, sourceID); err != nil {
 		t.Fatal(err)
 	}
@@ -132,4 +135,39 @@ VALUES ($1,$2,'endpoint','post /api/login','POST https://oa.example-corp.com/api
 	if len(refs) != 0 {
 		t.Fatalf("跨项目采纳不应暴露，got %d", len(refs))
 	}
+}
+
+// purgeTestProject 物理清掉一个测试项目及其任务/图/情报行（按 FK 依赖顺序）。
+// 不用 Manager.DeleteTask：空 options 对 created 状态的任务不落删除，会在库里留脏。
+func purgeTestProject(m *Manager, projectID int64) {
+	var expIDs []int64
+	rows, err := m.pg.Query(`SELECT exploration_id FROM tasks WHERE project_id=$1`, projectID)
+	if err == nil {
+		for rows.Next() {
+			var id int64
+			if rows.Scan(&id) == nil && id > 0 {
+				expIDs = append(expIDs, id)
+			}
+		}
+		rows.Close()
+	}
+	for _, expID := range expIDs {
+		_, _ = m.pg.Exec(`DELETE FROM exploration_nodes WHERE exploration_id=$1`, expID)
+	}
+	_, _ = m.pg.Exec(`DELETE FROM task_relations WHERE task_id IN (SELECT id FROM tasks WHERE project_id=$1)
+   OR source_task_id IN (SELECT id FROM tasks WHERE project_id=$1)`, projectID)
+	// 引用 tasks 的子表都要先清，否则 DELETE FROM tasks 会被外键挡住（实测踩过：
+	// 静默失败 → 每跑一次测试就在生产库多三条空任务）。
+	for _, table := range []string{
+		"task_scope", "task_asset_links", "task_foreign_assets", "task_intercept_rules",
+		"task_llm_profiles", "task_intel_links", "task_intel", "findings",
+		"side_question_sessions", "task_archives",
+	} {
+		_, _ = m.pg.Exec(`DELETE FROM `+table+` WHERE task_id IN (SELECT id FROM tasks WHERE project_id=$1)`, projectID)
+	}
+	_, _ = m.pg.Exec(`DELETE FROM tasks WHERE project_id=$1`, projectID)
+	for _, expID := range expIDs {
+		_, _ = m.pg.Exec(`DELETE FROM explorations WHERE id=$1`, expID)
+	}
+	_, _ = m.pg.Exec(`DELETE FROM projects WHERE id=$1`, projectID)
 }
