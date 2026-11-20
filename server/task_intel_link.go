@@ -643,9 +643,11 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 				return actool.Errorf(err.Error()), nil
 			}
 			matched := a.Matched
-			if len(matched) == 0 && prev != nil && len(prev.Matched) > 0 {
-				// 优先用候选阶段落下的 SQL 命中明细：它和 match_score 同一口径。
-				// 情报表前 N 行会混进未计分的 vuln/组件，审计里会「命中 3 条却列 4 条」。
+			if prev != nil && len(prev.Matched) > 0 {
+				// 审计的 matched 必须与 match_score 同源：用候选阶段的 SQL 命中，
+				// 不用模型在 adopt 参数里自己归纳的「命中」——后者会和分数对不上账
+				// （实测出现过「分数 2.6 / 命中 4 条，明细列的是另一组」）。
+				matched = nil
 				_ = json.Unmarshal(prev.Matched, &matched)
 			}
 			if len(matched) == 0 {

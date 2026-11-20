@@ -148,23 +148,23 @@ FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, taskID, relatedT
 // （direction=out），也覆盖别人勾连本任务（direction=in）。Related* 是对端
 // 任务与它所属项目；相关项目可能为空（任务未挂项目）。
 type TaskIntelLinkTrace struct {
-	ID                 int64
-	ProjectID          int64
-	TaskID             int64
-	RelatedTaskID      int64
-	Decision           string
-	Reason             string
-	Matched            json.RawMessage
-	DecidedBy          string
+	ID            int64
+	ProjectID     int64
+	TaskID        int64
+	RelatedTaskID int64
+	Decision      string
+	Reason        string
+	Matched       json.RawMessage
+	DecidedBy     string
 	// 两级评分：审计要同时看到"为什么进候选"（SQL 分）和"为什么采纳"（LLM 分）。
-	MatchStrength     string
-	MatchScore        float64
-	MatchHits         int
-	RelevanceScore    int
-	RelevanceStrength string
-	Chains            json.RawMessage
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	MatchStrength      string
+	MatchScore         float64
+	MatchHits          int
+	RelevanceScore     int
+	RelevanceStrength  string
+	Chains             json.RawMessage
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 	Direction          string // out=本任务发起，in=对端勾连本任务
 	RelatedTaskName    string
 	RelatedProjectID   sql.NullInt64
@@ -245,11 +245,15 @@ VALUES ($1,$2,$3,'candidate',$4,$5,'reader',$6,$7,$8, now())
 ON CONFLICT (task_id, related_task_id) DO UPDATE
 SET decision = 'candidate',
     reason = EXCLUDED.reason,
-    matched = EXCLUDED.matched,
     decided_by = EXCLUDED.decided_by,
     match_strength = COALESCE(NULLIF(EXCLUDED.match_strength,''), task_intel_links.match_strength),
+    -- matched 与 match_score 必须同源：分数只在更高时更新，明细也只在同一次
+    -- 更高分命中时替换。否则会出现「分数 2.6 / 命中 4 条，明细只列 3 条」。
+    matched = CASE WHEN EXCLUDED.match_score > task_intel_links.match_score
+                   THEN EXCLUDED.matched ELSE task_intel_links.matched END,
     match_score = GREATEST(EXCLUDED.match_score, task_intel_links.match_score),
-    match_hits = GREATEST(EXCLUDED.match_hits, task_intel_links.match_hits),
+    match_hits = CASE WHEN EXCLUDED.match_score > task_intel_links.match_score
+                      THEN EXCLUDED.match_hits ELSE task_intel_links.match_hits END,
     updated_at = now()
 WHERE task_intel_links.decision NOT IN ('adopted','dismissed')
 RETURNING id`,

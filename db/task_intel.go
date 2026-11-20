@@ -349,9 +349,9 @@ const taskIntelCols = `id, project_id, task_id, kind, key, match_key, value, det
 // UpsertIntelResult 是一次批量写入的统计（信号摘要只报**新增**行数：重复生成
 // 不产生新攻击面，不该反复唤醒 reader）。
 type UpsertIntelResult struct {
-	Total    int            `json:"total"`
-	Inserted int            `json:"inserted"`
-	Updated  int            `json:"updated"`
+	Total    int `json:"total"`
+	Inserted int `json:"inserted"`
+	Updated  int `json:"updated"`
 	// Unchanged 是内容与库里完全一致、没有 bump rev 的行数。ticker 每 5 分钟
 	// 重抽一次，绝大多数行属于这一类；不区分的话"更新"会掩盖真实变化。
 	Unchanged int            `json:"unchanged"`
@@ -575,6 +575,37 @@ type ReaderChain struct {
 	NodeIDs  []int64  `json:"node_ids"` // 出处节点，下钻用
 }
 
+// sanitizeReaderChains 在落库前清掉链摘要里的脏值：模型偶尔把 node_ids 填成
+// 0（或漏填），0 不是合法节点 id，留着会让 ask_reader 下钻取到空节点。
+// 同时丢掉 entry/outcome 都为空的废链。
+func sanitizeReaderChains(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage(`[]`)
+	}
+	var chains []ReaderChain
+	if err := json.Unmarshal(raw, &chains); err != nil {
+		return json.RawMessage(`[]`)
+	}
+	out := make([]ReaderChain, 0, len(chains))
+	for _, c := range chains {
+		c.Entry = strings.TrimSpace(c.Entry)
+		c.Outcome = strings.TrimSpace(c.Outcome)
+		if c.Entry == "" && c.Outcome == "" {
+			continue
+		}
+		ids := make([]int64, 0, len(c.NodeIDs))
+		for _, id := range c.NodeIDs {
+			if id > 0 {
+				ids = append(ids, id)
+			}
+		}
+		c.NodeIDs = ids
+		out = append(out, c)
+	}
+	b, _ := json.Marshal(out)
+	return b
+}
+
 // ValidIntelLinkDecision 报告决策是否属于 adopted|dismissed|candidate。
 func ValidIntelLinkDecision(d string) bool {
 	switch d {
@@ -601,6 +632,7 @@ func (d *DB) SaveTaskIntelLink(ctx context.Context, l TaskIntelLink) (int64, err
 	if len(chains) == 0 || !json.Valid(chains) {
 		chains = json.RawMessage(`[]`)
 	}
+	chains = sanitizeReaderChains(chains)
 	// 评分档位留空时按分数补：写入方可能只给分数（SQL 打分侧），也可能只给
 	// 档位（阅读者判案侧）。两处都不给就保持空串，审计里显示"未评分"。
 	ms := strings.ToLower(strings.TrimSpace(l.MatchStrength))
