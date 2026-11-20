@@ -784,6 +784,18 @@ export interface ReaderTraceMatch {
   kind: string;
   key: string;
   value: string;
+  // 该条命中对候选总分的贡献：精确接口 1.0 / 模糊 0.6 / 凭据 1.2 / 资产 0.8 / 组件 0.3
+  score?: number;
+  match?: "exact" | "fuzzy" | string;
+}
+
+// 阅读者判案时读到的利用链摘要（替代原始边暴露给规划者）。
+export interface ReaderChain {
+  entry: string;
+  steps: string[];
+  outcome: string;
+  verified: boolean;
+  node_ids: number[];
 }
 
 export interface ReaderTraceItem {
@@ -794,11 +806,20 @@ export interface ReaderTraceItem {
   decision: "adopted" | "dismissed" | "candidate" | string;
   reason: string;
   matched: ReaderTraceMatch[];
+  // 两级评分：match_* 是 SQL 命中分（进候选），relevance_* 是阅读者读完整图后的
+  // 相关性分（暴露）。candidate 只有 match_*；adopted/dismissed 两者都有。
+  match_strength: string;
+  match_score: number;
+  match_hits: number;
+  relevance_score: number;
+  relevance_strength: string;
+  chains: ReaderChain[];
   // 采纳带进发起方任务的外部资产 host（仅 adopted 有值，其余为空数组）。
   foreign_hosts: string[];
   // 决策者：reader=阅读者判定；''=旧流程（V9-READER 之前）。
   decided_by: string;
   created_at: string;
+  updated_at: string;
   direction: "in" | "out" | string; // out=本任务借鉴了对方，in=对方借鉴了本任务
 }
 
@@ -809,11 +830,26 @@ export interface ReaderTraceRun {
   summary: string;
 }
 
+// 一次 ask_reader 的审计记录：哪条意图、向哪个参考任务、下钻了哪些节点。
+export interface ReaderDrill {
+  id: number;
+  project_id: number;
+  task_id: number;
+  related_task_id: number;
+  intent_id: number;
+  node_ids: number[];
+  query: string;
+  mode: string; // planner=要方法论 / detail=要执行细节 / index=只回可下钻索引
+  item_count: number;
+  created_at: string;
+}
+
 export interface ReaderTraces {
   task_id: number;
   cross_task: ReaderTraceItem[];
   cross_project: ReaderTraceItem[];
   runs: ReaderTraceRun[];
+  drills: ReaderDrill[];
 }
 
 // Daily token aggregate bucket (GET /api/tokens/daily).

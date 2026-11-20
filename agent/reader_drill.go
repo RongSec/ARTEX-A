@@ -20,12 +20,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/redact"
 	actool "github.com/Autumn-27/norma/tool"
 )
+
+// reReaderHostRef 挡住 worker 在 query 里夹带 host/IP/URL：worker 只允许按路径、
+// 参数名或漏洞类型下钻，地址一律由本任务的授权资产决定，不能从参考任务“借”。
+var reReaderHostRef = regexp.MustCompile(`(?i)https?://|\b\d{1,3}(?:\.\d{1,3}){3}\b|\b[a-z0-9][a-z0-9\-]*\.(?:com|cn|net|org|io|co|cc|top|xyz|info|biz|edu|gov|mil|local|lan|corp|internal|intra|test|dev|cloud|site|online)\b`)
 
 // 脱敏统一走 redact 包（与 db 层暴露索引同一套规则）。
 func redactTestMethod(s string) string { return redact.TestMethod(s) }
@@ -50,14 +56,46 @@ type ReaderDrillRequest struct {
 	RelatedTaskID int64             `json:"related_task_id"`
 	Query         string            `json:"query,omitempty"`
 	Items         []ReaderDrillNode `json:"items"`
+	// Audience 区分调用方：planner=要方法论（规划用），worker=要可执行的测试细节
+	// （执行用）。阅读者的总结口径不同，但两者都只给脱敏后的“怎么测”。
+	Audience string `json:"audience,omitempty"`
+	// CurrentGoal/CurrentIntent 让阅读者知道“当前任务在测什么”，从而裁剪经验，
+	// 而不是把参考任务的所有细节平铺。worker 传入自己领到的意图。
+	CurrentGoal   string `json:"current_goal,omitempty"`
+	CurrentIntent string `json:"current_intent,omitempty"`
+}
+
+// recordReaderDrill 落一条审计记录（V11）。审计是旁路：上下文已取消/库写失败
+// 都不能让下钻本身失败——用户看到的是「这次下钻拿了什么」，不是「记录成功没」。
+func (t *ToolSet) recordReaderDrill(ctx context.Context, relatedID int64, ids []int64, query, mode string, items int) {
+	if t == nil || t.ts == nil || t.taskID <= 0 {
+		return
+	}
+	modeName := "planner"
+	if t.readerDetailMode {
+		modeName = "detail"
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	_ = t.ts.RecordReaderDrill(rctx, db.ReaderDrill{
+		TaskID: t.taskID, RelatedTaskID: relatedID, IntentID: t.readerIntentID,
+		NodeIDs: ids, Query: query, Mode: modeName, ItemCount: items,
+	})
 }
 
 func (t *ToolSet) askReader() actool.CoreTool {
-	return t.readExpTool("ask_reader",
-		"向阅读者下钻被采纳任务的细节，拿回【接口测试方法论】（不含 host/IP/凭据）。\n"+
-			"什么时候用：graph_overview.reader_refs 里某个参考任务的接口/漏洞看着和当前目标同构，需要知道它当时怎么测的、验什么、判据是什么。\n"+
-			"不给 node_ids 时按 query 在对方 finding/fact 摘要里检索；给 node_ids 就按 id 取（id 来自 reader_refs.drillable/intents，或本次返回的检索结果）。\n"+
-			"返回的 methodology 是阅读者读完证据后的总结；evidence 只是脱敏后的证据索引。方法论要套到当前任务的授权目标上验证，别照抄对方的目标。",
+	desc := "向阅读者下钻被采纳任务的细节，拿回【接口测试方法论】（不含 host/IP/凭据）。\n" +
+		"什么时候用：graph_overview.reader_refs 里某个参考任务的接口/漏洞看着和当前目标同构，需要知道它当时怎么测的、验什么、判据是什么。\n" +
+		"不给 node_ids 时按 query 在对方 finding/fact/intent 摘要与执行步骤里检索；给 node_ids 就按 id 取（id 来自 reader_refs.drillable/intents，或本次返回的检索结果）。\n" +
+		"返回的 methodology 是阅读者读完证据后的总结；evidence 只是脱敏后的证据索引。方法论要套到当前任务的授权目标上验证，别照抄对方的目标。"
+	if t.readerDetailMode {
+		desc = "向阅读者下钻被采纳任务的【脱敏测试细节/步骤】（不含 host/IP/域名/凭据）。\n" +
+			"什么时候用：本条意图要测的接口/组件在 graph_overview.reader_refs 里出现过，需要知道参考任务当时发了什么请求、用了什么参数/payload、怎么判断命中。\n" +
+			"node_ids 取自 reader_refs.drillable/intents；留空则按 query 检索 finding/fact/intent 摘要与 intent 执行步骤。\n" +
+			"query 只写路径、参数名、漏洞类型或组件名（如 /api/user、越权、shiro）；**不要写 URL、host、IP、域名**，写了会被拒绝。\n" +
+			"返回的 items 是逐条脱敏后的证据（请求行/步骤/说明）；details 不足时阅读者会补一段经验总结。把它们套到本意图的授权资产上验证，不要直接打参考任务的地址。"
+	}
+	return t.readExpTool("ask_reader", desc,
 		obj(map[string]any{
 			"related_task_id": str("参考任务 id（reader_refs[].related_task_id）"),
 			"node_ids": map[string]any{
@@ -65,8 +103,8 @@ func (t *ToolSet) askReader() actool.CoreTool {
 				"items":       map[string]any{"type": "integer"},
 				"description": "要下钻的节点 id（finding/fact/intent）。留空则按 query 检索",
 			},
-			"query": str("关键词：接口路径/漏洞类型/组件名，如 /api/user、越权、shiro"),
-			"limit": map[string]any{"type": "integer", "description": "返回条数，默认 5，上限 10"},
+			"query": str("关键词：接口路径/漏洞类型/组件名，如 /api/user、越权、shiro；worker 禁止写 host/IP/URL"),
+			"limit": map[string]any{"type": "integer", "description": "返回条数，默认 5（worker 默认 8），上限 10"},
 		}, "related_task_id"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -80,9 +118,25 @@ func (t *ToolSet) askReader() actool.CoreTool {
 			if relatedID <= 0 {
 				return actool.Errorf("related_task_id 必填（取 reader_refs[].related_task_id）"), nil
 			}
+			if t.readerDetailMode {
+				if t.readerCallLimit > 0 && t.readerCalls >= t.readerCallLimit {
+					return actool.Errorf(fmt.Sprintf("本意图的 ask_reader 调用已达上限（%d 次）：用已拿到的细节继续测，或把缺口写进 fact 交规划者", t.readerCallLimit)), nil
+				}
+				if q := strings.TrimSpace(a.Query); q != "" && reReaderHostRef.MatchString(q) {
+					return actool.Errorf(fmt.Sprintf("query 只允许路径/参数名/漏洞类型，不能包含 URL、host 或 IP：%q。请改成 /api/... 这类路径再试", q)), nil
+				}
+				t.readerCalls++
+			}
 			limit := a.Limit
-			if limit <= 0 || limit > 10 {
-				limit = 5
+			if limit <= 0 {
+				if t.readerDetailMode {
+					limit = 8
+				} else {
+					limit = 5
+				}
+			}
+			if limit > 10 {
+				limit = 10
 			}
 			ids := make([]int64, 0, len(a.NodeIDs))
 			for _, raw := range a.NodeIDs {
@@ -140,6 +194,7 @@ func (t *ToolSet) askReader() actool.CoreTool {
 					for _, n := range target.Nodes {
 						out = append(out, map[string]any{"id": n.ID, "kind": n.Kind, "summary": n.Summary})
 					}
+					t.recordReaderDrill(ctx, relatedID, nil, strings.TrimSpace(a.Query), "index", 0)
 					return jsonResult(map[string]any{
 						"related_task_id": relatedID,
 						"drillable":       out,
@@ -167,37 +222,23 @@ func (t *ToolSet) askReader() actool.CoreTool {
 					return ""
 				}
 				item.Summary = redactTestMethod(str("summary"))
+				detailCap := 1200
+				if t.readerDetailMode {
+					detailCap = 2200
+				}
 				switch n.Kind {
 				case db.KindFinding:
 					item.Severity = str("severity")
 					item.Vuln = str("vulnclass")
 					body := strings.Join([]string{str("detail"), str("evidence"), str("repro")}, "\n")
 					item.Requests = requestsIn(body)
-					item.Detail = truncateRunes(redactTestMethod(body), 1200)
+					item.Detail = truncateRunes(redactTestMethod(body), detailCap)
 				case db.KindFact:
 					body := strings.Join([]string{str("detail"), str("evidence")}, "\n")
 					item.Requests = requestsIn(body)
-					item.Detail = truncateRunes(redactTestMethod(body), 1200)
+					item.Detail = truncateRunes(redactTestMethod(body), detailCap)
 				case db.KindIntent:
-					steps, err := t.ts.ReaderTaskTrace(relatedID, n.ID, 30)
-					if err == nil {
-						for _, act := range steps {
-							line := strings.TrimSpace(act.Tool)
-							if act.Summary != "" {
-								if line != "" {
-									line += " · "
-								}
-								line += redactTestMethod(act.Summary)
-							}
-							if strings.TrimSpace(line) == "" {
-								continue
-							}
-							if len(item.Steps) >= 12 {
-								break
-							}
-							item.Steps = append(item.Steps, truncateRunes(line, 220))
-						}
-					}
+					item.Steps = t.readerIntentSteps(relatedID, n.ID, 12, 220)
 				}
 				items = append(items, item)
 				if len(items) >= limit {
@@ -205,12 +246,41 @@ func (t *ToolSet) askReader() actool.CoreTool {
 				}
 			}
 
-			// 阅读者总结：把「证据」变成「怎么测」。未注入（测试/无 LLM）时如实退回证据。
+			// worker 模式：核心交付是「脱敏后的细节」，不是方法论。细节不足时
+			// 才把参考任务最近意图的执行步骤补进来，再请阅读者补一段经验总结。
+			if t.readerDetailMode {
+				if !hasConcreteReaderEvidence(items) && t.readerAnswer != nil {
+					items = t.readerWidenEvidence(relatedID, items, 3)
+				}
+				out := map[string]any{
+					"related_task_id": relatedID,
+					"mode":            "detail",
+					"items":           items,
+					"note":            "items 是参考任务里脱敏后的测试细节（请求行/步骤/说明）：host/IP 已换成占位符，凭据值已抹除。套到本意图的授权资产上验证，不要直接打占位符。",
+				}
+				if t.readerAnswer != nil && len(items) > 0 && !hasConcreteReaderEvidence(items) {
+					exp, err := t.readerAnswer(ctx, ReaderDrillRequest{
+						RelatedTaskID: relatedID, Query: strings.TrimSpace(a.Query), Items: items,
+						Audience: "worker", CurrentGoal: t.readerGoal, CurrentIntent: t.readerIntent,
+					})
+					if err != nil {
+						out["reader_error"] = err.Error()
+					} else if strings.TrimSpace(exp) != "" {
+						out["experience"] = exp
+					}
+				}
+				t.recordReaderDrill(ctx, relatedID, ids, strings.TrimSpace(a.Query), "detail", len(items))
+				return jsonResult(out)
+			}
+
+			// 规划者模式：阅读者总结：把「证据」变成「怎么测」。未注入（测试/无 LLM）时如实退回证据。
 			if t.readerAnswer != nil && len(items) > 0 {
 				method, err := t.readerAnswer(ctx, ReaderDrillRequest{
 					RelatedTaskID: relatedID, Query: strings.TrimSpace(a.Query), Items: items,
+					Audience: "planner", CurrentGoal: t.readerGoal, CurrentIntent: t.readerIntent,
 				})
 				if err != nil {
+					t.recordReaderDrill(ctx, relatedID, ids, strings.TrimSpace(a.Query), "planner", len(items))
 					return jsonResult(map[string]any{
 						"related_task_id": relatedID,
 						"items":           items,
@@ -229,6 +299,7 @@ func (t *ToolSet) askReader() actool.CoreTool {
 					}
 					evidence = append(evidence, e)
 				}
+				t.recordReaderDrill(ctx, relatedID, ids, strings.TrimSpace(a.Query), "planner", len(items))
 				return jsonResult(map[string]any{
 					"related_task_id": relatedID,
 					"methodology":     method,
@@ -236,12 +307,87 @@ func (t *ToolSet) askReader() actool.CoreTool {
 					"note":            "methodology 是阅读者读完对方证据后总结的测试方法（已脱敏）。套到当前任务的授权目标上验证；evidence 只是出处索引。",
 				})
 			}
+			t.recordReaderDrill(ctx, relatedID, ids, strings.TrimSpace(a.Query), "planner", len(items))
 			return jsonResult(map[string]any{
 				"related_task_id": relatedID,
 				"items":           items,
 				"note":            "只保留测试方法：host/IP 已替换为占位符，凭据值已抹除。把这些方法套到当前任务的授权目标上，不要直接打占位符。",
 			})
 		})
+}
+
+// readerIntentSteps 把一个意图的 activity 压成「工具 · 脱敏摘要」的短行。
+// worker 下钻时它就是「参考任务当时怎么打的」最直接的证据。
+func (t *ToolSet) readerIntentSteps(relatedID, intentID int64, maxSteps, maxRunes int) []string {
+	steps, err := t.ts.ReaderTaskTrace(relatedID, intentID, maxSteps*3)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, maxSteps)
+	for _, act := range steps {
+		line := strings.TrimSpace(act.Tool)
+		if act.Summary != "" {
+			if line != "" {
+				line += " · "
+			}
+			line += redactTestMethod(act.Summary)
+		}
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		out = append(out, truncateRunes(line, maxRunes))
+		if len(out) >= maxSteps {
+			break
+		}
+	}
+	return out
+}
+
+// hasConcreteReaderEvidence 判断这批证据是否已经能让执行者直接构造请求：
+// 有请求行、有执行步骤，或有正文说明，都算「够用」；只有摘要才算不足。
+func hasConcreteReaderEvidence(items []ReaderDrillNode) bool {
+	for _, it := range items {
+		if len(it.Requests) > 0 || len(it.Steps) > 0 || strings.TrimSpace(it.Detail) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// readerWidenEvidence 在按 id 取到的证据不足时，补参考任务最近结束意图的执行步骤。
+// 这是「阅读者去 B 的上下文里找经验」的确定性版本：不猜、不读 host，只把已脱敏的
+// 步骤补进来；补完仍不足才走 LLM 总结。
+func (t *ToolSet) readerWidenEvidence(relatedID int64, items []ReaderDrillNode, max int) []ReaderDrillNode {
+	if max <= 0 {
+		return items
+	}
+	seen := map[int64]bool{}
+	for _, it := range items {
+		seen[it.ID] = true
+	}
+	intents, err := t.ts.ReaderTaskLastIntents(relatedID, 8)
+	if err != nil {
+		return items
+	}
+	added := 0
+	for _, in := range intents {
+		if seen[in.ID] {
+			continue
+		}
+		steps := t.readerIntentSteps(relatedID, in.ID, 12, 220)
+		if len(steps) == 0 {
+			continue
+		}
+		items = append(items, ReaderDrillNode{
+			ID: in.ID, Kind: db.KindIntent, State: in.State, Summary: in.Summary, Steps: steps,
+		})
+		seen[in.ID] = true
+		added++
+		if added >= max {
+			break
+		}
+	}
+	return items
 }
 
 func truncateRunes(s string, n int) string {

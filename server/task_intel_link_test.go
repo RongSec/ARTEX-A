@@ -799,6 +799,66 @@ func TestReaderLinkScopeSwitches(t *testing.T) {
 	}
 }
 
+// TestIntelSurfaceKeysHighFreqComponents 守受控产品表：Shiro/WebLogic/fastjson
+// 这类 CVE 密集组件必须能被 surface 抽出，否则「同组件版本且有在野利用」这条
+// 强信号在实战里永远触发不了。
+func TestIntelSurfaceKeysHighFreqComponents(t *testing.T) {
+	cases := []struct{ surface, wantKey string }{
+		{"识别组件 Apache Shiro 1.7.0，登录返回 user_token", "shiro@1.7"},
+		{"fastjson 1.2.47 反序列化可打", "fastjson@1.2"},
+		{"WebLogic 12.2.1.3 控制台暴露", "weblogic@12.2"},
+	}
+	for _, c := range cases {
+		keys := intelSurfaceKeys(c.surface)
+		found := false
+		for _, k := range keys {
+			if k.Kind == db.IntelKindComponent && k.Key == c.wantKey {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("surface %q 未抽出组件 %q，实际 keys=%+v", c.surface, c.wantKey, keys)
+		}
+	}
+}
+
+// TestReaderLinkScoringTwoTier 守 V11-READER3 的两级评分第一级：
+// 精确 1.0 / 模糊 0.6 / 凭据 1.2 / 资产 0.8 / 组件 0.3；
+// Σ≥2.0 strong、Σ≥1.0 medium、Σ<1.0 weak（weak 不进候选）。
+func TestReaderLinkScoringTwoTier(t *testing.T) {
+	matches := []db.IntelTaskMatch{
+		// task 1：1 精确 + 1 模糊 = 1.65 → medium
+		{TaskIntel: db.TaskIntel{TaskID: 1, Kind: db.IntelKindEndpoint, Key: "get /api/user/list", MatchKey: "/api/user/list"}},
+		{TaskIntel: db.TaskIntel{TaskID: 1, Kind: db.IntelKindEndpoint, Key: "get /api/user/info", MatchKey: "/api/user/info"}, MatchScore: 0.65, MatchKind: "fuzzy"},
+		// task 2：单条模糊 0.6 → weak，不进候选
+		{TaskIntel: db.TaskIntel{TaskID: 2, Kind: db.IntelKindEndpoint, Key: "get /api/order/list", MatchKey: "/api/order/list"}, MatchScore: 0.6, MatchKind: "fuzzy"},
+		// task 3：两条精确 = 2.0 → strong
+		{TaskIntel: db.TaskIntel{TaskID: 3, Kind: db.IntelKindEndpoint, Key: "get /a", MatchKey: "/a"}},
+		{TaskIntel: db.TaskIntel{TaskID: 3, Kind: db.IntelKindEndpoint, Key: "post /b", MatchKey: "/b"}},
+		// task 4：可复用凭据 1.2 → medium
+		{TaskIntel: db.TaskIntel{TaskID: 4, Kind: db.IntelKindCredential, Key: "password|admin|ssh", MatchKey: "password|admin"}},
+	}
+	out, _ := aggregateReaderLinkCandidates(matches, 10)
+	if len(out) != 3 {
+		t.Fatalf("应剩 3 个候选（task1/3/4），得到 %d: %+v", len(out), out)
+	}
+	if out[0].TaskID != 3 || out[0].MatchStrength != "strong" {
+		t.Errorf("第一名应是 task3/strong，得到 %+v", out[0])
+	}
+	if out[1].TaskID != 1 || out[1].MatchStrength != "medium" {
+		t.Errorf("第二名应是 task1/medium，得到 %+v", out[1])
+	}
+	if out[2].TaskID != 4 || out[2].MatchStrength != "medium" {
+		t.Errorf("第三名应是 task4/medium（凭据），得到 %+v", out[2])
+	}
+	for _, c := range out {
+		if c.TaskID == 2 {
+			t.Errorf("单条模糊 task2 不应进候选")
+		}
+	}
+}
+
 // TestReaderLinkWeakComponentOnlyDropped 守 V8-SIG：只有组件命中的候选必须被丢弃。
 func TestReaderLinkWeakComponentOnlyDropped(t *testing.T) {
 	matches := []db.IntelTaskMatch{
@@ -806,7 +866,7 @@ func TestReaderLinkWeakComponentOnlyDropped(t *testing.T) {
 		{TaskIntel: db.TaskIntel{TaskID: 2, Kind: db.IntelKindComponent, Key: "dvwa@1.10", MatchKey: "dvwa", Value: "DVWA 1.10"}},
 		{TaskIntel: db.TaskIntel{TaskID: 2, Kind: db.IntelKindEndpoint, Key: "post /vulnerabilities/sqli/", MatchKey: "/vulnerabilities/sqli/", Value: "http://t/x"}},
 	}
-	out := aggregateReaderLinkCandidates(matches, 10)
+	out, _ := aggregateReaderLinkCandidates(matches, 10)
 	if len(out) != 1 || out[0].TaskID != 2 {
 		t.Fatalf("只应有接口命中的任务 2，得到 %+v", out)
 	}

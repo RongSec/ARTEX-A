@@ -6,21 +6,20 @@ import (
 )
 
 func TestPlannerPromptAdoptsReaderHint(t *testing.T) {
-	// V9-READER：规划者不再持有/调用勾连工具，相关任务经验由阅读者判定后以
-	// hint 下发，planner 直接采信。
+	// V11-WORKER-READER：hint 只给方向，细节由执行者 ask_reader 下钻；
+	// 规划者仍不持有勾连工具，但要知道 worker 有 ask_reader。
 	t.Cleanup(func() { PromptOverride = nil })
 	PromptOverride = nil
 	got := plannerSystem("拿下X", "/data", "/data")
-	for _, banned := range []string{"request_reader_links", "adopt_related_task", "dismiss_related_task"} {
+	for _, banned := range []string{"request_reader_links", "adopt_related_task", "dismiss_related_task", "worker 没有这个工具"} {
 		if strings.Contains(got, banned) {
-			t.Errorf("planner prompt 不应再出现勾连工具 %q: %s", banned, got)
+			t.Errorf("planner prompt 不应再出现 %q: %s", banned, got)
 		}
 	}
-	if !strings.Contains(got, "直接采信") {
-		t.Errorf("planner prompt 应写明「直接采信」阅读者 hint: %s", got)
-	}
-	if !strings.Contains(got, "不要再调用勾连工具") || !strings.Contains(got, "不要自己下钻核对") {
-		t.Errorf("planner prompt 应禁止再下钻核对: %s", got)
+	for _, want := range []string{"方向提示", "不是可直接执行的细节", "ask_reader 规划者和 worker 都有", "readonly=true", "drill_via=reader"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("planner prompt 缺少新协作口径 %q: %s", want, got)
+		}
 	}
 }
 

@@ -63,6 +63,7 @@ import type {
   ChatAttachment,
   IntentAsset,
   InterceptApprovalRow,
+  ReaderDrill,
   ReaderTraceItem,
   ReaderTraces,
   Session,
@@ -532,6 +533,25 @@ function fmtReaderTraceTime(ts: string): string {
 
 // ReaderTraceCard 一条借鉴记录：对端任务 / 方向（谁借鉴谁）/ 决策 / 判定者 /
 // 理由 / 命中明细。方向刻意用「借鉴」措辞：这里是知识复用，不是主动串联对方。
+// confidenceCls 给 SQL 命中档位着色：strong 绿 / medium 琥珀 / weak 灰。
+function confidenceCls(strength: string) {
+  switch (strength) {
+    case "strong":
+      return "border-emerald-500/40 text-emerald-600";
+    case "medium":
+      return "border-amber-500/40 text-amber-600";
+    default:
+      return "text-muted-foreground";
+  }
+}
+
+// scoreCls 给 LLM 相关性评分着色：≥60 绿（直接暴露）/ 40-59 琥珀（部分可迁移）/ <40 红。
+function scoreCls(score: number) {
+  if (score >= 60) return "border-emerald-500/40 text-emerald-600";
+  if (score >= 40) return "border-amber-500/40 text-amber-600";
+  return "border-red-500/40 text-red-600";
+}
+
 function ReaderTraceCard({ item }: { item: ReaderTraceItem }) {
   const decision = readerDecisionMeta[item.decision] ?? { label: item.decision, cls: "" };
   const out = item.direction === "out";
@@ -565,6 +585,47 @@ function ReaderTraceCard({ item }: { item: ReaderTraceItem }) {
         <span className="text-muted-foreground ml-auto tabular-nums">{fmtReaderTraceTime(item.created_at)}</span>
       </div>
       {item.reason && <p className="mt-2 leading-relaxed break-words">{item.reason}</p>}
+      {(item.match_strength || item.relevance_score > 0) && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          {item.match_strength && (
+            <Badge variant="outline" className={"font-normal " + confidenceCls(item.match_strength)}>
+              候选分 {item.match_score.toFixed(2)} · {item.match_strength}
+            </Badge>
+          )}
+          {item.match_hits > 0 && (
+            <span className="text-muted-foreground text-[11px]">命中 {item.match_hits} 条</span>
+          )}
+          {item.relevance_score > 0 && (
+            <Badge variant="outline" className={"font-normal " + scoreCls(item.relevance_score)}>
+              相关性 {item.relevance_score}/100
+            </Badge>
+          )}
+        </div>
+      )}
+      {item.chains?.length > 0 && (
+        <div className="mt-2 flex flex-col gap-1.5">
+          {item.chains.map((chain, index) => (
+            <div key={`${chain.entry}-${index}`} className="bg-muted/50 rounded px-2 py-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="font-mono text-[10px] break-all">{chain.entry}</span>
+                <Badge
+                  variant="outline"
+                  className={
+                    "h-4 px-1 text-[10px] font-normal " +
+                    (chain.verified ? "border-emerald-500/40 text-emerald-600" : "border-amber-500/40 text-amber-600")
+                  }
+                >
+                  {chain.verified ? "已验证" : "待验证"}
+                </Badge>
+              </div>
+              {chain.steps?.length > 0 && (
+                <p className="text-muted-foreground mt-1 break-words">{chain.steps.join(" → ")}</p>
+              )}
+              {chain.outcome && <p className="mt-0.5 break-words">→ {chain.outcome}</p>}
+            </div>
+          ))}
+        </div>
+      )}
       {item.matched.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1">
           {item.matched.map((m, index) => (
@@ -579,6 +640,43 @@ function ReaderTraceCard({ item }: { item: ReaderTraceItem }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// ReaderDrillRow 是一条下钻记录：意图 → 参考任务 → 节点 → 查询词。
+// 它回答的是「这条意图的经验从哪来」，而不是「采纳了谁」。
+function ReaderDrillRow({ drill }: { drill: ReaderDrill }) {
+  const modeLabel =
+    drill.mode === "detail" ? "执行细节" : drill.mode === "index" ? "可下钻索引" : "测试方法";
+  return (
+    <div className="rounded-lg border p-2.5 text-xs">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Badge variant="outline" className="font-normal">
+          {modeLabel}
+        </Badge>
+        <Link
+          href={`/function/tasks/detail?id=${encodeURIComponent(String(drill.related_task_id))}`}
+          className="font-medium hover:underline"
+        >
+          参考任务 #{drill.related_task_id}
+        </Link>
+        {drill.intent_id > 0 && (
+          <span className="text-muted-foreground font-mono text-[10px]">意图 #{drill.intent_id}</span>
+        )}
+        <span className="text-muted-foreground">取回 {drill.item_count} 条</span>
+        <span className="text-muted-foreground ml-auto tabular-nums">{fmtReaderTraceTime(drill.created_at)}</span>
+      </div>
+      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+        {drill.query && (
+          <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 font-mono text-[10px] break-all">
+            {drill.query}
+          </span>
+        )}
+        {drill.node_ids.length > 0 && (
+          <span className="text-muted-foreground font-mono text-[10px]">节点 {drill.node_ids.join(", ")}</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -598,8 +696,13 @@ function ReaderTracePanel({
   onRetry: () => void;
 }) {
   const isTask = scope === "cross_task";
-  const list = (isTask ? traces?.cross_task : traces?.cross_project) ?? [];
+  const all = (isTask ? traces?.cross_task : traces?.cross_project) ?? [];
+  // 审计分两块：已决（采纳/舍弃）与候选。候选只有 SQL 命中分，没有 LLM 相关性分；
+  // 用户要求「所有候选的评分和是否采纳都能看到」，所以候选单独一组展示，不混进已决。
+  const list = all.filter((item) => item.decision !== "candidate");
+  const candidates = all.filter((item) => item.decision === "candidate");
   const runs = traces?.runs ?? [];
+  const drills = traces?.drills ?? [];
 
   if (loading && !traces) {
     return (
@@ -652,6 +755,32 @@ function ReaderTracePanel({
             <ReaderTraceCard key={`${item.direction}-${item.related_task_id}`} item={item} />
           ))}
         </div>
+      )}
+      {candidates.length > 0 && (
+        <section className="flex flex-col gap-2">
+          <h3 className="text-sm font-medium">候选（SQL 命中，待阅读者读图判定）</h3>
+          <p className="text-muted-foreground -mt-1 text-xs">
+            weak 不在此列；medium 以上才会进候选。相关性分为 0 说明还没读完两张图。
+          </p>
+          <div className="flex flex-col gap-2">
+            {candidates.map((item) => (
+              <ReaderTraceCard key={`cand-${item.direction}-${item.related_task_id}`} item={item} />
+            ))}
+          </div>
+        </section>
+      )}
+      {drills.length > 0 && (
+        <section className="flex flex-col gap-2">
+          <h3 className="text-sm font-medium">下钻明细</h3>
+          <p className="text-muted-foreground -mt-1 text-xs">
+            本任务每次向阅读者要细节的记录：哪条意图、问哪个参考任务、取了哪些节点。
+          </p>
+          <div className="flex flex-col gap-1.5">
+            {drills.map((drill) => (
+              <ReaderDrillRow key={drill.id} drill={drill} />
+            ))}
+          </div>
+        </section>
       )}
       {runs.length > 0 && (
         <section className="flex flex-col gap-2">

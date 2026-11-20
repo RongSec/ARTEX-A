@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/url"
 	"regexp"
@@ -237,6 +238,11 @@ type readerLinkHit struct {
 	Key      string `json:"key"`
 	MatchKey string `json:"match_key,omitempty"`
 	Value    string `json:"value"`
+	// Score 是本条命中对候选总分的贡献：精确 1.0 / 模糊 0.6 / 凭据 1.2 /
+	// 资产 0.8 / 组件 0.3。审计里据此解释"为什么它在候选里"。
+	Score float64 `json:"score,omitempty"`
+	// Match 标记命中方式：exact=归一化后完全相等 / fuzzy=路径相似。
+	Match string `json:"match,omitempty"`
 }
 
 // readerLinkSurfaceKey 是 debug.surface_keys 的元素：surface 抽出的精确键 +
@@ -248,14 +254,22 @@ type readerLinkSurfaceKey struct {
 }
 
 // readerLinkCandidate 是 request_reader_links 返回的候选任务。
+//
+// 两级评分的第一级在这里：MatchScore 是 SQL 侧命中打分，MatchStrength 是
+// 它映射出的档位。规则（用户认可）：Σ≥2.0 strong / Σ≥1.0 medium / Σ>0 weak；
+// **weak 不进候选**（单条模糊或仅组件同名不足以让阅读者去读两张图）。
 type readerLinkCandidate struct {
-	TaskID       int64           `json:"task_id"`
-	TaskName     string          `json:"task_name"`
-	ProjectID    int64           `json:"project_id"`
-	Hits         []readerLinkHit `json:"hits"`
-	HitCount     int             `json:"hit_count"`
-	FindingCount int             `json:"finding_count"`
-	IntentCount  int             `json:"intent_count"`
+	TaskID        int64           `json:"task_id"`
+	TaskName      string          `json:"task_name"`
+	ProjectID     int64           `json:"project_id"`
+	Hits          []readerLinkHit `json:"hits"`
+	HitCount      int             `json:"hit_count"`
+	ExactHits     int             `json:"exact_hits,omitempty"`
+	FuzzyHits     int             `json:"fuzzy_hits,omitempty"`
+	MatchScore    float64         `json:"match_score"`
+	MatchStrength string          `json:"match_strength"`
+	FindingCount  int             `json:"finding_count"`
+	IntentCount   int             `json:"intent_count"`
 }
 
 // taskIntelLinkTarget 取勾连决策的「发起方任务」上下文：即被暴露情报给其规划者
@@ -369,9 +383,33 @@ func (s *Server) toolRequestReaderLinks() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			cands := aggregateReaderLinkCandidates(matches, limit)
-			for i := range cands {
-				cands[i].HitCount = len(cands[i].Hits)
+			// V11：精确 match_key 只认「归一化后完全相等」，同 controller 的
+			// /api/user/list 与 /api/user/info 会漏。这里补一层路径模糊匹配，
+			// 按 (task_id,kind,key) 与精确结果合并（精确优先，不重复计分）。
+			exactCount := len(matches)
+			if fuzzy, ferr := s.m.pg.MatchTaskIntelFuzzy(ctx, pid, keys, excludeID, scope == "cross", 0.6); ferr == nil {
+				matches = mergeIntelMatches(matches, fuzzy)
+			} else {
+				debug["fuzzy_error"] = ferr.Error()
+			}
+			debug["exact_rows"] = exactCount
+			debug["fuzzy_rows"] = len(matches) - exactCount
+			cands, weakDropped := aggregateReaderLinkCandidates(matches, limit)
+			debug["weak_dropped"] = weakDropped
+			// 候选落库：审计要能列出「所有候选的评分与是否采纳」。只落不给
+			// 规划者——暴露门槛在 adopt（阅读者读完两张图后的 relevance 评分）。
+			// 已有 adopted/dismissed 的对会被 SaveCandidateIntelLink 保护，不覆盖。
+			if excludeID > 0 {
+				for _, c := range cands {
+					raw, _ := json.Marshal(c.Hits)
+					_, _, _ = s.m.pg.SaveCandidateIntelLink(ctx, db.TaskIntelLink{
+						ProjectID: pid, TaskID: excludeID, RelatedTaskID: c.TaskID,
+						Reason: fmt.Sprintf("SQL 命中 %d 条（%.2f/%s），待阅读者读图判定",
+							c.HitCount, c.MatchScore, c.MatchStrength),
+						Matched: raw, MatchStrength: c.MatchStrength,
+						MatchScore: c.MatchScore, MatchHits: c.HitCount,
+					})
+				}
 			}
 			out := map[string]any{
 				"surface":    a.Surface,
@@ -388,11 +426,42 @@ func (s *Server) toolRequestReaderLinks() actool.CoreTool {
 		})
 }
 
-// aggregateReaderLinkCandidates 是纯函数：命中行 → 候选任务（按命中条数降序，
-// 同数按 task_id 升序保证稳定），并截断到 limit。
-func aggregateReaderLinkCandidates(matches []db.IntelTaskMatch, limit int) []readerLinkCandidate {
+// mergeIntelMatches 把精确 JOIN 与模糊补漏的命中行合并，按
+// (task_id, kind, key) 去重——精确行先入，模糊行只有在没被精确命中时才补进来。
+// 这样同一个接口不会既算 1.0 又算 0.6。
+func mergeIntelMatches(exact, fuzzy []db.IntelTaskMatch) []db.IntelTaskMatch {
+	if len(fuzzy) == 0 {
+		return exact
+	}
+	key := func(m db.IntelTaskMatch) string {
+		return fmt.Sprintf("%d\x00%s\x00%s", m.TaskID, m.Kind, m.Key)
+	}
+	seen := make(map[string]bool, len(exact)+len(fuzzy))
+	out := make([]db.IntelTaskMatch, 0, len(exact)+len(fuzzy))
+	for _, m := range exact {
+		seen[key(m)] = true
+		out = append(out, m)
+	}
+	for _, m := range fuzzy {
+		if seen[key(m)] {
+			continue
+		}
+		seen[key(m)] = true
+		out = append(out, m)
+	}
+	return out
+}
+
+// aggregateReaderLinkCandidates 是纯函数：命中行 → 候选任务（按累计分降序），
+// 并截断到 limit。
+//
+// 打分（用户认可的口径）：精确接口 1.0 / 模糊接口 0.6 / 凭据 1.2 / 资产 0.8 /
+// 组件 0.3。Σ≥2.0 strong、Σ≥1.0 medium、Σ>0 weak。
+// **weak 不进候选**：单条模糊路径或仅组件同名，不足以让阅读者去读两张完整图。
+// 组件仍然随强信号返回（作为旁证），只是不能单独成候选。
+func aggregateReaderLinkCandidates(matches []db.IntelTaskMatch, limit int) ([]readerLinkCandidate, int) {
 	if len(matches) == 0 {
-		return []readerLinkCandidate{}
+		return []readerLinkCandidate{}, 0
 	}
 	byTask := map[int64]*readerLinkCandidate{}
 	hitSeen := map[int64]map[string]bool{}
@@ -413,37 +482,51 @@ func aggregateReaderLinkCandidates(matches []db.IntelTaskMatch, limit int) []rea
 		if hitSeen[m.TaskID][id] {
 			continue
 		}
+		// 精确 JOIN 的行没有 MatchScore，按 kind 取固定分；模糊补漏的行带相似度。
+		score, how := m.MatchScore, m.MatchKind
+		if score <= 0 {
+			score, how = db.EndpointHitScore(m.Kind), "exact"
+		}
+		if score <= 0 {
+			continue // vuln 等不可比类型
+		}
 		hitSeen[m.TaskID][id] = true
-		c.Hits = append(c.Hits, readerLinkHit{Kind: m.Kind, Key: m.Key, MatchKey: m.MatchKey, Value: m.Value})
+		c.Hits = append(c.Hits, readerLinkHit{
+			Kind: m.Kind, Key: m.Key, MatchKey: m.MatchKey, Value: m.Value,
+			Score: score, Match: how,
+		})
+		c.MatchScore += score
+		if how == "fuzzy" {
+			c.FuzzyHits++
+		} else {
+			c.ExactHits++
+		}
 	}
 	out := make([]readerLinkCandidate, 0, len(byTask))
+	dropped := 0
 	for _, c := range byTask {
-		// V8-SIG：只有组件（软件版本）撞上的候选不算"相关任务"——实测 task#51
-		// 就是仅命中 mariadb@10.1 被当成候选，规划者要花一轮去排除。强信号
-		// 只认接口/漏洞/凭据/资产；组件只作为"附带的旁证"随强信号一起返回。
-		strong := false
-		for _, h := range c.Hits {
-			if h.Kind != db.IntelKindComponent {
-				strong = true
-				break
-			}
-		}
-		if !strong {
+		c.MatchScore = math.Round(c.MatchScore*100) / 100
+		c.MatchStrength = db.MatchStrengthOf(c.MatchScore)
+		if c.MatchStrength == "" || c.MatchStrength == "weak" {
+			dropped++ // weak 不进候选（见函数注释），但计数回给调用方做 debug
 			continue
 		}
-		c.HitCount = len(c.Hits)
+		c.HitCount = c.ExactHits + c.FuzzyHits // 只数计分命中：vuln 等 0 分项不算「命中 N 条」
 		out = append(out, *c)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if len(out[i].Hits) != len(out[j].Hits) {
-			return len(out[i].Hits) > len(out[j].Hits)
+		if out[i].MatchScore != out[j].MatchScore {
+			return out[i].MatchScore > out[j].MatchScore
+		}
+		if out[i].HitCount != out[j].HitCount {
+			return out[i].HitCount > out[j].HitCount
 		}
 		return out[i].TaskID < out[j].TaskID
 	})
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
-	return out
+	return out, dropped
 }
 
 // toolAdoptRelatedTask 阅读者判定两个任务相关后调用：落
@@ -454,26 +537,39 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 	return wrTool("adopt_related_task",
 		"阅读者专用：你读完【发起方任务】与【被勾连任务】两边上下文（get_task_graph_digest，读摘要不读全文）后，判定两者相关（同一攻击面/同一资产可复用/同一利用链）时调用。"+
 			"记 decision=adopted，并把被勾连任务的可复用要点写成结构化 hint 写进发起方任务图，唤醒其规划者。"+
-			"注意：hint 只在发起方一轮上下文里有效；后续细节由规划者用 ask_reader 向你下钻（你只回脱敏后的测试方法）。"+
+			"注意：hint 只在发起方一轮上下文里有效，只作方向；后续细节由规划者/执行者用 ask_reader 向你下钻（你只回脱敏后的测试细节/方法）。"+
 			"无关的候选请用 dismiss_related_task；重复采纳同一对任务是幂等的（不重复写 hint）。",
 		objSchema(map[string]any{
-			"task_id":         strParam("发起方任务 id：本轮图变更消息里的 task_id（要被暴露情报、被唤醒规划者的任务）"),
-			"related_task_id": strParam("被勾连任务 id：情报来源任务（读到的旧任务）"),
-			"reason":          strParam("判定相关的理由：必须写「读到了什么」（如两边都有未授权 /api/user/{id} 且旧任务已验证越权），不能只写「键相同」"),
-			"strength":        map[string]any{"type": "string", "enum": []any{"strong", "medium", "weak"}, "description": "关联强度：同一利用链=strong / 同一资产可复用=medium / 同一攻击面待验证=weak（缺省 strong）"},
+			"task_id":            strParam("发起方任务 id：本轮图变更消息里的 task_id（要被暴露情报、被唤醒规划者的任务）"),
+			"related_task_id":    strParam("被勾连任务 id：情报来源任务（读到的旧任务）"),
+			"reason":             strParam("判定相关的理由：必须写「读到了什么」（如两边都有未授权 /api/user/{id} 且旧任务已验证越权），不能只写「键相同」"),
+			"strength":           map[string]any{"type": "string", "enum": []any{"strong", "medium", "weak"}, "description": "关联强度（兼容字段）：同一利用链=strong / 同一资产可复用=medium / 同一攻击面待验证=weak。新调用请用 relevance_score"},
+			"relevance_score":    map[string]any{"type": "integer", "description": "读完两边完整图后的相关性评分 0-100：≥60 strong / 40-59 medium / <40 不采纳。暴露门槛是 medium（40），低于它请改用 dismiss_related_task"},
+			"relevance_strength": map[string]any{"type": "string", "enum": []any{"strong", "medium", "weak"}, "description": "相关性档位（可选，最终以 relevance_score 推算为准）"},
+			"chains": map[string]any{"type": "array", "description": "读到并确认可迁移的利用链摘要（最多 6 条）。规划者靠它判断值不值得迁移，不靠原始边 id", "items": objSchema(map[string]any{
+				"entry":    strParam("入口，如 GET /api/sso/userinfo"),
+				"steps":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "中间结论，2-4 条短句"},
+				"outcome":  strParam("终点/影响，如 越权读取任意用户信息"),
+				"verified": map[string]any{"type": "boolean", "description": "对方任务里是否已验证"},
+				"node_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "出处节点 id（read_task_graph 返回的整数 id，如 537；不确定就留空数组，不要填 0）"},
+			})},
 			"matched": map[string]any{"type": "array", "items": objSchema(map[string]any{
 				"kind":  strParam("endpoint/credential/component/asset/vuln"),
 				"key":   strParam("归一化键"),
 				"value": strParam("人类可读原文"),
 			}), "description": "可选：本次采纳依据的命中明细（缺省用被勾连任务情报表前若干行）"},
-		}, "task_id", "related_task_id", "reason"),
+		}, "task_id", "related_task_id", "reason", "chains"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				TaskID        json.RawMessage `json:"task_id"`
 				RelatedTaskID json.RawMessage `json:"related_task_id"`
 				Reason        string          `json:"reason"`
 				Strength      string          `json:"strength"`
-				Matched       []readerLinkHit `json:"matched"`
+				// 第二级评分：阅读者读完两张完整图后的相关性判断。这是暴露门槛。
+				RelevanceScore    int              `json:"relevance_score"`
+				RelevanceStrength string           `json:"relevance_strength"`
+				Chains            []db.ReaderChain `json:"chains"`
+				Matched           []readerLinkHit  `json:"matched"`
 			}
 			_ = json.Unmarshal(in, &a)
 			taskID, tctx, err := s.taskIntelLinkTarget(ctx, a.TaskID)
@@ -488,10 +584,52 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 			if reason == "" {
 				return actool.Errorf("reason 必填：写清读到了什么（不能只写键相同）"), nil
 			}
-			strength, err := normalizeReaderLinkStrength(a.Strength)
+			rawStrength := strings.ToLower(strings.TrimSpace(a.Strength))
+			relStrength := strings.ToLower(strings.TrimSpace(a.RelevanceStrength))
+			score := a.RelevanceScore
+			if score <= 0 {
+				// 兼容旧调用：没给分数就按档位映射。两个都没给 → 拒绝，不允许
+				// "读完图但说不出相关性"的采纳——那正是评分机制要挡的。
+				switch {
+				case relStrength == "strong" || rawStrength == "strong":
+					score = 70
+				case relStrength == "medium" || rawStrength == "medium":
+					score = 50
+				case relStrength == "weak" || rawStrength == "weak":
+					score = 30
+				default:
+					return actool.Errorf("必须给 relevance_score（0-100）：读完两张完整图后的相关性评分。≥60 才暴露；40-59 可采纳但需说明；<40 请用 dismiss_related_task"), nil
+				}
+			}
+			if score < 0 {
+				score = 0
+			}
+			if score > 100 {
+				score = 100
+			}
+			if score < 40 {
+				return actool.Errorf(fmt.Sprintf("relevance_score=%d 低于暴露门槛（medium=40）：不要 adopt。请用 dismiss_related_task 并写明「还缺什么证据」", score)), nil
+			}
+			switch {
+			case score >= 60:
+				relStrength = "strong"
+			default:
+				relStrength = "medium"
+			}
+			strength, err := normalizeReaderLinkStrength(rawStrength)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			chains := a.Chains
+			if len(chains) == 0 {
+				// 链摘要是规划者判断「值不值得迁移」的唯一依据（它看不到原始边）。
+				// 不给就等于只暴露了一个接口名，跟旧版没区别，所以这里硬拦。
+				return actool.Errorf("chains 必填：至少 1 条，从 read_task_graph 的 edges/nodes 整理——entry（接口 method+path）、steps（中间结论）、outcome（终点）、verified、node_ids。不要只写接口名"), nil
+			}
+			if len(chains) > 6 {
+				chains = chains[:6]
+			}
+			chainRaw, _ := json.Marshal(chains)
 			rt, err := s.m.pg.GetTask(relatedID)
 			if err != nil || rt == nil {
 				return actool.Errorf(fmt.Sprintf("被勾连任务不存在: %d", relatedID)), nil
@@ -500,18 +638,24 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(fmt.Sprintf("读取被勾连任务上下文失败: %v", err)), nil
 			}
-			matched := a.Matched
-			if len(matched) == 0 {
-				matched = s.intelHitsForTask(ctx, relatedID, readerLinkHintMaxRows)
-			}
-			raw, _ := json.Marshal(matched)
 			prev, err := s.m.pg.TaskIntelLinkFor(ctx, taskID, relatedID)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			matched := a.Matched
+			if len(matched) == 0 && prev != nil && len(prev.Matched) > 0 {
+				// 优先用候选阶段落下的 SQL 命中明细：它和 match_score 同一口径。
+				// 情报表前 N 行会混进未计分的 vuln/组件，审计里会「命中 3 条却列 4 条」。
+				_ = json.Unmarshal(prev.Matched, &matched)
+			}
+			if len(matched) == 0 {
+				matched = s.intelHitsForTask(ctx, relatedID, readerLinkHintMaxRows)
+			}
+			raw, _ := json.Marshal(matched)
 			linkID, err := s.m.pg.SaveTaskIntelLink(ctx, db.TaskIntelLink{
 				ProjectID: tctx.ProjectID, TaskID: taskID, RelatedTaskID: relatedID,
 				Decision: "adopted", Reason: reason, Matched: raw, DecidedBy: readerLinkDecidedBy,
+				RelevanceScore: score, RelevanceStrength: relStrength, Chains: chainRaw,
 			})
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -532,7 +676,7 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 			if srcName == "" {
 				srcName = strings.TrimSpace(rt.Description)
 			}
-			hintID, err := s.writeReaderAdoptHint(taskID, readerAdoptHint{
+			hintID, err := s.writeReaderAdoptHint(ctx, taskID, readerAdoptHint{
 				SourceTaskID: relatedID, SourceTaskName: srcName,
 				SourceProjectID: rctx.ProjectID, SourceProjectName: rctx.ProjectName,
 				Strength: strength, Reason: reason, Points: points, Facts: facts,
@@ -626,10 +770,15 @@ type readerAdoptHint struct {
 // writeReaderAdoptHint 把 adopted 结论写进发起方任务图（与 add_hint 同形态：
 // kind=hint + 图变更事件），并调用 NotifyHint 唤醒其规划者。规划者不再自己
 // 下钻：hint 里已给出来源任务、关联强度和可复用要点。
-func (s *Server) writeReaderAdoptHint(taskID int64, h readerAdoptHint) (int64, error) {
-	t, ok := s.m.Task(strconv.FormatInt(taskID, 10))
-	if !ok || t == nil || t.Store == nil {
-		return 0, fmt.Errorf("发起方任务不在运行表")
+func (s *Server) writeReaderAdoptHint(ctx context.Context, taskID int64, h readerAdoptHint) (int64, error) {
+	// 不能用 s.m.Task：那只查「运行表」（引擎里活着的任务）。用户暂停的任务、
+	// 或刚好在两次唤醒之间的任务都不在表里，hint 会被静默丢掉——而 hint 是
+	// 阅读者暴露给规划者的唯一通道，丢了等于这次采纳白做。直接写 PG。
+	var expID, projectID int64
+	if err := s.m.pg.QueryRowContext(ctx, `
+SELECT exploration_id, COALESCE(project_id,0) FROM tasks WHERE id=$1 AND deleted_at IS NULL`, taskID).
+		Scan(&expID, &projectID); err != nil {
+		return 0, fmt.Errorf("发起方任务#%d 不存在或已删除: %w", taskID, err)
 	}
 	text := renderReaderAdoptHint(h)
 	payload := map[string]any{
@@ -647,11 +796,19 @@ func (s *Server) writeReaderAdoptHint(taskID int64, h readerAdoptHint) (int64, e
 		"key_facts":           redactStrings(h.Facts),
 		"link_id":             h.LinkID,
 	}
-	id, err := t.Store.AddNode(db.KindHint, payload, 0, "active", "reader", nil)
+	id, err := s.m.pg.Exploration(expID).AddNode(db.KindHint, payload, 0, "active", "reader", nil)
 	if err != nil {
 		return 0, err
 	}
-	t.NotifyHint([]string{text})
+	// 图变更事件：让项目级阅读者水位看到这条 hint（也让审计能追到）。
+	if projectID > 0 {
+		_ = s.m.pg.InsertGraphEvent(ctx, projectID, taskID, id, db.KindHint,
+			fmt.Sprintf("阅读者采纳任务#%d（%s）：%s", h.SourceTaskID, h.Strength, firstLine(h.Reason, 120)))
+	}
+	// 任务在跑就立刻唤醒规划者；暂停的任务只落图，恢复后第一轮就能读到。
+	if t, ok := s.m.Task(strconv.FormatInt(taskID, 10)); ok && t != nil {
+		t.NotifyHint([]string{text})
+	}
 	return id, nil
 }
 
@@ -707,7 +864,7 @@ func renderReaderAdoptHint(h readerAdoptHint) string {
 		// 上下文。禁打由执行层按 task_foreign_assets 硬拦，这里只给数量。
 		b.WriteString(fmt.Sprintf("\n被勾连任务另有 %d 个资产，已加入本任务的禁止访问清单（不在本任务授权范围，故不列出地址）。要把经验用到本任务已有资产上；确需扩到新资产，先由本任务正常登记资产后再打。", len(h.ForeignHosts)))
 	}
-	b.WriteString("\n直接采信以上结论，不要再重读来源任务；若要验证，按上述要点在当前任务执行。")
+	b.WriteString("\n直接采信以上方向，不要再重读来源任务；具体测法由执行者按意图用 ask_reader 向阅读者下钻，再在本任务资产上验证。")
 	return b.String()
 }
 
@@ -895,6 +1052,8 @@ type intelSummaryItem struct {
 	Kind   string `json:"kind"`
 	Key    string `json:"key"`
 	Value  string `json:"value"`
+	// Rev 是变更序列；同一行被更新（接口细节变丰富）时会以新 rev 再出现。
+	Rev int64 `json:"rev,omitempty"`
 }
 
 // intelSummaryGroup 是按 kind 分组的增量摘要。
@@ -905,27 +1064,34 @@ type intelSummaryGroup struct {
 	Items []intelSummaryItem `json:"items"`
 }
 
-// toolReadTaskIntel 按 since_id 水位增量读情报表，按 kind 分组返回摘要。
+// toolReadTaskIntel 按 since_rev 水位增量读情报表，按 kind 分组返回摘要。
 // project_id 缺省=全部开启 reader_enabled 的 active 项目（阅读者的常规视野）。
 func (s *Server) toolReadTaskIntel() actool.CoreTool {
 	return roTool("read_task_intel",
-		"按水位增量读任务情报表（每个任务终态生成的接口/凭据/组件/资产/漏洞表），用于判断「哪些任务可以互相比对」。"+
-			"since_id 传上一轮返回的 next_since_id（首轮 0）；project_id 缺省=全部已开启 reader_enabled 的项目（跨项目视野）。"+
-			"显式指定 project_id 时，该项目需 observer_enabled 或 reader_enabled 至少一项开启，否则进 skipped。返回按 kind 分组的条目与任务归属，以及 next_since_id（下次传回）。",
+		"按变更序列增量读任务情报表（每个任务终态生成的接口/凭据/组件/资产/漏洞表），用于判断「哪些任务可以互相比对」。"+
+			"since_rev 传上一轮返回的 next_since_rev（首轮 0）；它是全局变更序列，接口细节变丰富也会重新下发（不是只增不改的 id）。"+
+			"project_id 缺省=全部已开启 reader_enabled 的项目（跨项目视野）。"+
+			"显式指定 project_id 时，该项目需 observer_enabled 或 reader_enabled 至少一项开启，否则进 skipped。返回按 kind 分组的条目与任务归属，以及 next_since_rev（下次传回）。",
 		objSchema(map[string]any{
 			"project_id": map[string]any{"type": "integer", "description": "可选：只读某个项目；缺省=全部开启 reader_enabled 的项目"},
-			"since_id":   map[string]any{"type": "integer", "description": "可选：上次读到的最大 id（首轮 0）"},
+			"since_rev":  map[string]any{"type": "integer", "description": "可选：上次读到的最大 rev（首轮 0）"},
+			// 兼容旧参数：V10 提示词里写的是 since_id，传进来按 rev 处理并回显提示。
+			"since_id": map[string]any{"type": "integer", "description": "已废弃：等同 since_rev（保留兼容）"},
 		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				ProjectID json.RawMessage `json:"project_id"`
+				SinceRev  json.RawMessage `json:"since_rev"`
 				SinceID   json.RawMessage `json:"since_id"`
 			}
 			_ = json.Unmarshal(in, &a)
 			if s == nil || s.m == nil || s.m.pg == nil {
 				return actool.Errorf("情报表存储不可用"), nil
 			}
-			since := parseProfileID(a.SinceID)
+			since := parseProfileID(a.SinceRev)
+			if since <= 0 {
+				since = parseProfileID(a.SinceID)
+			}
 			pid := parseProfileID(a.ProjectID)
 			var pids []int64
 			skipped := []map[string]any{}
@@ -961,20 +1127,20 @@ func (s *Server) toolReadTaskIntel() actool.CoreTool {
 				}
 				total += len(rows)
 				projects = append(projects, map[string]any{
-					"project_id":    p,
-					"since_id":      since,
-					"next_since_id": watermark,
-					"has_more":      len(rows) >= 500,
-					"total":         len(rows),
-					"groups":        groupIntelSummary(rows),
-					"tasks":         intelTaskCounts(rows),
+					"project_id":     p,
+					"since_rev":      since,
+					"next_since_rev": watermark,
+					"has_more":       len(rows) >= 500,
+					"total":          len(rows),
+					"groups":         groupIntelSummary(rows),
+					"tasks":          intelTaskCounts(rows),
 				})
 			}
 			out := map[string]any{
-				"since_id":      since,
-				"next_since_id": next,
-				"total":         total,
-				"projects":      projects,
+				"since_rev":      since,
+				"next_since_rev": next,
+				"total":          total,
+				"projects":       projects,
 			}
 			if len(skipped) > 0 {
 				out["skipped"] = skipped
@@ -994,7 +1160,7 @@ func groupIntelSummary(rows []db.TaskIntel) []intelSummaryGroup {
 	byKind := map[string][]intelSummaryItem{}
 	for _, r := range rows {
 		byKind[r.Kind] = append(byKind[r.Kind], intelSummaryItem{
-			ID: r.ID, TaskID: r.TaskID, Kind: r.Kind, Key: r.Key, Value: r.Value,
+			ID: r.ID, TaskID: r.TaskID, Kind: r.Kind, Key: r.Key, Value: r.Value, Rev: r.Rev,
 		})
 	}
 	out := make([]intelSummaryGroup, 0, len(intelGroupOrder))

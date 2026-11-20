@@ -557,6 +557,10 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	}
 	goalRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "goals"}
 	plannerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "planner"}
+	// 阅读者角色的下钻总结单独用 reader 这个 agentKey：llm_records 会记成
+	// worker=reader，任务页的「阅读者审计」才能看到这次下钻；没有 reader 绑定
+	// 时 taskLLMRuntime 会按任务链/全局配置回退，行为不变。
+	readerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "reader"}
 	workerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "worker"}
 	mainRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
@@ -572,6 +576,11 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
+	// V11-WORKER-READER：worker 下钻的“细节不足”兜底也走阅读者角色（reader 链）。
+	// 正常下钻直接回脱敏细节，不触发这次 LLM 调用。
+	wk.SetReaderAnswer(func(ctx context.Context, req agent.ReaderDrillRequest) (string, error) {
+		return s.readerDrillAnswer(ctx, readerRuntime, req)
+	})
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetGuard(s.newPlannerGuard()) // V9-SCOPE：hint 里的外部资产对规划者自己的探测同样拦截（只跑范围规则）
 	pl.SetFindingRecorder(s.evidenceStore())
@@ -582,10 +591,10 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
-	// V10-READER：ask_reader 的「总结成测试方法论」走任务 planner 链（同一套模型配置），
-	// 失败只是退回脱敏证据，不影响规划者本轮。
+	// V11-WORKER-READER：ask_reader 的总结走阅读者角色（reader 链），
+	// 失败只是退回脱敏证据，不影响规划者/执行者本轮。
 	pl.SetReaderAnswer(func(ctx context.Context, req agent.ReaderDrillRequest) (string, error) {
-		return s.readerDrillAnswer(ctx, plannerRuntime, req)
+		return s.readerDrillAnswer(ctx, readerRuntime, req)
 	})
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetWebSearch(s.webSearchFor("planner"))

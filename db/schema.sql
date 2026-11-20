@@ -1846,6 +1846,43 @@ ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS matched JSONB NOT NULL DEF
 ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS decided_by TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_tintel_link_task ON task_intel_links(task_id, decision);
 
+-- V11-READER3：变更序列 rev。id 只增不改——接口行被 ticker 更新（purpose/params/
+-- status 变丰富）时，按 id 水位的增量读不到；rev 在内容变更时 bump，增量按它读。
+ALTER TABLE task_intel ADD COLUMN IF NOT EXISTS rev BIGINT NOT NULL DEFAULT 0;
+CREATE SEQUENCE IF NOT EXISTS task_intel_rev_seq;
+UPDATE task_intel SET rev = nextval('task_intel_rev_seq') WHERE rev = 0;
+CREATE INDEX IF NOT EXISTS idx_tintel_rev ON task_intel(project_id, rev);
+
+-- V11-READER3：两级评分。match_* 是 SQL 侧命中打分（决定"进不进候选"），
+-- relevance_* 是阅读者读完整图后的相关性评分（决定"暴不暴露给规划者"）。
+-- chains 是判案时读到的利用链摘要（entry → steps → outcome），暴露给规划者
+-- 替代原始边：原始边是 id 对，规划者要读懂必须逐个 node_detail。
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS match_strength TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS match_score NUMERIC(8,2) NOT NULL DEFAULT 0;
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS match_hits INT NOT NULL DEFAULT 0;
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS relevance_score INT NOT NULL DEFAULT 0;
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS relevance_strength TEXT NOT NULL DEFAULT '';
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS chains JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS graph_read_at TIMESTAMPTZ;
+ALTER TABLE task_intel_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+-- 下钻审计：每一次 ask_reader 落一行（谁问、问哪个参考任务、哪些节点、什么问题、
+-- 哪种模式）。没有这张表，任务页审计只能看到"采纳了谁"，看不到"用了哪几个点"。
+CREATE TABLE IF NOT EXISTS reader_drills (
+    id              BIGSERIAL PRIMARY KEY,
+    project_id      BIGINT NOT NULL DEFAULT 0,
+    task_id         BIGINT NOT NULL,
+    related_task_id BIGINT NOT NULL,
+    intent_id       BIGINT NOT NULL DEFAULT 0,
+    node_ids        BIGINT[] NOT NULL DEFAULT '{}',
+    query           TEXT NOT NULL DEFAULT '',
+    mode            TEXT NOT NULL DEFAULT '',
+    item_count      INT NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_reader_drills_task ON reader_drills(task_id, related_task_id);
+CREATE INDEX IF NOT EXISTS idx_reader_drills_intent ON reader_drills(intent_id);
+
 -- V9-SCOPE：阅读者采纳任务时，被勾连任务的资产 host 写到发起方任务名下。
 -- 这是「负向清单」：hint 里的经验可以复用，但这些 host 不属于发起方授权范围，
 -- guard 的内置规则会拒绝对它们发起的请求/扫描/利用（见 guard/foreign_scope.go）。

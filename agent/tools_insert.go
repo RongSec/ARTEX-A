@@ -655,6 +655,10 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchAllWorkerTraces(), t.getWorkerTrace(),
 		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
 		t.nodeDetail(),
+		// ask_reader：执行者也能向阅读者下钻参考任务的脱敏细节——只在“本条意图
+		// 要测的接口/组件在采纳任务里出现过”时用，拿回请求构造/步骤/判据；
+		// 工具在 worker 模式下会拒绝 host/IP/URL，并限制每意图调用次数。
+		t.askReader(),
 		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}

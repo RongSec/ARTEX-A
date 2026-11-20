@@ -197,7 +197,10 @@ func (s *Server) buildTaskIntelMode(ctx context.Context, taskID int64, replace, 
 // intelProductAlternation 是受控产品表的正则选择支（长名在前，避免前缀抢先）。
 // 只有这张表里的产品才会进 component：自由文本里的 "HTTP"/"OK" 这类泛词不入表，
 // 也就不可能变成一条"组件"。
-const intelProductAlternation = `apache|httpd|nginx|php|tomcat|redis|mariadb|postgresql|postgres|pgsql|mysql|docker|jenkins|dvwa|openssh|openssl|iis|expressjs|express|jquery|bootstrap|spring[ \t]+boot|spring`
+const intelProductAlternation = `apache[ \t]+shiro|apache|httpd|nginx|php|tomcat|redis|mariadb|postgresql|postgres|pgsql|mysql|docker|jenkins|dvwa|openssh|openssl|iis|expressjs|express|jquery|bootstrap|` +
+	`spring[ \t]+cloud[ \t]+gateway|spring[ \t]+boot|spring|` +
+	`shiro|weblogic|struts2|struts|fastjson|log4j2|log4j|` +
+	`nacos|consul|grafana|zabbix|kibana|elasticsearch|rabbitmq|mongodb|jboss|wildfly|thinkphp|laravel|django|flask`
 
 // intelProductAliases 把同一产品的别名归一到 canonical 名（apache/httpd 同族、
 // apache tomcat 归 tomcat）：跨任务比对要的是"同一个产品"，不是同一个写法。
@@ -213,6 +216,17 @@ var intelProductAliases = map[string]string{
 	"express": "express", "expressjs": "express", "express.js": "express",
 	"jquery": "jquery", "bootstrap": "bootstrap",
 	"spring": "spring", "spring boot": "spring", "springboot": "spring",
+	"spring cloud gateway": "spring cloud gateway",
+	// 实战高频、CVE 密集的组件：不在表里就永远比不到跨任务同组件，
+	// 而「同组件版本且有在野利用」是阅读者的强信号之一。
+	"apache shiro": "shiro", "shiro": "shiro",
+	"weblogic": "weblogic", "oracle weblogic": "weblogic",
+	"struts2": "struts2", "struts": "struts2",
+	"fastjson": "fastjson", "log4j2": "log4j", "log4j": "log4j",
+	"nacos": "nacos", "consul": "consul", "grafana": "grafana", "zabbix": "zabbix",
+	"kibana": "kibana", "elasticsearch": "elasticsearch", "rabbitmq": "rabbitmq",
+	"mongodb": "mongodb", "jboss": "jboss", "wildfly": "wildfly",
+	"thinkphp": "thinkphp", "laravel": "laravel", "django": "django", "flask": "flask",
 }
 
 var (

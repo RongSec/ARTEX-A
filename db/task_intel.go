@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -38,8 +39,11 @@ type TaskIntel struct {
 	Detail    json.RawMessage `json:"detail"`
 	Source    string          `json:"source"`
 	SourceID  *int64          `json:"source_id,omitempty"`
-	CreatedAt time.Time       `json:"created_at"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	// Rev 是全局变更序列（task_intel_rev_seq）：新增和内容变更都 bump。
+	// 阅读者的增量读按它而不是 id —— id 只增不改，接口细节变丰富时读不到。
+	Rev       int64     `json:"rev"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // 情报 kind 枚举（与 schema 的 CHECK 一致）。
@@ -340,7 +344,7 @@ func IntelMatchKey(kind, key string) string {
 // 落库 / 读取
 // ---------------------------------------------------------------------------
 
-const taskIntelCols = `id, project_id, task_id, kind, key, match_key, value, detail, source, source_id, created_at, updated_at`
+const taskIntelCols = `id, project_id, task_id, kind, key, match_key, value, detail, source, source_id, rev, created_at, updated_at`
 
 // UpsertIntelResult 是一次批量写入的统计（信号摘要只报**新增**行数：重复生成
 // 不产生新攻击面，不该反复唤醒 reader）。
@@ -348,7 +352,10 @@ type UpsertIntelResult struct {
 	Total    int            `json:"total"`
 	Inserted int            `json:"inserted"`
 	Updated  int            `json:"updated"`
-	ByKind   map[string]int `json:"by_kind"` // kind → 本次新增条数
+	// Unchanged 是内容与库里完全一致、没有 bump rev 的行数。ticker 每 5 分钟
+	// 重抽一次，绝大多数行属于这一类；不区分的话"更新"会掩盖真实变化。
+	Unchanged int            `json:"unchanged"`
+	ByKind    map[string]int `json:"by_kind"` // kind → 本次新增条数
 }
 
 // UpsertTaskIntel 批量落一个任务的情报行，按 UNIQUE(project_id,task_id,kind,key)
@@ -401,20 +408,35 @@ WHERE task_id=$1 AND project_id=$2 AND source IN ('finding','fact','asset')`, ta
 			mk = IntelMatchKey(r.Kind, r.Key)
 		}
 		var inserted bool
+		var rev int64
+		// rev 是内容变更序列：只在 match_key/value/detail/source 真的变了时 bump。
+		// 无条件 bump 会让 ticker 每 5 分钟把所有行重新推给阅读者，增量变全量。
+		// WHERE 不成立时 DO UPDATE 不返回行（sql.ErrNoRows）= 内容未变。
 		err := tx.QueryRowContext(ctx, `
-INSERT INTO task_intel(project_id, task_id, kind, key, match_key, value, detail, source, source_id)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+INSERT INTO task_intel(project_id, task_id, kind, key, match_key, value, detail, source, source_id, rev)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, nextval('task_intel_rev_seq'))
 ON CONFLICT (project_id, task_id, kind, key) DO UPDATE
 SET match_key = EXCLUDED.match_key,
     value = EXCLUDED.value,
     detail = EXCLUDED.detail,
     source = EXCLUDED.source,
     source_id = EXCLUDED.source_id,
+    rev = nextval('task_intel_rev_seq'),
     updated_at = now()
-RETURNING (xmax = 0)`,
+WHERE task_intel.match_key IS DISTINCT FROM EXCLUDED.match_key
+   OR task_intel.value IS DISTINCT FROM EXCLUDED.value
+   OR task_intel.detail IS DISTINCT FROM EXCLUDED.detail
+   OR task_intel.source IS DISTINCT FROM EXCLUDED.source
+   OR task_intel.source_id IS DISTINCT FROM EXCLUDED.source_id
+RETURNING (xmax = 0), rev`,
 			projectID, taskID, r.Kind, truncateRunes(utf8Clean(r.Key), 500), mk,
 			truncateRunes(utf8Clean(r.Value), 2000), string(detail),
-			truncateRunes(src, 32), r.SourceID).Scan(&inserted)
+			truncateRunes(src, 32), r.SourceID).Scan(&inserted, &rev)
+		if errors.Is(err, sql.ErrNoRows) {
+			res.Total++
+			res.Unchanged++
+			continue
+		}
 		if err != nil {
 			return UpsertIntelResult{ByKind: map[string]int{}}, err
 		}
@@ -458,27 +480,32 @@ FROM task_intel WHERE task_id=$1 ORDER BY kind, key`, taskID)
 	return scanTaskIntelRows(rows)
 }
 
-// IntelSince 按 id 水位增量读某项目的情报行（reader 侧用；本单只提供查询，
-// 不接 reader）。返回 (rows, watermark)：watermark = 本批最大 id（无行时等于
-// afterID），调用方下次传回即可；单批上限 500 行，循环调用直到 rows 为空。
-func (d *DB) IntelSince(ctx context.Context, projectID, afterID int64) ([]TaskIntel, int64, error) {
+// IntelSince 按 rev 水位增量读某项目的情报行（reader 侧用）。
+//
+// V11 起水位从 id 换成 rev：id 只增不改，接口行被 ticker 更新（purpose/params/
+// status 变丰富）时按 id 读不到，阅读者会一直拿着旧版本比对。rev 在内容变更时
+// bump，新增和更新都能被捕获。
+//
+// 返回 (rows, watermark)：watermark = 本批最大 rev（无行时等于 afterRev），
+// 调用方下次传回即可；单批上限 500 行，循环调用直到 rows 为空。
+func (d *DB) IntelSince(ctx context.Context, projectID, afterRev int64) ([]TaskIntel, int64, error) {
 	if projectID <= 0 {
-		return nil, afterID, nil
+		return nil, afterRev, nil
 	}
 	rows, err := d.QueryContext(ctx, `SELECT `+taskIntelCols+`
-FROM task_intel WHERE project_id=$1 AND id>$2 ORDER BY id LIMIT 500`, projectID, afterID)
+FROM task_intel WHERE project_id=$1 AND rev>$2 ORDER BY rev LIMIT 500`, projectID, afterRev)
 	if err != nil {
-		return nil, afterID, err
+		return nil, afterRev, err
 	}
 	defer rows.Close()
 	list, err := scanTaskIntelRows(rows)
 	if err != nil {
-		return nil, afterID, err
+		return nil, afterRev, err
 	}
-	watermark := afterID
+	watermark := afterRev
 	for _, r := range list {
-		if r.ID > watermark {
-			watermark = r.ID
+		if r.Rev > watermark {
+			watermark = r.Rev
 		}
 	}
 	return list, watermark, nil
@@ -491,7 +518,7 @@ func scanTaskIntelRows(rows *sql.Rows) ([]TaskIntel, error) {
 		var detail []byte
 		var sourceID sql.NullInt64
 		if err := rows.Scan(&r.ID, &r.ProjectID, &r.TaskID, &r.Kind, &r.Key, &r.MatchKey, &r.Value,
-			&detail, &r.Source, &sourceID, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			&detail, &r.Source, &sourceID, &r.Rev, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if len(detail) == 0 {
@@ -522,7 +549,30 @@ type TaskIntelLink struct {
 	Reason        string          `json:"reason"`
 	Matched       json.RawMessage `json:"matched"`
 	DecidedBy     string          `json:"decided_by"`
-	CreatedAt     time.Time       `json:"created_at"`
+	// MatchStrength/MatchScore/MatchHits 是 SQL 侧命中打分（进候选的门槛）。
+	// Strong = Σ≥2.0；Medium = Σ≥1.0（1 条精确或 2 条模糊）；Weak 不进候选。
+	MatchStrength string  `json:"match_strength"`
+	MatchScore    float64 `json:"match_score"`
+	MatchHits     int     `json:"match_hits"`
+	// RelevanceScore/RelevanceStrength 是阅读者读完整图后的相关性评分
+	// （0-100，≥60 strong / 40-59 medium / <40 dismissed）。暴露门槛看它。
+	RelevanceScore    int             `json:"relevance_score"`
+	RelevanceStrength string          `json:"relevance_strength"`
+	Chains            json.RawMessage `json:"chains"`
+	GraphReadAt       *time.Time      `json:"graph_read_at,omitempty"`
+	CreatedAt         time.Time       `json:"created_at"`
+	UpdatedAt         time.Time       `json:"updated_at"`
+}
+
+// ReaderChain 是阅读者判案时读到的一条利用链摘要。暴露给规划者的是它，
+// 不是原始边：原始边是 (src,rel,dst) id 三元组，规划者要读懂必须逐个
+// node_detail，成本高于收益；链摘要已经是编译过的语义。
+type ReaderChain struct {
+	Entry    string   `json:"entry"`    // 入口，如 "GET /api/sso/userinfo"
+	Steps    []string `json:"steps"`    // 中间结论，["未校验 token 归属","遍历 user_id 读他人信息"]
+	Outcome  string   `json:"outcome"`  // 终点，如 "越权读取"
+	Verified bool     `json:"verified"` // 对方任务里是否已验证
+	NodeIDs  []int64  `json:"node_ids"` // 出处节点，下钻用
 }
 
 // ValidIntelLinkDecision 报告决策是否属于 adopted|dismissed|candidate。
@@ -547,26 +597,76 @@ func (d *DB) SaveTaskIntelLink(ctx context.Context, l TaskIntelLink) (int64, err
 	if len(matched) == 0 || !json.Valid(matched) {
 		matched = json.RawMessage(`[]`)
 	}
+	chains := l.Chains
+	if len(chains) == 0 || !json.Valid(chains) {
+		chains = json.RawMessage(`[]`)
+	}
+	// 评分档位留空时按分数补：写入方可能只给分数（SQL 打分侧），也可能只给
+	// 档位（阅读者判案侧）。两处都不给就保持空串，审计里显示"未评分"。
+	ms := strings.ToLower(strings.TrimSpace(l.MatchStrength))
+	rs := strings.ToLower(strings.TrimSpace(l.RelevanceStrength))
 	var id int64
 	err := d.QueryRowContext(ctx, `
-INSERT INTO task_intel_links(project_id, task_id, related_task_id, decision, reason, matched, decided_by)
-VALUES ($1,$2,$3,$4,$5,$6,$7)
+INSERT INTO task_intel_links(project_id, task_id, related_task_id, decision, reason, matched, decided_by,
+                             match_strength, match_score, match_hits,
+                             relevance_score, relevance_strength, chains, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, now())
 ON CONFLICT (task_id, related_task_id) DO UPDATE
 SET decision = EXCLUDED.decision,
     reason = EXCLUDED.reason,
     matched = EXCLUDED.matched,
-    decided_by = EXCLUDED.decided_by
+    decided_by = EXCLUDED.decided_by,
+    match_strength = COALESCE(NULLIF(EXCLUDED.match_strength,''), task_intel_links.match_strength),
+    match_score = GREATEST(EXCLUDED.match_score, task_intel_links.match_score),
+    match_hits = GREATEST(EXCLUDED.match_hits, task_intel_links.match_hits),
+    relevance_score = GREATEST(EXCLUDED.relevance_score, task_intel_links.relevance_score),
+    relevance_strength = COALESCE(NULLIF(EXCLUDED.relevance_strength,''), task_intel_links.relevance_strength),
+    chains = CASE WHEN EXCLUDED.chains = '[]'::jsonb THEN task_intel_links.chains ELSE EXCLUDED.chains END,
+    graph_read_at = CASE WHEN EXCLUDED.relevance_score > 0 THEN now() ELSE task_intel_links.graph_read_at END,
+    updated_at = now()
 RETURNING id`,
 		l.ProjectID, l.TaskID, l.RelatedTaskID, l.Decision,
 		truncateRunes(utf8Clean(l.Reason), 1000), string(matched),
-		truncateRunes(utf8Clean(l.DecidedBy), 40)).Scan(&id)
+		truncateRunes(utf8Clean(l.DecidedBy), 40),
+		ms, l.MatchScore, l.MatchHits, l.RelevanceScore, rs, string(chains)).Scan(&id)
 	return id, err
+}
+
+// taskIntelLinkCols 是 task_intel_links 的读取列，顺序与 scanTaskIntelLink 一致。
+const taskIntelLinkCols = `id, project_id, task_id, related_task_id, decision, reason, matched, decided_by,
+       match_strength, match_score, match_hits, relevance_score, relevance_strength, chains, graph_read_at,
+       created_at, updated_at`
+
+func scanTaskIntelLink(sc interface{ Scan(...any) error }) (TaskIntelLink, error) {
+	var l TaskIntelLink
+	var matched, chains []byte
+	var graphRead sql.NullTime
+	err := sc.Scan(&l.ID, &l.ProjectID, &l.TaskID, &l.RelatedTaskID,
+		&l.Decision, &l.Reason, &matched, &l.DecidedBy,
+		&l.MatchStrength, &l.MatchScore, &l.MatchHits, &l.RelevanceScore, &l.RelevanceStrength,
+		&chains, &graphRead, &l.CreatedAt, &l.UpdatedAt)
+	if err != nil {
+		return l, err
+	}
+	if len(matched) == 0 {
+		matched = []byte(`[]`)
+	}
+	if len(chains) == 0 {
+		chains = []byte(`[]`)
+	}
+	l.Matched = json.RawMessage(matched)
+	l.Chains = json.RawMessage(chains)
+	if graphRead.Valid {
+		t := graphRead.Time
+		l.GraphReadAt = &t
+	}
+	return l, nil
 }
 
 // ListTaskIntelLinks 返回某发起方任务的全部勾连决策（新在前）。
 func (d *DB) ListTaskIntelLinks(ctx context.Context, taskID int64) ([]TaskIntelLink, error) {
 	rows, err := d.QueryContext(ctx, `
-SELECT id, project_id, task_id, related_task_id, decision, reason, matched, decided_by, created_at
+SELECT `+taskIntelLinkCols+`
 FROM task_intel_links WHERE task_id=$1 ORDER BY id DESC`, taskID)
 	if err != nil {
 		return nil, err
@@ -574,16 +674,10 @@ FROM task_intel_links WHERE task_id=$1 ORDER BY id DESC`, taskID)
 	defer rows.Close()
 	var out []TaskIntelLink
 	for rows.Next() {
-		var l TaskIntelLink
-		var matched []byte
-		if err := rows.Scan(&l.ID, &l.ProjectID, &l.TaskID, &l.RelatedTaskID,
-			&l.Decision, &l.Reason, &matched, &l.DecidedBy, &l.CreatedAt); err != nil {
+		l, err := scanTaskIntelLink(rows)
+		if err != nil {
 			return nil, err
 		}
-		if len(matched) == 0 {
-			matched = []byte(`[]`)
-		}
-		l.Matched = json.RawMessage(matched)
 		out = append(out, l)
 	}
 	return out, rows.Err()

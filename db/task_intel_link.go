@@ -28,6 +28,11 @@ type IntelTaskMatch struct {
 	TaskName     string `json:"task_name"`
 	FindingCount int    `json:"finding_count"`
 	IntentCount  int    `json:"intent_count"`
+	// MatchScore/MatchKind 只在模糊补漏（MatchTaskIntelFuzzy）时填：
+	// exact=1.0，fuzzy=段级相似度（0.6..0.95）。精确 JOIN 的行由调用方
+	// 按 kind 直接取分（EndpointHitScore）。
+	MatchScore float64 `json:"match_score,omitempty"`
+	MatchKind  string  `json:"match_kind,omitempty"`
 }
 
 // MatchTaskIntel 按【匹配键】命中 task_intel，排除当前任务。
@@ -80,7 +85,7 @@ SELECT id FROM projects WHERE reader_enabled = TRUE AND status = 'active')`
 	}
 
 	q := `SELECT ti.id, ti.project_id, ti.task_id, ti.kind, ti.key, ti.match_key, ti.value, ti.detail,
-       ti.source, ti.source_id, ti.created_at, ti.updated_at,
+       ti.source, ti.source_id, ti.rev, ti.created_at, ti.updated_at,
        COALESCE(t.name, ''),
        (SELECT COUNT(*) FROM findings f WHERE f.task_id = ti.task_id),
        (SELECT COUNT(*) FROM exploration_nodes en
@@ -103,7 +108,7 @@ ORDER BY ti.task_id, ti.kind, ti.key`
 		var detail []byte
 		var sourceID sql.NullInt64
 		if err := rows.Scan(&m.ID, &m.ProjectID, &m.TaskID, &m.Kind, &m.Key, &m.MatchKey, &m.Value, &detail,
-			&m.Source, &sourceID, &m.CreatedAt, &m.UpdatedAt,
+			&m.Source, &sourceID, &m.Rev, &m.CreatedAt, &m.UpdatedAt,
 			&m.TaskName, &m.FindingCount, &m.IntentCount); err != nil {
 			return nil, err
 		}
@@ -126,22 +131,16 @@ func (d *DB) TaskIntelLinkFor(ctx context.Context, taskID, relatedTaskID int64) 
 	if taskID <= 0 || relatedTaskID <= 0 {
 		return nil, nil
 	}
-	var l TaskIntelLink
-	var matched []byte
-	err := d.QueryRowContext(ctx, `
-SELECT id, project_id, task_id, related_task_id, decision, reason, matched, decided_by, created_at
-FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, taskID, relatedTaskID).
-		Scan(&l.ID, &l.ProjectID, &l.TaskID, &l.RelatedTaskID, &l.Decision, &l.Reason, &matched, &l.DecidedBy, &l.CreatedAt)
+	row := d.QueryRowContext(ctx, `
+SELECT `+taskIntelLinkCols+`
+FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, taskID, relatedTaskID)
+	l, err := scanTaskIntelLink(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if len(matched) == 0 {
-		matched = []byte(`[]`)
-	}
-	l.Matched = json.RawMessage(matched)
 	return &l, nil
 }
 
@@ -157,19 +156,26 @@ type TaskIntelLinkTrace struct {
 	Reason             string
 	Matched            json.RawMessage
 	DecidedBy          string
-	CreatedAt          time.Time
+	// 两级评分：审计要同时看到"为什么进候选"（SQL 分）和"为什么采纳"（LLM 分）。
+	MatchStrength     string
+	MatchScore        float64
+	MatchHits         int
+	RelevanceScore    int
+	RelevanceStrength string
+	Chains            json.RawMessage
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 	Direction          string // out=本任务发起，in=对端勾连本任务
 	RelatedTaskName    string
 	RelatedProjectID   sql.NullInt64
 	RelatedProjectName sql.NullString
 }
 
-// ListTaskIntelLinkTraces 返回与本任务相关的全部【已决】勾连记录（双向），
-// 按时间倒序。只连未删除的对端任务（已删档任务仍留在 links 表，但审计面展示
-// 无意义）。
+// ListTaskIntelLinkTraces 返回与本任务相关的全部勾连记录（双向），按时间倒序。
+// 只连未删除的对端任务（已删档任务仍留在 links 表，但审计面展示无意义）。
 //
-// decision='candidate' 是阅读者下钻过程中的中间态，不是结论：展示出来会被读
-// 成「确实存在这层关系」，所以在这里直接过滤（过滤发生在接口层，不改表）。
+// V11 起 candidate 也返回：用户要求审计能看到「所有候选的置信度评分和是否
+// 采纳」。过滤改在前端做（candidate 单独一组），不在接口层丢弃。
 func (d *DB) ListTaskIntelLinkTraces(ctx context.Context, taskID int64) ([]TaskIntelLinkTrace, error) {
 	if taskID <= 0 {
 		return nil, nil
@@ -177,7 +183,10 @@ func (d *DB) ListTaskIntelLinkTraces(ctx context.Context, taskID int64) ([]TaskI
 	rows, err := d.QueryContext(ctx, `
 SELECT l.id, l.project_id, l.task_id,
        CASE WHEN l.task_id = $1 THEN l.related_task_id ELSE l.task_id END,
-       l.decision, l.reason, l.matched, l.decided_by, l.created_at,
+       l.decision, l.reason, l.matched, l.decided_by,
+       l.match_strength, l.match_score, l.match_hits,
+       l.relevance_score, l.relevance_strength, l.chains,
+       l.created_at, l.updated_at,
        CASE WHEN l.task_id = $1 THEN 'out' ELSE 'in' END,
        COALESCE(rt.name, ''),
        rt.project_id,
@@ -187,7 +196,6 @@ JOIN tasks rt ON rt.id = CASE WHEN l.task_id = $1 THEN l.related_task_id ELSE l.
              AND rt.deleted_at IS NULL
 LEFT JOIN projects rp ON rp.id = rt.project_id
 WHERE (l.task_id = $1 OR l.related_task_id = $1)
-  AND l.decision <> 'candidate'
 ORDER BY l.created_at DESC, l.id DESC`, taskID)
 	if err != nil {
 		return nil, err
@@ -196,15 +204,23 @@ ORDER BY l.created_at DESC, l.id DESC`, taskID)
 	var out []TaskIntelLinkTrace
 	for rows.Next() {
 		var t TaskIntelLinkTrace
-		var matched []byte
+		var matched, chains []byte
 		if err := rows.Scan(&t.ID, &t.ProjectID, &t.TaskID, &t.RelatedTaskID, &t.Decision, &t.Reason, &matched,
-			&t.DecidedBy, &t.CreatedAt, &t.Direction, &t.RelatedTaskName, &t.RelatedProjectID, &t.RelatedProjectName); err != nil {
+			&t.DecidedBy,
+			&t.MatchStrength, &t.MatchScore, &t.MatchHits,
+			&t.RelevanceScore, &t.RelevanceStrength, &chains,
+			&t.CreatedAt, &t.UpdatedAt,
+			&t.Direction, &t.RelatedTaskName, &t.RelatedProjectID, &t.RelatedProjectName); err != nil {
 			return nil, err
 		}
 		if len(matched) == 0 {
 			matched = []byte(`[]`)
 		}
+		if len(chains) == 0 {
+			chains = []byte(`[]`)
+		}
 		t.Matched = json.RawMessage(matched)
+		t.Chains = json.RawMessage(chains)
 		out = append(out, t)
 	}
 	return out, rows.Err()
@@ -221,18 +237,25 @@ func (d *DB) SaveCandidateIntelLink(ctx context.Context, l TaskIntelLink) (id in
 	if len(matched) == 0 || !json.Valid(matched) {
 		matched = json.RawMessage(`[]`)
 	}
+	// 候选也带 SQL 打分：审计要能看到「为什么它进了候选、为什么另一条没进」。
 	err = d.QueryRowContext(ctx, `
-INSERT INTO task_intel_links(project_id, task_id, related_task_id, decision, reason, matched, decided_by)
-VALUES ($1,$2,$3,'candidate',$4,$5,'reader')
+INSERT INTO task_intel_links(project_id, task_id, related_task_id, decision, reason, matched, decided_by,
+                             match_strength, match_score, match_hits, updated_at)
+VALUES ($1,$2,$3,'candidate',$4,$5,'reader',$6,$7,$8, now())
 ON CONFLICT (task_id, related_task_id) DO UPDATE
 SET decision = 'candidate',
     reason = EXCLUDED.reason,
     matched = EXCLUDED.matched,
-    decided_by = EXCLUDED.decided_by
+    decided_by = EXCLUDED.decided_by,
+    match_strength = COALESCE(NULLIF(EXCLUDED.match_strength,''), task_intel_links.match_strength),
+    match_score = GREATEST(EXCLUDED.match_score, task_intel_links.match_score),
+    match_hits = GREATEST(EXCLUDED.match_hits, task_intel_links.match_hits),
+    updated_at = now()
 WHERE task_intel_links.decision NOT IN ('adopted','dismissed')
 RETURNING id`,
 		l.ProjectID, l.TaskID, l.RelatedTaskID,
-		truncateRunes(utf8Clean(l.Reason), 1000), string(matched)).Scan(&id)
+		truncateRunes(utf8Clean(l.Reason), 1000), string(matched),
+		strings.ToLower(strings.TrimSpace(l.MatchStrength)), l.MatchScore, l.MatchHits).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 已有 adopted/dismissed：保护生效，回读现有行 id 供调用方回报。
 		cur, qerr := d.TaskIntelLinkFor(ctx, l.TaskID, l.RelatedTaskID)

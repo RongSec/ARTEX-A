@@ -36,11 +36,21 @@ type ReaderTraceItem struct {
 	Decision           string             `json:"decision"`
 	Reason             string             `json:"reason"`
 	Matched            []ReaderTraceMatch `json:"matched"`
+	// 两级评分：match_* 是 SQL 命中分（进候选的依据），relevance_* 是阅读者
+	// 读完整图后的相关性分（暴露的依据）。审计要把两个都亮出来，否则看不出
+	// 「为什么进了候选却没采纳」。
+	MatchStrength     string          `json:"match_strength"`
+	MatchScore        float64         `json:"match_score"`
+	MatchHits         int             `json:"match_hits"`
+	RelevanceScore    int             `json:"relevance_score"`
+	RelevanceStrength string          `json:"relevance_strength"`
+	Chains            []db.ReaderChain `json:"chains"`
 	// ForeignHosts 是本条采纳带进发起方任务的外部资产 host（V9-SCOPE）。
 	// 只有 decision=adopted 才有；dismissed/候选恒为空数组。
 	ForeignHosts []string  `json:"foreign_hosts"`
 	DecidedBy    string    `json:"decided_by"`
 	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 	Direction    string    `json:"direction"` // out=本任务勾连别人，in=别人勾连本任务
 }
 
@@ -81,9 +91,16 @@ func (s *Server) taskReaderTraces(w http.ResponseWriter, r *http.Request) {
 			Decision:           row.Decision,
 			Reason:             row.Reason,
 			Matched:            decodeReaderTraceMatches(row.Matched),
+			MatchStrength:      row.MatchStrength,
+			MatchScore:         row.MatchScore,
+			MatchHits:          row.MatchHits,
+			RelevanceScore:     row.RelevanceScore,
+			RelevanceStrength:  row.RelevanceStrength,
+			Chains:             decodeReaderChains(row.Chains),
 			ForeignHosts:       []string{},
 			DecidedBy:          row.DecidedBy,
 			CreatedAt:          row.CreatedAt,
+			UpdatedAt:          row.UpdatedAt,
 			Direction:          row.Direction,
 		}
 		if row.Decision == "adopted" {
@@ -111,12 +128,34 @@ func (s *Server) taskReaderTraces(w http.ResponseWriter, r *http.Request) {
 		// 运行记录是附加信息：查不到不能让整个审计面失败。
 		runs = []db.ReaderLLMRun{}
 	}
+	// 下钻明细：审计的第二块——「采纳了谁」之外，还要看到「用了对方的哪几个点」。
+	// 查询失败同样降级为空数组，审计面不因附加信息缺失而整体 500。
+	drills, err := s.m.pg.ListReaderDrills(r.Context(), taskID)
+	if err != nil {
+		drills = []db.ReaderDrill{}
+	}
 	writeJSON(w, 200, map[string]any{
 		"task_id":       taskID,
 		"cross_task":    crossTask,
 		"cross_project": crossProject,
 		"runs":          runs,
+		"drills":        drills,
 	})
+}
+
+// decodeReaderChains 把 chains JSONB 收敛成结构化链摘要。坏行归一为空。
+func decodeReaderChains(raw json.RawMessage) []db.ReaderChain {
+	if len(raw) == 0 {
+		return []db.ReaderChain{}
+	}
+	var chains []db.ReaderChain
+	if err := json.Unmarshal(raw, &chains); err != nil {
+		return []db.ReaderChain{}
+	}
+	if chains == nil {
+		return []db.ReaderChain{}
+	}
+	return chains
 }
 
 // decodeReaderTraceMatches 把 matched JSONB 收敛成 {kind,key,value} 数组。

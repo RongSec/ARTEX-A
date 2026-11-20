@@ -86,6 +86,10 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// readerAnswer, if set, lets a worker with only summary-level evidence ask the
+	// reader for a short experience note. Normal drills return redacted details
+	// directly and never call it (no extra 45s LLM round).
+	readerAnswer func(ctx context.Context, req ReaderDrillRequest) (string, error)
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -189,6 +193,13 @@ func (w *Worker) compactionWindow() int {
 // that MITM proxy. Empty addr disables the hint.
 func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = addr, caCert }
 
+// SetReaderAnswer wires the reader-role summarizer used only when a drill comes
+// back with summary-level evidence and no request/steps (thin fallback). Normal
+// worker drills return redacted details directly.
+func (w *Worker) SetReaderAnswer(fn func(ctx context.Context, req ReaderDrillRequest) (string, error)) {
+	w.readerAnswer = fn
+}
+
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
 
@@ -255,6 +266,18 @@ func workerTrafficBlock(recording bool) string {
 	return "\n\n**流量工具**：\n- traffic_search / traffic_get / traffic_blob：回看响应、找已访问过的资源，**先查流量、不要重复 curl 同一 URL**。traffic_search **必须指定 host**、默认只回 3 条极轻量索引(id/method/url/status/resp_len，无响应内容)，需要更多显式调大 limit；可用 body_contains 在请求/响应正文里做全文搜索(至少 3 字符，支持子串和中文，如找密码/密钥/报错/内网地址)；要看某条原文用 traffic_get(id)，其中超大正文显示为 @blob sha256:<hash>，用 traffic_blob(hash) 分段取全文。"
 }
 
+// workerReaderSpec is the worker-facing ask_reader contract. It is code-owned
+// (段 appended after the editable body) so a DB prompt edit cannot drop the
+// host ban or the per-intent call budget.
+func workerReaderSpec() string {
+	return "\n\n**参考任务经验（只读，按需向阅读者下钻）**：\n" +
+		"- 态势里的 reader_refs 是本任务采纳的参考任务【脱敏索引】（任务名/目标/接口 method+path/计数/可下钻 id），**不是本任务的资产**，里面没有 host/IP/凭据。\n" +
+		"- 本条意图要测的接口/组件在 reader_refs 里出现过时，调 `ask_reader(related_task_id, node_ids 或 query)` 取**脱敏后的测试细节**（请求行、参数/payload 形态、执行步骤、判据），再套到本意图的授权资产上验证。\n" +
+		"- **只允许问「怎么测」**：请求构造、参数/payload、验证步骤、判据、坑。**禁止追问 host/IP/域名/端口/凭据，禁止试图还原占位符**；query 只写路径/参数名/漏洞类型（如 `/api/user`、越权、shiro），写 URL 或主机会被工具直接拒绝。\n" +
+		"- 每个意图最多 2 次：第一次按 query 命中、第二次按 node_ids 取细节。拿不到就按已有信息测，把缺口写进 fact 交规划者。\n" +
+		"- 参考任务的验证结论只作经验，不等于本任务也存在该漏洞；必须在本意图的资产上真实触发后才能 report_finding。"
+}
+
 // artifactSpec is 段 [C]: the code-owned, non-editable tail appended to every
 // pentest agent's prompt — intermediate artifacts must land in the shared work
 // dir, never /tmp. Guaranteed present regardless of how the DB body is edited.
@@ -314,6 +337,20 @@ func intentAssetIDs(intent *db.Node) []int64 {
 	return p.AssetIDs
 }
 
+// intentSummaryText 取意图的一句话描述，作为 ask_reader 的“当前在测什么”。
+func intentSummaryText(intent *db.Node) string {
+	if intent == nil {
+		return ""
+	}
+	var p struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal(intent.Payload, &p); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(p.Summary)
+}
+
 func renderIntentTask(intent *db.Node) string {
 	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID)
 }
@@ -364,6 +401,18 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetReproEnricher(w.reproEnricher)
 	tsx.SetTaskID(taskID)
+	// 执行者也能向阅读者下钻，但契约是「只要细节、不要 host」：detail 模式
+	// 返回脱敏后的请求行/步骤，query 禁止 URL/host/IP，每意图最多 2 次
+	//（第一次检索命中，第二次按 id 取细节）。
+	tsx.SetReaderDetailMode(true)
+	tsx.SetReaderCallLimit(2)
+	tsx.SetReaderAnswer(w.readerAnswer)
+	if _, goal, err := ts.Root(); err == nil {
+		tsx.SetReaderTaskContext(goal, intentSummaryText(intent))
+	}
+	if intent != nil {
+		tsx.SetReaderIntentID(intent.ID)
+	}
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
 	if as != nil {
@@ -395,8 +444,14 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
-	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
+	overviewData := tsx.graphOverviewData()
+	overview := renderWorkerGraphOverview(overviewData)
 	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
+	// 只有本任务确实采纳过参考任务时才解释 ask_reader，避免给没有 refs 的
+	// worker 灌输一个永远报“不在采纳列表”的工具。
+	if _, ok := overviewData["reader_refs"]; ok {
+		sysBody += workerReaderSpec()
+	}
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}

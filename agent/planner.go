@@ -387,13 +387,13 @@ func plannerSystem(goal, dataDir, workDir string) string {
 	return body + artifactSpec(workDir) + plannerLinkGuidance
 }
 
-// plannerLinkGuidance 是 V9-READER 的固定指引（代码所有，不可在 prompt 页编辑）：
-// 相关任务的经验由阅读者判定后以 hint 形式下发，规划者直接采信，不再自己申请/
-// 下钻/核对旧任务——规划者的上下文只花在当前任务上。
-const plannerLinkGuidance = "\n\n**相关任务经验（直接采信）**：相关任务的经验由阅读者判定后以 hint 形式给你，**直接采信**：hint 里写了来源任务、关联理由和可复用要点，不要再调用勾连工具、不要自己下钻核对；若 hint 与当前目标冲突，按 hint 里的要点验证而不是重读旧任务。" +
-	"\n**reader_refs（经验索引，不是资产）**：graph_overview.reader_refs 里的参考任务只给脱敏索引——任务概述、接口 method+path、五类计数、可下钻 id。需要具体测法（参数怎么构造、验什么、判据）时调 ask_reader(related_task_id, node_ids 或 query)，它返回阅读者总结的测试方法论；不要直接打 reader_refs 里的接口，那些 host 属于别的任务。" +
-	"\n**ask_reader 是规划者工具（硬规则）**：worker 没有这个工具。需要方法论时，你在本轮规划里直接调用 ask_reader 并把它返回的 methodology 写进意图的 summary/约束，不要把「调用 ask_reader」派成一条意图——worker 调不到，只会白跑一轮。" +
-	"\n\n**经验参考的授权边界（硬规则）**：阅读者给的 hint 是**经验参考**（reference_only=true），其中的资产不属于本任务授权范围。被勾连任务的外部资产已写入本任务的禁止访问清单，由执行层硬拦（hint 不再列出具体地址）；要把经验用到**本任务已有资产**上。确需扩到新资产，先由本任务正常登记资产后再打。"
+// plannerLinkGuidance 是 V11-WORKER-READER 的固定指引（代码所有，不可在 prompt 页编辑）：
+// hint 只给方向，参考图是只读索引；具体测法由执行者在意图里用 ask_reader 向阅读者
+// 下钻。规划者不重读旧任务，但可以按被暴露的接口安排 worker 做可能性测试。
+const plannerLinkGuidance = "\n\n**相关任务经验（方向 vs 细节）**：hint 是阅读者判定后给你的一轮性【方向提示】（来源任务、关联理由、可复用要点），照着它决定往哪测；它不是可直接执行的细节，别把 hint 当测试步骤。" +
+	"\n**reader_refs（只读、脱敏的参考图）**：graph_overview.reader_refs 是本任务采纳的参考任务索引——任务概述、接口 method+path、**链摘要 chains**（入口 → 中间结论 → 终点，带 verified）、五类计数、可下钻 id，**没有 host/IP/凭据**；每条都标了 readonly=true、drill_via=reader。用 chains 判断「这条利用链能不能迁移到我的目标上」，用 endpoints 判断「这个接口对方测过没有」；endpoints_total/truncated 说明接口表是窗口不是全表。**不要直接打 reader_refs 里的接口**，那些 host 属于别的任务。" +
+	"\n**ask_reader 规划者和 worker 都有**：你写意图时把目标接口/组件、要验证的假设写清楚，执行者会自己用 ask_reader(related_task_id, node_ids 或 query) 向阅读者下钻【脱敏后的测试细节】；你只在“规划本身需要判断可行性/判据”时才自己下钻。**不要把“调用 ask_reader”单独派成一条意图**——那是白跑一轮，工具要在具体测试语境里用。" +
+	"\n\n**经验参考的授权边界（硬规则）**：阅读者给的 hint 是**经验参考**（reference_only=true），其中的资产不属于本任务授权范围。被勾连任务的外部资产已写入本任务的禁止访问清单（foreign_hosts），**禁止对 foreign_hosts 里的地址发起任何请求/扫描/利用**，由执行层硬拦（hint 不再列出具体地址）；要把经验用到**本任务已有资产**上。确需扩到新资产，先由本任务正常登记资产后再打。"
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution
 // steps (so users can see how it reads the situation and judges goals — the
@@ -420,6 +420,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tsx.SetShellGate(shellGateFor(ts)) // prove_goal 的 shell 目标校验（T03，查库抖动宁放过）
 	tsx.killWork = p.killWork          // enable kill_work tool (nil = unavailable)
 	tsx.readerAnswer = p.readerAnswer  // ask_reader → 阅读者总结（nil = 只回脱敏证据）
+	tsx.SetReaderTaskContext(goal, "")  // 下钻时告诉阅读者“当前任务目标”，便于裁剪经验
 	tsx.steerWork = p.steerWork        // enable steer_work tool (nil = unavailable)
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)

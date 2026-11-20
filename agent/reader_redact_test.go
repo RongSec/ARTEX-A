@@ -38,3 +38,49 @@ func TestRequestsIn(t *testing.T) {
 		t.Fatalf("请求行不对: %v", got)
 	}
 }
+
+// TestWorkerAskReaderContract 锁住 worker 侧的两条硬约束：工具必须在
+// WorkerTools 里，提示词必须写明「只要方法/只许路径/禁止 host/每意图 2 次」。
+func TestWorkerAskReaderContract(t *testing.T) {
+	names := map[string]bool{}
+	for _, tool := range NewToolSet(nil, "worker").WorkerTools() {
+		names[tool.Name()] = true
+	}
+	if !names["ask_reader"] {
+		t.Fatal("WorkerTools 必须包含 ask_reader（worker 要能向阅读者下钻）")
+	}
+	spec := workerReaderSpec()
+	for _, want := range []string{"只允许问", "禁止追问 host", "query 只写路径", "最多 2 次"} {
+		if !strings.Contains(spec, want) {
+			t.Errorf("worker 阅读者规约缺少 %q: %s", want, spec)
+		}
+	}
+}
+
+// TestReaderHostQueryGuard 断言 worker 的 query 不能夹带 URL/host/IP。
+func TestReaderHostQueryGuard(t *testing.T) {
+	for _, q := range []string{"http://oa.example.com/api", "10.0.0.5", "admin.corp.local"} {
+		if !reReaderHostRef.MatchString(q) {
+			t.Errorf("应拦截含 host/IP 的 query: %q", q)
+		}
+	}
+	for _, q := range []string{"/api/user", "越权", "shiro"} {
+		if reReaderHostRef.MatchString(q) {
+			t.Errorf("不应误拦纯路径/漏洞类型: %q", q)
+		}
+	}
+}
+
+// TestHasConcreteReaderEvidence 区分「有请求行/步骤/正文」和「只有摘要」：
+// 只有后者才值得再走一次阅读者 LLM 总结。
+func TestHasConcreteReaderEvidence(t *testing.T) {
+	if hasConcreteReaderEvidence([]ReaderDrillNode{{Summary: "同构接口"}}) {
+		t.Fatal("只有摘要应判为证据不足")
+	}
+	if !hasConcreteReaderEvidence([]ReaderDrillNode{{Requests: []string{"POST /api/login"}}}) {
+		t.Fatal("有请求行应判为足够")
+	}
+	if !hasConcreteReaderEvidence([]ReaderDrillNode{{Steps: []string{"curl · 200"}}}) {
+		t.Fatal("有执行步骤应判为足够")
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/sidequestion"
 )
 
@@ -478,6 +479,12 @@ func (s *Server) runConversation(c *db.Conversation, msg, busyKey string, userMe
 // for completion before starting the next queued fire for the same agent.
 func (s *Server) runConversationSync(c *db.Conversation, msg, busyKey string) {
 	ctx, cancel := s.conversationRunContext(c.ID, busyKey)
+	// 触发型会话（reader/observer/reporter…）的 session 不是 exp<N>-<role>，llmrec
+	// 解析不出 lane，记录会写成 worker=''。这里按 agent key 显式打标，让「阅读者
+	// 判案用了哪些调用」能在 LLM 记录页单独筛出来。
+	if c.AgentKey != "" {
+		ctx = llmrec.WithWorker(ctx, c.AgentKey)
+	}
 	s.runConversationTurn(ctx, cancel, c, msg, busyKey)
 }
 

@@ -173,10 +173,14 @@ ORDER BY id DESC LIMIT $`+fmt.Sprint(len(args)), args...)
 
 			// 情报表：接口是「重合度」的主证据；其余四类给 key，供阅读者比对。
 			intel := s.readerIntelFull(taskID)
+			// 边：判案时要能看出对方「哪条链走通了、哪条断了」。采纳时写的
+			// chains（entry→steps→outcome）就是从这张边表整理出来的——只看
+			// 节点列表看不出先后与产出关系。
+			edges := s.readerGraphEdges(expID, 400)
 			out := map[string]any{
 				"task_id": taskID, "project_id": projectID,
 				"name": name, "goal": clipRunes(goal, 400), "status": status,
-				"nodes": nodeOut, "intel": intel,
+				"nodes": nodeOut, "intel": intel, "edges": edges,
 			}
 			if truncated || budget <= 0 {
 				out["truncated"] = true
@@ -184,6 +188,45 @@ ORDER BY id DESC LIMIT $`+fmt.Sprint(len(args)), args...)
 			}
 			return jsonResult(out)
 		})
+}
+
+// readerGraphEdges 读探索图的边（src/rel/dst），给阅读者判「哪条链走通了」。
+// 只给 id 三元组 + 两端节点的一句话摘要：摘要让模型不用再猜 id 是什么，
+// 又不会把正文重复灌一遍（正文已经在 nodes 里）。
+func (s *Server) readerGraphEdges(expID int64, limit int) []map[string]any {
+	if expID <= 0 {
+		return nil
+	}
+	if limit <= 0 || limit > 800 {
+		limit = 400
+	}
+	rows, err := s.m.pg.Query(`
+SELECT e.src_id, e.rel, e.dst_id,
+       COALESCE(sn.kind,''), COALESCE(sn.payload->>'summary',''),
+       COALESCE(dn.kind,''), COALESCE(dn.payload->>'summary','')
+FROM exploration_edges e
+LEFT JOIN exploration_nodes sn ON sn.id = e.src_id
+LEFT JOIN exploration_nodes dn ON dn.id = e.dst_id
+WHERE e.exploration_id=$1
+ORDER BY e.src_id, e.dst_id LIMIT $2`, expID, limit)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var src, dst int64
+		var rel, srcKind, srcSum, dstKind, dstSum string
+		if rows.Scan(&src, &rel, &dst, &srcKind, &srcSum, &dstKind, &dstSum) != nil {
+			continue
+		}
+		out = append(out, map[string]any{
+			"from": src, "rel": rel, "to": dst,
+			"from_kind": srcKind, "from_summary": clipRunes(srcSum, 80),
+			"to_kind": dstKind, "to_summary": clipRunes(dstSum, 80),
+		})
+	}
+	return out
 }
 
 // readerIntentSteps 读一个意图的 activity（工具 + 摘要），过滤思考/用量行。

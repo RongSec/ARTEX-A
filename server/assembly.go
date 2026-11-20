@@ -266,7 +266,14 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 			if len(row.Schema) > 0 {
 				_ = json.Unmarshal(row.Schema, &schema)
 			}
-			return meterTool(agent.DecorateTool(t, row.Description, schema), pg, row.Key, agentKey, runInfo)
+			desc := row.Description
+			// ask_reader 的描述按角色不同：planner=方法论，worker=脱敏细节且
+			// 禁止 host/IP/URL。DB 里只有一份（planner 版），worker 必须用代码里
+			// 的角色描述，否则模型会按“规划者要方法论”的旧契约调用。
+			if row.Key == "ask_reader" && agentKey == "worker" {
+				desc = t.Description()
+			}
+			return meterTool(agent.DecorateTool(t, desc, schema), pg, row.Key, agentKey, runInfo)
 		}
 		out := tools[:0:0]
 		for _, t := range tools {

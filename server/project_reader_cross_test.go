@@ -30,8 +30,9 @@ func TestReaderPromptUpgradeFor(t *testing.T) {
 		{"V6 统一版旧默认", readerUnifiedPromptV6, readerPromptReplace},
 		{"V7-LINK 旧默认", readerUnifiedPrompt, readerPromptReplace},      // V8-NAME 起升级到新称谓版
 		{"V8-NAME 旧默认", readerUnifiedPromptNames, readerPromptReplace}, // V9-READER 起升级到下钻判定版
-		{"V9-READER 旧默认", readerUnifiedPromptV9, readerPromptReplace}, // V10 起升级到读图判定版
-		{"V10-READER 当前默认", readerUnifiedPromptV10, readerPromptKeep},
+		{"V9-READER 旧默认", readerUnifiedPromptV9, readerPromptReplace}, // V11 起升级到评分版
+		{"V10-READER 旧默认", readerUnifiedPromptV10, readerPromptReplace}, // V11 起升级到评分版
+		{"V11-READER3 当前默认", readerUnifiedPromptV11, readerPromptKeep},
 		{"用户编辑过", readerPromptV1 + "\n补充：只看 443 端口。", readerPromptKeep},
 		{"用户全新正文", "自定义阅读者", readerPromptKeep},
 	}
@@ -54,6 +55,14 @@ func TestReaderPromptUpgradeFor(t *testing.T) {
 	if !strings.Contains(readerUnifiedPromptV9, "不要把未判定的候选丢给规划者") ||
 		!strings.Contains(readerUnifiedPromptV9, "最多判定 3 个候选") {
 		t.Fatal("V9-READER 默认正文缺少下钻判定工作流关键约束")
+	}
+	if readerUnifiedPromptV11 == readerUnifiedPromptV10 {
+		t.Fatal("V11 默认正文与 V10 相同：两级评分升级无从发生")
+	}
+	for _, want := range []string{"relevance_score", "chains", "match_score", "since_rev"} {
+		if !strings.Contains(readerUnifiedPromptV11, want) {
+			t.Fatalf("V11 默认正文缺少关键字段 %q", want)
+		}
 	}
 }
 

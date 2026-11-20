@@ -85,6 +85,22 @@ type ToolSet struct {
 	// test methodology (one LLM call). nil = deterministic redacted dump only.
 	// Wired by the server (task LLM chain) via Planner.SetReaderAnswer.
 	readerAnswer func(ctx context.Context, req ReaderDrillRequest) (string, error)
+	// readerDetailMode 把 ask_reader 从「规划者要方法论」切到「执行者要细节」：
+	// 默认 limit 8、detail 截断更宽、返回 items 而非 methodology，并禁止 query
+	// 里出现 URL/host/IP。worker 专属；planner 保持零变化。
+	readerDetailMode bool
+	// readerCallLimit/readerCalls 是每次 run 的调用上限（worker 默认 2）：
+	// 第一次按 query 命中、第二次按 id 取细节，足够；防止把 45s 的 LLM 调用
+	// 当成常规工具刷。
+	readerCallLimit int
+	readerCalls     int
+	// readerGoal/readerIntent 是当前任务目标与本轮意图，随下钻请求交给阅读者，
+	// 让它裁剪经验而不是平铺参考任务的全部细节。
+	readerGoal   string
+	readerIntent string
+	// readerIntentID 是当前 worker 领到的意图 id（0 = 规划者/无意图）。下钻审计
+	// 靠它回答「这条经验被哪条意图用了」——只有 task_id 不够，一个任务几十条意图。
+	readerIntentID int64
 	// notify, if set, wakes the task's planner after a graph change that should be
 	// re-planned promptly (currently: a new hint). nil = no wake (the hint is still
 	// stored and read on the next round triggered by other events). debounced.
@@ -175,6 +191,29 @@ func (t *ToolSet) Writes() WriteCounts { return t.writes }
 
 func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 	return &ToolSet{ts: ts, worker: worker}
+}
+
+// SetReaderDetailMode switches ask_reader to the worker-facing contract:
+// redacted details instead of a planner methodology, with host/URL guards and a
+// per-run call limit. Call before WorkerTools() so the tool description matches.
+func (t *ToolSet) SetReaderDetailMode(on bool) { t.readerDetailMode = on }
+
+// SetReaderCallLimit caps ask_reader calls for this run (<=0 = unlimited).
+func (t *ToolSet) SetReaderCallLimit(n int) { t.readerCallLimit = n }
+
+// SetReaderTaskContext records what this run is trying to do, so the reader can
+// tailor the experience to the current goal/intent instead of dumping everything.
+func (t *ToolSet) SetReaderTaskContext(goal, intent string) {
+	t.readerGoal, t.readerIntent = strings.TrimSpace(goal), strings.TrimSpace(intent)
+}
+
+// SetReaderIntentID records which intent this run is executing (0 = planner).
+func (t *ToolSet) SetReaderIntentID(id int64) { t.readerIntentID = id }
+
+// SetReaderAnswer wires the reader-role summarizer for this tool set (worker's
+// thin-evidence fallback path). Planner wires its own copy on the Planner struct.
+func (t *ToolSet) SetReaderAnswer(fn func(ctx context.Context, req ReaderDrillRequest) (string, error)) {
+	t.readerAnswer = fn
 }
 
 // SetTaskID sets the PG task id on this ToolSet so that report_finding can
