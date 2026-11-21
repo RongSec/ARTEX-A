@@ -30,7 +30,6 @@ import (
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/guard"
-	"github.com/Autumn-27/artex/redact"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -43,10 +42,8 @@ const (
 	readerLinkHintMaxHits = 6
 	// readerLinkHintMaxRows 是无 matched 入参时从被采纳任务情报表取的行数上限。
 	readerLinkHintMaxRows = 8
-	// readerLinkHintMaxPoints 是 hint 里「可复用要点」的条数上限。
-	readerLinkHintMaxPoints = 8
-	// readerLinkHintMaxFacts 是 hint 里「关键事实摘要」的条数上限。
-	readerLinkHintMaxFacts = 3
+	// readerLinkHintMaxOverlap 是 hint 里「重合接口」的条数上限。
+	readerLinkHintMaxOverlap = 4
 	// readerLinkDecidedBy 是 V9-READER 起勾连决策的决策者标记。
 	readerLinkDecidedBy = "reader"
 )
@@ -536,16 +533,15 @@ func aggregateReaderLinkCandidates(matches []db.IntelTaskMatch, limit int) ([]re
 func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 	return wrTool("adopt_related_task",
 		"阅读者专用：你读完【发起方任务】与【被勾连任务】两边上下文（get_task_graph_digest，读摘要不读全文）后，判定两者相关（同一攻击面/同一资产可复用/同一利用链）时调用。"+
-			"记 decision=adopted，并把被勾连任务的可复用要点写成结构化 hint 写进发起方任务图，唤醒其规划者。"+
-			"注意：hint 只在发起方一轮上下文里有效，只作方向；后续细节由规划者/执行者用 ask_reader 向你下钻（你只回脱敏后的测试细节/方法）。"+
+			"记 decision=adopted，并写一条【方向提示】hint（来源任务+相关性分+重合接口）唤醒发起方规划者。"+
+			"注意：hint 不承载测法（不写请求/参数/凭据），只在发起方一轮上下文里有效；细节由规划者/执行者用 ask_reader 向你下钻。"+
+			"必须给 relevance_score（1-100，读完两张完整图后的判断），没有分数不接受采纳。"+
 			"无关的候选请用 dismiss_related_task；重复采纳同一对任务是幂等的（不重复写 hint）。",
 		objSchema(map[string]any{
 			"task_id":            strParam("发起方任务 id：本轮图变更消息里的 task_id（要被暴露情报、被唤醒规划者的任务）"),
 			"related_task_id":    strParam("被勾连任务 id：情报来源任务（读到的旧任务）"),
 			"reason":             strParam("判定相关的理由：必须写「读到了什么」（如两边都有未授权 /api/user/{id} 且旧任务已验证越权），不能只写「键相同」"),
-			"strength":           map[string]any{"type": "string", "enum": []any{"strong", "medium", "weak"}, "description": "关联强度（兼容字段）：同一利用链=strong / 同一资产可复用=medium / 同一攻击面待验证=weak。新调用请用 relevance_score"},
-			"relevance_score":    map[string]any{"type": "integer", "description": "读完两边完整图后的相关性评分 0-100：≥60 strong / 40-59 medium / <40 不采纳。暴露门槛是 medium（40），低于它请改用 dismiss_related_task"},
-			"relevance_strength": map[string]any{"type": "string", "enum": []any{"strong", "medium", "weak"}, "description": "相关性档位（可选，最终以 relevance_score 推算为准）"},
+			"relevance_score":    map[string]any{"type": "integer", "description": "必填：读完两边完整图后的相关性评分 1-100（≥60 strong / 40-59 medium / <40 不采纳）。没有分数就不许采纳——档位兜底会把分数写成固定值，审计会失真"},
 			"chains": map[string]any{"type": "array", "description": "读到并确认可迁移的利用链摘要（最多 6 条）。规划者靠它判断值不值得迁移，不靠原始边 id", "items": objSchema(map[string]any{
 				"entry":    strParam("入口，如 GET /api/sso/userinfo"),
 				"steps":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "中间结论，2-4 条短句"},
@@ -564,12 +560,11 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 				TaskID        json.RawMessage `json:"task_id"`
 				RelatedTaskID json.RawMessage `json:"related_task_id"`
 				Reason        string          `json:"reason"`
-				Strength      string          `json:"strength"`
-				// 第二级评分：阅读者读完两张完整图后的相关性判断。这是暴露门槛。
-				RelevanceScore    int              `json:"relevance_score"`
-				RelevanceStrength string           `json:"relevance_strength"`
-				Chains            []db.ReaderChain `json:"chains"`
-				Matched           []readerLinkHit  `json:"matched"`
+				// 第二级评分：阅读者读完两张完整图后的相关性判断。这是暴露门槛，
+				// 必填——不再接受从 strength 档位反推（那会把分数写成 70/50/30 的固定值）。
+				RelevanceScore int              `json:"relevance_score"`
+				Chains         []db.ReaderChain `json:"chains"`
+				Matched        []readerLinkHit  `json:"matched"`
 			}
 			_ = json.Unmarshal(in, &a)
 			taskID, tctx, err := s.taskIntelLinkTarget(ctx, a.TaskID)
@@ -584,25 +579,12 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 			if reason == "" {
 				return actool.Errorf("reason 必填：写清读到了什么（不能只写键相同）"), nil
 			}
-			rawStrength := strings.ToLower(strings.TrimSpace(a.Strength))
-			relStrength := strings.ToLower(strings.TrimSpace(a.RelevanceStrength))
 			score := a.RelevanceScore
 			if score <= 0 {
-				// 兼容旧调用：没给分数就按档位映射。两个都没给 → 拒绝，不允许
-				// "读完图但说不出相关性"的采纳——那正是评分机制要挡的。
-				switch {
-				case relStrength == "strong" || rawStrength == "strong":
-					score = 70
-				case relStrength == "medium" || rawStrength == "medium":
-					score = 50
-				case relStrength == "weak" || rawStrength == "weak":
-					score = 30
-				default:
-					return actool.Errorf("必须给 relevance_score（0-100）：读完两张完整图后的相关性评分。≥60 才暴露；40-59 可采纳但需说明；<40 请用 dismiss_related_task"), nil
-				}
-			}
-			if score < 0 {
-				score = 0
+				// 不接受「读完图但说不出相关性」的采纳，也不再用档位兜底：旧逻辑
+				// 会把 strong 写成固定 70，审计里看起来像真打了分（实测 3 条采纳
+				// 只有 1 条真给分）。
+				return actool.Errorf("必须给 relevance_score（1-100）：读完两张完整图后的相关性评分。≥60 才暴露；40-59 可采纳但需说明；<40 请用 dismiss_related_task。档位（strength）不再兜底分数"), nil
 			}
 			if score > 100 {
 				score = 100
@@ -610,16 +592,11 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 			if score < 40 {
 				return actool.Errorf(fmt.Sprintf("relevance_score=%d 低于暴露门槛（medium=40）：不要 adopt。请用 dismiss_related_task 并写明「还缺什么证据」", score)), nil
 			}
-			switch {
-			case score >= 60:
+			relStrength := "medium"
+			if score >= 60 {
 				relStrength = "strong"
-			default:
-				relStrength = "medium"
 			}
-			strength, err := normalizeReaderLinkStrength(rawStrength)
-			if err != nil {
-				return actool.Errorf(err.Error()), nil
-			}
+			strength := relStrength
 			chains := a.Chains
 			if len(chains) == 0 {
 				// 链摘要是规划者判断「值不值得迁移」的唯一依据（它看不到原始边）。
@@ -673,7 +650,6 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 				s.noteReaderDecision(ctx, "adopted", fmt.Sprintf("%d:%d", taskID, relatedID))
 				return actool.Text(fmt.Sprintf("任务#%d ↔ #%d 已是 adopted，决策与明细已更新；hint 不重复写入", taskID, relatedID)), nil
 			}
-			points, facts := s.reusableIntelForTask(ctx, relatedID)
 			srcName := strings.TrimSpace(rt.Name)
 			if srcName == "" {
 				srcName = strings.TrimSpace(rt.Description)
@@ -681,7 +657,7 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 			hintID, err := s.writeReaderAdoptHint(ctx, taskID, readerAdoptHint{
 				SourceTaskID: relatedID, SourceTaskName: srcName,
 				SourceProjectID: rctx.ProjectID, SourceProjectName: rctx.ProjectName,
-				Strength: strength, Reason: reason, Points: points, Facts: facts,
+				Strength: strength, Score: score, Overlap: overlapEndpoints(matched, readerLinkHintMaxOverlap),
 				ForeignHosts: foreignHosts, LinkID: linkID,
 			})
 			s.noteReaderDecision(ctx, "adopted", fmt.Sprintf("%d:%d", taskID, relatedID))
@@ -743,26 +719,23 @@ func (s *Server) toolDismissRelatedTask() actool.CoreTool {
 		})
 }
 
-func normalizeReaderLinkStrength(s string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "":
-		return "strong", nil
-	case "strong", "medium", "weak":
-		return strings.ToLower(strings.TrimSpace(s)), nil
-	}
-	return "", fmt.Errorf("strength 只能是 strong/medium/weak")
-}
-
 // readerAdoptHint 是写进发起方任务图的结构化 hint 内容。
+//
+// V11-READER4（用户口径）：hint 只是「往哪看」的方向提示，**不承载测法**。
+// 早期版本把被勾连任务的可复用要点、关键事实、凭据掩码都塞进 hint，结果是
+// 执行者照 hint 就能复述结论，ask_reader 反而没人调（实测一轮里 3 次下钻全是
+// 人工注入）。细节应当由执行者按意图下钻，且下钻后必须做本任务自己的验证。
 type readerAdoptHint struct {
 	SourceTaskID      int64
 	SourceTaskName    string
 	SourceProjectID   int64
 	SourceProjectName string
 	Strength          string
-	Reason            string
-	Points            []string
-	Facts             []string
+	// Score 是阅读者读完两张完整图后的相关性评分（暴露门槛，不再是档位兜底）。
+	Score int
+	// Overlap 是两边撞上的接口（METHOD /path，已脱敏），最多 4 条。
+	// 规划者靠它把「本轮要测的端点」和「参考任务测过的端点」对上。
+	Overlap []string
 	// ForeignHosts 是被勾连任务情报表（task_intel kind=asset）里的资产 host。
 	// 它们只是经验参考的对象，不属于发起方任务授权范围（V9-SCOPE）。
 	ForeignHosts []string
@@ -793,9 +766,8 @@ SELECT exploration_id, COALESCE(project_id,0) FROM tasks WHERE id=$1 AND deleted
 		"source_project_id":   h.SourceProjectID,
 		"source_project_name": h.SourceProjectName,
 		"strength":            h.Strength,
-		"reason":              redact.TestMethod(h.Reason),
-		"reusable_points":     redactStrings(h.Points),
-		"key_facts":           redactStrings(h.Facts),
+		"relevance_score":     h.Score,
+		"overlap_endpoints":   h.Overlap,
 		"link_id":             h.LinkID,
 	}
 	id, err := s.m.pg.Exploration(expID).AddNode(db.KindHint, payload, 0, "active", "reader", nil)
@@ -805,20 +777,79 @@ SELECT exploration_id, COALESCE(project_id,0) FROM tasks WHERE id=$1 AND deleted
 	// 图变更事件：让项目级阅读者水位看到这条 hint（也让审计能追到）。
 	if projectID > 0 {
 		_ = s.m.pg.InsertGraphEvent(ctx, projectID, taskID, id, db.KindHint,
-			fmt.Sprintf("阅读者采纳任务#%d（%s）：%s", h.SourceTaskID, h.Strength, firstLine(h.Reason, 120)))
+			fmt.Sprintf("阅读者采纳任务#%d（%s，相关性 %d）：重合接口 %s",
+				h.SourceTaskID, h.Strength, h.Score, strings.Join(h.Overlap, "、")))
 	}
 	// 任务在跑就立刻唤醒规划者；暂停的任务只落图，恢复后第一轮就能读到。
 	if t, ok := s.m.Task(strconv.FormatInt(taskID, 10)); ok && t != nil {
 		t.NotifyHint([]string{text})
+		// 光唤醒规划者不够：worker 是长 run，它的 system prompt 在启动时就固定了，
+		// 采纳完成时它可能已经跑了几十秒（实测 17:57:23 的 ask_reader(136) 被拒，
+		// 17:58:14 才 adopt）。adopt 的瞬间给所有 running 意图排一条纠正消息，
+		// worker 下一步就能拿到下钻入口，不用等下一轮或人工注入。
+		s.steerWorkersOnAdopt(ctx, expID, h)
 	}
 	return id, nil
 }
 
-// renderReaderAdoptHint 是纯函数：规划者读到的 hint 正文。所有可采信信息
-// （来源/强度/理由/要点/事实）都写在 text 里——graph_overview 只渲染 text。
+// steerWorkersOnAdopt 在采纳落库后，给本任务所有 running 意图注入一条「可以下钻了」
+// 的指令。只做通知，不改意图：worker 仍按自己的意图走，只是知道了入口和两段要求。
+func (s *Server) steerWorkersOnAdopt(ctx context.Context, expID int64, h readerAdoptHint) {
+	if s.engine == nil || expID <= 0 || h.SourceTaskID <= 0 {
+		return
+	}
+	nodes, err := s.m.pg.Exploration(expID).ListByKind(db.KindIntent, 50)
+	if err != nil {
+		return
+	}
+	overlap := strings.Join(h.Overlap, "、")
+	if overlap == "" {
+		return // 没有重合接口 = 没什么可借的，别拿噪音打扰 worker
+	}
+	// 只通知「可能用得上」的意图：summary 里出现任一重合接口的路径。否则一次采纳
+	// 会给所有 running 意图都塞一条无关消息，5 条采纳就是 5 条噪音。
+	paths := make([]string, 0, len(h.Overlap))
+	for _, ep := range h.Overlap {
+		if i := strings.IndexByte(ep, ' '); i > 0 {
+			ep = strings.TrimSpace(ep[i+1:])
+		}
+		if ep = strings.ToLower(strings.TrimSpace(ep)); ep != "" {
+			paths = append(paths, ep)
+		}
+	}
+	msg := fmt.Sprintf("阅读者已采纳任务#%d（相关性 %d/100，重合接口 %s）。现在可以 ask_reader(%d, query=\"/api/...\") 下钻；返回的凭据仅作低置信参考（可能过期、属于参考环境），在本任务资产上验证成功才算数。下钻后仍须「借鉴复现 + 自主验证」两段，只复现 = 未完成。",
+		h.SourceTaskID, h.Score, overlap, h.SourceTaskID)
+	for _, n := range nodes {
+		if n.State != "running" {
+			continue
+		}
+		var p struct {
+			Summary string `json:"summary"`
+		}
+		_ = json.Unmarshal(n.Payload, &p)
+		summary := strings.ToLower(p.Summary)
+		hit := len(paths) == 0
+		for _, path := range paths {
+			if strings.Contains(summary, path) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		if err := s.engine.SteerWork(n.ID, msg); err != nil {
+			log.Printf("[reader] adopt 后 steer 意图#%d 失败（不影响采纳）: %v", n.ID, err)
+		}
+	}
+}
+
+// renderReaderAdoptHint 是纯函数：规划者读到的 hint 正文。graph_overview 只渲染
+// text，所以正文必须自足，但只到「方向」这一层：来源、分数、重合接口、怎么下钻。
+// 不含要点/事实/凭据——那些是 ask_reader 的交付物，塞进 hint 会让执行者跳过下钻。
 func renderReaderAdoptHint(h readerAdoptHint) string {
 	var b strings.Builder
-	b.WriteString("【阅读者勾连·已判定相关】来源任务#")
+	b.WriteString("【阅读者勾连·方向提示】来源任务#")
 	b.WriteString(strconv.FormatInt(h.SourceTaskID, 10))
 	if n := strings.TrimSpace(h.SourceTaskName); n != "" {
 		b.WriteString("「")
@@ -835,56 +866,29 @@ func renderReaderAdoptHint(h readerAdoptHint) string {
 		}
 		b.WriteString("）")
 	}
-	b.WriteString("；关联强度：")
+	b.WriteString("；相关性：")
 	b.WriteString(h.Strength)
-	b.WriteString("。理由：")
-	b.WriteString(redact.TestMethod(h.Reason))
-	if len(h.Points) > 0 {
-		b.WriteString("\n可复用要点：")
-		for i, p := range h.Points {
-			b.WriteString("\n")
-			b.WriteString(strconv.Itoa(i + 1))
-			b.WriteString(". ")
-			// 要点来自情报表原文（「资产 10.0.0.5:8080」「凭据 …@host」），
-			// 必须与 facts 同口径脱敏；漏这一处就等于把 host 随要点发给规划者。
-			b.WriteString(redact.TestMethod(p))
-		}
+	if h.Score > 0 {
+		b.WriteString("（")
+		b.WriteString(strconv.Itoa(h.Score))
+		b.WriteString("/100）")
 	}
-	if len(h.Facts) > 0 {
-		b.WriteString("\n关键事实：")
-		for _, f := range h.Facts {
-			b.WriteString("\n- ")
-			b.WriteString(redact.TestMethod(f))
-		}
+	b.WriteString("。")
+	if len(h.Overlap) > 0 {
+		b.WriteString("\n重合接口：")
+		b.WriteString(strings.Join(h.Overlap, "、"))
 	}
-	b.WriteString("\n这条 hint 只在你这一轮上下文里（下一轮就会淡出）。要细节时用 ask_reader(related_task_id=")
+	b.WriteString("\n这只是「往哪看」，不是测法（hint 不含请求/参数/凭据）。细节由执行者在意图里用 ask_reader(related_task_id=")
 	b.WriteString(strconv.FormatInt(h.SourceTaskID, 10))
-	b.WriteString(", query=…)：它只回脱敏后的测试方法（方法+路径/参数/payload/工具），不含 host 与凭据。")
-	b.WriteString("\n经验参考：reference_only=true，以上内容仅用于借鉴打法，来源任务的资产不属于本任务授权范围。")
+	b.WriteString(", query=\"/api/...\") 下钻；下钻后必须两段都做：① 借鉴复现——按对方请求形态在本任务资产上重放、拿到基线；② 自主验证——至少一条本任务独立设计的验证（变体参数/负控/低权账号/兄弟实例/边界遍历）。只复现对方结论就回报 = 未完成意图。")
+	b.WriteString("\n这条提示不会下一轮就消失：它作为 hint 节点留在图上，每轮随 graph_overview 下发；reader_refs[].borrow_state=pending 表示「已采纳、还没借」。")
+	b.WriteString("\n经验参考：reference_only=true，来源任务的资产不属于本任务授权范围。")
 	if len(h.ForeignHosts) > 0 {
 		// 不列 host：跨项目采纳时，列出来等于把另一个项目的资产清单塞进本任务
 		// 上下文。禁打由执行层按 task_foreign_assets 硬拦，这里只给数量。
 		b.WriteString(fmt.Sprintf("\n被勾连任务另有 %d 个资产，已加入本任务的禁止访问清单（不在本任务授权范围，故不列出地址）。要把经验用到本任务已有资产上；确需扩到新资产，先由本任务正常登记资产后再打。", len(h.ForeignHosts)))
 	}
-	b.WriteString("\n直接采信以上方向，不要再重读来源任务；具体测法由执行者按意图用 ask_reader 向阅读者下钻，再在本任务资产上验证。")
 	return b.String()
-}
-
-// redactStrings 对切片逐条脱敏（hint payload 与规划者上下文同口径）。
-func redactStrings(in []string) []string {
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		out = append(out, redact.TestMethod(s))
-	}
-	return out
-}
-
-// nonNilStrings 保证 JSON 里是 [] 而不是 null（前端/模型都按数组消费）。
-func nonNilStrings(in []string) []string {
-	if in == nil {
-		return []string{}
-	}
-	return in
 }
 
 // foreignAssetHostsForTask 从被勾连任务的小结表（task_intel）取资产 host。
@@ -916,114 +920,39 @@ func (s *Server) foreignAssetHostsForTask(ctx context.Context, taskID int64) []s
 	return out
 }
 
-// reusableIntelForTask 从被勾连任务的小结表抽取可复用要点与关键事实：
-//   - 要点最多 readerLinkHintMaxPoints 条：接口（path+用途）、凭据（类型/用户名/
-//     服务）、漏洞名，其次资产/组件；
-//   - 事实最多 readerLinkHintMaxFacts 条：该任务 fact 节点的 summary。
-func (s *Server) reusableIntelForTask(ctx context.Context, taskID int64) ([]string, []string) {
-	rows, err := s.m.pg.TaskIntelForTask(ctx, taskID)
-	if err != nil {
-		return nil, nil
+// overlapEndpoints 是纯函数：从候选命中里取两边撞上的接口键（METHOD /path），
+// 去重保序并截断到 n。它是 hint 里唯一允许出现的「参考任务内容」——路径不带
+// host，规划者据此判断本轮要测的端点是否值得借鉴；其余细节一律走下钻。
+func overlapEndpoints(hits []readerLinkHit, n int) []string {
+	if n <= 0 {
+		return nil
 	}
-	byKind := map[string][]db.TaskIntel{}
-	for _, r := range rows {
-		byKind[r.Kind] = append(byKind[r.Kind], r)
-	}
-	// 配额：接口 4 / 凭据 2 / 漏洞 2；不足时由资产+组件顺序补齐到上限。
-	quota := map[string]int{
-		db.IntelKindEndpoint: 4, db.IntelKindCredential: 2, db.IntelKindVuln: 2,
-		db.IntelKindAsset: readerLinkHintMaxPoints, db.IntelKindComponent: readerLinkHintMaxPoints,
-	}
-	order := []string{db.IntelKindEndpoint, db.IntelKindCredential, db.IntelKindVuln, db.IntelKindAsset, db.IntelKindComponent}
-	points := make([]string, 0, readerLinkHintMaxPoints)
-	for _, kind := range order {
-		used := 0
-		for _, r := range byKind[kind] {
-			if len(points) >= readerLinkHintMaxPoints || used >= quota[kind] {
-				break
-			}
-			if p := reusableIntelPoint(r); p != "" {
-				points = append(points, p)
-				used++
-			}
+	out := make([]string, 0, n)
+	seen := map[string]bool{}
+	for _, h := range hits {
+		if h.Kind != db.IntelKindEndpoint {
+			continue
 		}
-	}
-	facts, err := s.m.pg.TaskFactsForIntel(ctx, taskID)
-	if err != nil {
-		return points, nil
-	}
-	outFacts := make([]string, 0, readerLinkHintMaxFacts)
-	for _, f := range facts {
-		if len(outFacts) >= readerLinkHintMaxFacts {
+		k := strings.TrimSpace(h.Key)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, k)
+		if len(out) >= n {
 			break
 		}
-		if s := strings.TrimSpace(f.Summary); s != "" {
-			outFacts = append(outFacts, clipRunes(s, 240))
-		}
 	}
-	return points, outFacts
+	return out
 }
 
-// clipRunes 按 rune 截断，给 hint 要点/事实限长。
+// clipRunes 按 rune 截断，给 hint / 参考图摘要限长。
 func clipRunes(s string, max int) string {
 	r := []rune(strings.TrimSpace(s))
 	if len(r) <= max {
 		return string(r)
 	}
 	return string(r[:max]) + "…"
-}
-
-// reusableIntelPoint 把一行情报转成一句可复用要点（不含命中键的泛化描述）。
-func reusableIntelPoint(r db.TaskIntel) string {
-	var d map[string]any
-	if len(r.Detail) > 0 {
-		_ = json.Unmarshal(r.Detail, &d)
-	}
-	str := func(k string) string {
-		if v, ok := d[k].(string); ok {
-			return strings.TrimSpace(v)
-		}
-		return ""
-	}
-	switch r.Kind {
-	case db.IntelKindEndpoint:
-		line := "接口 " + r.Key
-		if p := str("purpose"); p != "" {
-			line += " — " + clipRunes(p, 80)
-		}
-		return line
-	case db.IntelKindCredential:
-		line := "凭据 " + strings.TrimSpace(r.Value)
-		if m := str("secret_masked"); m != "" {
-			line += "（掩码 " + m + "）"
-		}
-		return line
-	case db.IntelKindVuln:
-		name := str("title")
-		if name == "" {
-			name = r.Value
-		}
-		line := "漏洞 " + strings.TrimSpace(name)
-		meta := []string{}
-		if vc := str("vulnclass"); vc != "" {
-			meta = append(meta, vc)
-		}
-		if sv := str("severity"); sv != "" {
-			meta = append(meta, sv)
-		}
-		if len(meta) > 0 {
-			line += "（" + strings.Join(meta, "/") + "）"
-		}
-		return line
-	case db.IntelKindAsset:
-		if v := strings.TrimSpace(r.Value); v != "" {
-			return "资产 " + v
-		}
-		return "资产 " + r.Key
-	case db.IntelKindComponent:
-		return "组件 " + r.Key
-	}
-	return ""
 }
 
 // intelHitsForTask 读某任务情报表的前 n 行，转成 hint 用的命中明细。

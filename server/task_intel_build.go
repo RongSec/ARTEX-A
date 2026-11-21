@@ -1254,11 +1254,25 @@ func (a *intelAcc) addCredential(kind, username, service, secret, pattern string
 // intelMaxWhereUsed 是一条凭据最多记多少个使用位置。
 const intelMaxWhereUsed = 8
 
+// reIntelSecretShape 判定「像密文」的字符集（token/JWT/base64/hex/口令）。
+// Cookie 正则抓的是整行，遇到散文（中文、空格、引号、括号）时会截进正文碎片；
+// 这类字符串不展示掩码——前 2 后 2 的截断反而把正文带进详情页（实测出现
+// 「re****估。」「us****]}」）。
+var reIntelSecretShape = regexp.MustCompile(`^[A-Za-z0-9._~+/=:@\-]+$`)
+
 // maskIntelSecret 只留前 2 后 2 字符（≤4 字符全遮），返回值本身不含可用明文。
+// 形如 "user_token=eyJ..." 的 cookie 只掩 = 后面的值部分。
 func maskIntelSecret(s string) string {
-	r := []rune(strings.TrimSpace(s))
+	s = strings.TrimSpace(s)
+	if i := strings.LastIndex(s, "="); i >= 0 && i < len(s)-1 {
+		s = strings.TrimSpace(s[i+1:])
+	}
+	r := []rune(s)
 	if len(r) <= 4 {
 		return "****"
+	}
+	if len(r) > 128 || !reIntelSecretShape.MatchString(s) {
+		return "" // 不是密文形态：宁可不展示，也不把正文碎片当掩码
 	}
 	return string(r[:2]) + "****" + string(r[len(r)-2:])
 }

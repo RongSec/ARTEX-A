@@ -22,6 +22,20 @@ var (
 
 // TestMethod 脱敏：URL 只留 path?query，IP/域名换占位符，凭据值 <redacted>。
 func TestMethod(s string) string {
+	return redactText(s, false)
+}
+
+// TestMethodKeepSecrets 与 TestMethod 同口径，但**保留凭据值**。
+//
+// 只给 worker 下钻用（用户口径）：参考任务里的口令/token 可能被复用到本任务目标
+// 上，抹掉就等于丢掉「密码复用」这条线索。代价是它只是低置信参考——可能过期、
+// 可能只属于参考环境——所以调用方必须在结果里明确标注，不能当成本任务已确认的
+// 凭据。host/IP/域名仍然照常脱敏：跨任务资产不在本任务授权范围内。
+func TestMethodKeepSecrets(s string) string {
+	return redactText(s, true)
+}
+
+func redactText(s string, keepSecrets bool) string {
 	if s == "" {
 		return ""
 	}
@@ -38,7 +52,9 @@ func TestMethod(s string) string {
 	})
 	s = ipv4.ReplaceAllString(s, "<ip>")
 	s = domains.ReplaceAllString(s, "<host>")
-	s = secrets.ReplaceAllString(s, "$1=<redacted>")
+	if !keepSecrets {
+		s = secrets.ReplaceAllString(s, "$1=<redacted>")
+	}
 	return s
 }
 

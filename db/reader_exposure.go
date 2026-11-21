@@ -68,12 +68,39 @@ type ReaderTaskRef struct {
 	// （进候选的依据）+ 阅读者读图后的相关性分（暴露的依据）。
 	MatchStrength  string `json:"match_strength,omitempty"`
 	RelevanceScore int    `json:"relevance_score,omitempty"`
+	// BorrowState 是「这条参考图有没有被用起来」的持久账本（由 agent 层按意图
+	// payload 的 borrow 计算，不落库）：
+	//   pending = 已采纳但还没有任何带 borrow 的意图（该借未借）
+	//   running = 有 borrow 意图正在跑；done = 已跑完。
+	// hint 只是通知，可能被 compaction 压掉；这个字段每轮都在 graph_overview 里，
+	// 规划者据此判断「是不是把采纳的事忘了」。
+	BorrowState    string `json:"borrow_state,omitempty"`
+	BorrowIntentID int64  `json:"borrow_intent_id,omitempty"`
 }
 
 const (
 	readerRefMaxEndpoints = 20
 	readerRefMaxNodes     = 10
 )
+
+// ReaderLinkDecision 返回当前任务对某个参考任务的判定状态：
+// "candidate"（阅读者还在读图）/ "adopted" / "dismissed" / ""（无记录）。
+// ask_reader 用它把「还没判定完」和「永久不可下钻」区分开——前者稍后就会可用。
+func (s *ExplorationStore) ReaderLinkDecision(relatedTaskID int64) (string, error) {
+	owner, err := s.TaskID()
+	if err != nil || owner <= 0 {
+		return "", err
+	}
+	var decision string
+	err = s.db.QueryRow(`
+SELECT decision FROM task_intel_links
+WHERE task_id=$1 AND related_task_id=$2
+ORDER BY id DESC LIMIT 1`, owner, relatedTaskID).Scan(&decision)
+	if err != nil {
+		return "", nil
+	}
+	return decision, nil
+}
 
 // ReaderRefs 返回当前任务被采纳的参考任务（adopted），**不按项目过滤**：
 // 用户口径是「跨项目也要能返回」——同一个组件/同一类接口出现在别的项目里，

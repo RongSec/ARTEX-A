@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,27 @@ import (
 // reReaderHostRef 挡住 worker 在 query 里夹带 host/IP/URL：worker 只允许按路径、
 // 参数名或漏洞类型下钻，地址一律由本任务的授权资产决定，不能从参考任务“借”。
 var reReaderHostRef = regexp.MustCompile(`(?i)https?://|\b\d{1,3}(?:\.\d{1,3}){3}\b|\b[a-z0-9][a-z0-9\-]*\.(?:com|cn|net|org|io|co|cc|top|xyz|info|biz|edu|gov|mil|local|lan|corp|internal|intra|test|dev|cloud|site|online)\b`)
+
+// readerTwoPartContract 是 worker 下钻后的硬要求（V11-READER4，用户口径）：
+// 只复现对方的结论不算完成——那正是「下钻完只做简单复现就回报」的退化形态。
+// 每次下钻都要在本任务资产上补一条自己设计的验证，用来发现借鉴经验没覆盖的
+// 部分（或证伪它）。
+const readerTwoPartContract = "两段都要做：① 借鉴复现——按 items 里的请求形态在本任务资产上重放，拿到与对方一致的基线；② 自主验证——至少一条本任务独立设计的验证（变体参数/负控/低权账号/兄弟实例/边界遍历）。只复现对方结论就回报 = 未完成意图；fact/finding 的 evidence 必须分「借鉴复现」「自主验证」两节，写清各自请求与结果。"
+
+// readerCredentialNote 是 worker 下钻时凭据的定性（用户口径）：凭据不隐藏，
+// 因为密码复用本身就是一条要测的攻击路径；但它是参考任务环境里的原值，可能
+// 过期/不通用，只能当低置信假设，不能直接写进本任务报告。
+const readerCredentialNote = "items 里的凭据（口令/token/Cookie）是参考任务环境中的原值，**仅作低置信参考**：可能已过期、可能只在那台机器有效。只用于在本任务目标上试密码复用/默认口令；本任务资产上验证成功后才算数，不要当成本任务已确认的凭据写进 finding。"
+
+// readerRefIDs 把已采纳参考任务转成「#134、#136」这样的短清单，
+// 用于 ask_reader 的报错信息（执行者据此改 related_task_id，不用再试错）。
+func readerRefIDs(refs []db.ReaderTaskRef) []string {
+	out := make([]string, 0, len(refs))
+	for _, r := range refs {
+		out = append(out, "#"+strconv.FormatInt(r.TaskID, 10))
+	}
+	return out
+}
 
 // 脱敏统一走 redact 包（与 db 层暴露索引同一套规则）。
 func redactTestMethod(s string) string { return redact.TestMethod(s) }
@@ -93,7 +115,7 @@ func (t *ToolSet) askReader() actool.CoreTool {
 			"什么时候用：本条意图要测的接口/组件在 graph_overview.reader_refs 里出现过，需要知道参考任务当时发了什么请求、用了什么参数/payload、怎么判断命中。\n" +
 			"node_ids 取自 reader_refs.drillable/intents；留空则按 query 检索 finding/fact/intent 摘要与 intent 执行步骤。\n" +
 			"query 只写路径、参数名、漏洞类型或组件名（如 /api/user、越权、shiro）；**不要写 URL、host、IP、域名**，写了会被拒绝。\n" +
-			"返回的 items 是逐条脱敏后的证据（请求行/步骤/说明）；details 不足时阅读者会补一段经验总结。把它们套到本意图的授权资产上验证，不要直接打参考任务的地址。"
+			"返回的 items 是逐条脱敏后的证据（请求行/步骤/说明），并带 required_next：**下钻不是让你照抄一遍**——必须①在本任务资产上复现基线，②再做至少一条本任务独立设计的验证（变体参数/负控/兄弟实例/边界遍历），两段都写进 fact/finding。只复现=未完成意图。不要直接打参考任务的地址。"
 	}
 	return t.readExpTool("ask_reader", desc,
 		obj(map[string]any{
@@ -186,7 +208,19 @@ func (t *ToolSet) askReader() actool.CoreTool {
 						}
 					}
 					if target == nil {
-						return actool.Errorf(fmt.Sprintf("任务#%d 不在本任务的采纳列表里（只有 adopted 的参考任务可下钻）", relatedID)), nil
+						// 下钻前不知道「本任务到底采纳了谁」会让执行者反复试错
+						// （实测 3 次调用全打在不同任务上、全被拒）。错误里直接
+						// 给已采纳清单，下一次就能命中。
+						msg := fmt.Sprintf("任务#%d 不在本任务的采纳列表里（只有 adopted 的参考任务可下钻）", relatedID)
+						if ids := readerRefIDs(refs); len(ids) > 0 {
+							msg += "；当前已采纳：" + strings.Join(ids, "、") + "。只能从这些任务里选 related_task_id"
+						}
+						// candidate ≠ 永久拒绝：阅读者还在读图，adopt 完成后同一调用
+						// 立刻可用（adopt 会唤醒规划者并 steer 正在跑的 worker）。
+						if d, derr := t.ts.ReaderLinkDecision(relatedID); derr == nil && d == "candidate" {
+							msg += "；该任务是候选（candidate），阅读者尚未判完——adopt 后立刻可用，届时你会收到规划者注入的指令，稍后重试即可"
+						}
+						return actool.Errorf(msg), nil
 					}
 					// 检索为空也走这里：给可下钻索引（id+摘要），不要只回一句「没命中」
 					// ——规划者拿不到索引就只能放弃或瞎猜。
@@ -221,7 +255,13 @@ func (t *ToolSet) askReader() actool.CoreTool {
 					}
 					return ""
 				}
-				item.Summary = redactTestMethod(str("summary"))
+				// worker 要拿凭据试密码复用 → 保留凭据值；planner 只要方法论 → 抹掉。
+				// host/IP 两者都脱敏（参考任务的资产不在本任务授权范围）。
+				redactBody := redactTestMethod
+				if t.readerDetailMode {
+					redactBody = redact.TestMethodKeepSecrets
+				}
+				item.Summary = redactBody(str("summary"))
 				detailCap := 1200
 				if t.readerDetailMode {
 					detailCap = 2200
@@ -232,11 +272,11 @@ func (t *ToolSet) askReader() actool.CoreTool {
 					item.Vuln = str("vulnclass")
 					body := strings.Join([]string{str("detail"), str("evidence"), str("repro")}, "\n")
 					item.Requests = requestsIn(body)
-					item.Detail = truncateRunes(redactTestMethod(body), detailCap)
+					item.Detail = truncateRunes(redactBody(body), detailCap)
 				case db.KindFact:
 					body := strings.Join([]string{str("detail"), str("evidence")}, "\n")
 					item.Requests = requestsIn(body)
-					item.Detail = truncateRunes(redactTestMethod(body), detailCap)
+					item.Detail = truncateRunes(redactBody(body), detailCap)
 				case db.KindIntent:
 					item.Steps = t.readerIntentSteps(relatedID, n.ID, 12, 220)
 				}
@@ -256,7 +296,9 @@ func (t *ToolSet) askReader() actool.CoreTool {
 					"related_task_id": relatedID,
 					"mode":            "detail",
 					"items":           items,
-					"note":            "items 是参考任务里脱敏后的测试细节（请求行/步骤/说明）：host/IP 已换成占位符，凭据值已抹除。套到本意图的授权资产上验证，不要直接打占位符。",
+					"required_next":   readerTwoPartContract,
+					"credential_note": readerCredentialNote,
+					"note":            "items 是参考任务里的测试细节（请求行/步骤/说明）：host/IP 已换成占位符；凭据按原值给出，只作低置信参考。套到本意图的授权资产上验证，不要直接打占位符。",
 				}
 				if t.readerAnswer != nil && len(items) > 0 && !hasConcreteReaderEvidence(items) {
 					exp, err := t.readerAnswer(ctx, ReaderDrillRequest{
@@ -324,13 +366,18 @@ func (t *ToolSet) readerIntentSteps(relatedID, intentID int64, maxSteps, maxRune
 		return nil
 	}
 	out := make([]string, 0, maxSteps)
+	// worker 要看到「当时用的口令/token」才能试复用；planner 只要方法，抹掉。
+	redactStep := redactTestMethod
+	if t.readerDetailMode {
+		redactStep = redact.TestMethodKeepSecrets
+	}
 	for _, act := range steps {
 		line := strings.TrimSpace(act.Tool)
 		if act.Summary != "" {
 			if line != "" {
 				line += " · "
 			}
-			line += redactTestMethod(act.Summary)
+			line += redactStep(act.Summary)
 		}
 		if strings.TrimSpace(line) == "" {
 			continue

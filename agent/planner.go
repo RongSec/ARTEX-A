@@ -390,10 +390,15 @@ func plannerSystem(goal, dataDir, workDir string) string {
 // plannerLinkGuidance 是 V11-WORKER-READER 的固定指引（代码所有，不可在 prompt 页编辑）：
 // hint 只给方向，参考图是只读索引；具体测法由执行者在意图里用 ask_reader 向阅读者
 // 下钻。规划者不重读旧任务，但可以按被暴露的接口安排 worker 做可能性测试。
-const plannerLinkGuidance = "\n\n**相关任务经验（方向 vs 细节）**：hint 是阅读者判定后给你的一轮性【方向提示】（来源任务、关联理由、可复用要点），照着它决定往哪测；它不是可直接执行的细节，别把 hint 当测试步骤。" +
-	"\n**reader_refs（只读、脱敏的参考图）**：graph_overview.reader_refs 是本任务采纳的参考任务索引——任务概述、接口 method+path、**链摘要 chains**（入口 → 中间结论 → 终点，带 verified）、五类计数、可下钻 id，**没有 host/IP/凭据**；每条都标了 readonly=true、drill_via=reader。用 chains 判断「这条利用链能不能迁移到我的目标上」，用 endpoints 判断「这个接口对方测过没有」；endpoints_total/truncated 说明接口表是窗口不是全表。**不要直接打 reader_refs 里的接口**，那些 host 属于别的任务。" +
-	"\n**ask_reader 规划者和 worker 都有**：你写意图时把目标接口/组件、要验证的假设写清楚，执行者会自己用 ask_reader(related_task_id, node_ids 或 query) 向阅读者下钻【脱敏后的测试细节】；你只在“规划本身需要判断可行性/判据”时才自己下钻。**不要把“调用 ask_reader”单独派成一条意图**——那是白跑一轮，工具要在具体测试语境里用。" +
-	"\n\n**经验参考的授权边界（硬规则）**：阅读者给的 hint 是**经验参考**（reference_only=true），其中的资产不属于本任务授权范围。被勾连任务的外部资产已写入本任务的禁止访问清单（foreign_hosts），**禁止对 foreign_hosts 里的地址发起任何请求/扫描/利用**，由执行层硬拦（hint 不再列出具体地址）；要把经验用到**本任务已有资产**上。确需扩到新资产，先由本任务正常登记资产后再打。"
+const plannerLinkGuidance = "\n\n**相关任务经验（方向 vs 细节）**：hint 是阅读者给你的【方向提示】——来源任务、相关性分、重合接口。它**不含请求/参数/凭据**，只告诉你「哪个任务可能值得借」，不是测试步骤，别照着它直接写意图。hint 是图上的节点，不是一次性消息：每轮 graph_overview 都会带（除非被 compaction 折叠）；判断「借没借」不要看 hint 在不在，看 `reader_refs[].borrow_state`（pending=已采纳但还没有带 borrow 的意图 / queued / running / done）和顶层的 `borrow_pending` 列表。" +
+	"\n**每轮先定端点，再查参考图**：graph_overview.reader_refs 是本任务采纳的参考任务只读索引——任务概述、接口 method+path、**链摘要 chains**（入口 → 中间结论 → 终点，带 verified）、可下钻 id，**没有 host/IP/凭据**；每条都标了 readonly=true、drill_via=reader。确定本轮要测的端点后，先看 reader_refs[].overlap / endpoints 里有没有同一接口：\n" +
+	"  - **有** → 用 add_intent 下发一条【合并工单】：summary 写清本任务要验证的假设；同时填 `borrow{related_task_id, endpoint, baseline, self_test}`。执行者会在本条意图里向阅读者下钻细节，先复现 baseline，再做 self_test（本任务独立设计的验证）。**不要拆成「先借一轮、再测一轮」两条意图**——那是白跑一轮；也不要只派「去问阅读者」这种空意图。\n" +
+	"  - **没有** → 正常派意图，不要硬凑借鉴。\n" +
+	"  - baseline 取自 reader_refs.chains / endpoints（例如入口请求、判据）；**self_test 必须是你按本任务目标自己想的**（变体参数、负控、低权账号、兄弟实例、边界遍历），不能留空——只复现对方结论等于没测。\n" +
+	"**hint 到达时已有意图覆盖同一端点**：如果那条意图**没有 borrow**，说明它是采纳前派的（阅读者读图要时间，首轮常抢跑）。**不要以「方向已覆盖」为由 0 意图**：正在跑的用 `steer_work` 把两段工单注进去（① 复现 baseline ② 自主验证）；还没跑的补一条带 borrow 的合并意图。否则执行者拿不到借鉴，只会按旧意图自己摸。\n" +
+	"**borrow_pending 是持久账本**：只要某条参考的 borrow_state=pending，就表示「已采纳、还没借」。本轮没测到它的 overlap 端点可以先放着；一旦要测那个端点，必须当场派 borrow 工单，不要因为 hint 是前几轮的、或当前轮没再提它就当没发生。hint 会淡出，账本不会。" +
+	"\n**自己下钻只在「规划本身需要判断可行性/判据」时**：你写意图时把目标接口/组件、要验证的假设写清楚，执行者会自己用 ask_reader。**不要把“调用 ask_reader”单独派成一条意图**。" +
+	"\n\n**经验参考的授权边界（硬规则）**：阅读者给的 hint 是**经验参考**（reference_only=true），其中的资产不属于本任务授权范围。被勾连任务的外部资产已写入本任务的禁止访问清单（foreign_hosts），**禁止对 foreign_hosts 里的地址发起任何请求/扫描/利用**，由执行层硬拦（hint 不列出具体地址）；要把经验用到**本任务已有资产**上。确需扩到新资产，先由本任务正常登记资产后再打。"
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution
 // steps (so users can see how it reads the situation and judges goals — the

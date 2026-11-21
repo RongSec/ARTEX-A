@@ -874,3 +874,41 @@ func TestReaderLinkWeakComponentOnlyDropped(t *testing.T) {
 		t.Errorf("强信号候选应保留全部命中（含组件旁证），got %d", out[0].HitCount)
 	}
 }
+
+// TestRenderReaderAdoptHintIsDirectionOnly 守 V11-READER4：hint 只给方向，
+// 不再携带可复用要点/关键事实/凭据掩码——否则执行者照 hint 就能复述结论，
+// ask_reader 没人调（实测一轮 3 次下钻全靠人工注入）。
+func TestRenderReaderAdoptHintIsDirectionOnly(t *testing.T) {
+	text := renderReaderAdoptHint(readerAdoptHint{
+		SourceTaskID: 136, SourceTaskName: "任务D", SourceProjectID: 58,
+		Strength: "strong", Score: 72,
+		Overlap:      []string{"GET /api/sso/userinfo", "POST /api/sso/login"},
+		ForeignHosts: []string{"10.0.0.9"},
+	})
+	for _, banned := range []string{"可复用要点", "关键事实", "掩码", "secret", "cookie for"} {
+		if strings.Contains(text, banned) {
+			t.Errorf("hint 不应包含 %q：\n%s", banned, text)
+		}
+	}
+	for _, want := range []string{"#136", "72/100", "GET /api/sso/userinfo", "两段", "自主验证", "只复现"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("hint 缺少 %q：\n%s", want, text)
+		}
+	}
+}
+
+// TestOverlapEndpoints 守 hint 的重合接口：只取 endpoint、去重、保序、截断。
+func TestOverlapEndpoints(t *testing.T) {
+	hits := []readerLinkHit{
+		{Kind: db.IntelKindCredential, Key: "cookie|admin|h:80"},
+		{Kind: db.IntelKindEndpoint, Key: "GET /a"},
+		{Kind: db.IntelKindEndpoint, Key: "GET /a"},
+		{Kind: db.IntelKindAsset, Key: "h:80"},
+		{Kind: db.IntelKindEndpoint, Key: "POST /b"},
+		{Kind: db.IntelKindEndpoint, Key: "GET /c"},
+	}
+	got := overlapEndpoints(hits, 2)
+	if len(got) != 2 || got[0] != "GET /a" || got[1] != "POST /b" {
+		t.Fatalf("overlapEndpoints = %#v, want [GET /a POST /b]", got)
+	}
+}

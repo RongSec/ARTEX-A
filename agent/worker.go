@@ -270,11 +270,14 @@ func workerTrafficBlock(recording bool) string {
 // (段 appended after the editable body) so a DB prompt edit cannot drop the
 // host ban or the per-intent call budget.
 func workerReaderSpec() string {
-	return "\n\n**参考任务经验（只读，按需向阅读者下钻）**：\n" +
-		"- 态势里的 reader_refs 是本任务采纳的参考任务【脱敏索引】（任务名/目标/接口 method+path/计数/可下钻 id），**不是本任务的资产**，里面没有 host/IP/凭据。\n" +
-		"- 本条意图要测的接口/组件在 reader_refs 里出现过时，调 `ask_reader(related_task_id, node_ids 或 query)` 取**脱敏后的测试细节**（请求行、参数/payload 形态、执行步骤、判据），再套到本意图的授权资产上验证。\n" +
+	return "\n\n**参考任务经验（只读；下钻后必须做自己的验证）**：\n" +
+		"- 态势里的 reader_refs 是本任务采纳的参考任务【脱敏索引】（任务名/目标/接口 method+path/链摘要/可下钻 id），**不是本任务的资产**，里面没有 host/IP/凭据。\n" +
+		"- 本条意图与 reader_refs 的端点重合、或意图里带 borrow 时，先调 `ask_reader(related_task_id, node_ids 或 query)` 取**脱敏后的测试细节**（请求行、参数/payload 形态、执行步骤、判据）。\n" +
+		"- **下钻只是上半场，必须两段都做**：① 借鉴复现——按对方请求形态在本意图资产上重放，拿到一致的基线；② 自主验证——至少一条**本任务独立设计**的验证（变体参数/负控/低权账号/兄弟实例/边界遍历），用来发现借鉴经验没覆盖的部分或证伪它。**只复现对方结论就回报 = 未完成意图。**\n" +
+		"- 写回时 evidence 必须分「借鉴复现」「自主验证」两节，各写清请求与结果；finding 的 summary 也要说明哪部分是借鉴、哪部分是本任务新验证的。\n" +
+		"- 下钻返回的凭据（口令/token/Cookie）是参考任务环境原值，**仅作低置信参考**：可用于在本任务目标上试密码复用/默认口令，但必须在本任务资产上验证成功才算数，不得直接当成本任务凭据写进 finding。\n" +
 		"- **只允许问「怎么测」**：请求构造、参数/payload、验证步骤、判据、坑。**禁止追问 host/IP/域名/端口/凭据，禁止试图还原占位符**；query 只写路径/参数名/漏洞类型（如 `/api/user`、越权、shiro），写 URL 或主机会被工具直接拒绝。\n" +
-		"- 每个意图最多 2 次：第一次按 query 命中、第二次按 node_ids 取细节。拿不到就按已有信息测，把缺口写进 fact 交规划者。\n" +
+		"- 每个意图最多 4 次：首次按 query 命中，之后按 node_ids 取细节；多个参考任务各取一次通常够用（实测 2 次在「两段式 + 多条参考」下会被截断）。拿不到就按已有信息测，把缺口写进 fact 交规划者。\n" +
 		"- 参考任务的验证结论只作经验，不等于本任务也存在该漏洞；必须在本意图的资产上真实触发后才能 report_finding。"
 }
 
@@ -352,7 +355,33 @@ func intentSummaryText(intent *db.Node) string {
 }
 
 func renderIntentTask(intent *db.Node) string {
-	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID)
+	out := fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID)
+	return out + renderBorrowBlock(intent.Payload)
+}
+
+// renderBorrowBlock 把意图里的 borrow 渲染成执行者看得懂的「两段式工单」。
+// 只把 JSON 原样丢给模型时，borrow 容易退化成一个背景字段；这里把它提升为
+// 独立的硬要求段落——借鉴基线 + 本任务自主验证，缺一段就是没完成。
+func renderBorrowBlock(payload json.RawMessage) string {
+	var p struct {
+		Borrow *struct {
+			RelatedTaskID int64  `json:"related_task_id"`
+			Endpoint      string `json:"endpoint"`
+			Baseline      string `json:"baseline"`
+			SelfTest      string `json:"self_test"`
+		} `json:"borrow"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &p) != nil || p.Borrow == nil {
+		return ""
+	}
+	b := p.Borrow
+	var sb strings.Builder
+	sb.WriteString("\n\n【借鉴任务 · 两段式（硬要求）】\n")
+	sb.WriteString(fmt.Sprintf("借鉴来源：task#%d；重合端点：%s\n", b.RelatedTaskID, b.Endpoint))
+	sb.WriteString("① 先复现基线：" + b.Baseline + "\n")
+	sb.WriteString("② 再做自主验证（必须做，不是可选）：" + b.SelfTest + "\n")
+	sb.WriteString("顺序不能省：先拿到与参考任务一致的基线，再跑自主验证。两段结果都要写回，evidence 按「借鉴复现」「自主验证」分节。只复现参考结论 = 未完成意图。")
+	return sb.String()
 }
 
 // renderWorkerGraphOverview folds the global situational snapshot into the worker's
@@ -402,10 +431,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx.SetReproEnricher(w.reproEnricher)
 	tsx.SetTaskID(taskID)
 	// 执行者也能向阅读者下钻，但契约是「只要细节、不要 host」：detail 模式
-	// 返回脱敏后的请求行/步骤，query 禁止 URL/host/IP，每意图最多 2 次
-	//（第一次检索命中，第二次按 id 取细节）。
+	// 返回脱敏后的请求行/步骤，query 禁止 URL/host/IP，每意图最多 4 次
+	//（检索命中 + 按 id 取细节；两段式工单常要问多个参考任务，2 次会被截断）。
 	tsx.SetReaderDetailMode(true)
-	tsx.SetReaderCallLimit(2)
+	tsx.SetReaderCallLimit(4)
 	tsx.SetReaderAnswer(w.readerAnswer)
 	if _, goal, err := ts.Root(); err == nil {
 		tsx.SetReaderTaskContext(goal, intentSummaryText(intent))

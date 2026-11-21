@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -11,6 +12,11 @@ import (
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
+
+// reReaderHintRef 从 steer/意图文本里捞「可能指向参考任务」的 id（#136、
+// related_task_id=136）。只用来找 hint 账本，误捞的 id 不会命中任何 hint，
+// 所以宁可放宽。
+var reReaderHintRef = regexp.MustCompile(`#(\d+)|related_task_id\s*[=:]\s*"?(\d+)"?`)
 
 // compactIntents distills intents to {id, summary, state, asset_ids, parents,
 // yields} so the planner sees both the direction and its LINEAGE — parents (the
@@ -573,7 +579,22 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// planner 用 ask_reader 向阅读者要。留空时不写这个字段，老任务提示词零变化。
 	if t.ts != nil {
 		if refs, err := t.ts.ReaderRefs(4); err == nil && len(refs) > 0 {
+			// 持久账本：这条参考图到底有没有被「借」过。hint 会被 compaction 压掉，
+			// reader_refs 每轮都在；borrow_state=pending 就是「该借还没借」。
+			t.annotateReaderBorrow(refs)
 			out["reader_refs"] = refs
+			pending := make([]map[string]any, 0, len(refs))
+			for _, r := range refs {
+				if r.BorrowState == "pending" {
+					pending = append(pending, map[string]any{
+						"related_task_id": r.TaskID, "overlap": r.Overlap,
+						"relevance_score": r.RelevanceScore,
+					})
+				}
+			}
+			if len(pending) > 0 {
+				out["borrow_pending"] = pending
+			}
 		}
 	}
 	// coverage：粗略的资产测试覆盖度参考——范围(task_scope)内的资产里，被 fact 碰过的
@@ -715,6 +736,116 @@ func recentTerminalIntents(store *db.ExplorationStore, limit int) []*db.Node {
 		cursor = page[len(page)-1].ID
 	}
 	return out
+}
+
+// annotateReaderBorrow 给已采纳的参考图算「借没借」的持久状态。
+// 依据是意图 payload 里的 borrow.related_task_id（不是 hint 是否还在）：
+//   pending  已采纳，但没有任何带 borrow 的意图 → 该借未借
+//   queued   有 open 状态的 borrow 意图（还没被 worker 领）
+//   running  有 running 状态的 borrow 意图
+//   done     只有已结束的 borrow 意图
+// 同一任务有多种状态时取「最活跃」的那个。
+func (t *ToolSet) annotateReaderBorrow(refs []db.ReaderTaskRef) {
+	intents, err := t.ts.ListByKind(db.KindIntent, 500)
+	if err != nil {
+		return
+	}
+	// hint 被标 consumed = 规划者已经就这条参考做过动作（建 borrow 意图或 steer
+	// worker）。只看意图会漏掉 steer 路径（实测 planner 更常用 steer），账本会
+	// 一直停在 pending。
+	consumed := map[int64]bool{}
+	if hints, herr := t.ts.ListByKind(db.KindHint, 100); herr == nil {
+		for _, h := range hints {
+			if h.State != "consumed" {
+				continue
+			}
+			var p struct {
+				SourceTaskID int64 `json:"source_task_id"`
+			}
+			if json.Unmarshal(h.Payload, &p) == nil && p.SourceTaskID > 0 {
+				consumed[p.SourceTaskID] = true
+			}
+		}
+	}
+	rank := map[string]int{"done": 1, "blocked": 1, "exhausted": 1, "stopped": 1, "open": 2, "running": 3}
+	type borrowState struct {
+		state string
+		id    int64
+	}
+	byTask := map[int64]borrowState{}
+	for _, n := range intents {
+		var p struct {
+			Borrow *struct {
+				RelatedTaskID int64 `json:"related_task_id"`
+			} `json:"borrow"`
+		}
+		if len(n.Payload) == 0 || json.Unmarshal(n.Payload, &p) != nil || p.Borrow == nil || p.Borrow.RelatedTaskID <= 0 {
+			continue
+		}
+		cur := byTask[p.Borrow.RelatedTaskID]
+		if rank[n.State] > rank[cur.state] {
+			byTask[p.Borrow.RelatedTaskID] = borrowState{state: n.State, id: n.ID}
+		}
+	}
+	for i := range refs {
+		st, ok := byTask[refs[i].TaskID]
+		if !ok {
+			if consumed[refs[i].TaskID] {
+				refs[i].BorrowState = "done" // 已通过 steer 借过，只是没有 borrow 意图
+			} else {
+				refs[i].BorrowState = "pending"
+			}
+			continue
+		}
+		refs[i].BorrowIntentID = st.id
+		switch st.state {
+		case "running":
+			refs[i].BorrowState = "running"
+		case "open":
+			refs[i].BorrowState = "queued"
+		default:
+			refs[i].BorrowState = "done"
+		}
+	}
+}
+
+// markReaderHintsConsumed 把「来源任务已被参考」的 active hint 标成 consumed。
+// 由两条路径调用：add_intent(borrow) 和 steer_work（消息里提到某个参考任务 id）。
+// 这样 borrow_state 账本不会永远停在 pending。
+func (t *ToolSet) markReaderHintsConsumed(text string) {
+	if t.ts == nil || strings.TrimSpace(text) == "" {
+		return
+	}
+	ids := map[int64]bool{}
+	for _, m := range reReaderHintRef.FindAllStringSubmatch(text, -1) {
+		for i := 1; i < len(m); i++ {
+			if m[i] == "" {
+				continue
+			}
+			if v, err := strconv.ParseInt(m[i], 10, 64); err == nil && v > 0 {
+				ids[v] = true
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	hints, err := t.ts.ListByKind(db.KindHint, 100)
+	if err != nil {
+		return
+	}
+	for _, h := range hints {
+		if h.State != "active" {
+			continue
+		}
+		var p struct {
+			SourceTaskID int64 `json:"source_task_id"`
+		}
+		if json.Unmarshal(h.Payload, &p) != nil || !ids[p.SourceTaskID] {
+			continue
+		}
+		_ = t.ts.SetNodeState(h.ID, "consumed")
+	}
 }
 
 // relatedTaskOverviews distills persistent blackboard state from direct source
@@ -1085,6 +1216,22 @@ type intentItem struct {
 	AssetIDs  []json.RawMessage `json:"asset_ids"`
 	ParentIDs []json.RawMessage `json:"parent_ids"`
 	Priority  int               `json:"priority"`
+	// Borrow 非空 = 本条意图要借鉴某个已采纳参考任务：把「借鉴复现」和
+	// 「本任务自主验证」合并成一次下发（用户口径：不要拆成两轮，也不要让
+	// 执行者下钻完只做一遍复现就回报）。
+	Borrow *intentBorrow `json:"borrow"`
+}
+
+// intentBorrow 是意图里的借鉴工单。三件套缺一不可：
+//   - endpoint：两边重合的接口（METHOD /path），让执行者知道借的是哪条；
+//   - baseline：从阅读者那里要来的复现基线（请求形态/判据）；
+//   - self_test：本任务独立设计的验证（变体参数/负控/兄弟实例/边界遍历）——
+//     没有它，执行者就会退化成「照抄一遍就回报」。
+type intentBorrow struct {
+	RelatedTaskID json.RawMessage `json:"related_task_id"`
+	Endpoint      string          `json:"endpoint"`
+	Baseline      string          `json:"baseline"`
+	SelfTest      string          `json:"self_test"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1130,6 +1277,26 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
 	}
+	if it.Borrow != nil {
+		// 借鉴工单允许空的只有 related_task_id 的解析（json.Number/字符串都收），
+		// 其余三件套必须写全：缺 baseline 执行者不知道复现什么，缺 self_test
+		// 就会退化成「只复现」。两者都不接受「后面再说」。
+		rid := pid(it.Borrow.RelatedTaskID)
+		ep := strings.TrimSpace(it.Borrow.Endpoint)
+		base := strings.TrimSpace(it.Borrow.Baseline)
+		self := strings.TrimSpace(it.Borrow.SelfTest)
+		if rid <= 0 || ep == "" || base == "" || self == "" {
+			return 0, fmt.Errorf("borrow 三件套必须写全：related_task_id（已采纳的参考任务 id）、endpoint（METHOD /path）、baseline（借鉴到的复现基线）、self_test（本任务独立设计的验证）。只复现不算完成，所以 self_test 不能空；如果还没想好怎么自测，就先用 ask_reader 下钻或先不写 borrow")
+		}
+		payload["borrow"] = map[string]any{
+			"related_task_id": rid,
+			"endpoint":        ep,
+			"baseline":        base,
+			"self_test":       self,
+		}
+		// 账本：这条参考已经有 borrow 意图，hint 可以收口了（不再每轮提醒）。
+		t.markReaderHintsConsumed(fmt.Sprintf("#%d", rid))
+	}
 	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
 	if err != nil {
 		return 0, err
@@ -1154,11 +1321,18 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
 		obj(map[string]any{
-			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/borrow）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
 			"summary":    str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
 			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
 			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"priority":   intp("优先级 0-10，默认5"),
+			"borrow": map[string]any{"type": "object", "description": "可选：本条意图要借鉴某个已采纳参考任务时填（把「借鉴复现」和「自主验证」合并成一次下发，不要拆成两条意图）。字段：related_task_id=reader_refs[].related_task_id；endpoint=两边重合的 METHOD /path；baseline=从阅读者下钻/链摘要得到的复现基线；self_test=本任务独立设计的验证（变体参数/负控/兄弟实例/边界遍历）。四项都必须写，缺 self_test 会被拒绝——只复现不算完成。",
+				"properties": map[string]any{
+					"related_task_id": map[string]any{"type": "integer", "description": "已采纳的参考任务 id（reader_refs[].related_task_id）"},
+					"endpoint":        str("重合接口：METHOD /path"),
+					"baseline":        str("借鉴到的复现基线：请求形态 + 判据（来自 reader_refs.chains 或 ask_reader）"),
+					"self_test":       str("本任务独立设计的验证：变体参数/负控/低权账号/兄弟实例/边界遍历，至少一条"),
+				}, "required": []string{"related_task_id", "endpoint", "baseline", "self_test"}},
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1831,6 +2005,9 @@ func (t *ToolSet) steerWorkTool() actool.CoreTool {
 			if err := t.steerWork(id, a.Message); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
+			// 消息里提到哪个参考任务，就把对应 hint 收口：账本从 pending 转 done，
+			// 避免 planner 下一轮又看到 borrow_pending 重复派活。
+			t.markReaderHintsConsumed(a.Message)
 			return actool.Text(fmt.Sprintf("已向意图 %d 的 work 注入纠偏指令（下一步生效）", id)), nil
 		})
 }
