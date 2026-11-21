@@ -238,6 +238,12 @@ func (t *ToolSet) askReader() actool.CoreTool {
 				}
 			}
 			items := make([]ReaderDrillNode, 0, len(ids))
+			// worker 要拿凭据试密码复用 → 保留凭据值；planner 只要方法论 → 抹掉。
+			// host/IP 两者都脱敏（参考任务的资产不在本任务授权范围）。
+			redactBody := redactTestMethod
+			if t.readerDetailMode {
+				redactBody = redact.TestMethodKeepSecrets
+			}
 			for _, id := range ids {
 				n, err := t.ts.ReaderTaskNode(relatedID, id)
 				if err != nil {
@@ -254,12 +260,6 @@ func (t *ToolSet) askReader() actool.CoreTool {
 						return v
 					}
 					return ""
-				}
-				// worker 要拿凭据试密码复用 → 保留凭据值；planner 只要方法论 → 抹掉。
-				// host/IP 两者都脱敏（参考任务的资产不在本任务授权范围）。
-				redactBody := redactTestMethod
-				if t.readerDetailMode {
-					redactBody = redact.TestMethodKeepSecrets
 				}
 				item.Summary = redactBody(str("summary"))
 				detailCap := 1200
@@ -286,6 +286,19 @@ func (t *ToolSet) askReader() actool.CoreTool {
 				}
 			}
 
+			// 节点在参考任务里的上下游：只给节点正文会把链剪断，执行者没法顺着
+			// yields/derived_from 找下一个攻击面。边仍按 adopted 门槛取，摘要脱敏。
+			edges := make([]map[string]any, 0, 16)
+			if es, eerr := t.ts.ReaderTaskEdges(relatedID, ids, 40); eerr == nil {
+				for _, e := range es {
+					edges = append(edges, map[string]any{
+						"from": e.From, "from_kind": e.FromKind, "from_summary": redactBody(e.FromSummary),
+						"rel": e.Rel,
+						"to":  e.To, "to_kind": e.ToKind, "to_summary": redactBody(e.ToSummary),
+					})
+				}
+			}
+
 			// worker 模式：核心交付是「脱敏后的细节」，不是方法论。细节不足时
 			// 才把参考任务最近意图的执行步骤补进来，再请阅读者补一段经验总结。
 			if t.readerDetailMode {
@@ -298,7 +311,8 @@ func (t *ToolSet) askReader() actool.CoreTool {
 					"items":           items,
 					"required_next":   readerTwoPartContract,
 					"credential_note": readerCredentialNote,
-					"note":            "items 是参考任务里的测试细节（请求行/步骤/说明）：host/IP 已换成占位符；凭据按原值给出，只作低置信参考。套到本意图的授权资产上验证，不要直接打占位符。",
+					"edges":           edges,
+					"note":            "items 是参考任务里的测试细节（请求行/步骤/说明）：host/IP 已换成占位符；凭据按原值给出，只作低置信参考。edges 是这些节点在参考任务里的上下游（derived_from=由谁推出，yields=产出），用来顺着完整链扩攻击面；链上的结论仍要在本任务资产上验证。",
 				}
 				if t.readerAnswer != nil && len(items) > 0 && !hasConcreteReaderEvidence(items) {
 					exp, err := t.readerAnswer(ctx, ReaderDrillRequest{

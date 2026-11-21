@@ -427,6 +427,11 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	for _, h := range hints {
 		var p map[string]any
 		_ = json.Unmarshal(h.Payload, &p)
+		// 已借过的阅读者提示不再进上下文（用户口径：hint 被使用就脱离）。
+		// 只过滤 reader 写的；人类 hint 即使 state=consumed 也保留。
+		if h.State == "consumed" && fmt.Sprint(p["decided_by"]) == "reader" {
+			continue
+		}
 		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
 		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
 			hint["traffic_refs"] = p["traffic_refs"]
@@ -582,6 +587,21 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			// 持久账本：这条参考图到底有没有被「借」过。hint 会被 compaction 压掉，
 			// reader_refs 每轮都在；borrow_state=pending 就是「该借还没借」。
 			t.annotateReaderBorrow(refs)
+			// 已经借完的参考图只留一行身份（task/name/score/state），不再每轮
+			// 重复 endpoints/chains/drillable——那是上下文里最贵的一块（实测
+			// 4 条约 8.7k 字符）。pending/queued/running 的细节保留，因为还要用。
+			for i := range refs {
+				if refs[i].BorrowState != "done" {
+					continue
+				}
+				refs[i].Reason = ""
+				refs[i].Overlap = nil
+				refs[i].Endpoints = nil
+				refs[i].Chains = nil
+				refs[i].Nodes = nil
+				refs[i].Intents = nil
+				refs[i].Truncated = false
+			}
 			out["reader_refs"] = refs
 			pending := make([]map[string]any, 0, len(refs))
 			for _, r := range refs {

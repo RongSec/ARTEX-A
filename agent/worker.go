@@ -277,7 +277,7 @@ func workerReaderSpec() string {
 		"- 写回时 evidence 必须分「借鉴复现」「自主验证」两节，各写清请求与结果；finding 的 summary 也要说明哪部分是借鉴、哪部分是本任务新验证的。\n" +
 		"- 下钻返回的凭据（口令/token/Cookie）是参考任务环境原值，**仅作低置信参考**：可用于在本任务目标上试密码复用/默认口令，但必须在本任务资产上验证成功才算数，不得直接当成本任务凭据写进 finding。\n" +
 		"- **只允许问「怎么测」**：请求构造、参数/payload、验证步骤、判据、坑。**禁止追问 host/IP/域名/端口/凭据，禁止试图还原占位符**；query 只写路径/参数名/漏洞类型（如 `/api/user`、越权、shiro），写 URL 或主机会被工具直接拒绝。\n" +
-		"- 每个意图最多 4 次：首次按 query 命中，之后按 node_ids 取细节；多个参考任务各取一次通常够用（实测 2 次在「两段式 + 多条参考」下会被截断）。拿不到就按已有信息测，把缺口写进 fact 交规划者。\n" +
+		"- 每个参考任务通常问一次（query 命中或按 node_ids 取细节），总上限按已采纳数放宽（至少 4 次）；同一条参考不要反复问。拿不到就按已有信息测，把缺口写进 fact 交规划者。\n" +
 		"- 参考任务的验证结论只作经验，不等于本任务也存在该漏洞；必须在本意图的资产上真实触发后才能 report_finding。"
 }
 
@@ -434,7 +434,13 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 返回脱敏后的请求行/步骤，query 禁止 URL/host/IP，每意图最多 4 次
 	//（检索命中 + 按 id 取细节；两段式工单常要问多个参考任务，2 次会被截断）。
 	tsx.SetReaderDetailMode(true)
-	tsx.SetReaderCallLimit(4)
+	// 每个已采纳参考任务通常要问一次（检索命中或按 id 取细节）；固定 4 次在
+	// 「5 条采纳」时必然截断（实测 #141）。按采纳数放宽，至少 4、至多 8。
+	readerCalls := 4
+	if refs, rerr := ts.ReaderRefs(8); rerr == nil && len(refs) > readerCalls {
+		readerCalls = len(refs)
+	}
+	tsx.SetReaderCallLimit(readerCalls)
 	tsx.SetReaderAnswer(w.readerAnswer)
 	if _, goal, err := ts.Root(); err == nil {
 		tsx.SetReaderTaskContext(goal, intentSummaryText(intent))

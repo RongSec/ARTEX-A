@@ -16,6 +16,7 @@ package db
 import (
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/redact"
@@ -534,4 +535,56 @@ func endpointMethodPath(key string) (method, path string) {
 		key = key[:i]
 	}
 	return method, key
+}
+
+// ReaderEdgeRef 是参考任务里一条边的可读视图（两端带 kind/summary）。
+// worker 下钻节点时用它看「这个节点在完整链里的上下游」——只给节点本身等于
+// 把链剪断，执行者没法顺着 yields/derived_from 扩攻击面。
+type ReaderEdgeRef struct {
+	From        int64  `json:"from"`
+	FromKind    string `json:"from_kind,omitempty"`
+	FromSummary string `json:"from_summary,omitempty"`
+	Rel         string `json:"rel"`
+	To          int64  `json:"to"`
+	ToKind      string `json:"to_kind,omitempty"`
+	ToSummary   string `json:"to_summary,omitempty"`
+}
+
+// ReaderTaskEdges 取参考任务里与 ids 相邻的边（最多 limit 条）。
+// 仍走 adopted 门槛；未采纳返回空，不泄露图结构。
+func (s *ExplorationStore) ReaderTaskEdges(relatedTaskID int64, ids []int64, limit int) ([]ReaderEdgeRef, error) {
+	expID, err := s.adoptedExploration(relatedTaskID)
+	if err != nil || expID == 0 || len(ids) == 0 {
+		return nil, err
+	}
+	if limit <= 0 || limit > 80 {
+		limit = 40
+	}
+	args := []any{expID, limit}
+	marks := make([]string, 0, len(ids))
+	for _, id := range ids {
+		args = append(args, id)
+		marks = append(marks, "$"+strconv.Itoa(len(args)))
+	}
+	list := strings.Join(marks, ",")
+	rows, err := s.db.Query(`SELECT e.src_id, COALESCE(fn.kind,''), COALESCE(fn.payload->>'summary',''),
+       e.rel, e.dst_id, COALESCE(tn.kind,''), COALESCE(tn.payload->>'summary','')
+FROM exploration_edges e
+LEFT JOIN exploration_nodes fn ON fn.id=e.src_id AND fn.exploration_id=$1
+LEFT JOIN exploration_nodes tn ON tn.id=e.dst_id AND tn.exploration_id=$1
+WHERE e.exploration_id=$1 AND (e.src_id IN (`+list+`) OR e.dst_id IN (`+list+`))
+ORDER BY e.created_at, e.src_id, e.dst_id LIMIT $2`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ReaderEdgeRef, 0, 16)
+	for rows.Next() {
+		var e ReaderEdgeRef
+		if err := rows.Scan(&e.From, &e.FromKind, &e.FromSummary, &e.Rel, &e.To, &e.ToKind, &e.ToSummary); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
