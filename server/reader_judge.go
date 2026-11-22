@@ -359,6 +359,9 @@ func (s *Server) toolJudgeRelatedTasks() actool.CoreTool {
 					ok++
 				}
 			}
+			// 阅读者是项目级 agent（task_id=0），它的工具调用默认不进任务活动流；
+			// 判官这里显式补一条，任务审计页才看得到「这一轮判了哪些候选、给了多少分」。
+			s.appendReaderJudgeActivity(ctx, taskID, verdicts, ok)
 			return jsonResult(map[string]any{
 				"task_id":  taskID,
 				"verdicts": verdicts,
@@ -366,4 +369,41 @@ func (s *Server) toolJudgeRelatedTasks() actool.CoreTool {
 					ok, len(verdicts)),
 			})
 		})
+}
+
+// appendReaderJudgeActivity 把一次判官的结论写进发起方任务的 activity（kind=tool_use），
+// 让任务页能像其它工具一样看到「判了几条、分数多少、哪条失败」。失败只记日志。
+func (s *Server) appendReaderJudgeActivity(ctx context.Context, taskID int64, verdicts []readerJudgeVerdict, ok int) {
+	if s.m == nil || s.m.pg == nil || taskID <= 0 {
+		return
+	}
+	var expID int64
+	if err := s.m.pg.QueryRowContext(ctx, `SELECT exploration_id FROM tasks WHERE id=$1`, taskID).Scan(&expID); err != nil || expID <= 0 {
+		return
+	}
+	top := make([]string, 0, 4)
+	for i, v := range verdicts {
+		if i >= 4 {
+			break
+		}
+		if v.Error != "" {
+			top = append(top, fmt.Sprintf("#%d=ERR", v.CandidateTaskID))
+			continue
+		}
+		top = append(top, fmt.Sprintf("#%d=%d", v.CandidateTaskID, v.Score))
+	}
+	raw, _ := json.Marshal(verdicts)
+	detail := string(raw)
+	if len([]rune(detail)) > 4000 {
+		detail = string([]rune(detail)[:4000]) + "…"
+	}
+	if _, err := s.m.pg.Exploration(expID).AppendActivity(db.Activity{
+		Worker:  "reader",
+		Kind:    "tool_use",
+		Tool:    "judge_related_tasks",
+		Summary: fmt.Sprintf("判官独立判定 %d 个候选（%d 成功）：%s", len(verdicts), ok, strings.Join(top, " ")),
+		Detail:  detail,
+	}); err != nil {
+		log.Printf("[reader-judge] 写 activity 失败（不影响判定）: %v", err)
+	}
 }

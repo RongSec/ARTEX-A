@@ -141,8 +141,19 @@ func (t *ToolSet) askReader() actool.CoreTool {
 				return actool.Errorf("related_task_id 必填（取 reader_refs[].related_task_id）"), nil
 			}
 			if t.readerDetailMode {
-				if t.readerCallLimit > 0 && t.readerCalls >= t.readerCallLimit {
-					return actool.Errorf(fmt.Sprintf("本意图的 ask_reader 调用已达上限（%d 次）：用已拿到的细节继续测，或把缺口写进 fact 交规划者", t.readerCallLimit)), nil
+				// 上限按「当前已采纳的参考任务数」动态放宽：worker 的 ToolSet 是
+				// 意图开始时就建好的，那时采纳数还是 0；运行中阅读者继续采纳时，
+				// 固定的 4 次会把后面几条参考直接挡掉（实测 #144 第 5 次被拦）。
+				limit := t.readerCallLimit
+				if limit > 0 {
+					if refs, rerr := t.ts.ReaderRefs(8); rerr == nil {
+						if want := len(refs) + 2; want > limit {
+							limit = want
+						}
+					}
+				}
+				if limit > 0 && t.readerCalls >= limit {
+					return actool.Errorf(fmt.Sprintf("本意图的 ask_reader 调用已达上限（%d 次，按已采纳参考数动态计算）：用已拿到的细节继续测，或把缺口写进 fact 交规划者", limit)), nil
 				}
 				if q := strings.TrimSpace(a.Query); q != "" && reReaderHostRef.MatchString(q) {
 					return actool.Errorf(fmt.Sprintf("query 只允许路径/参数名/漏洞类型，不能包含 URL、host 或 IP：%q。请改成 /api/... 这类路径再试", q)), nil

@@ -884,13 +884,13 @@ func TestRenderReaderAdoptHintIsDirectionOnly(t *testing.T) {
 			t.Errorf("hint 不应包含 %q：\n%s", banned, text)
 		}
 	}
-	for _, want := range []string{"#136", "72/100", "GET /api/sso/userinfo", "本任务已测", "node_ids=[673,674]"} {
+	for _, want := range []string{"#136", "72/100", "GET /api/sso/userinfo", "本任务已测", "node_ids=[673,674]", "边界"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("hint 缺少 %q：\n%s", want, text)
 		}
 	}
-	if n := len([]rune(text)); n > 260 {
-		t.Errorf("hint 过长（%d 字），应只保留来源/重合/已测/下钻四行：\n%s", n, text)
+	if n := len([]rune(text)); n > 340 {
+		t.Errorf("hint 过长（%d 字），应只保留来源/重合/已测/下钻/边界五行：\n%s", n, text)
 	}
 }
 
@@ -907,5 +907,25 @@ func TestOverlapEndpoints(t *testing.T) {
 	got := overlapEndpoints(hits, 2)
 	if len(got) != 2 || got[0] != "GET /a" || got[1] != "POST /b" {
 		t.Fatalf("overlapEndpoints = %#v, want [GET /a POST /b]", got)
+	}
+}
+
+// TestOverlapEndpointsRestoresCase 守 hint 的大小写：归一化 key 全小写，但
+// Linux 路径大小写敏感，显示必须回到原文（方法统一大写）。
+func TestOverlapEndpointsRestoresCase(t *testing.T) {
+	hits := []readerLinkHit{
+		{Kind: db.IntelKindEndpoint, Key: "get /api/sso/userinfo", Value: "https://10.0.0.5:9091/api/SSO/UserInfo?UserID=2"},
+		{Kind: db.IntelKindEndpoint, Key: "post /api/sso/login", Value: "POST /api/SSO/Login"},
+		{Kind: db.IntelKindEndpoint, Key: "get /api/sso/userinfo", Value: "https://10.0.0.5:9091/api/SSO/UserInfo?UserID=2"},
+	}
+	got := overlapEndpoints(hits, 4)
+	if len(got) != 2 {
+		t.Fatalf("去重失败: %#v", got)
+	}
+	if got[0] != "GET /api/SSO/UserInfo?UserID=2" {
+		t.Errorf("URL 路径大小写未还原: %q", got[0])
+	}
+	if got[1] != "POST /api/SSO/Login" {
+		t.Errorf("METHOD /path 大小写未还原: %q", got[1])
 	}
 }

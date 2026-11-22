@@ -908,6 +908,9 @@ func renderReaderAdoptHint(h readerAdoptHint) string {
 	} else {
 		b.WriteString(")")
 	}
+	// 一行边界：不写长解释，但「参考资产不属于本任务授权范围」必须让规划者看到
+	// （执行层另有 task_foreign_assets 硬拦，这里是意图层的提醒）。
+	b.WriteString("\n边界：参考资产不在本任务授权范围，禁打；经验只用在本任务已有资产上。")
 	return b.String()
 }
 
@@ -1031,9 +1034,52 @@ func (s *Server) foreignAssetHostsForTask(ctx context.Context, taskID int64) []s
 	return out
 }
 
-// overlapEndpoints 是纯函数：从候选命中里取两边撞上的接口键（METHOD /path），
-// 去重保序并截断到 n。它是 hint 里唯一允许出现的「参考任务内容」——路径不带
-// host，规划者据此判断本轮要测的端点是否值得借鉴；其余细节一律走下钻。
+// endpointLabel 还原接口的原始大小写。归一化 key 全小写（Linux 路径大小写
+// 敏感，直接把 /api/SSO/UserInfo 显示成 /api/sso/userinfo 会误导），所以方法
+// 一律大写、路径优先从人类可读原文（Value）里取。
+func endpointLabel(h readerLinkHit) string {
+	key := strings.TrimSpace(h.Key)
+	method, keyPath := "", key
+	if i := strings.IndexByte(key, ' '); i > 0 {
+		method = strings.ToUpper(strings.TrimSpace(key[:i]))
+		keyPath = strings.TrimSpace(key[i+1:])
+	}
+	raw := strings.TrimSpace(h.Value)
+	if raw != "" {
+		if u, err := url.Parse(raw); err == nil && u.Scheme != "" && u.Host != "" {
+			p := u.EscapedPath()
+			if p == "" {
+				p = u.Path
+			}
+			if u.RawQuery != "" {
+				p += "?" + u.RawQuery
+			}
+			if p != "" {
+				if method != "" {
+					return method + " " + p
+				}
+				return p
+			}
+		}
+		if m := reSurfaceMethodPath.FindStringSubmatch(raw); len(m) == 3 {
+			return strings.ToUpper(m[1]) + " " + m[2]
+		}
+		if m := reSurfaceBarePath.FindStringSubmatch(raw); len(m) == 2 {
+			if method != "" {
+				return method + " " + m[1]
+			}
+			return m[1]
+		}
+	}
+	if method != "" {
+		return method + " " + keyPath
+	}
+	return keyPath
+}
+
+// overlapEndpoints 是纯函数：从候选命中里取两边撞上的接口（METHOD /path，
+// 路径保留原文大小写），去重保序并截断到 n。它是 hint 里唯一允许出现的
+// 「参考任务内容」——路径不带 host；其余细节一律走下钻。
 func overlapEndpoints(hits []readerLinkHit, n int) []string {
 	if n <= 0 {
 		return nil
@@ -1044,11 +1090,15 @@ func overlapEndpoints(hits []readerLinkHit, n int) []string {
 		if h.Kind != db.IntelKindEndpoint {
 			continue
 		}
-		k := strings.TrimSpace(h.Key)
-		if k == "" || seen[k] {
+		k := strings.TrimSpace(endpointLabel(h))
+		if k == "" || k == " " {
 			continue
 		}
-		seen[k] = true
+		dedup := strings.ToLower(k)
+		if seen[dedup] {
+			continue
+		}
+		seen[dedup] = true
 		out = append(out, k)
 		if len(out) >= n {
 			break
