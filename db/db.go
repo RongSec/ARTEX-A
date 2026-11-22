@@ -282,6 +282,9 @@ ON CONFLICT (name) DO NOTHING`,
 	if err := d.seedDefaultInterceptRulesV4(); err != nil {
 		return fmt.Errorf("seed intercept rules v4: %w", err)
 	}
+	if err := d.seedDefaultInterceptRulesV5(); err != nil {
+		return fmt.Errorf("seed intercept rules v5: %w", err)
+	}
 	if err := d.bumpV4ExclusivePriorities(); err != nil {
 		return fmt.Errorf("bump v4 exclusive priorities: %w", err)
 	}
@@ -801,4 +804,117 @@ WHERE name = $1 AND pattern = $2
   AND timeout_action = 'deny' AND timeout_seconds = 60`,
 		rmRecursiveRuleName, rmRecursivePattern)
 	return err
+}
+
+// V12-RULES 种子规则：把原来写在短路规则文件（shortcircuit_rules.json）里的
+// 红线，落成普通的 intercept_rules 行。三类规则（内置/短路/DB）合并成一套后，
+// 这是唯一的一套规则数据 —— 页面上可看、可改、可停用、可删。
+//
+// 为什么规则只有 4 条而不是原来 9 组正则 + 3 个名单：
+//   - 平台凭据 / 本机凭据 / 控制面 API 三条是「按路径拦读」的，各一条正则即可；
+//   - MCP 注册 + 删除资产、低危放行两条是「按工具名拦」的，各一条；
+//   - 其余的（远端豁免、字段感知、记录类工具豁免）不是规则，是匹配引擎的
+//     判定逻辑，见 intercept/platform_scope.go 与 guard/shortcircuit.go。
+//
+// 命名带 [平台]/[本机] 前缀：命中审计里一眼能看出拦的是「平台自身」还是
+// 「本机敏感文件」，不必再去翻规则表对照 id。
+func (d *DB) seedDefaultInterceptRulesV5() error {
+	if v, _, _ := d.GetSetting("intercept_default_rules_v5"); v == "done" {
+		return nil
+	}
+	type seedRule struct {
+		name         string
+		target       string
+		typ          string
+		pattern      string
+		action       string
+		message      string
+		priority     int
+		remoteExempt bool
+	}
+	rules := []seedRule{
+		{
+			name:     "[平台] 凭据与进程环境",
+			target:   "tool_input",
+			typ:      "regex",
+			priority: 100,
+			pattern: `(?i)(?:` +
+				// jwt.key 的各种变形（插入空格/点/下划线分隔）
+				`j[\s._-]*w[\s._-]*t[\s._-]*\.?[\s._-]*k[\s._-]*e[\s._-]*y` +
+				// 平台 .env
+				`|/app/\.env\b` +
+				// MITM CA 私钥/证书
+				`|/app/data/traffic/_ca/[^\s"']*\.(?:pem|key|crt)` +
+				// 裸相对名：agent 在平台工作目录里直接 config.json / .jwt
+				`|(?:^|[\s"'(=\[,;|&])config\.json(?:$|[\s"'),;\]|&])` +
+				`|(?:^|[\s"'(=\[,;|&])\.jwt\b` +
+				`)`,
+			action:  "deny",
+			message: "该路径指向 ARTEX 平台自身的签名密钥 / 环境变量 / MITM CA，属于平台控制面而不是渗透目标资产，已禁止读取。",
+		},
+		{
+			name:         "[本机] 系统凭据与进程环境",
+			target:       "tool_input",
+			typ:          "regex",
+			priority:     95,
+			remoteExempt: true,
+			pattern: `(?i)(?:` +
+				// /etc/shadow、/etc/gshadow（允许中间插分隔符的变形）
+				`/etc/(?:s[\s._-]*h[\s._-]*a[\s._-]*d[\s._-]*o[\s._-]*w|gshadow)` +
+				// sudoers
+				`|/etc/s[\s._-]*u[\s._-]*d[\s._-]*o[\s._-]*e[\s._-]*r[\s._-]*s(?:\.d)?` +
+				// root 私钥
+				`|/root/\.ssh/[^\s"'\x60]+` +
+				// sshd host key
+				`|/etc/ssh/ssh_host_[^\s"'\x60]*key` +
+				// 进程环境（只认数字 PID：/proc/self/environ 是 agent 自己的环境，
+				// 本来就看得见，不该拦；/proc/1/environ 里才是平台的口令与 DSN）
+				`|/proc/\d+/envi(?:ron)?\b` +
+				// 进程内存/命令行同理
+				`|/proc/\d+/(?:cmdline|mem)\b` +
+				`)`,
+			action:  "deny",
+			message: "读取本机系统凭据或其它进程的环境/内存属于越权。若目标是远端主机，用 ssh/scp 等远程方式读取（远程指代会自动豁免本规则）。",
+		},
+		{
+			name:     "[平台] 控制面 API",
+			target:   "tool_input",
+			typ:      "regex",
+			priority: 100,
+			pattern: `(?:https?://)?(?:{{PLATFORM_IPS}})(?::(?:{{PLATFORM_PORTS}}))?/api/` +
+				`(?:intercept|settings|system|agents|mcp|tools|shortcircuit)(?:[/?#\s"'` + "`" + `;&|)>},.]|$)` +
+				`|(?:https?://)?(?:{{PLATFORM_IPS}})(?::(?:{{PLATFORM_PORTS}}))?/api/tasks/(?:control(?:/batch)?|[^/\s"'` + "`" + `;&|]+/control)(?:[/?#\s"'` + "`" + `;&|)>},.]|$)`,
+			action:  "deny",
+			message: "禁止调用平台自身的控制面接口（拦截规则/设置/系统/Agent/MCP/任务控制）。这类接口能让 agent 关掉自己的护栏，属于控制面而非目标资产。",
+		},
+		{
+			name:     "[平台] MCP 注册与批量删除资产",
+			target:   "tool_name",
+			typ:      "regex",
+			priority: 110,
+			pattern:  `^(?:create_mcp|update_mcp|delete_assets_by_host)$`,
+			action:   "deny",
+			message:  "MCP 注册等价于让平台对任意地址带任意 header 发请求（stdio 还会以容器 root 拉起任意二进制）；批量删除业务资产直接销毁测评成果。两件都不允许 agent 自行执行。",
+		},
+		{
+			name:     "[平台] 低危配置类工具放行",
+			target:   "tool_name",
+			typ:      "regex",
+			priority: 90,
+			pattern:  `^(?:create_skill|create_custom_tool|update_custom_tool|update_skill_file)$`,
+			action:   "allow",
+			message:  "平台配置/新建能力类工具不直接破坏业务数据，按自主策略放行（其行为仍受规则与判官约束）。",
+		},
+	}
+	for _, r := range rules {
+		if _, err := d.Exec(`
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action, remote_exempt)
+SELECT $1, true, $2, $3, $4, $5, $6, $7, false, 60, 'deny', $8
+WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
+			r.name, r.priority, r.target, r.typ, r.pattern, r.action, r.message, r.remoteExempt,
+		); err != nil {
+			return fmt.Errorf("rule %q: %w", r.name, err)
+		}
+	}
+	return d.SetSetting("intercept_default_rules_v5", "done")
 }

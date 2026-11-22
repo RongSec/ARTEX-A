@@ -289,3 +289,20 @@ func TestMCPToolAskRuleGoesToJudgeVerdict(t *testing.T) {
 		}
 	})
 }
+
+// MatchToolName 只跑 tool_name 规则（纯记录类工具用；判据与 Match 同源）。
+func (f *fakeEngine) MatchToolName(tool string) (intercept.Decision, bool) {
+	for _, r := range f.rules {
+		if r.target != "tool_name" {
+			continue
+		}
+		if strings.Contains(tool, r.pattern) {
+			return intercept.Decision{
+				RuleName: r.name,
+				Action:   r.action,
+				Message:  "[规则] " + r.name + " 命中",
+			}, true
+		}
+	}
+	return intercept.Decision{}, false
+}

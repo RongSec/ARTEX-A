@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 )
 
@@ -72,8 +71,9 @@ type judgeTestRequest struct {
 	UseJudge *bool           `json:"use_judge"` // 缺省 true；false 时跳过判官（省钱）
 
 	// 测量用开关：默认 false，生产语义不变。见文件头「测量模式」。
-	SkipShortCircuit bool `json:"skip_short_circuit"`
-	SkipRules        bool `json:"skip_rules"`
+	// V12-RULES：短路层已删除（规则只有 intercept_rules 一套），故测量开关
+	// 只剩「跳过规则表」一个。
+	SkipRules bool `json:"skip_rules"`
 }
 
 // judgeTestLayer 是短路表/规则两层的观测结果。hit=false 时其余字段省略。
@@ -99,7 +99,7 @@ type judgeTestJudge struct {
 }
 
 // judgeTestFinal 是最终结论：动作 + 由哪一层定的。
-// Layer ∈ shortcircuit|rule|judge|none（none = 三层都没拦，按放行处理）。
+// Layer ∈ rule|judge|none（none = 规则与判官都没拦，按放行处理）。
 type judgeTestFinal struct {
 	Action  string `json:"action"`
 	Layer   string `json:"layer"`
@@ -108,11 +108,10 @@ type judgeTestFinal struct {
 
 // judgeTestResponse 是试判返回体。
 //
-// Bypassed 只在测量模式（skip_*）下出现：[]string{"shortcircuit","rules"} 的
+// Bypassed 只在测量模式（skip_*）下出现：[]string{"rules"} 的
 // 子集，明示本次哪些层根本没参与判定。默认参数下省略，返回体与上线语义版
 // 逐字段一致，避免把测量结果误读成线上真实行为。
 type judgeTestResponse struct {
-	ShortCircuit  judgeTestLayer `json:"short_circuit"`
 	Rule          judgeTestLayer `json:"rule"`
 	Judge         judgeTestJudge `json:"judge"`
 	Final         judgeTestFinal `json:"final"`
@@ -137,8 +136,7 @@ func judgeTestJudgeMessage(msg string, bypassed []string) string {
 // 生产路径由 s.judgeTestDeps() 接上真实的 guard/interceptor；单测注入假
 // 判定即可覆盖"短路命中不调判官""规则命中"等分支，无需起库。
 type judgeTestDeps struct {
-	shortCircuit func(tool string, input []byte) *intercept.Decision
-	match        func(tool string, input []byte) (intercept.Decision, bool)
+	match func(tool string, input []byte) (intercept.Decision, bool)
 	judge        func(ctx context.Context, tool string, input json.RawMessage) (intercept.Decision, bool)
 }
 
@@ -148,25 +146,11 @@ func evaluateJudgeTest(ctx context.Context, req judgeTestRequest, deps judgeTest
 	useJudge := req.UseJudge == nil || *req.UseJudge
 	var resp judgeTestResponse
 	// 测量模式：记录本次主动跳过了哪几层（默认两个 false → 空，返回体省略）。
-	if req.SkipShortCircuit {
-		resp.Bypassed = append(resp.Bypassed, "shortcircuit")
-	}
 	if req.SkipRules {
 		resp.Bypassed = append(resp.Bypassed, "rules")
 	}
 
-	// 第一层：短路表（代码常量，不受 settings/DB 热改影响）。
-	if !req.SkipShortCircuit && deps.shortCircuit != nil {
-		if sc := deps.shortCircuit(tool, req.Input); sc != nil {
-			resp.ShortCircuit = judgeTestLayer{
-				Hit: true, Action: sc.Action, RuleName: sc.RuleName, Message: sc.Message,
-			}
-			resp.Final = judgeTestFinal{Action: sc.Action, Layer: "shortcircuit", Message: sc.Message}
-			return resp
-		}
-	}
-
-	// 第二层：DB 规则（priority DESC，首条命中）。
+	// 第一层：DB 规则（priority DESC，首条命中）。V12-RULES 后这是唯一一层规则。
 	var ruleDec intercept.Decision
 	ruleMatched := false
 	if !req.SkipRules && deps.match != nil {
@@ -185,12 +169,12 @@ func evaluateJudgeTest(ctx context.Context, req judgeTestRequest, deps judgeTest
 		}
 	}
 
-	// 第三层：判官（仅在前两层未给终局、且调用方请求时）。
+	// 第二层：判官（仅当规则表未给终局、且调用方请求时）。
 	if !useJudge {
 		resp.Judge = judgeTestJudge{Called: false, Reason: "未请求判官（use_judge=false）"}
-		noneMsg := "未命中短路表与拦截规则，且未请求判官，按放行处理"
+		noneMsg := "未命中拦截规则，且未请求判官，按放行处理"
 		if len(resp.Bypassed) > 0 {
-			noneMsg = "前两层已按 skip 参数跳过，且未请求判官，按放行处理"
+			noneMsg = "规则表已按 skip 参数跳过，且未请求判官，按放行处理"
 		}
 		resp.Final = judgeTestFinal{Action: "allow", Layer: "none", Message: noneMsg}
 		if ruleMatched {
@@ -207,9 +191,9 @@ func evaluateJudgeTest(ctx context.Context, req judgeTestRequest, deps judgeTest
 	}
 	if !judged {
 		resp.Judge = judgeTestJudge{Called: false, Reason: "判官未启用"}
-		noneMsg := "未命中短路表与拦截规则，判官未启用，按放行处理"
+		noneMsg := "未命中拦截规则，判官未启用，按放行处理"
 		if len(resp.Bypassed) > 0 {
-			noneMsg = "前两层已按 skip 参数跳过，判官未启用，按放行处理"
+			noneMsg = "规则表已按 skip 参数跳过，判官未启用，按放行处理"
 		}
 		resp.Final = judgeTestFinal{Action: "allow", Layer: "none", Message: noneMsg}
 		if ruleMatched {
@@ -248,9 +232,9 @@ func evaluateJudgeTest(ctx context.Context, req judgeTestRequest, deps judgeTest
 
 // judgeTestDeps 接上生产实现。interceptor 未初始化（无库/单测直构 Server）
 // 时规则与判官两层按"不存在"处理 —— 与 Guard 在 interceptor==nil 时的放行
-// 语义一致，试判仍能回答短路表那一层。
+// 语义一致。
 func (s *Server) judgeTestDeps() judgeTestDeps {
-	deps := judgeTestDeps{shortCircuit: guard.PreviewShortCircuit}
+	deps := judgeTestDeps{}
 	if s.m == nil || s.m.interceptor == nil {
 		return deps
 	}

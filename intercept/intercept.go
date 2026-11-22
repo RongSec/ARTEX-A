@@ -193,6 +193,9 @@ func (i *Interceptor) loadLocked() error {
 	if err != nil {
 		return err
 	}
+	// V12-RULES：规则里的平台地址用占位符写，编译时展开成本机实际地址集合
+	// （回环 + 各网卡 + 设置项追加）。展开在编译期做一次，匹配路径零开销。
+	extraIPs, platformPorts := i.platformScopeFromSettings()
 	var out []compiledRule
 	for _, r := range rules {
 		if !r.Enabled {
@@ -200,7 +203,8 @@ func (i *Interceptor) loadLocked() error {
 		}
 		cr := compiledRule{InterceptRule: r}
 		if r.MatchType == "regex" {
-			re, err := regexp.Compile(r.Pattern)
+			pattern := ExpandPlatformPlaceholders(r.Pattern, extraIPs, platformPorts)
+			re, err := regexp.Compile(pattern)
 			if err != nil {
 				continue // skip rules with bad regex rather than crashing
 			}
@@ -795,6 +799,13 @@ func ruleMatches(r compiledRule, toolName string, input []byte, normalized strin
 	default:
 		return false
 	}
+	// V12-RULES：本机专用规则遇到远程指代就整条跳过。`ssh root@target
+	// 'cat /etc/shadow'` 是打靶战果，不是读本机凭据；反过来，平台自身路径
+	// （jwt.key / dataDir）的规则没有这个标记——靶机上不存在那些文件，
+	// 「远程读它」只可能是本机，套豁免会漏。
+	if r.RemoteExempt && r.MatchTarget == "tool_input" && HasRemoteTargeting(subjects...) {
+		return false
+	}
 	if r.MatchType == "regex" {
 		if r.re == nil {
 			return false
@@ -992,4 +1003,25 @@ func (i *Interceptor) Decide(pendingID int64, allowed bool) error {
 	}
 	i.pending.resolve(pendingID, allowed)
 	return nil
+}
+
+// MatchToolName 只跑 match_target='tool_name' 的规则。
+//
+// 给「纯记录类工具」用：它们只写 DB、不执行命令，tool_input 规则扫它们等于
+// 禁止在证据里引用被拦命令的原文（审计恰恰需要那段原文）。工具名本身仍是
+// 判定对象——create_mcp 这类该禁的照禁。
+func (i *Interceptor) MatchToolName(toolName string) (Decision, bool) {
+	rules, err := i.rules()
+	if err != nil {
+		return Decision{}, false
+	}
+	for _, r := range rules {
+		if r.MatchTarget != "tool_name" {
+			continue
+		}
+		if ruleMatches(r, toolName, nil, "") {
+			return matchRule(r.InterceptRule), true
+		}
+	}
+	return Decision{}, false
 }

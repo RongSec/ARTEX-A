@@ -1,7 +1,7 @@
 "use client";
 
-// 短路规则已并入 /system/intercept（同一页两个区块）。旧链接保留可用：
-// 静态导出没有服务端重定向，这里由客户端跳转过去。
+// V12-RULES：短路规则已删除（三类规则合并为 intercept_rules 一套）。
+// 旧链接保留可用，跳到拦截规则页。
 
 import * as React from "react";
 
@@ -12,7 +12,7 @@ import { Spinner } from "@/components/ui/spinner";
 export default function LegacyShortCircuitRedirectPage() {
   const router = useRouter();
   React.useEffect(() => {
-    router.replace("/system/intercept?tab=short");
+    router.replace("/system/intercept");
   }, [router]);
   return (
     <div className="text-muted-foreground flex flex-1 items-center justify-center gap-2 p-6 text-sm">

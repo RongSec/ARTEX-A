@@ -2,8 +2,10 @@ package guard
 
 import "testing"
 
-// V9-UI：管理页「内置规则」区块的数据源。守住三件事：
-//  1. 要求的三条规则（控制面 / 平台凭据 / 外部任务资产范围）必须在目录里；
+// V9-UI / V12-RULES：管理页「内置规则」区块的数据源。
+// 三类规则合并后，规则类红线全部落到 intercept_rules，这里只剩「外部任务
+// 资产范围」一条（它依赖任务上下文，无法表达成一条正则）。守住三件事：
+//  1. 这条必须还在（adopt 的安全边界靠它）；
 //  2. name 必须与真实判定用的 RuleName 常量一致（否则页面与审计链对不上）；
 //  3. 全部为 deny —— 目录只展示无人工放行路径的硬拦项。
 func TestBuiltinRulesCoverHardDenyRules(t *testing.T) {
@@ -26,9 +28,7 @@ func TestBuiltinRulesCoverHardDenyRules(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"platform_control_plane": builtinControlPlaneRuleName,
-		"platform_credentials":   builtinPlatformCredRuleName,
-		"foreign_task_assets":    builtinForeignScopeRuleName,
+		"foreign_task_assets": builtinForeignScopeRuleName,
 	}
 	for key, name := range want {
 		r, ok := byKey[key]

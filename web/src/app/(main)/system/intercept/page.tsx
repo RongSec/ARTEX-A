@@ -1,33 +1,35 @@
 "use client";
 
-// 拦截规则（V9-UI2）：顶部 segmented tabs 在「拦截规则 / 短路规则 / 资产拦截」
-// 之间切换，只显示当前 tab 的区块；当前 tab 记在 URL query（?tab=short|assets），
-// 刷新/分享不丢。旧 /system/shortcircuit 与 /system/intercept/assets 客户端
-// 跳到对应 tab。
+// 拦截规则（V9-UI2 / V12-RULES）：顶部 segmented tabs 在「拦截规则 / 资产拦截」
+// 之间切换，只显示当前 tab 的区块；当前 tab 记在 URL query（?tab=assets），
+// 刷新/分享不丢。
+//
+// 「短路规则」tab 在规则合并后删除：三类规则（内置 / 短路 / DB）只剩
+// intercept_rules 一套，平台地址改成设置项 + 规则里的占位符（见页面顶部
+// 的「平台自身地址」卡片）。
 
 import * as React from "react";
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
-import { BanIcon, ShieldAlertIcon, ShieldCheckIcon } from "lucide-react";
+import { BanIcon, ShieldAlertIcon } from "lucide-react";
 
 import { SectionHeader } from "@/components/section-header";
 import { SegmentedTabs } from "@/components/segmented-tabs";
 
 import { AssetInterceptSection } from "./_components/asset-intercept-section";
 import { InterceptSection } from "./_components/intercept-section";
-import { ShortCircuitSection } from "./_components/shortcircuit-section";
 
-type InterceptTab = "rules" | "short" | "assets";
+type InterceptTab = "rules" | "assets";
 
 const TABS: { value: InterceptTab; label: string }[] = [
   { value: "rules", label: "拦截规则" },
-  { value: "short", label: "短路规则" },
   { value: "assets", label: "资产拦截" },
 ];
 
 function readTab(v: string | null): InterceptTab {
-  return v === "short" || v === "assets" ? v : "rules";
+  // 旧的 ?tab=short 链接落到「拦截规则」：短路规则已并入规则表。
+  return v === "assets" ? v : "rules";
 }
 
 function InterceptPageInner() {
@@ -54,20 +56,9 @@ function InterceptPageInner() {
           <SectionHeader
             icon={ShieldAlertIcon}
             title="拦截规则"
-            description="工具执行前先按拦截规则匹配；未命中的命令可交由模型兜底判定。"
+            description="工具执行前先按拦截规则匹配（唯一一套规则）；未命中的命令可交由模型兜底判定。"
           />
           <InterceptSection />
-        </section>
-      ) : null}
-
-      {tab === "short" ? (
-        <section data-section="short-circuit" className="flex flex-col gap-4">
-          <SectionHeader
-            icon={ShieldCheckIcon}
-            title="短路规则"
-            description="代码级红线（不进 DB、不受设置热改影响），只能改文件 + 重启服务端生效。"
-          />
-          <ShortCircuitSection />
         </section>
       ) : null}
 

@@ -5,12 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 )
 
@@ -35,45 +33,11 @@ func mustRaw(t *testing.T, s string) json.RawMessage {
 	return json.RawMessage(s)
 }
 
-// 1. 短路表命中（裸读本机 /etc/shadow）：final 落在 shortcircuit，判官 0 次。
-func TestJudgeTestShortCircuitHitSkipsJudge(t *testing.T) {
-	fj := &fakeJudge{dec: intercept.Decision{Action: "allow"}, ok: true}
-	deps := judgeTestDeps{
-		shortCircuit: guard.PreviewShortCircuit,
-		match: func(string, []byte) (intercept.Decision, bool) {
-			t.Fatal("短路表命中后不应再跑 DB 规则（线上路径也是终局）")
-			return intercept.Decision{}, false
-		},
-		judge: fj.judge,
-	}
-	resp := evaluateJudgeTest(context.Background(), judgeTestRequest{
-		Tool:     "Bash",
-		Input:    mustRaw(t, `{"command":"cat /etc/shadow"}`),
-		UseJudge: ptrBool(true),
-	}, deps)
-
-	if !resp.ShortCircuit.Hit || resp.ShortCircuit.Action != "deny" {
-		t.Fatalf("短路表应 deny，得到 %+v", resp.ShortCircuit)
-	}
-	if resp.ShortCircuit.RuleName == "" || resp.ShortCircuit.Message == "" {
-		t.Fatalf("短路层须带规则名与消息：%+v", resp.ShortCircuit)
-	}
-	if resp.Final.Layer != "shortcircuit" || resp.Final.Action != "deny" {
-		t.Fatalf("final 应为 shortcircuit/deny，得到 %+v", resp.Final)
-	}
-	if fj.calls != 0 || resp.Judge.Called {
-		t.Fatalf("短路命中后判官不应被调用，calls=%d judge=%+v", fj.calls, resp.Judge)
-	}
-	if resp.JudgeCostHint != "" {
-		t.Fatalf("未调判官不应给用量提示，得到 %q", resp.JudgeCostHint)
-	}
-}
 
 // 2. DB 规则命中（crontab -r）：final 落在 rule，deny 不再下探判官。
 func TestJudgeTestRuleHitStopsBeforeJudge(t *testing.T) {
 	fj := &fakeJudge{dec: intercept.Decision{Action: "allow"}, ok: true}
 	deps := judgeTestDeps{
-		shortCircuit: guard.PreviewShortCircuit,
 		match: func(tool string, _ []byte) (intercept.Decision, bool) {
 			if tool != "Bash" {
 				t.Fatalf("规则层收到的工具名不符：%q", tool)
@@ -91,9 +55,6 @@ func TestJudgeTestRuleHitStopsBeforeJudge(t *testing.T) {
 		UseJudge: ptrBool(true),
 	}, deps)
 
-	if resp.ShortCircuit.Hit {
-		t.Fatal("crontab -r 不应命中短路表")
-	}
 	if !resp.Rule.Hit || resp.Rule.RuleID != 21 || resp.Rule.Action != "deny" {
 		t.Fatalf("规则层应命中 21/deny，得到 %+v", resp.Rule)
 	}
@@ -112,7 +73,6 @@ func TestJudgeTestJudgeAllowsWhenNoLayerHit(t *testing.T) {
 		ok:  true,
 	}
 	deps := judgeTestDeps{
-		shortCircuit: guard.PreviewShortCircuit,
 		match:        func(string, []byte) (intercept.Decision, bool) { return intercept.Decision{}, false },
 		judge:        fj.judge,
 	}
@@ -122,8 +82,8 @@ func TestJudgeTestJudgeAllowsWhenNoLayerHit(t *testing.T) {
 		UseJudge: ptrBool(true),
 	}, deps)
 
-	if resp.ShortCircuit.Hit || resp.Rule.Hit {
-		t.Fatalf("两层都不应命中：%+v %+v", resp.ShortCircuit, resp.Rule)
+	if resp.Rule.Hit {
+		t.Fatalf("规则表不应命中：%+v", resp.Rule)
 	}
 	if !resp.Judge.Called || resp.Judge.Action != "allow" || resp.Judge.ModelFallback {
 		t.Fatalf("判官应被调用且 allow，得到 %+v", resp.Judge)
@@ -143,7 +103,6 @@ func TestJudgeTestJudgeAllowsWhenNoLayerHit(t *testing.T) {
 func TestJudgeTestUseJudgeFalseSkipsJudge(t *testing.T) {
 	fj := &fakeJudge{dec: intercept.Decision{Action: "deny"}, ok: true}
 	deps := judgeTestDeps{
-		shortCircuit: guard.PreviewShortCircuit,
 		match:        func(string, []byte) (intercept.Decision, bool) { return intercept.Decision{}, false },
 		judge:        fj.judge,
 	}
@@ -167,7 +126,6 @@ func TestJudgeTestUseJudgeFalseSkipsJudge(t *testing.T) {
 // 判官未启用：called=false + reason=判官未启用，final 仍是 none。
 func TestJudgeTestJudgeDisabled(t *testing.T) {
 	deps := judgeTestDeps{
-		shortCircuit: guard.PreviewShortCircuit,
 		match:        func(string, []byte) (intercept.Decision, bool) { return intercept.Decision{}, false },
 		judge: func(context.Context, string, json.RawMessage) (intercept.Decision, bool) {
 			return intercept.Decision{}, false
@@ -319,87 +277,13 @@ func TestJudgeTestHTTPResponseShape(t *testing.T) {
 	}
 }
 
-// 测量模式1：skip_short_circuit 后 cat /etc/shadow 不再被短路表拦，改由判官定论。
-func TestJudgeTestSkipShortCircuitFallsToJudge(t *testing.T) {
-	scCalls := 0
-	fj := &fakeJudge{dec: intercept.Decision{Action: "deny", Message: "[模型] 读取本机凭据"}, ok: true}
-	deps := judgeTestDeps{
-		shortCircuit: func(tool string, input []byte) *intercept.Decision {
-			scCalls++
-			return guard.PreviewShortCircuit(tool, input)
-		},
-		match: func(string, []byte) (intercept.Decision, bool) { return intercept.Decision{}, false },
-		judge: fj.judge,
-	}
-	resp := evaluateJudgeTest(context.Background(), judgeTestRequest{
-		Tool:             "Bash",
-		Input:            mustRaw(t, `{"command":"cat /etc/shadow"}`),
-		UseJudge:         ptrBool(true),
-		SkipShortCircuit: true,
-	}, deps)
 
-	if scCalls != 0 {
-		t.Fatalf("skip_short_circuit=true 时短路表不应被求值，calls=%d", scCalls)
-	}
-	if resp.ShortCircuit.Hit {
-		t.Fatalf("短路层应标记未命中：%+v", resp.ShortCircuit)
-	}
-	if len(resp.Bypassed) != 1 || resp.Bypassed[0] != "shortcircuit" {
-		t.Fatalf("bypassed 应为 [shortcircuit]，得到 %v", resp.Bypassed)
-	}
-	if resp.Final.Layer != "judge" || resp.Final.Action != "deny" {
-		t.Fatalf("final 应由判官定论为 deny，得到 %+v", resp.Final)
-	}
-	if !strings.HasPrefix(resp.Final.Message, "[仅判官·已跳过前两层] ") {
-		t.Fatalf("测量模式下的判官定论应带前缀，得到 %q", resp.Final.Message)
-	}
-	if fj.calls != 1 {
-		t.Fatalf("判官应调用 1 次，得到 %d", fj.calls)
-	}
-}
-
-// 测量模式2：skip_rules 后 crontab -r 不再被 DB 规则拦，改由判官定论。
-func TestJudgeTestSkipRulesFallsToJudge(t *testing.T) {
-	matchCalls := 0
-	fj := &fakeJudge{dec: intercept.Decision{Action: "ask", Message: "[模型] 定时任务改动需人工确认"}, ok: true}
-	deps := judgeTestDeps{
-		shortCircuit: guard.PreviewShortCircuit,
-		match: func(string, []byte) (intercept.Decision, bool) {
-			matchCalls++
-			return intercept.Decision{RuleID: 21, RuleName: "[内置] 定时任务删除", Action: "deny"}, true
-		},
-		judge: fj.judge,
-	}
-	resp := evaluateJudgeTest(context.Background(), judgeTestRequest{
-		Tool:      "Bash",
-		Input:     mustRaw(t, `{"command":"crontab -r"}`),
-		UseJudge:  ptrBool(true),
-		SkipRules: true,
-	}, deps)
-
-	if matchCalls != 0 {
-		t.Fatalf("skip_rules=true 时不应求值 DB 规则，calls=%d", matchCalls)
-	}
-	if resp.Rule.Hit {
-		t.Fatalf("规则层应标记未命中：%+v", resp.Rule)
-	}
-	if len(resp.Bypassed) != 1 || resp.Bypassed[0] != "rules" {
-		t.Fatalf("bypassed 应为 [rules]，得到 %v", resp.Bypassed)
-	}
-	if resp.Final.Layer != "judge" || resp.Final.Action != "ask" {
-		t.Fatalf("final 应由判官定论为 ask，得到 %+v", resp.Final)
-	}
-	if !strings.HasPrefix(resp.Final.Message, "[仅判官·已跳过前两层] ") {
-		t.Fatalf("测量模式下的判官定论应带前缀，得到 %q", resp.Final.Message)
-	}
-}
 
 // 测量模式3：两层都跳过且 use_judge=false → 无任何判定，final=none，
 // bypassed 两个元素齐全。
 func TestJudgeTestSkipBothWithoutJudge(t *testing.T) {
 	fj := &fakeJudge{dec: intercept.Decision{Action: "deny"}, ok: true}
 	deps := judgeTestDeps{
-		shortCircuit: guard.PreviewShortCircuit,
 		match: func(string, []byte) (intercept.Decision, bool) {
 			return intercept.Decision{RuleID: 21, Action: "deny"}, true
 		},
@@ -409,12 +293,11 @@ func TestJudgeTestSkipBothWithoutJudge(t *testing.T) {
 		Tool:             "Bash",
 		Input:            mustRaw(t, `{"command":"cat /etc/shadow"}`),
 		UseJudge:         ptrBool(false),
-		SkipShortCircuit: true,
 		SkipRules:        true,
 	}, deps)
 
-	if len(resp.Bypassed) != 2 || resp.Bypassed[0] != "shortcircuit" || resp.Bypassed[1] != "rules" {
-		t.Fatalf("bypassed 应为 [shortcircuit rules]，得到 %v", resp.Bypassed)
+	if len(resp.Bypassed) != 1 || resp.Bypassed[0] != "rules" {
+		t.Fatalf("bypassed 应为 [rules]，得到 %v", resp.Bypassed)
 	}
 	if resp.Final.Layer != "none" || resp.Final.Action != "allow" {
 		t.Fatalf("final 应为 none/allow，得到 %+v", resp.Final)
@@ -424,31 +307,5 @@ func TestJudgeTestSkipBothWithoutJudge(t *testing.T) {
 	}
 }
 
-// 回归：默认参数（两个 skip 均未传）与上一版逐字段一致 —— 短路 deny、
-// 无规则/判官结论、无 bypassed、无成本提示。
-func TestJudgeTestDefaultParamsUnchanged(t *testing.T) {
-	input := mustRaw(t, `{"command":"cat /etc/shadow"}`)
-	sc := guard.PreviewShortCircuit("Bash", input)
-	if sc == nil || sc.Action != "deny" {
-		t.Fatalf("前置条件：/etc/shadow 应命中短路表，得到 %+v", sc)
-	}
-	fj := &fakeJudge{dec: intercept.Decision{Action: "allow"}, ok: true}
-	deps := judgeTestDeps{
-		shortCircuit: guard.PreviewShortCircuit,
-		match:        func(string, []byte) (intercept.Decision, bool) { return intercept.Decision{}, false },
-		judge:        fj.judge,
-	}
-	resp := evaluateJudgeTest(context.Background(), judgeTestRequest{Tool: "Bash", Input: input}, deps)
-	want := judgeTestResponse{
-		ShortCircuit: judgeTestLayer{Hit: true, Action: sc.Action, RuleName: sc.RuleName, Message: sc.Message},
-		Final:        judgeTestFinal{Action: sc.Action, Layer: "shortcircuit", Message: sc.Message},
-	}
-	if !reflect.DeepEqual(resp, want) {
-		t.Fatalf("默认参数响应与上一版不一致：\n got %+v\nwant %+v", resp, want)
-	}
-	if fj.calls != 0 {
-		t.Fatalf("默认路径短路命中后判官不应被调用，calls=%d", fj.calls)
-	}
-}
 
 func ptrBool(v bool) *bool { return &v }

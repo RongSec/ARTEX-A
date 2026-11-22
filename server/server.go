@@ -896,9 +896,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/records/{id}", s.pgGetLLMRecord)
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
-	// 短路规则（V6-CFG）：文件级配置，保存后必须重启才生效（不提供热改）。
-	// 与 settings 同权限：仅需管理员 JWT（requireAuth 统一校验）。
-	mux.HandleFunc("GET /api/system/shortcircuit", s.shortCircuitGet)
+	// V12-RULES：短路规则（/api/system/shortcircuit*）已删除——规则只有
+	// /api/intercept/rules 一套。平台自身地址改由设置项 platform_ips/platform_ports
+	// 提供（规则里用 {{PLATFORM_IPS}} / {{PLATFORM_PORTS}} 占位符引用）。
 	// V10-INTEL：漏洞情报（NVD + CISA KEV 公开源）
 	mux.HandleFunc("GET /api/intel/status", s.intelStatus)
 	mux.HandleFunc("GET /api/intel/search", s.intelSearch)
@@ -911,9 +911,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/system/host-tools", s.hostToolsStatus)
 	mux.HandleFunc("POST /api/system/host-tools/install", s.hostToolsInstall)
 	mux.HandleFunc("GET /api/system/host-tools/install/{id}", s.hostToolsInstallStatus)
-	mux.HandleFunc("PUT /api/system/shortcircuit", s.shortCircuitPut)
-	mux.HandleFunc("PUT /api/system/shortcircuit/rules", s.shortCircuitRulesPut)
-	mux.HandleFunc("POST /api/system/shortcircuit/reset", s.shortCircuitReset)
 	mux.HandleFunc("POST /api/system/restart", s.systemRestart)
 	// 漏洞 IM 推送。渠道是「多实例 + 各自过滤规则」的资源，因此独立成一组
 	// REST 接口，而不是塞进扁平的 /api/settings 键值里。
@@ -1022,6 +1019,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/llm/models", s.pgListModels)
 
 	// 拦截规则管理
+	// V12-RULES：平台自身地址（多网卡）供规则里的 {{PLATFORM_IPS}} 占位符展开。
+	mux.HandleFunc("GET /api/intercept/platform-scope", s.interceptGetPlatformScope)
+	mux.HandleFunc("PUT /api/intercept/platform-scope", s.interceptSetPlatformScope)
 	mux.HandleFunc("GET /api/intercept/rules", s.interceptListRules)
 	mux.HandleFunc("POST /api/intercept/rules", s.interceptCreateRule)
 	mux.HandleFunc("PUT /api/intercept/rules/{id}", s.interceptUpdateRule)

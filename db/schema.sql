@@ -1059,9 +1059,15 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     timeout_enabled BOOLEAN NOT NULL DEFAULT true,
     timeout_seconds INTEGER NOT NULL DEFAULT 60,
     timeout_action  TEXT    NOT NULL DEFAULT 'deny',
+    -- V12-RULES：本规则是否只针对【本机】。true 时匹配引擎先看命令里有没有
+    -- 远程指代（ssh/scp/curl/psql -h/…），有就跳过这条——`ssh root@target
+    -- 'cat /etc/shadow'` 是合法打靶战果，不该被「本机系统凭据」规则拦下。
+    -- 平台自身路径（jwt.key / dataDir）恒为 false：靶机上不存在这些文件。
+    remote_exempt   BOOLEAN NOT NULL DEFAULT false,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE intercept_rules ADD COLUMN IF NOT EXISTS remote_exempt BOOLEAN NOT NULL DEFAULT false;
 DROP TRIGGER IF EXISTS trg_intercept_rules_upd ON intercept_rules;
 CREATE TRIGGER trg_intercept_rules_upd BEFORE UPDATE ON intercept_rules
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();

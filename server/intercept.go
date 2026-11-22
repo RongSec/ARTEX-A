@@ -125,7 +125,7 @@ func (s *Server) interceptCreateRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.CreateInterceptRule(req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
+	rule, err := pg.CreateInterceptRule(req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction, req.RemoteExempt != nil && *req.RemoteExempt)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -153,7 +153,14 @@ func (s *Server) interceptUpdateRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.UpdateInterceptRule(id, req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
+	// 没传 remote_exempt 时先用库里现值兜底（见 interceptRuleReq 的指针注释）。
+	remoteExempt := false
+	if req.RemoteExempt != nil {
+		remoteExempt = *req.RemoteExempt
+	} else if cur, err := pg.GetInterceptRule(id); err == nil && cur != nil {
+		remoteExempt = cur.RemoteExempt
+	}
+	rule, err := pg.UpdateInterceptRule(id, req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction, remoteExempt)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -483,6 +490,9 @@ type interceptRuleReq struct {
 	TimeoutEnabled bool   `json:"timeout_enabled"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	TimeoutAction  string `json:"timeout_action"`
+	// RemoteExempt 用指针区分「没传」与「显式 false」：老前端/脚本不传时必须
+	// 保留库里原值，否则编辑一次「[本机] 系统凭据」规则就把远程豁免悄悄关掉。
+	RemoteExempt *bool `json:"remote_exempt"`
 }
 
 func validateInterceptRuleReq(req interceptRuleReq) error {
@@ -580,4 +590,78 @@ func (s *Server) interceptExecution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"conversation_id": target.ConversationID, "task_id": target.TaskID, "session": target.Session, "seq": target.Seq, "items": activityDTOs(target.Items)})
+}
+
+// --- 平台自身地址（V12-RULES） ---
+
+// interceptGetPlatformScope 返回「平台自身地址」配置：回环 + 各网卡（自动探测，
+// 只读展示）+ 用户额外配置的地址 + 端口。
+//
+// 用途：控制面 API 规则的 pattern 里写 {{PLATFORM_IPS}} / {{PLATFORM_PORTS}}，
+// 规则编译时展开成实际地址集合。一台机器常有多个网卡（127.0.0.1 / 10.x /
+// 172.17.x），写死单一地址必然漏。
+func (s *Server) interceptGetPlatformScope(w http.ResponseWriter, r *http.Request) {
+	detected := intercept.DefaultPlatformIPs()
+	var extra []string
+	if v, ok, _ := s.m.pg.GetSetting("platform_ips"); ok {
+		_ = json.Unmarshal([]byte(v), &extra)
+	}
+	var ports []string
+	if v, ok, _ := s.m.pg.GetSetting("platform_ports"); ok {
+		_ = json.Unmarshal([]byte(v), &ports)
+	}
+	effective := append([]string{}, detected...)
+	effective = append(effective, extra...)
+	writeJSON(w, 200, map[string]any{
+		"detected_ips":   detected,          // 自动探测（只读）
+		"extra_ips":      extra,             // 用户额外配置
+		"ports":          ports,             // 空=用默认 8801/8787/8802
+		"default_ports":  intercept.DefaultPlatformPorts(),
+		"effective_ips":  dedupeStrings(effective),
+		"placeholder_ip":   "{{PLATFORM_IPS}}",
+		"placeholder_port": "{{PLATFORM_PORTS}}",
+	})
+}
+
+// interceptSetPlatformScope 保存用户额外配置的平台地址/端口，并让规则重新加载
+// （地址变了，编译期展开的结果就变了）。
+func (s *Server) interceptSetPlatformScope(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ExtraIPs []string `json:"extra_ips"`
+		Ports    []string `json:"ports"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	ips, _ := json.Marshal(dedupeStrings(req.ExtraIPs))
+	ports, _ := json.Marshal(dedupeStrings(req.Ports))
+	if err := s.m.pg.SetSetting("platform_ips", string(ips)); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if err := s.m.pg.SetSetting("platform_ports", string(ports)); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if s.m.interceptor != nil {
+		// 规则表缓存里存的是「展开后的正则」，改了地址必须让它失效才会重编译。
+		s.m.interceptor.Invalidate()
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// dedupeStrings 去空去重、保序。
+func dedupeStrings(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }

@@ -23,6 +23,7 @@ import type {
   BatchControlItem,
   BatchTasksResult,
   BuiltinInterceptRule,
+  PlatformScope,
   ChatAttachment,
   CommandRecord,
   Company,
@@ -102,9 +103,6 @@ import type {
   SessionTokenUsage,
   Settings,
   Severity,
-  ShortCircuitConfig,
-  ShortCircuitRule,
-  ShortCircuitState,
   SkillCall,
   SkillItem,
   SSProject,
@@ -964,19 +962,9 @@ export const api = {
   settings: () => get<Settings>(`/settings`),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
 
-  // ---- 短路规则（V6-CFG）----
-  // 只写文件，不热改内存；三个写/重启动作都要求管理员 JWT（由 http 统一带）。
-  shortCircuit: () => get<ShortCircuitState>(`/system/shortcircuit`),
-  saveShortCircuit: (config: ShortCircuitConfig) =>
-    put<{ ok: boolean; need_restart: boolean; file_path: string }>(`/system/shortcircuit`, { config }),
-  // V9-RULE：统一规则表整表保存（内置项只改 enabled，自定义项全字段）。
-  saveShortCircuitRules: (rules: ShortCircuitRule[]) =>
-    put<{ ok: boolean; need_restart: boolean; file_path: string; rules: ShortCircuitRule[] }>(
-      `/system/shortcircuit/rules`,
-      { rules },
-    ),
-  resetShortCircuit: () =>
-    post<{ ok: boolean; need_restart: boolean; file_path: string }>(`/system/shortcircuit/reset`, {}),
+  // ---- 服务端重启 ----
+  // V12-RULES：短路规则文件与 /system/shortcircuit* 端点已删除（规则只有
+  // /intercept/rules 一套）。重启端点保留，用于换二进制/改环境变量后生效。
   restartServer: () =>
     post<{ ok: boolean; scheduled: boolean; delay_seconds: number; log_file: string }>(`/system/restart`, {}),
   // Run a real "test" search with the given (or saved) config to verify it works.
@@ -1366,9 +1354,13 @@ export const api = {
   deleteInterceptRule: (id: number) => del<{ deleted: number }>(`/intercept/rules/${id}`),
   toggleInterceptRule: (id: number, enabled: boolean) =>
     post<{ ok: boolean; enabled: boolean }>(`/intercept/rules/${id}/toggle`, { enabled }),
-  // 代码内置规则目录（只读）：名称/说明由服务端从 guard 包常量下发。
+  // 仍由代码持有的判定项（只读）：目前只剩「外部任务资产范围」一条。
   interceptBuiltinRules: () =>
     get<{ rules: BuiltinInterceptRule[] }>("/intercept/builtin-rules").then((r) => arr(r.rules)),
+  // 平台自身地址（V12-RULES）：控制面规则的 {{PLATFORM_IPS}} 占位符从这里取。
+  interceptPlatformScope: () => get<PlatformScope>("/intercept/platform-scope"),
+  setInterceptPlatformScope: (extra_ips: string[], ports: string[]) =>
+    put<{ ok: boolean }>("/intercept/platform-scope", { extra_ips, ports }),
 
   // ---- asset intercept rules（资产拦截：全局黑名单） ----
   assetInterceptRules: () => get<{ rules: AssetInterceptRule[] }>("/asset-intercept/rules").then((r) => arr(r.rules)),

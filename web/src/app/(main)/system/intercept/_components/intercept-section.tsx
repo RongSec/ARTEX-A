@@ -63,6 +63,7 @@ import type {
   JudgeDayUsage,
   JudgeUsage,
   LLMProfile,
+  PlatformScope,
   Tool,
 } from "@/lib/types";
 
@@ -161,6 +162,7 @@ type RuleForm = {
   timeout_enabled: boolean;
   timeout_seconds: number;
   timeout_action: "deny" | "allow";
+  remote_exempt: boolean;
 };
 
 const defaultForm = (): RuleForm => ({
@@ -175,6 +177,7 @@ const defaultForm = (): RuleForm => ({
   timeout_enabled: true,
   timeout_seconds: 60,
   timeout_action: "deny",
+  remote_exempt: false,
 });
 
 // ---- small components ----
@@ -196,70 +199,6 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-// ---- builtin rules (代码内置，只读) ----
-
-// BuiltinRulesCard 列 guard 包里硬编码的红线规则：名称/说明/动作全部由后端
-// 常量下发，前端不写字面量。这里只读——不是遗漏了开关，而是这些规则没有
-// 运行期开关（DB 规则可 toggle/删除，内置规则不能）。
-function BuiltinRulesCard() {
-  const [rules, setRules] = React.useState<BuiltinInterceptRule[]>([]);
-  const [loading, setLoading] = React.useState(true);
-
-  React.useEffect(() => {
-    api
-      .interceptBuiltinRules()
-      .then(setRules)
-      // 目录只是说明性信息：拉取失败不打断规则管理。
-      .catch(() => setRules([]))
-      .finally(() => setLoading(false));
-  }, []);
-
-  return (
-    <Card>
-      <CardHeader className="border-b py-3">
-        <CardTitle className="flex items-center gap-2 text-sm">
-          <LockIcon className="h-4 w-4 text-muted-foreground" />
-          内置规则（代码内置，不可编辑）
-        </CardTitle>
-        <CardDescription className="text-xs">
-          代码内置，不受数据库规则与判官影响，页面不可关闭。即使删光下面的数据库规则、关掉模型兜底，这些红线仍然生效。
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="p-0">
-        {loading ? (
-          <p className="px-6 py-4 text-sm text-muted-foreground">加载中…</p>
-        ) : rules.length === 0 ? (
-          <p className="px-6 py-4 text-sm text-muted-foreground">暂无可展示的内置规则</p>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow className="hover:bg-transparent">
-                <TableHead className="w-[220px]">名称</TableHead>
-                <TableHead>说明</TableHead>
-                <TableHead className="w-[72px]">动作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rules.map((rule) => (
-                <TableRow key={rule.key} className="hover:bg-transparent">
-                  <TableCell className="align-top">
-                    <span className="text-xs font-medium">{rule.name}</span>
-                  </TableCell>
-                  <TableCell className="align-top">
-                    <span className="text-xs text-muted-foreground">{rule.description}</span>
-                  </TableCell>
-                  <TableCell className="align-top">
-                    <ActionBadge action={rule.action} />
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
 
 // ---- LLM fallback judge card ----
 
@@ -509,6 +448,107 @@ function JudgeCard() {
 
 // ---- page ----
 
+
+// ---- 平台自身地址（V12-RULES） ----
+
+// PlatformScopeCard 配「哪些地址算平台自己」：控制面 API 规则的 pattern 里写
+// {{PLATFORM_IPS}} / {{PLATFORM_PORTS}}，编译时展开成这里列出的地址。
+//
+// 为什么要能配多个：一台机器常有 loopback + 业务网卡 + 容器网桥。服务监听在
+// 0.0.0.0，agent 从哪个地址访问都可能，只匹配 127.0.0.1 会漏。回环与网卡地址
+// 自动探测（只读展示），用户只需补域名 / DNAT 地址这类探测不到的。
+function PlatformScopeCard() {
+  const [scope, setScope] = React.useState<PlatformScope | null>(null);
+  const [extra, setExtra] = React.useState("");
+  const [ports, setPorts] = React.useState("");
+  const [saving, setSaving] = React.useState(false);
+
+  const load = React.useCallback(() => {
+    api
+      .interceptPlatformScope()
+      .then((r) => {
+        setScope(r);
+        setExtra(r.extra_ips.join(", "));
+        setPorts(r.ports.join(", "));
+      })
+      .catch(() => setScope(null));
+  }, []);
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  async function save() {
+    setSaving(true);
+    try {
+      const split = (v: string) =>
+        v
+          .split(/[,，\s]+/)
+          .map((x) => x.trim())
+          .filter(Boolean);
+      await api.setInterceptPlatformScope(split(extra), split(ports));
+      toast.success("已保存，规则已重新编译");
+      load();
+    } catch (e) {
+      toast.error("保存失败：" + (e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card size="sm">
+      <CardHeader className="border-b py-3">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <ShieldAlertIcon className="h-4 w-4 text-muted-foreground" />
+          平台自身地址
+        </CardTitle>
+        <CardDescription className="text-xs">
+          规则里写 <code className="rounded bg-muted px-1">{"{{PLATFORM_IPS}}"}</code> /{" "}
+          <code className="rounded bg-muted px-1">{"{{PLATFORM_PORTS}}"}</code> 即代表这些地址。
+          多网卡机器把探测不到的地址（域名、DNAT 出口）补在这里，不用改规则。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3 pt-3">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-xs text-muted-foreground">自动探测：</span>
+          {(scope?.detected_ips ?? []).map((ip) => (
+            <Badge key={ip} variant="secondary" className="font-mono text-[10px]">
+              {ip}
+            </Badge>
+          ))}
+        </div>
+        <div className="grid gap-2 sm:grid-cols-2">
+          <div className="grid gap-1.5">
+            <Label className="text-xs">额外地址（逗号分隔）</Label>
+            <Input
+              value={extra}
+              onChange={(e) => setExtra(e.target.value)}
+              placeholder="如 art.example.com, 192.0.2.10"
+              className="h-8 text-xs"
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label className="text-xs">
+              平台端口（留空=默认 {(scope?.default_ports ?? []).join(" / ")}）
+            </Label>
+            <Input
+              value={ports}
+              onChange={(e) => setPorts(e.target.value)}
+              placeholder="8801, 8787"
+              className="h-8 text-xs"
+            />
+          </div>
+        </div>
+        <div className="flex justify-end">
+          <Button size="sm" onClick={save} disabled={saving}>
+            {saving ? "保存中…" : "保存地址"}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 export function InterceptSection() {
   const [rules, setRules]     = React.useState<InterceptRule[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -583,7 +623,7 @@ export function InterceptSection() {
       match_target: rule.match_target, match_type: rule.match_type,
       pattern: rule.pattern, action: rule.action, message: rule.message,
       timeout_enabled: rule.timeout_enabled, timeout_seconds: rule.timeout_seconds,
-      timeout_action: rule.timeout_action,
+      timeout_action: rule.timeout_action, remote_exempt: rule.remote_exempt ?? false,
     });
     setRegexErr("");
     setOpen(true);
@@ -718,6 +758,8 @@ export function InterceptSection() {
 
         {/* ---- tab: 拦截规则 ---- */}
         <TabsContent value="rules" className="mt-4 flex flex-col gap-4">
+          <PlatformScopeCard />
+
           <div className="flex items-center justify-between gap-3">
             <p className="text-xs text-muted-foreground">
               按优先级（数字越大越先）逐条匹配，首条命中的规则生效
@@ -811,7 +853,6 @@ export function InterceptSection() {
             </CardContent>
           </Card>
 
-          <BuiltinRulesCard />
         </TabsContent>
 
         {/* ---- tab: 模型配置 ---- */}
@@ -916,6 +957,25 @@ export function InterceptSection() {
                   className="resize-none"
                 />
               </Field>
+            )}
+
+            {form.match_target === "tool_input" && (
+              <>
+                <Separator />
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium">仅针对本机（远程命令跳过）</p>
+                    <p className="text-xs text-muted-foreground">
+                      开启后，命令里出现 ssh / scp / curl / psql -h 等远程指代时跳过本条。
+                      「本机系统凭据」类规则应开启；平台自身路径（jwt.key）不要开。
+                    </p>
+                  </div>
+                  <Switch
+                    checked={form.remote_exempt}
+                    onCheckedChange={(v) => set({ remote_exempt: v })}
+                  />
+                </div>
+              </>
             )}
 
             {form.action === "ask" && (

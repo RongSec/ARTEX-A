@@ -648,11 +648,30 @@ const taskIntelLinkToolsV9Flag = "task_intel_link_tools_v9"
 // 先存在（reporter 同款顺序依赖）。绑定不给 auto/planner：跨任务读图+写 hint
 // 是阅读者特权，最小暴露面。tool_base='none' 两 key 都保留（只读安全红线）。
 func (s *Server) seedProjectTools() {
+	// V12-CLEANUP：旧洞察工具已从代码删除，存量库里还留着行。不清掉的话工具页
+	// 会显示一个点不动的条目、agent 绑定列表里也挂着不存在的名字。
+	for _, key := range []string{
+		"write_project_insight", "write_global_insight",
+		"read_all_project_insights", "reject_insight",
+	} {
+		if _, err := s.m.pg.Exec(`DELETE FROM tools WHERE key=$1 AND system`, key); err != nil {
+			log.Printf("[project-tools] 清理废弃工具 %s: %v", key, err)
+		}
+	}
+	// 观察者/阅读者四件工具：seed 后【无条件】把绑定覆盖成 reader。
+	// 原来是 SeedTool-only（首插生效）+ seedReaderAgent 里 AddAgentToToolBinding
+	// 兜一次；新增 read_cross_project_assets 时，存量库因为 seedReaderAgent 有
+	// flag 早退，新工具就停在 agents=[] 上——线上表现是「工具在、阅读者调不到」。
 	emptyBindings, _ := json.Marshal([]string{})
+	readerAgents, _ := json.Marshal([]string{"reader"})
 	for _, t := range append(s.projectObserverTools(), s.projectReaderTools()...) {
 		schema, _ := json.Marshal(t.InputSchema())
 		if err := s.m.PG().SeedTool(t.Name(), t.Description(), schema, emptyBindings); err != nil {
 			log.Printf("[project-tools] seed %s: %v", t.Name(), err)
+			continue
+		}
+		if err := s.m.PG().SetSystemToolAgents(t.Name(), readerAgents); err != nil {
+			log.Printf("[project-tools] bind %s → reader: %v", t.Name(), err)
 		}
 	}
 	// V9-READER：情报表勾连工具全部只绑 reader（read_task_intel / link_tasks /

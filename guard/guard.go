@@ -36,6 +36,8 @@ type interceptorAPI interface {
 	JudgeAllToolsEnabled() bool
 	IsToolExternal(string) bool
 	Match(string, []byte) (intercept.Decision, bool)
+	// MatchToolName 只跑 match_target=tool_name 的规则（纯记录类工具用）。
+	MatchToolName(string) (intercept.Decision, bool)
 	Judge(context.Context, string, json.RawMessage) (intercept.Decision, bool)
 	JudgeAskVerdict(context.Context, intercept.Decision, string, json.RawMessage) (intercept.Decision, bool)
 	AskBurstExceeded(context.Context, string) bool
@@ -65,12 +67,7 @@ func New() *Guard { return newGuard(nil) }
 func NewWithInterceptor(ic *intercept.Interceptor) *Guard { return newGuard(ic) }
 
 func newGuard(ic *intercept.Interceptor) *Guard {
-	// V6-CFG：短路表在首个 Guard 初始化时读一次 <dataDir>/shortcircuit_rules.json。
-	// 加载失败时 main 会拒绝启动（见 cmd/artex）；这里只留下日志，运行期由
-	// shortCircuit 的 fail-closed 分支兜底。
-	if err := InitShortCircuit(); err != nil {
-		log.Printf("[guard] ⚠ 短路规则配置加载失败（将按 fail-closed 全拒）: %v", err)
-	}
+	// V12-RULES：短路规则文件已删除，规则只在 intercept_rules（DB）一处加载。
 	g := &Guard{
 		attrib:     map[string]int{},
 		judgeCache: newJudgeVerdictCache(time.Now, judgeVerdictTTL, judgeVerdictCacheCap),
@@ -127,64 +124,50 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	if g.scopeOnly {
 		return hook.Result{}
 	}
-	// 短路表须先于规则匹配求值：它是代码常量红线，对全部工具生效，命中即终局。
-	if dec := shortCircuit(ev.ToolName, ev.Input); dec != nil {
-		switch dec.Action {
-		case "allow":
-			// 显式放行也要留痕：平台工具调用量小，进审计链无压力；
-			// 事后要能回答「谁在何时建过什么」。
-			if g.interceptor != nil {
-				logCtx := intercept.WithCall(ctx, ev.ToolName, ev.Input)
-				g.interceptor.Log(logCtx, intercept.ConvIDFromContext(logCtx), *dec, ev.ToolName, ev.Input, "allowed")
-				g.interceptor.AppendDecisionEvent(logCtx, *dec, ev.ToolName, ev.Input, "allow")
-			}
-			g.record(ev.ToolName, "allow", dec.Message, "")
-			return hook.Result{}
-		case "ask":
-			// 审批防疲劳：同一 agent 在窗口内反复对同一高危面请求审批，
-			// 达阈值后直接拒绝，不再打扰人（也堵住「疲劳点 allow」的循环）。
-			if g.interceptor != nil && g.interceptor.AskBurstExceeded(ctx, ev.ToolName) {
-				esc := *dec
-				esc.Action = "deny"
-				esc.RuleName = builtinAskBurstRuleName
-				esc.Message = "同一 agent 在时间窗内对本工具的审批请求已超阈值，按防疲劳策略直接拒绝。"
-				logCtx := intercept.WithCall(ctx, ev.ToolName, ev.Input)
-				g.interceptor.Log(logCtx, intercept.ConvIDFromContext(logCtx), esc, ev.ToolName, ev.Input, "denied")
-				g.interceptor.AppendDecisionEvent(logCtx, esc, ev.ToolName, ev.Input, "denied")
-				g.record(ev.ToolName, "block", esc.Message, "")
-				return g.block(ev.ToolName, systemBlockMessage(esc.Message), "")
-			}
-			if g.interceptor == nil {
-				return g.block(ev.ToolName, systemBlockMessage("人工审批通道不可用（"+dec.Message+"）"), "")
-			}
-			ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
-			if !g.interceptor.HandleAsk(ctx, intercept.ConvIDFromContext(ctx), *dec, ev.ToolName, ev.Input) {
-				return g.block(ev.ToolName, systemBlockMessage("人工审批未通过（用户拒绝或审批超时）"), "")
-			}
-			return hook.Result{}
-		default:
-			// 短路表的 deny 也要落库。此前它只进内存 audit 切片（上限 2000、
-			// 进程退出即失），于是「谁在何时想干什么」查无实据 —— 而短路表
-			// 恰恰是唯一一道不受 DB 热改面影响的防线，最需要留痕。
-			// Log 是 best-effort：DB 写失败不影响本次调用结果。
-			if g.interceptor != nil {
-				logCtx := intercept.WithCall(ctx, ev.ToolName, ev.Input)
-				g.interceptor.Log(logCtx, intercept.ConvIDFromContext(logCtx), *dec, ev.ToolName, ev.Input, "denied")
-			}
-			g.record(ev.ToolName, "block", dec.Message, "")
-			return g.block(ev.ToolName, systemBlockMessage(dec.Message), "")
-		}
-	}
+	// V12-RULES：三类规则（内置 / 短路 / DB）合并成 intercept_rules 一套，
+	// 这里不再有独立的「短路表」求值。只保留两件「拿哪段文本去匹配」的收窄：
+	//
+	//   - 纯记录类工具（record_fact / report_finding…只写 DB）：只跑
+	//     match_target='tool_name' 的规则。正文里如实引用被拦命令的原文是
+	//     审计刚需，不该因为出现 /etc/shadow 就被拒。
+	//   - 文件写入类工具（Write/Edit/MultiEdit）：只扫 file_path/path/
+	//     command/args。content/new_string 是内容不是命令。
+	//
+	// 两条收窄都只影响 tool_input 规则看哪段文本；工具名规则照常全量判定。
 	if g.interceptor == nil {
 		return hook.Result{}
+	}
+	recordOnly := isRecordOnlyTool(ev.ToolName)
+	matchInput := ev.Input
+	if !recordOnly {
+		matchInput = executionSurfaceInput(ev.ToolName, ev.Input)
+	}
+	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
+	var dec intercept.Decision
+	var matched bool
+	if recordOnly {
+		dec, matched = g.interceptor.MatchToolName(ev.ToolName)
+	} else {
+		dec, matched = g.interceptor.Match(ev.ToolName, matchInput)
+	}
+	// ask 档的审批防疲劳：同一 agent 在窗口内反复对同一高危面请求审批，达阈值
+	// 后直接拒绝，不再打扰人（也堵住「疲劳点 allow」的循环）。原来挂在短路表
+	// 的 ask 分支上，规则合并后挪到这里，对 DB 规则的 ask 同样生效。
+	if matched && dec.Action == "ask" && g.interceptor.AskBurstExceeded(ctx, ev.ToolName) {
+		esc := dec
+		esc.Action = "deny"
+		esc.RuleName = builtinAskBurstRuleName
+		esc.Message = "同一 agent 在时间窗内对本工具的审批请求已超阈值，按防疲劳策略直接拒绝。"
+		g.interceptor.Log(ctx, intercept.ConvIDFromContext(ctx), esc, ev.ToolName, ev.Input, "denied")
+		g.interceptor.AppendDecisionEvent(ctx, esc, ev.ToolName, ev.Input, "denied")
+		g.record(ev.ToolName, "block", esc.Message, "")
+		return g.block(ev.ToolName, systemBlockMessage(esc.Message), "")
 	}
 	// 规则表对【全部】工具生效：Match 本身按规则的 MatchTarget（tool_name /
 	// tool_input）比对，与白名单无关。此前先判 IsToolEnabled 再 Match，白名单
 	// 外的 MCP / 自定义工具根本不过规则表 —— 一条 tool_input=deny 的规则（如
 	// 内置 rm -rf、凭据读写）对它们永不生效，用户在 UI 里给 mcp__xxx__run 建的
 	// tool_name 规则同样形同虚设。白名单现在只决定「无规则命中后送不送判官」。
-	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
-	dec, matched := g.interceptor.Match(ev.ToolName, ev.Input)
 	if !matched {
 		// 无规则命中。白名单外：
 		//   - 内置平台工具（kind=builtin，record_fact / graph_overview 等）不送

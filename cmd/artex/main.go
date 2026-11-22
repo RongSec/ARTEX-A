@@ -18,7 +18,6 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/config"
-	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/selfupdate"
 	"github.com/Autumn-27/artex/server"
 )
@@ -96,16 +95,10 @@ func run() int {
 	ctx, shutdown := shutdownContext(sigCtx)
 	defer shutdown(agent.AbortShutdown)
 
-	// 短路规则（V6-CFG）：在构造任何 Guard 之前读一次 <dataDir>/shortcircuit_rules.json。
-	// 文件非法（正则编译失败/关键列表为空）必须拒绝启动——静默退化成空规则等于
-	// 把「不能热改的红线」降级为「没有红线」。
-	guard.SetShortCircuitDataDir(*dataDir)
-	// V6-CP：控制面判定需要平台实际监听地址（127.0.0.1/localhost:<port>）。
-	// 必须在 InitShortCircuit 之前注入——短路表启动时编译一次，运行期不热改。
-	guard.SetShortCircuitListenAddr(*addr)
-	if err := guard.InitShortCircuit(); err != nil {
-		log.Fatalf("[guard] 短路规则配置非法，拒绝启动: %v", err)
-	}
+	// V12-RULES：短路规则文件（shortcircuit_rules.json）已删除。规则只有
+	// intercept_rules（DB）一套，由 intercept 包按需加载，无需启动期初始化。
+	// 平台自身地址改由规则里的 {{PLATFORM_IPS}} / {{PLATFORM_PORTS}} 占位符
+	// 在编译期展开（回环 + 各网卡 + 设置项），不再需要注入监听地址。
 
 	mgr, err := server.NewManager(*dataDir, *proxy)
 	if err != nil {

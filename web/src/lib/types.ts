@@ -999,63 +999,9 @@ export interface TrafficHost {
   count: number;
 }
 
-// ---- 短路规则（V6-CFG）：文件级红线配置，保存后需重启服务端才生效 ----
-export interface ShortCircuitTools {
-  deny: string[];
-  ask: string[];
-  allow: string[];
-}
-
-export interface ShortCircuitConfig {
-  version: number;
-  tools: ShortCircuitTools;
-  platform_paths: string[];
-  platform_loose_patterns: string[];
-  bare_read_names: string[];
-  host_paths: string[];
-  ssh_host_key_patterns: string[];
-  remote_exempt_patterns: string[];
-  record_only_tools: string[];
-  control_plane_patterns: string[];
-  // 管理员自定义条目（V9-SC）。只 deny，可增删改；内置档只读。
-  custom_rules: ShortCircuitCustomRule[];
-  // 运行时派生：启动时由 dataDir 绝对路径填充，只读展示（不参与保存）。
-  platform_abs_dir: string;
-}
-
-// ShortCircuitCustomRule 是短路规则页「自定义区」的条目。
-// 没有 action 字段：自定义条目只能收紧（命中即 deny），不能写成 allow。
-export interface ShortCircuitCustomRule {
-  key: string; // 唯一标识，字母/数字/下划线
-  name: string; // 显示名
-  pattern: string; // 匹配执行面文本的 RE2 正则（一行）
-  note?: string; // 可选说明
-  enabled: boolean; // 默认 true；关闭后保留条目但不参与匹配
-}
-
-export interface ShortCircuitState {
-  config: ShortCircuitConfig; // 当前【生效】配置（重启前不会变）
-  defaults: ShortCircuitConfig; // 代码内置默认，供「恢复默认」
-  // V9-RULE：内置工具策略 + 平台路径 + 自定义条目合并后的统一规则表
-  // （priority 升序；readonly=true 的内置行只允许切 enabled）。
-  rules?: ShortCircuitRule[];
-  file_path: string;
-  loaded_at: string;
-  dirty: boolean; // 文件内容与生效配置不同 = 需重启
-}
-
-// ShortCircuitRule 是 V9-RULE 统一规则行。
-export interface ShortCircuitRule {
-  id: string;
-  kind: "builtin" | "custom";
-  priority: number;
-  name: string;
-  action: "allow" | "deny" | "ask";
-  pattern: string;
-  description: string;
-  enabled: boolean;
-  readonly: boolean;
-}
+// V12-RULES：短路规则的配置类型（ShortCircuitConfig / State / Rule / Tools /
+// CustomRule）随配置文件与 /system/shortcircuit* 端点一起删除。规则只有
+// intercept_rules 一套，见 InterceptRule。
 
 // ---- App settings (runtime toggles) ----
 export interface Settings {
@@ -1418,6 +1364,9 @@ export interface InterceptRule {
   timeout_enabled: boolean;
   timeout_seconds: number;
   timeout_action: "deny" | "allow";
+  // V12-RULES：true = 本规则只针对本机；命令里出现 ssh/scp/curl 等远程指代
+  // 时跳过（`ssh root@target 'cat /etc/shadow'` 是打靶战果，不该拦）。
+  remote_exempt?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -1839,6 +1788,19 @@ export interface ProjectGraphResp {
 
 // V12-CLEANUP：ProjectInsight 随 project_insights 表删除（洞察注入整体移除，
 // 跨任务经验改走阅读者 judge → adopt → hint）。
+
+// PlatformScope 是「平台自身地址」配置（GET /api/intercept/platform-scope）。
+// 控制面 API 规则的 pattern 里写 {{PLATFORM_IPS}} / {{PLATFORM_PORTS}}，
+// 编译时展开成这里的地址集合 —— 一台机器多网卡时不用改规则。
+export interface PlatformScope {
+  detected_ips: string[]; // 自动探测：回环 + 各网卡（只读）
+  extra_ips: string[]; // 用户额外配置（含域名 / DNAT 地址）
+  ports: string[]; // 空=用 default_ports
+  default_ports: string[];
+  effective_ips: string[];
+  placeholder_ip: string;
+  placeholder_port: string;
+}
 
 export interface BatchTasksResult {
   created: string[];
