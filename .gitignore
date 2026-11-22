@@ -67,3 +67,15 @@ Thumbs.db
 /.gocache/
 web/out.bak.*/
 web/.next.bak.*/
+# 宿主工具预编译二进制（由 docker/hostbin/fetch.sh 现取，不入库）
+/docker/hostbin/nuclei
+/docker/hostbin/httpx
+/docker/hostbin/subfinder
+/docker/hostbin/katana
+/docker/hostbin/dnsx
+/docker/hostbin/tlsx
+/docker/hostbin/ffuf
+/docker/hostbin/dalfox
+/docker/hostbin/chisel
+/docker/hostbin/artex
+/docker/hostbin/VERSIONS.txt

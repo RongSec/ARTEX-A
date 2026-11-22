@@ -249,6 +249,60 @@ func TestListInsightsKeywordOrdering(t *testing.T) {
 	}
 }
 
+// TestListInsightsMatchNoBackfill 钉死 V11-INSIGHT9 的核心语义：
+// ListInsightsMatch 只返回 keywords 与 matchKeys 有交集的行，【不做时间补位】；
+// 而 ListInsights（管理面/读全量）保持旧行为，两者不能互相污染。
+func TestListInsightsMatchNoBackfill(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) — skipping", err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+
+	suffix := strconv.FormatInt(time.Now().UnixNano()%1000000, 10)
+	p, err := d.CreateProject(CreateProjectInput{Name: "insight-no-backfill-" + suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Exec(`DELETE FROM projects WHERE id=$1`, p.ID) //nolint:errcheck // 级联删
+
+	hit, err := d.WriteInsight(ctx, p.ID, "同组件可复用", 0, []string{"canal.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 不命中的行故意最后写：旧 ListInsights 会把它按 created_at DESC 补到最前，
+	// 正是不该再发生的「无差别广播」。
+	if _, err := d.WriteInsight(ctx, p.ID, "完全无关的另一套系统", 0, []string{"other.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := d.ListInsightsMatch(ctx, p.ID, []string{"canal.example.com", "10.0.0.8"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != hit.ID {
+		t.Fatalf("ListInsightsMatch 应只返回命中的 1 条(id=%d)，got %+v", hit.ID, got)
+	}
+
+	// 无交集 / 空键集 → 空（不是「拿最近的顶上」）。
+	if l, err := d.ListInsightsMatch(ctx, p.ID, []string{"no-such.example"}, 10); err != nil || len(l) != 0 {
+		t.Errorf("无交集必须为空, got %d err=%v", len(l), err)
+	}
+	if l, err := d.ListInsightsMatch(ctx, p.ID, nil, 10); err != nil || len(l) != 0 {
+		t.Errorf("空键集必须为空, got %d err=%v", len(l), err)
+	}
+
+	// 全量视图不受影响：两条都在（管理面/跨项目阅读输入仍要看得见）。
+	all, err := d.ListInsights(ctx, p.ID, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Errorf("ListInsights 应仍返回 2 条, got %d", len(all))
+	}
+}
+
 func globalIDs(list []GlobalInsight) []int64 {
 	out := make([]int64, 0, len(list))
 	for _, g := range list {

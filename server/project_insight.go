@@ -12,10 +12,14 @@ package server
 // 保留项目内洞察注入，planner 侧 projectInsightsRendered 见空串即整段不出现，
 // prompt 与原版逐字节一致 = 三停收编后的"注入停"。
 //
-// 限量与命中：ListInsights(matchKeywords=当前任务 open 意图锚定资产的归一化
-// 键) 让「与本任务正在打的资产相交」的洞察排最前，取 ≤3 条、每条正文截
-// 200 rune、带「（来源任务#N）」回链。keywords 交集为空时退化为按时间新在
-// 前补位——跨任务阅读者攒的经验值得被看见，但绝不挤过直接命中的。
+// 限量与命中：ListInsightsMatch(matchKeys=当前任务锚定资产的归一化键 + 分词弱键)
+// 只返回 keywords 与之【有交集】的洞察，取 ≤3 条、每条正文截 200 rune、带
+// 「（来源任务#N）」回链。
+//
+// V11-INSIGHT9：不再「交集为空时按时间补位」。旧行为把项目里最近 3 条洞察
+// 无差别塞给每个任务——项目里挂了互不相关的目标时，这是纯噪声（600 字/轮），
+// 还会稀释真正命中的信号。项目洞察的语义就是「同资产/同组件可复用」，没有
+// 交集就不该出现。整段为空时 planner prompt 与基线逐字节一致。
 //
 // 命中键来源（障碍1，三级并集，任一级非空即停）：
 //   a. 本探索图 state IN ('open','running') 的意图锚定资产（running 也很常见：
@@ -113,8 +117,15 @@ func (s *Server) projectInsightResolverFor() func(taskID int64) string {
 		// 命中原料：五级并集，查询抖动按「该级为空」降级，绝不因旁路查询报错
 		// 把整段注入打掉。
 		match := s.insightMatchSources(ctx, pg, tctx, taskID)
-		// 项目洞察：ListInsights 内部走单表 scope='project'（U2）。
-		list, err := pg.ListInsights(ctx, tctx.ProjectID, match.keys(), insightInjectMax)
+		keys := match.keys()
+		if len(keys) == 0 {
+			// V11-INSIGHT9：一个锚定键都没有 = 本任务还没落到任何资产上，
+			// 此时「最近 3 条洞察」与它毫无关系。宁可不注入（旧行为是补位
+			// 硬塞，项目内每个新任务都会看到，等于无差别广播）。
+			return ""
+		}
+		// 项目洞察：只取 keywords 与本任务锚定键【真有交集】的行，不补位。
+		list, err := pg.ListInsightsMatch(ctx, tctx.ProjectID, keys, insightInjectMax)
 		if err != nil {
 			insightWarner.warn("ListInsights", taskID, err)
 			return ""

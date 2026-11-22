@@ -144,6 +144,56 @@ ORDER BY `+order+` LIMIT $`+fmt.Sprint(len(args)), args...)
 	return out, rows.Err()
 }
 
+// ListInsightsMatch 返回某项目【active 且 keywords 与 matchKeys 有交集】的洞察
+// （命中数降序，同分新在前）。与 ListInsights 的唯一差别是**不做时间补位**：
+// 一条都不交集时返回空，不是「拿最近的 3 条顶上」。
+//
+// 为什么要这个变体（V11-INSIGHT9）：planner 侧注入原来走 ListInsights，关键词
+// 全不命中时按 created_at DESC 补满 limit。项目 ≠ 相关域——一个项目里可能挂
+// 着 N 个互不相关的目标系统，补位等于把「A 任务的 canal 经验」无差别广播给
+// 正在打 B 系统的任务：每轮 3×200 字噪声，还稀释真正命中的信号。
+// 只注入真交集，「跨任务复用」才回到「同资产/同组件」的原意。
+//
+// matchKeys 为空直接返回 nil（不发 SQL）：没有任何锚定键时，任何洞察都不该
+// 被视为「与本任务相关」。
+func (d *DB) ListInsightsMatch(ctx context.Context, projectID int64, matchKeys []string, limit int) ([]Insight, error) {
+	if projectID <= 0 || len(matchKeys) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	// 命中计数写两遍（ORDER BY / WHERE 各一次）：PG 不会把同一条子查询在
+	// ORDER BY 与 WHERE 间复用，拆成 CTE 反而多一次物化——行数少（单项目
+	// 洞察通常几十条），重复算更省。
+	const hits = `(SELECT count(*) FROM unnest(keywords) kw WHERE kw = ANY($2::text[]))`
+	rows, err := d.QueryContext(ctx, `SELECT id, project_id, content, source_task_id,
+       array_to_json(keywords)::text, status, rejected_reason, created_at
+FROM project_insights
+WHERE project_id=$1 AND scope='project' AND status='active' AND `+hits+` > 0
+ORDER BY `+hits+` DESC, created_at DESC, id DESC
+LIMIT $3`, projectID, marshalTextArray(matchKeys), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Insight
+	for rows.Next() {
+		var in Insight
+		var src sql.NullInt64
+		var kwJSON string
+		if err := rows.Scan(&in.ID, &in.ProjectID, &in.Content, &src, &kwJSON, &in.Status, &in.RejectedReason, &in.CreatedAt); err != nil {
+			return nil, err
+		}
+		if src.Valid {
+			in.SourceTaskID = src.Int64
+		}
+		_ = json.Unmarshal([]byte(kwJSON), &in.Keywords)
+		out = append(out, in)
+	}
+	return out, rows.Err()
+}
+
 // DeleteInsight 按 id 删一条项目洞察；不存在返回 ErrInsightNotFound
 // （observer 管理面/测试清理用，调用方按项目归属自行校验前先查行）。
 func (d *DB) DeleteInsight(ctx context.Context, id int64) error {

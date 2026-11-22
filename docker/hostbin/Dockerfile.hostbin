@@ -1,0 +1,45 @@
+# V15-HOSTBIN：在已跑通的 v14 上加一层「预编译 Go 工具」。
+#
+# 为什么是增量层而不是回到全量 Dockerfile：
+#   构建机 4C/7G（可用内存约 1G）。v14 之前为了让这些工具跑起来，曾尝试在
+#   镜像里 `go install`——nuclei v3 单次编译 36 分钟，导出层时 OOM。工具本身
+#   全都提供官方 linux-amd64 静态二进制，所以正解不是加内存，是**不编译**：
+#   二进制由 docker/hostbin/fetch.sh 在有外网的机器上取好，这里只 COPY 一层。
+#
+# 构建（上下文就是 hostbin 目录，几百 MB，秒级完成）：
+#   cd /root/Desktop/sec/artex-hs/hostbin
+#   docker build -f Dockerfile.hostbin -t artex-hs-local:v15 .
+#
+# 校验：RUN 里逐个 `--version`，任何一个跑不起来就让构建失败，
+#       不留「镜像构建成功但工具是坏的」这种坑。
+
+FROM artex-hs-local:v14
+
+# 目标目录 /usr/local/bin 已在镜像 PATH 里（v14 的 ENV PATH 含它），
+# 且 hosttools 的探测是 exec.LookPath——落在这里页面立刻能看到「已安装」。
+COPY nuclei httpx subfinder katana dnsx tlsx ffuf dalfox chisel /usr/local/bin/
+
+# 同一层顺带换掉 artex 主程序：工具层和业务层一起发版，避免「镜像里工具是新的、
+# 二进制还是旧的」这种半更新态。artex 由本机交叉编译（CGO_ENABLED=0），
+# 不带动态依赖，COPY 进来即可跑。
+COPY artex /app/artex
+
+RUN set -eux; \
+    chmod 0755 /usr/local/bin/nuclei /usr/local/bin/httpx /usr/local/bin/subfinder \
+               /usr/local/bin/katana /usr/local/bin/dnsx /usr/local/bin/tlsx \
+               /usr/local/bin/ffuf /usr/local/bin/dalfox /usr/local/bin/chisel \
+               /app/artex; \
+    # 逐个自检：能打印版本才算装好（静态二进制不依赖 libc，正常不会有动态库缺失）
+    nuclei -version | head -1; \
+    httpx -version | head -1; \
+    subfinder -version 2>&1 | head -1; \
+    katana -version | head -1; \
+    dnsx -version | head -1; \
+    tlsx -version | head -1; \
+    ffuf -V | head -1; \
+    dalfox version 2>&1 | head -1; \
+    chisel --version | head -1
+
+# nuclei 的版本自检/模板自动更新在内网会卡住（连不上 GitHub），默认关掉；
+# 模板目录由 compose 挂到 $HOME/nuclei-templates（见 docker-compose.hs.yml）。
+ENV NUCLEI_DISABLE_UPDATE_CHECK=true

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -111,10 +112,22 @@ func init() {
 	// ARTEX_HOSTPY 指到挂载卷时（容器部署），pip --prefix 装的 CLI 入口在
 	// <prefix>/bin、库在 <prefix>/lib/python3.*/site-packages，两者都要进
 	// 本进程环境，否则装完 which 找不到、import 也失败。重建镜像不丢。
+	//
+	// 注意顺序：bin 必须【追加】到 PATH 末尾，不能像 HOSTBIN 那样前置。
+	// pip 生态里有和 Go 工具重名的 CLI——最典型的是 python 的 httpx
+	// （pip install impacket 会连带装上），它的入口一旦排在 /usr/local/bin
+	// 前面，镜像里预装的 ProjectDiscovery httpx 就永远探测不到，页面显示
+	// 「已安装」但跑起来是另一个程序。追加到末尾保证：页面装的（HOSTBIN）
+	// > 镜像预装（/usr/local/bin）> pip 入口。python 库本身靠 PYTHONPATH，
+	// 与 PATH 顺序无关。
 	if v := strings.TrimSpace(os.Getenv("ARTEX_HOSTPY")); v != "" {
 		bin := filepath.Join(v, "bin")
 		_ = os.MkdirAll(bin, 0o755)
-		os.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+		if cur := os.Getenv("PATH"); cur != "" {
+			os.Setenv("PATH", cur+string(os.PathListSeparator)+bin)
+		} else {
+			os.Setenv("PATH", bin)
+		}
 		if matches, _ := filepath.Glob(filepath.Join(v, "lib", "python3*", "site-packages")); len(matches) > 0 {
 			old := os.Getenv("PYTHONPATH")
 			if old != "" {
@@ -166,7 +179,7 @@ func Catalog() []Tool {
 		// ---- Web 与 API ----
 		{Key: "httpx", Name: "httpx", Bin: "httpx", Category: "Web 与 API", Install: goInstall("github.com/projectdiscovery/httpx/cmd/httpx"), Note: "探活/指纹；注意与 python httpx 同名，安装后确认 which"},
 		{Key: "katana", Name: "katana", Bin: "katana", Category: "Web 与 API", Install: goInstall("github.com/projectdiscovery/katana/cmd/katana")},
-		{Key: "ffuf", Name: "ffuf", Bin: "ffuf", Category: "Web 与 API", Install: goInstall("github.com/ffuf/ffuf/v2")},
+		{Key: "ffuf", Name: "ffuf", Bin: "ffuf", Category: "Web 与 API", VersionIn: []string{"-V"}, Install: goInstall("github.com/ffuf/ffuf/v2")},
 		{Key: "gobuster", Name: "gobuster", Bin: "gobuster", Category: "Web 与 API", Install: apt("gobuster")},
 		{Key: "feroxbuster", Name: "feroxbuster", Bin: "feroxbuster", Category: "Web 与 API", Install: apt("feroxbuster")},
 		{Key: "dirsearch", Name: "dirsearch", Bin: "dirsearch", Category: "Web 与 API", Install: pipx("dirsearch")},
@@ -175,7 +188,7 @@ func Catalog() []Tool {
 		{Key: "whatweb", Name: "whatweb", Bin: "whatweb", Category: "Web 与 API", Install: apt("whatweb")},
 		{Key: "wafw00f", Name: "wafw00f", Bin: "wafw00f", Category: "Web 与 API", Install: pipx("wafw00f")},
 		{Key: "sqlmap", Name: "sqlmap", Bin: "sqlmap", Category: "Web 与 API", Install: apt("sqlmap")},
-		{Key: "dalfox", Name: "dalfox", Bin: "dalfox", Category: "Web 与 API", Install: goInstall("github.com/hahwul/dalfox/v2")},
+		{Key: "dalfox", Name: "dalfox", Bin: "dalfox", Category: "Web 与 API", VersionIn: []string{"version"}, Install: goInstall("github.com/hahwul/dalfox/v2")},
 
 		// ---- 注入与利用 ----
 		{Key: "hydra", Name: "hydra", Bin: "hydra", Category: "注入与利用", Install: apt("hydra")},
@@ -302,8 +315,14 @@ func probe(t Tool) ToolStatus {
 	return st
 }
 
-// toolVersion 跑一次 `--version`（或目录里指定的参数）取首行，3 秒超时。
+// toolVersion 跑一次 `--version`（或目录里指定的参数）取版本行，3 秒超时。
 // 很多工具把版本打到 stderr，两个流都收。
+//
+// 取哪一行：优先【含语义化版本号的那行】，而不是机械取首行——ProjectDiscovery
+// 这一族（nuclei/httpx/subfinder/katana/dnsx/tlsx）的 `--version` 先打一段
+// ASCII banner，首行往往是空行或 `__  __` 这种装饰，直接取首行会让页面显示
+// 空白或乱码，用户据此会误判「这个工具没装好」。没有版本号格式的输出（自研
+// 脚本、打印自定义头的工具）退回首个非空行。
 func toolVersion(path string, args []string) string {
 	if len(args) == 0 {
 		args = []string{"--version"}
@@ -316,7 +335,31 @@ func toolVersion(path string, args []string) string {
 	if text == "" && err != nil {
 		return ""
 	}
-	line := strings.SplitN(text, "\n", 2)[0]
+	var first string
+	for _, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if first == "" {
+			first = line
+		}
+		if reVersionLine.MatchString(line) {
+			return clipVersionLine(line)
+		}
+	}
+	if first == "" {
+		return ""
+	}
+	return clipVersionLine(first)
+}
+
+// reVersionLine 认「v1.2.3 / 1.2.3 / 1.2」这类版本号（前后可以有词）。
+// 只用于挑行，不做严格解析——挑错最多是显示不好看，不影响任何判定。
+var reVersionLine = regexp.MustCompile(`\bv?\d+\.\d+(\.\d+)?\b`)
+
+// clipVersionLine 截到 120 字节以内（页面一格放不下更长的）。
+func clipVersionLine(line string) string {
 	if len(line) > 120 {
 		line = line[:120]
 	}

@@ -1,0 +1,29 @@
+name: artex-hs
+
+services:
+  artex-hs:
+    image: artex-hs-local:v15
+    container_name: artex-hs
+    network_mode: host
+    environment:
+      ARTEX_PG_DSN: "postgres://artexhs:241e07cf2b8cdd329f4b943ec7d4c786@127.0.0.1:5432/db_artexhs?sslmode=disable"
+      ARTEX_HOSTBIN: "/app/data/hostbin"
+      ARTEX_HOSTPY: "/app/data/pyenv"
+      GOBIN: "/app/data/hostbin"
+      GOPATH: "/app/data/gopath"
+      GOPROXY: "https://goproxy.cn,direct"
+      HOME: "/app/data/home"
+      TZ: "Asia/Shanghai"
+      # 内网连不上 GitHub，nuclei 的版本自检/模板自动更新会卡住——关掉。
+      # 模板已随宿主 data/home/nuclei-templates 提供（v10.5.2，85MB）。
+      NUCLEI_DISABLE_UPDATE_CHECK: "true"
+    volumes:
+      # data 整个挂上去：模板、hostbin、pyenv、gopath、报告产物全在卷里。
+      - /root/Desktop/sec/artex-hs/data:/app/data
+      - /root/Desktop/sec/artex-hs/skills:/app/skills
+      - /root/Desktop/sec/artex-hs/config.json:/app/config.json:ro
+      - /root/Desktop/sec/artex-hs/jwt.key:/app/jwt.key
+      # 字典（只读）：ffuf/gobuster 等直接指 /usr/share/wordlists。
+      - /root/Desktop/sec/artex-hs/data/wordlists:/usr/share/wordlists:ro
+    command: ["-addr", ":8801", "-proxy", "127.0.0.1:8802"]
+    restart: unless-stopped
