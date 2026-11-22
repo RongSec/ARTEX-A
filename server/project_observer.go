@@ -366,7 +366,7 @@ func (s *Server) projectReaderTools() []actool.CoreTool {
 // 故合并只发生在「绑定集合」这一层，不动那两个函数。
 var unifiedReaderToolKeys = []string{
 	"query_project_index", "get_task_graph_digest", "write_project_insight", "push_task_hint",
-	"read_all_project_insights", "write_global_insight",
+	"read_all_project_insights", "write_global_insight", "judge_related_tasks",
 }
 
 // ---------- seed（照 reporter 样板 orchestration.go:735） ----------
@@ -544,6 +544,29 @@ const readerUnifiedPromptV11 = "你同时承担两个只读视角：项目内【
 	"  3) 若某个正在运行的任务明显可复用另一项目的打法，用 adopt_related_task 把它关联到该运行中任务（task_id=运行中任务，relevance_score, reason, chains 同 scope=project 的要求）；否则 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
 	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。"
 
+// readerUnifiedPromptV12 是 V11-READER7 的当前默认正文：判定改走
+// judge_related_tasks（每个候选一个独立上下文，并发 3），不再把 N 张候选图
+// 读进同一个会话——实测 6 个候选把上下文从 6.6k 推到 29.3k、累计 13.7 万
+// 输入 token，而候选之间对彼此的判断没有帮助。V11 保留为升级比对基准。
+const readerUnifiedPromptV12 = "你同时承担两个只读视角：项目内【跨任务阅读者】（scope=project）、跨项目【跨项目阅读者】（scope=cross）。只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
+	"触发时机：项目探索图变更（图变更触发）或定时兜底（每 30 分钟一轮）；一条触发器同时挂这两个条件。\n" +
+	"【先看触发消息前缀判别本轮作用域】\n" +
+	"· 【scope=project】（项目图变更，消息里还带本批变更清单 kind/摘要/task_id）：做项目内跨任务阅读（你是跨任务阅读者），核心职责是【替规划者读图判定勾连】——\n" +
+	"  1) read_task_intel 读增量情报表（since_rev 传上一轮返回的 next_since_rev；rev 是变更序列，接口细节变丰富也会重新下发）；用触发消息里的 task_id 定位本轮变更任务（发起方）；\n" +
+	"  2) 找候选：request_reader_links(surface=发起方新出现的接口/组件/资产, project_id=发起方项目, exclude_task_id=发起方, scope=project)。候选已按 SQL 命中分排序（match_score / match_strength：精确接口 1.0、模糊路径 0.6、凭据 1.2、资产 0.8、组件 0.3；Σ≥2 strong、Σ≥1 medium）；weak 已被过滤，你只需要判 medium 以上的候选；\n" +
+	"  3) 拿到候选后，调 judge_related_tasks(task_id=发起方, candidate_ids=[候选 id...]) 一次判完：每个候选一个独立上下文（发起方摘要 + 该候选摘要），候选之间互不影响，发起方图也不会被重复读 N 次；只有某项 error（判官说证据不足）时，才用 read_task_graph 单独读那一张图补证；\n" +
+	"  4) 判官返回的 score(0-100) 就是 relevance_score：≥60 同一利用链/≥2 接口同构/已验证组件可复用；40-59 同攻击面部分可迁移；<40 只是键相同或组件同名；\n" +
+	"  5) relevance_score ≥40 才 adopt_related_task(task_id=发起方, related_task_id=候选, relevance_score, reason, chains)；低于 40 一律 dismiss_related_task。reason 必须写「在两边读到了什么」——点名重合的接口/组件/利用链，不能只写「键相同」；40-59 时还要写清「哪部分可迁移、哪部分不行」；\n" +
+	"  6) chains 用判官返回的原样带上（最多 6 条）；判官没给链但你确认可迁移时，再按 entry（method+path，不含 host）/steps/outcome/verified/node_ids 补写。规划者看不到原始边，只看到链摘要；\n" +
+	"  7) 采纳后：规划者只会看到脱敏后的 reader_refs（任务概述、接口 method+path、链摘要、计数、可下钻 id）。它需要细节时会用 ask_reader 找你下钻，你只回【测试细节/方法】——不要把整图、host、凭据写进 reason、chains 或洞察。\n" +
+	"  ★跨项目候选同样可以采纳：request_reader_links(scope=cross) 返回的候选（仅覆盖开启 reader_enabled 的项目）与项目内候选同等对待，采纳不按项目设限；是否外溢由你的评分控制。\n" +
+	"  ★不要把未判定的候选丢给规划者：它不读旧任务、不做下钻，只采信你 adopt 后写入的 hint；你判完才轮到它。\n" +
+	"· 【scope=cross】（定时触发）：做跨项目串联（你是跨项目阅读者）——\n" +
+	"  1) read_all_project_insights 拿本轮输入，【先看 cross_project_assets】——它已 join 好「同一资产/组件出现在 ≥2 个项目」；为空即无跨项目信号，直接空转结束；\n" +
+	"  2) 非空时围绕这些行核实：用 read_task_graph 读涉及任务的完整图（接口/组件/漏洞），确认真实可复用；\n" +
+	"  3) 若某个正在运行的任务明显可复用另一项目的打法，用 adopt_related_task 把它关联到该运行中任务（task_id=运行中任务，relevance_score, reason, chains 同 scope=project 的要求）；否则 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
+	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。"
+
 // seedObserverAgent 是 V6 之前的「跨任务观察者」seed（回退路径保留）。
 // V6-U3 起 observer 退化为只读别名：收敛完成后（reader_unified_v1 置位）
 // 一律早退，不再新建 agent/触发器；收官 nudge 硬编码的主 key 是 reader，
@@ -614,7 +637,7 @@ func (s *Server) seedReaderAgent() {
 		log.Printf("[reader] 创建 agent 失败: %v", err)
 		return
 	}
-	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV11); err != nil {
+	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV12); err != nil {
 		log.Printf("[reader] seed prompt 失败: %v", err)
 	}
 	// serial+merge=all：整波图变更合并成一次会话（observer 原策略），max_parallel=2。
@@ -843,7 +866,7 @@ func (s *Server) reconcileReaderAgentNames() {
 // 标记。V8-NAME 的旧 flag（reader_prompt_names_v8）在存量库已置位，继续用它
 // 会让新流程永远到不了 reader；换 flag 即再执行一次「逐字节比对旧默认才升级」
 // 的幂等收编。
-const readerPromptUpgradeFlag = "reader_prompt_graph_v11"
+const readerPromptUpgradeFlagV12 = "reader_prompt_judge_v12"
 
 // readerPromptUpgrade 是 upgradeReaderPrompt 的纯判定结果（无库可单测）。
 type readerPromptUpgrade int
@@ -866,7 +889,7 @@ func readerPromptUpgradeFor(cur string) readerPromptUpgrade {
 	switch strings.TrimSpace(cur) {
 	case "":
 		return readerPromptSeed
-	case readerPromptV1, readerPrompt, readerUnifiedPromptV6, readerUnifiedPrompt, readerUnifiedPromptNames, readerUnifiedPromptV9, readerUnifiedPromptV10:
+	case readerPromptV1, readerPrompt, readerUnifiedPromptV6, readerUnifiedPrompt, readerUnifiedPromptNames, readerUnifiedPromptV9, readerUnifiedPromptV10, readerUnifiedPromptV11:
 		return readerPromptReplace
 	default:
 		return readerPromptKeep
@@ -889,7 +912,7 @@ func (s *Server) upgradeReaderPrompt() {
 	if pg == nil {
 		return
 	}
-	if v, _, _ := pg.GetSetting(readerPromptUpgradeFlag); v == "true" {
+	if v, _, _ := pg.GetSetting(readerPromptUpgradeFlagV12); v == "true" {
 		return
 	}
 	a, err := pg.GetAgentByKey("reader")
@@ -903,21 +926,21 @@ func (s *Server) upgradeReaderPrompt() {
 	}
 	switch readerPromptUpgradeFor(cur) {
 	case readerPromptSeed:
-		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV11); err != nil {
+		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV12); err != nil {
 			log.Printf("[reader] 播种新默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已播种 V11-READER3 默认 prompt")
+		log.Printf("[reader] 已播种 V11-READER7 默认 prompt")
 	case readerPromptReplace:
-		if _, err := pg.SavePrompt(a.ID, readerUnifiedPromptV11, "V11-READER3 默认正文升级：两级评分（SQL 候选分 + LLM 相关性分）、采纳必须带链摘要", "system"); err != nil {
+		if _, err := pg.SavePrompt(a.ID, readerUnifiedPromptV12, "V11-READER7 默认正文升级：候选判定改走 judge_related_tasks（每候选独立上下文）", "system"); err != nil {
 			log.Printf("[reader] 升级默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已把未编辑的默认 prompt 升级为 V11-READER3 评分版（历史版本保留）")
+		log.Printf("[reader] 已把未编辑的默认 prompt 升级为 V11-READER7 独立判官版（历史版本保留）")
 	default:
 		log.Printf("[reader] 当前 prompt 已是新版或被用户编辑，跳过默认正文升级（如需新流程请手动恢复内置默认）")
 	}
-	if err := pg.SetSetting(readerPromptUpgradeFlag, "true"); err != nil {
+	if err := pg.SetSetting(readerPromptUpgradeFlagV12, "true"); err != nil {
 		log.Printf("[reader] 写入 prompt 升级标记失败: %v", err)
 	}
 }

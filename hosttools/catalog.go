@@ -108,6 +108,22 @@ func init() {
 		_ = os.MkdirAll(v, 0o755)
 		os.Setenv("PATH", v+string(os.PathListSeparator)+os.Getenv("PATH"))
 	}
+	// ARTEX_HOSTPY 指到挂载卷时（容器部署），pip --prefix 装的 CLI 入口在
+	// <prefix>/bin、库在 <prefix>/lib/python3.*/site-packages，两者都要进
+	// 本进程环境，否则装完 which 找不到、import 也失败。重建镜像不丢。
+	if v := strings.TrimSpace(os.Getenv("ARTEX_HOSTPY")); v != "" {
+		bin := filepath.Join(v, "bin")
+		_ = os.MkdirAll(bin, 0o755)
+		os.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+		if matches, _ := filepath.Glob(filepath.Join(v, "lib", "python3*", "site-packages")); len(matches) > 0 {
+			old := os.Getenv("PYTHONPATH")
+			if old != "" {
+				os.Setenv("PYTHONPATH", matches[0]+string(os.PathListSeparator)+old)
+			} else {
+				os.Setenv("PYTHONPATH", matches[0])
+			}
+		}
+	}
 }
 
 // Catalog 返回静态目录。安装命令按 Debian/Ubuntu 的 apt 写；其他发行版
@@ -117,7 +133,14 @@ func Catalog() []Tool {
 	goInstall := func(mod string) string {
 		return "GOBIN=" + BinDir() + " go install " + mod + "@latest"
 	}
-	pipx := func(pkg string) string { return "pip3 install --break-system-packages -q " + pkg }
+	// pip 工具默认装进系统 site-packages（容器重建即丢）；容器部署把
+	// ARTEX_HOSTPY 指到挂载卷后用 --prefix 安装，入口与库都落在卷上。
+	pipx := func(pkg string) string {
+		if v := strings.TrimSpace(os.Getenv("ARTEX_HOSTPY")); v != "" {
+			return "pip3 install --break-system-packages --prefix=" + v + " -q " + pkg
+		}
+		return "pip3 install --break-system-packages -q " + pkg
+	}
 
 	return []Tool{
 		// ---- 网络与主机 ----

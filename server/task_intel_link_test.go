@@ -172,7 +172,7 @@ func TestTaskIntelToolsWired(t *testing.T) {
 			t.Errorf("hostTools 缺少 %s（绑定未装配）", k)
 		}
 	}
-	if n := len(s.taskIntelReaderTools()); n != 5 {
+	if n := len(s.taskIntelReaderTools()); n != 6 {
 		t.Errorf("reader 勾连工具应为 5 件，got %d", n)
 	}
 	// seed 绑定：工具行必须存在且只绑 reader（planner 不再持有任何一件）。
@@ -365,8 +365,12 @@ func TestReaderLinkFlow(t *testing.T) {
 	}
 	adoptCall(ctx, map[string]any{
 		"task_id": idB, "related_task_id": idA, "reason": "两边都命中 /api/user/{id}，A 已验证越权",
-		"strength": "strong",
-		"matched":  []map[string]any{{"kind": db.IntelKindEndpoint, "key": epKey, "value": "https://a.example.com/api/user/9"}},
+		"relevance_score": 88,
+		"chains": []map[string]any{{
+			"entry": epKey, "steps": []string{"A 已验证越权"}, "outcome": "越权读取",
+			"verified": true, "node_ids": []int64{},
+		}},
+		"matched": []map[string]any{{"kind": db.IntelKindEndpoint, "key": epKey, "value": "https://a.example.com/api/user/9"}},
 	})
 	var decision, reason, matched, decidedBy string
 	if err := pg.QueryRow(`SELECT decision, reason, matched::text, decided_by FROM task_intel_links WHERE task_id=$1 AND related_task_id=$2`, idB, idA).
@@ -395,8 +399,8 @@ func TestReaderLinkFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	hintText, _ := payload["text"].(string)
-	if !strings.Contains(hintText, fmt.Sprintf("任务#%d", idA)) || !strings.Contains(hintText, epKey) || !strings.Contains(hintText, "直接采信") {
-		t.Errorf("hint 正文缺少来源任务/要点/直接采信: %q", hintText)
+	if !strings.Contains(hintText, fmt.Sprintf("#%d", idA)) || !strings.Contains(hintText, epKey) || !strings.Contains(hintText, "下钻") {
+		t.Errorf("hint 正文缺少来源任务/重合接口/下钻入口: %q", hintText)
 	}
 	if got := int64(floatOf(payload["source_task_id"])); got != idA {
 		t.Errorf("hint payload.source_task_id=%d want %d", got, idA)
@@ -407,35 +411,22 @@ func TestReaderLinkFlow(t *testing.T) {
 	if got := int64(floatOf(payload["source_project_id"])); got != pid {
 		t.Errorf("hint payload.source_project_id=%d want %d", got, pid)
 	}
-	if got, _ := payload["strength"].(string); got != "strong" {
-		t.Errorf("hint payload.strength=%q want strong", got)
+	if got := int64(floatOf(payload["relevance_score"])); got != 88 {
+		t.Errorf("hint payload.relevance_score=%d want 88", got)
 	}
-	points, _ := payload["reusable_points"].([]any)
-	if len(points) == 0 {
-		t.Fatalf("hint payload 应含可复用要点: %+v", payload)
+	overlap, _ := payload["overlap_endpoints"].([]any)
+	if len(overlap) == 0 || !strings.Contains(fmt.Sprint(overlap), epKey) {
+		t.Errorf("hint payload.overlap_endpoints 应含接口 %q: %+v", epKey, overlap)
 	}
-	foundEP := false
-	for _, p := range points {
-		if strings.Contains(fmt.Sprint(p), epKey) {
-			foundEP = true
-		}
-	}
-	if !foundEP {
-		t.Errorf("可复用要点应含接口 %q: %+v", epKey, points)
-	}
-	if facts, _ := payload["key_facts"].([]any); len(facts) == 0 {
-		t.Errorf("hint payload 应含关键事实摘要: %+v", payload)
-	}
-	// V9-SCOPE：hint 必须自我声明只是经验参考，并列出外部任务资产 host。
+	// V9-SCOPE：hint 必须自我声明只是经验参考；具体外部地址不进正文（由执行层硬拦）。
 	if ref, _ := payload["reference_only"].(bool); !ref {
 		t.Errorf("hint payload 必须 reference_only=true: %+v", payload)
 	}
-	foreign := fmt.Sprint(payload["foreign_hosts"])
-	if !strings.Contains(foreign, "10.0.0.9") || strings.Contains(foreign, "8080") {
-		t.Errorf("hint payload.foreign_hosts 应为归一 host（去端口），got %v", payload["foreign_hosts"])
+	if n := int64(floatOf(payload["foreign_host_count"])); n < 1 {
+		t.Errorf("hint payload.foreign_host_count 应 >0: %+v", payload)
 	}
-	if !strings.Contains(hintText, "禁止对以下地址") || !strings.Contains(hintText, "10.0.0.9") {
-		t.Errorf("hint 正文应列出禁止地址: %q", hintText)
+	if strings.Contains(hintText, "10.0.0.9") {
+		t.Errorf("hint 正文不应列出外部资产地址: %q", hintText)
 	}
 	// 落库：幂等一行，host 已归一去端口。
 	var foreignSource int64
@@ -882,18 +873,24 @@ func TestRenderReaderAdoptHintIsDirectionOnly(t *testing.T) {
 	text := renderReaderAdoptHint(readerAdoptHint{
 		SourceTaskID: 136, SourceTaskName: "任务D", SourceProjectID: 58,
 		Strength: "strong", Score: 72,
-		Overlap:      []string{"GET /api/sso/userinfo", "POST /api/sso/login"},
-		ForeignHosts: []string{"10.0.0.9"},
+		Overlap:    []string{"GET /api/sso/userinfo", "POST /api/sso/login"},
+		DrillNodes: []int64{673, 674},
+		SelfHits:   []string{"GET /api/sso/userinfo — fact#650 alice→bob 200"},
 	})
-	for _, banned := range []string{"可复用要点", "关键事实", "掩码", "secret", "cookie for"} {
+	// 两段式/授权边界/持久化说明都在 workerReaderSpec 与 plannerLinkGuidance 里，
+	// hint 再写一遍只是噪音（实测每条约 900 字，占 planner 上下文的大头）。
+	for _, banned := range []string{"可复用要点", "关键事实", "掩码", "secret", "cookie for", "两段", "reference_only", "不会下一轮"} {
 		if strings.Contains(text, banned) {
 			t.Errorf("hint 不应包含 %q：\n%s", banned, text)
 		}
 	}
-	for _, want := range []string{"#136", "72/100", "GET /api/sso/userinfo", "两段", "自主验证", "只复现"} {
+	for _, want := range []string{"#136", "72/100", "GET /api/sso/userinfo", "本任务已测", "node_ids=[673,674]"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("hint 缺少 %q：\n%s", want, text)
 		}
+	}
+	if n := len([]rune(text)); n > 260 {
+		t.Errorf("hint 过长（%d 字），应只保留来源/重合/已测/下钻四行：\n%s", n, text)
 	}
 }
 

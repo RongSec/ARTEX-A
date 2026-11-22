@@ -1398,6 +1398,21 @@ func (s *ExplorationStore) TokenTotal() (TokenUsage, error) {
 	return u, err
 }
 
+// ReaderTokenStats 汇总阅读者通道（llm_records.worker='reader'）在某个任务上的
+// token：判官（judge_related_tasks）与 ask_reader 下钻总结都走这条通道，它们不写
+// activity，所以任务页的 TokenStatsByWorker（activity kind='result'）看不到。
+// 全局用量（llm_usage）本来就含它们，缺的只是任务详情页这一格。
+func (d *DB) ReaderTokenStats(taskID string) (TokenUsage, error) {
+	var u TokenUsage
+	u.Worker = "reader"
+	err := d.QueryRow(`SELECT
+		COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+		COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_write),0)
+	FROM llm_records WHERE task_id=$1 AND worker='reader'`, taskID).
+		Scan(&u.InputTokens, &u.OutputTokens, &u.CacheReadTokens, &u.CacheWriteTokens)
+	return u, err
+}
+
 // TokenTotalsAll returns the whole-task token total for every exploration in one
 // query (exploration_id → total), so the task list can show per-task consumption
 // without a query per row.

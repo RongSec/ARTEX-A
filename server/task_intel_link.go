@@ -50,7 +50,7 @@ const (
 
 // readerLinkCandidateNote 是 request_reader_links 返回里必须带的一句提示
 // （用户规格：候选不等于结论，必须由阅读者读完两边上下文再判定）。
-const readerLinkCandidateNote = "以下为候选，须由你读完两边上下文判断相关性；相关的 adopt，无关的 dismiss；未判定的候选不要丢给规划者"
+const readerLinkCandidateNote = "以下为候选，须由你判断相关性；拿到后直接调 judge_related_tasks(task_id, candidate_ids=[...]) 一次判完（每个候选独立上下文，互不影响）；score≥40 的 adopt、<40 的 dismiss；未判定的候选不要丢给规划者"
 
 // ---------------------------------------------------------------------------
 // surface → (kind,key)
@@ -538,10 +538,10 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 			"必须给 relevance_score（1-100，读完两张完整图后的判断），没有分数不接受采纳。"+
 			"无关的候选请用 dismiss_related_task；重复采纳同一对任务是幂等的（不重复写 hint）。",
 		objSchema(map[string]any{
-			"task_id":            strParam("发起方任务 id：本轮图变更消息里的 task_id（要被暴露情报、被唤醒规划者的任务）"),
-			"related_task_id":    strParam("被勾连任务 id：情报来源任务（读到的旧任务）"),
-			"reason":             strParam("判定相关的理由：必须写「读到了什么」（如两边都有未授权 /api/user/{id} 且旧任务已验证越权），不能只写「键相同」"),
-			"relevance_score":    map[string]any{"type": "integer", "description": "必填：读完两边完整图后的相关性评分 1-100（≥60 strong / 40-59 medium / <40 不采纳）。没有分数就不许采纳——档位兜底会把分数写成固定值，审计会失真"},
+			"task_id":         strParam("发起方任务 id：本轮图变更消息里的 task_id（要被暴露情报、被唤醒规划者的任务）"),
+			"related_task_id": strParam("被勾连任务 id：情报来源任务（读到的旧任务）"),
+			"reason":          strParam("判定相关的理由：必须写「读到了什么」（如两边都有未授权 /api/user/{id} 且旧任务已验证越权），不能只写「键相同」"),
+			"relevance_score": map[string]any{"type": "integer", "description": "必填：读完两边完整图后的相关性评分 1-100（≥60 strong / 40-59 medium / <40 不采纳）。没有分数就不许采纳——档位兜底会把分数写成固定值，审计会失真"},
 			"chains": map[string]any{"type": "array", "description": "读到并确认可迁移的利用链摘要（最多 6 条）。规划者靠它判断值不值得迁移，不靠原始边 id", "items": objSchema(map[string]any{
 				"entry":    strParam("入口，如 GET /api/sso/userinfo"),
 				"steps":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "中间结论，2-4 条短句"},
@@ -654,10 +654,15 @@ func (s *Server) toolAdoptRelatedTask() actool.CoreTool {
 			if srcName == "" {
 				srcName = strings.TrimSpace(rt.Description)
 			}
+			overlap := overlapEndpoints(matched, readerLinkHintMaxOverlap)
 			hintID, err := s.writeReaderAdoptHint(ctx, taskID, readerAdoptHint{
 				SourceTaskID: relatedID, SourceTaskName: srcName,
 				SourceProjectID: rctx.ProjectID, SourceProjectName: rctx.ProjectName,
-				Strength: strength, Score: score, Overlap: overlapEndpoints(matched, readerLinkHintMaxOverlap),
+				Strength: strength, Score: score, Overlap: overlap,
+				// 给可直接下钻的节点 id（比让模型拼 query 少一轮）；
+				// 给本任务已测证据（规划者据此决定「首次覆盖」还是「复测」）。
+				DrillNodes:   s.drillNodeIDs(ctx, relatedID, chains, 4),
+				SelfHits:     s.selfOverlapEvidence(ctx, taskID, overlap, 3),
 				ForeignHosts: foreignHosts, LinkID: linkID,
 			})
 			s.noteReaderDecision(ctx, "adopted", fmt.Sprintf("%d:%d", taskID, relatedID))
@@ -736,6 +741,12 @@ type readerAdoptHint struct {
 	// Overlap 是两边撞上的接口（METHOD /path，已脱敏），最多 4 条。
 	// 规划者靠它把「本轮要测的端点」和「参考任务测过的端点」对上。
 	Overlap []string
+	// DrillNodes 是可以直接按 id 下钻的节点（chains.node_ids 优先，其次参考
+	// 任务情报表的 source_id），最多 4 个。给 id 比让模型自己拼 query 少一轮。
+	DrillNodes []int64
+	// SelfHits 是本任务【已经测过】同一接口的证据（"GET /api/x — fact#650 …"），
+	// 最多 3 条。规划者据此把「复测 + 借鉴」合成一条意图；为空表示首次覆盖。
+	SelfHits []string
 	// ForeignHosts 是被勾连任务情报表（task_intel kind=asset）里的资产 host。
 	// 它们只是经验参考的对象，不属于发起方任务授权范围（V9-SCOPE）。
 	ForeignHosts []string
@@ -844,51 +855,151 @@ func (s *Server) steerWorkersOnAdopt(ctx context.Context, expID int64, h readerA
 	}
 }
 
-// renderReaderAdoptHint 是纯函数：规划者读到的 hint 正文。graph_overview 只渲染
-// text，所以正文必须自足，但只到「方向」这一层：来源、分数、重合接口、怎么下钻。
-// 不含要点/事实/凭据——那些是 ask_reader 的交付物，塞进 hint 会让执行者跳过下钻。
+// renderReaderAdoptHint 是纯函数：规划者读到的 hint 正文。
+//
+// V11-READER7（用户口径）：hint 只留四件事——来源与分数、重合接口、本任务覆盖
+// 情况、下钻入口。两段式要求、授权边界、持久化说明全部删掉：
+//   - 两段式在 workerReaderSpec / ask_reader 的 required_next 里已有，hint 重复
+//     一遍只是噪音（实测每条约 900 字，占 planner 上下文的大头）；
+//   - 授权边界在 plannerLinkGuidance 的硬规则里已有，执行层还会硬拦；
+//   - hint 的持久性由 reader_refs.borrow_state 账本保证，不需要在正文里解释。
 func renderReaderAdoptHint(h readerAdoptHint) string {
 	var b strings.Builder
-	b.WriteString("【阅读者勾连·方向提示】来源任务#")
+	b.WriteString("【阅读者·可借鉴】#")
 	b.WriteString(strconv.FormatInt(h.SourceTaskID, 10))
 	if n := strings.TrimSpace(h.SourceTaskName); n != "" {
 		b.WriteString("「")
 		b.WriteString(n)
 		b.WriteString("」")
 	}
-	if h.SourceProjectID > 0 {
-		b.WriteString("（项目#")
-		b.WriteString(strconv.FormatInt(h.SourceProjectID, 10))
-		if pn := strings.TrimSpace(h.SourceProjectName); pn != "" {
-			b.WriteString("「")
-			b.WriteString(pn)
-			b.WriteString("」")
-		}
-		b.WriteString("）")
-	}
-	b.WriteString("；相关性：")
-	b.WriteString(h.Strength)
 	if h.Score > 0 {
-		b.WriteString("（")
+		b.WriteString(" ")
 		b.WriteString(strconv.Itoa(h.Score))
-		b.WriteString("/100）")
+		b.WriteString("/100")
 	}
-	b.WriteString("。")
 	if len(h.Overlap) > 0 {
-		b.WriteString("\n重合接口：")
+		b.WriteString("\n重合：")
 		b.WriteString(strings.Join(h.Overlap, "、"))
 	}
-	b.WriteString("\n这只是「往哪看」，不是测法（hint 不含请求/参数/凭据）。细节由执行者在意图里用 ask_reader(related_task_id=")
+	if len(h.SelfHits) > 0 {
+		b.WriteString("\n本任务已测：")
+		b.WriteString(strings.Join(h.SelfHits, "；"))
+	}
+	b.WriteString("\n下钻：ask_reader(")
 	b.WriteString(strconv.FormatInt(h.SourceTaskID, 10))
-	b.WriteString(", query=\"/api/...\") 下钻；下钻后必须两段都做：① 借鉴复现——按对方请求形态在本任务资产上重放、拿到基线；② 自主验证——至少一条本任务独立设计的验证（变体参数/负控/低权账号/兄弟实例/边界遍历）。只复现对方结论就回报 = 未完成意图。")
-	b.WriteString("\n这条提示不会下一轮就消失：它作为 hint 节点留在图上，每轮随 graph_overview 下发；reader_refs[].borrow_state=pending 表示「已采纳、还没借」。")
-	b.WriteString("\n经验参考：reference_only=true，来源任务的资产不属于本任务授权范围。")
-	if len(h.ForeignHosts) > 0 {
-		// 不列 host：跨项目采纳时，列出来等于把另一个项目的资产清单塞进本任务
-		// 上下文。禁打由执行层按 task_foreign_assets 硬拦，这里只给数量。
-		b.WriteString(fmt.Sprintf("\n被勾连任务另有 %d 个资产，已加入本任务的禁止访问清单（不在本任务授权范围，故不列出地址）。要把经验用到本任务已有资产上；确需扩到新资产，先由本任务正常登记资产后再打。", len(h.ForeignHosts)))
+	if len(h.DrillNodes) > 0 {
+		b.WriteString(", node_ids=[")
+		for i, id := range h.DrillNodes {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString(strconv.FormatInt(id, 10))
+		}
+		b.WriteString("])")
+	} else if len(h.Overlap) > 0 {
+		// 没有可定位的节点时才退化成 query：取第一条路径即可。
+		path := h.Overlap[0]
+		if i := strings.IndexByte(path, ' '); i > 0 {
+			path = strings.TrimSpace(path[i+1:])
+		}
+		b.WriteString(", query=\"")
+		b.WriteString(path)
+		b.WriteString("\")")
+	} else {
+		b.WriteString(")")
 	}
 	return b.String()
+}
+
+// selfOverlapEvidence 查本任务情报表里与参考任务重合的接口，返回
+// 「METHOD /path — fact#650 摘要」形态的证据行。用于让规划者知道这个端点
+// 是「首次覆盖」还是「复测」——复测要把既有结论和借鉴一起带进意图。
+func (s *Server) selfOverlapEvidence(ctx context.Context, taskID int64, overlap []string, n int) []string {
+	if s.m.pg == nil || taskID <= 0 || len(overlap) == 0 || n <= 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(overlap))
+	for _, ep := range overlap {
+		if ep = strings.TrimSpace(ep); ep != "" {
+			keys = append(keys, ep)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	// pgx stdlib 不把 []string 自动映射成 text[]，这里显式展开 IN（keys ≤4）。
+	args := []any{taskID}
+	marks := make([]string, 0, len(keys))
+	for _, k := range keys {
+		args = append(args, strings.ToLower(k))
+		marks = append(marks, "$"+strconv.Itoa(len(args)))
+	}
+	args = append(args, n)
+	rows, err := s.m.pg.QueryContext(ctx, `
+SELECT ti.key, ti.value, COALESCE(ti.source_id,0), COALESCE(n.kind,'')
+FROM task_intel ti
+LEFT JOIN exploration_nodes n ON n.id = ti.source_id
+WHERE ti.task_id=$1 AND ti.kind='endpoint' AND COALESCE(n.state,'') <> 'origin' AND lower(ti.key) IN (`+strings.Join(marks, ",")+`)
+ORDER BY ti.id DESC LIMIT $`+strconv.Itoa(len(args)), args...)
+	if err != nil {
+		log.Printf("[reader] 查任务#%d 本任务覆盖失败: %v", taskID, err)
+		return nil
+	}
+	defer rows.Close()
+	out := make([]string, 0, n)
+	for rows.Next() {
+		var key, val, nk string
+		var src int64
+		if err := rows.Scan(&key, &val, &src, &nk); err != nil {
+			continue
+		}
+		line := strings.TrimSpace(key)
+		if src > 0 {
+			if nk == "" {
+				nk = "node"
+			}
+			line += " — " + nk + "#" + strconv.FormatInt(src, 10)
+		}
+		if v := clipText(val, 80); v != "" {
+			line += " " + v
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// drillNodeIDs 从 chains 与参考任务情报表里选可下钻的节点 id（去重、保序、截断）。
+func (s *Server) drillNodeIDs(ctx context.Context, relatedID int64, chains []db.ReaderChain, n int) []int64 {
+	if n <= 0 {
+		return nil
+	}
+	out := make([]int64, 0, n)
+	seen := map[int64]bool{}
+	add := func(id int64) {
+		if id <= 0 || seen[id] || len(out) >= n {
+			return
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	for _, c := range chains {
+		for _, id := range c.NodeIDs {
+			add(id)
+		}
+	}
+	if len(out) < n {
+		if rows, err := s.m.pg.TaskIntelForTask(ctx, relatedID); err == nil {
+			for _, r := range rows {
+				if r.SourceID != nil {
+					add(*r.SourceID)
+				}
+				if len(out) >= n {
+					break
+				}
+			}
+		}
+	}
+	return out
 }
 
 // foreignAssetHostsForTask 从被勾连任务的小结表（task_intel）取资产 host。
@@ -1253,6 +1364,8 @@ func (s *Server) taskIntelReaderTools() []actool.CoreTool {
 		s.toolRequestReaderLinks(),
 		// 读双方完整图：判相关性时不能只看投影摘要（V10-READER-2）。
 		s.toolReadTaskGraph(),
+		// V11-READER7：每候选独立上下文的批量判官（避免 N 个候选互相污染上下文）。
+		s.toolJudgeRelatedTasks(),
 		s.toolAdoptRelatedTask(),
 		s.toolDismissRelatedTask(),
 	}

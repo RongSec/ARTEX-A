@@ -396,7 +396,8 @@ const plannerLinkGuidance = "\n\n**相关任务经验（方向 vs 细节）**：
 	"  - **没有** → 正常派意图，不要硬凑借鉴。\n" +
 	"  - baseline 取自 reader_refs.chains / endpoints（例如入口请求、判据）；**self_test 必须是你按本任务目标自己想的**（变体参数、负控、低权账号、兄弟实例、边界遍历），不能留空——只复现对方结论等于没测。\n" +
 	"**hint 到达时已有意图覆盖同一端点**：如果那条意图**没有 borrow**，说明它是采纳前派的（阅读者读图要时间，首轮常抢跑）。**不要以「方向已覆盖」为由 0 意图**：正在跑的用 `steer_work` 把两段工单注进去（① 复现 baseline ② 自主验证）；还没跑的补一条带 borrow 的合并意图。否则执行者拿不到借鉴，只会按旧意图自己摸。\n" +
-	"**borrow_pending 是持久账本**：只要某条参考的 borrow_state=pending，就表示「已采纳、还没借」。本轮没测到它的 overlap 端点可以先放着；一旦要测那个端点，必须当场派 borrow 工单，不要因为 hint 是前几轮的、或当前轮没再提它就当没发生。hint 会淡出，账本不会。" +
+	"**borrow_pending 是持久账本**：只要某条参考的 borrow_state=pending，就表示「已采纳、还没借」。本轮没测到它的 overlap 端点可以先放着；一旦要测那个端点，必须当场派 borrow 工单，不要因为 hint 是前几轮的、或当前轮没再提它就当没发生。hint 被消费后会自动退出上下文（state=consumed），账本才是判断依据。" +
+	"\n**hint 带「本任务已测」= 复测，不是首次覆盖**：这条端点在本任务情报表里已有记录（fact/finding），之前测过。不要因为「已经测过」跳过——发一条 add_intent：summary 写「复测 <端点>：先按 #N 的细节复现既有结论，再做二阶验证」，borrow 四项填全，self_test 必须是与既有结论不同的维度（换 token/角色主体、负控、参数变体、修复前后对比）。测完：有突破 → 正常继续；无突破 → 写一条 fact 说明「该端点已复测、既有结论仍成立/已修复」，这条参考即收口（hint 转 consumed、borrow_state=done）。" +
 	"\n**自己下钻只在「规划本身需要判断可行性/判据」时**：你写意图时把目标接口/组件、要验证的假设写清楚，执行者会自己用 ask_reader。**不要把“调用 ask_reader”单独派成一条意图**。" +
 	"\n\n**经验参考的授权边界（硬规则）**：阅读者给的 hint 是**经验参考**（reference_only=true），其中的资产不属于本任务授权范围。被勾连任务的外部资产已写入本任务的禁止访问清单（foreign_hosts），**禁止对 foreign_hosts 里的地址发起任何请求/扫描/利用**，由执行层硬拦（hint 不列出具体地址）；要把经验用到**本任务已有资产**上。确需扩到新资产，先由本任务正常登记资产后再打。"
 
@@ -425,7 +426,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tsx.SetShellGate(shellGateFor(ts)) // prove_goal 的 shell 目标校验（T03，查库抖动宁放过）
 	tsx.killWork = p.killWork          // enable kill_work tool (nil = unavailable)
 	tsx.readerAnswer = p.readerAnswer  // ask_reader → 阅读者总结（nil = 只回脱敏证据）
-	tsx.SetReaderTaskContext(goal, "")  // 下钻时告诉阅读者“当前任务目标”，便于裁剪经验
+	tsx.SetReaderTaskContext(goal, "") // 下钻时告诉阅读者“当前任务目标”，便于裁剪经验
 	tsx.steerWork = p.steerWork        // enable steer_work tool (nil = unavailable)
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)

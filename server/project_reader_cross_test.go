@@ -32,7 +32,8 @@ func TestReaderPromptUpgradeFor(t *testing.T) {
 		{"V8-NAME 旧默认", readerUnifiedPromptNames, readerPromptReplace}, // V9-READER 起升级到下钻判定版
 		{"V9-READER 旧默认", readerUnifiedPromptV9, readerPromptReplace}, // V11 起升级到评分版
 		{"V10-READER 旧默认", readerUnifiedPromptV10, readerPromptReplace}, // V11 起升级到评分版
-		{"V11-READER3 当前默认", readerUnifiedPromptV11, readerPromptKeep},
+		{"V11-READER3 旧默认", readerUnifiedPromptV11, readerPromptReplace}, // V11-READER7 起升级到独立判官版
+		{"V12 当前默认", readerUnifiedPromptV12, readerPromptKeep},
 		{"用户编辑过", readerPromptV1 + "\n补充：只看 443 端口。", readerPromptKeep},
 		{"用户全新正文", "自定义阅读者", readerPromptKeep},
 	}
@@ -62,6 +63,14 @@ func TestReaderPromptUpgradeFor(t *testing.T) {
 	for _, want := range []string{"relevance_score", "chains", "match_score", "since_rev"} {
 		if !strings.Contains(readerUnifiedPromptV11, want) {
 			t.Fatalf("V11 默认正文缺少关键字段 %q", want)
+		}
+	}
+	if readerUnifiedPromptV12 == readerUnifiedPromptV11 {
+		t.Fatal("V12 默认正文与 V11 相同：独立判官升级无从发生")
+	}
+	for _, want := range []string{"judge_related_tasks", "独立上下文", "candidate_ids"} {
+		if !strings.Contains(readerUnifiedPromptV12, want) {
+			t.Fatalf("V12 默认正文缺少关键字段 %q", want)
 		}
 	}
 }

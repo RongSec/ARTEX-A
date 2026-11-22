@@ -3064,6 +3064,15 @@ func (s *Server) tokenStats(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// 阅读者（判官/下钻总结）只写 llm_records，不写 activity，这里补一条 lane
+	// 并计入 total——否则任务页会显示「阅读者没花 token」，实际它可能是第二大头。
+	if rt, rerr := s.m.pg.ReaderTokenStats(t.ID); rerr == nil && rt.InputTokens+rt.OutputTokens+rt.CacheReadTokens+rt.CacheWriteTokens > 0 {
+		stats = append(stats, rt)
+		total.InputTokens += rt.InputTokens
+		total.OutputTokens += rt.OutputTokens
+		total.CacheReadTokens += rt.CacheReadTokens
+		total.CacheWriteTokens += rt.CacheWriteTokens
+	}
 	writeJSON(w, 200, map[string]any{"workers": stats, "sessions": sessions, "total": tokenTotalDTO(total)})
 }
 
