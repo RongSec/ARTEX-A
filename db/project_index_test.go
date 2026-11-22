@@ -206,13 +206,13 @@ func TestSchemaContainsProjectGraphTables(t *testing.T) {
 	wants := []string{
 		"CREATE TABLE IF NOT EXISTS project_index",
 		"CREATE TABLE IF NOT EXISTS project_graph_events",
-		"CREATE TABLE IF NOT EXISTS project_insights",
-		"CREATE TABLE IF NOT EXISTS global_insights",
+		// 洞察两表在 V12-CLEANUP 移除，这里改为钉「确实有 DROP」——
+		// 存量库升级时必须真删掉，不能留一张没人读的空表。
+		"DROP TABLE IF EXISTS project_insights",
 		// upsert 幂等键与 ON CONFLICT 目标必须同名可寻：
 		"CREATE UNIQUE INDEX IF NOT EXISTS ux_pidx_proj_node ON project_index(project_id, node_id)",
 		"idx_pidx_proj_kind", "idx_pidx_asset", // GIN(asset_keys) 交集命中
 		"idx_pge_scan ON project_graph_events(project_id, id)", // 水位索引
-		"idx_pins_kw", "idx_gins_time",
 		"observer_enabled",
 		"trg_pidx_upd",
 	}

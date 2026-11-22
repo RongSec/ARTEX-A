@@ -16,7 +16,7 @@ func TestPlannerPromptAdoptsReaderHint(t *testing.T) {
 			t.Errorf("planner prompt 不应再出现 %q: %s", banned, got)
 		}
 	}
-	for _, want := range []string{"方向提示", "不是可直接执行的细节", "ask_reader 规划者和 worker 都有", "readonly=true", "drill_via=reader"} {
+	for _, want := range []string{"方向提示", "不是测试步骤", "执行者会自己用 ask_reader", "readonly=true", "drill_via=reader"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("planner prompt 缺少新协作口径 %q: %s", want, got)
 		}

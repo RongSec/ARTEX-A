@@ -4,7 +4,7 @@ package db
 //
 // 背景：跨项目最强的信号是「同一资产/同一组件出现在多个项目里」，这本质是
 // 一次 join，不该让模型从各项目洞察的散文里自己猜。本文件把它做成一条 SQL，
-// 结果直接进 read_all_project_insights 的 cross_project_assets 字段。
+// 结果直接进 read_cross_project_assets 的 cross_project_assets 字段。
 //
 // 【资产关联链（以真实 schema 为准）】
 //   findings.asset_ids (JSONB 数组，元素=assets.id)

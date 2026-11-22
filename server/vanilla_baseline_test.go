@@ -8,14 +8,12 @@ package server
 //  2. record fact 后 project_graph_events / project_index 均无该任务行 ——
 //     端到端结果（非空操作：先断言 indexer 确在运行，排除"两表无行只是没人
 //     消费通道"的假阴性）；
-//  3. planner 洞察 resolver 对原版任务返回空串 —— 配合 agent 包
-//     TestProjectInsightsRendered（空 resolver → 渲染段逐字节不出现），
-//     「## 项目经验（观察者）」永不进原版任务的 prompt。
+//  3. （已移除）planner 洞察 resolver 断言随 project_insights 表删除而移除
+//     （V12-CLEANUP），原版任务不再存在任何洞察注入路径。
 
 import (
 	"context"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -78,13 +76,5 @@ func TestVanillaTaskZeroRegressionBaseline(t *testing.T) {
 		t.Errorf("原版任务不应进入 project_index，实际 %d 行", n)
 	}
 
-	// 断言 3：洞察 resolver 对原版任务恒空串 → planner 注入段字节级不出现。
-	got := s.projectInsightResolverFor()(tid)
-	if got != "" {
-		t.Errorf("原版任务洞察注入必须为空串（零回归），got %q", got)
-	}
-	// 显式钉标题词不出现（防有人日后给 resolver 塞默认文案）。
-	if strings.Contains(got, "## 项目经验（观察者）") {
-		t.Error(`原版任务注入段不应含「## 项目经验（观察者）」`)
-	}
+	// 断言 3（洞察注入）在 V12-CLEANUP 移除：project_insights 表与注入链已整体删除。
 }

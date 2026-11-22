@@ -107,7 +107,7 @@ func assetKeyFor(domain, rootDomain, ip, url string) string {
 //
 // 新键一律小写、不带 scheme（与 DeriveAssetKeys 的写入侧小写口径一致）。
 // 末尾额外补历史键 assetKeyFor 的原样形态（完整 URL/域名/IP）——存量
-// global_insights.asset_keys 与 project_insights.keywords 只可能是这一种形态，
+// 本项目历史洞察表（已于 V12-CLEANUP 删除）的 asset_keys/keywords 只可能是这一种形态，
 // 不补就永远匹配不上旧行。去重保序：具体键 → 泛化键 → 历史键。
 // host 推导不出时返回 nil。
 func assetKeyLevels(typ, domain, rootDomain, ip string, port int, rawURL string) []string {

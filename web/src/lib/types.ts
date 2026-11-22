@@ -1837,15 +1837,8 @@ export interface ProjectGraphResp {
   hint?: string; // 空投影时的后端文案（单一出处）
 }
 
-// 项目洞察（project_insights 行，GET /api/projects/{id}/insights；跨任务阅读者产出）。
-export interface ProjectInsight {
-  id: number;
-  project_id: number;
-  content: string;
-  source_task_id?: number; // 0/缺省=未知来源
-  keywords: string[];
-  created_at: string; // RFC3339
-}
+// V12-CLEANUP：ProjectInsight 随 project_insights 表删除（洞察注入整体移除，
+// 跨任务经验改走阅读者 judge → adopt → hint）。
 
 export interface BatchTasksResult {
   created: string[];

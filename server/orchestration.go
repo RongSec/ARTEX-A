@@ -48,9 +48,7 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	// 采纳/舍弃）。规划者一件不持有——它只采信阅读者 adopt 后写入的 hint。
 	// 绑定在 seed 时写入工具表，装配层对其他 agent 会按 agents 过滤丢弃。
 	tools = append(tools, s.taskIntelReaderTools()...)
-	// V5-A：planner 的洞察否决工具（host 工具，需 pg；tools 表 seed 时只绑 planner，
-	// 故装配层对其他 agent 会按绑定丢弃——worker/mainagent 看不到）。
-	tools = append(tools, s.toolRejectInsight())
+	// V5-A：planner 的洞察否决工具已随 project_insights 表一起移除（V12-CLEANUP）。
 	// V10-INTEL：漏洞情报两工具（只读，公开源）。绑定见 seedOrchestrationTools。
 	tools = append(tools, s.intelTools()...)
 	custom, err := s.customTools()

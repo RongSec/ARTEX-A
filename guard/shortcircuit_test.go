@@ -292,8 +292,9 @@ func TestShortCircuitAbsoluteCredentialStillDeny(t *testing.T) {
 func TestShortCircuitRecordOnlyToolsExempt(t *testing.T) {
 	quote := `{"content":"worker 曾尝试 cat /etc/shadow 与 cat /app/jwt.key，被短路表拦截，如实记录命令原文备审计"}`
 	for _, tool := range []string{"record_fact", "report_finding", "update_finding_report", "add_hint", "add_task_hint", "insert_assets",
-		// V6-CP2：观察者/阅读者落库工具，只写 DB 不执行，正文引用平台路径不应被拒。
-		"write_project_insight", "write_global_insight", "push_task_hint"} {
+		// V6-CP2：阅读者提示工具，只写 DB 不执行，正文引用平台路径不应被拒。
+		// V12-CLEANUP：write_project_insight / write_global_insight 已随洞察表删除。
+		"push_task_hint"} {
 		if dec := shortCircuit(tool, []byte(quote)); dec != nil {
 			t.Fatalf("%s 纯记录工具不应被凭据正则误伤，得到 %+v", tool, dec)
 		}

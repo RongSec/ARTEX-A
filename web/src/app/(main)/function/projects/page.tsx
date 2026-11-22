@@ -406,14 +406,14 @@ function CreateProjectDialog({
               <Switch checked={observer} onCheckedChange={setObserver} />
             </label>
             <p className="text-muted-foreground text-xs">
-              本项目内任务之间共享经验：任务图变更触发跨任务阅读者、项目洞察注入 planner。与跨项目无关。
+              本项目内任务之间共享经验：任务图变更触发跨任务阅读者，判定勾连后 adopt 并给规划者下发 hint。与跨项目无关。
             </p>
             <label className="flex items-center justify-between gap-3 text-sm">
               <span>跨项目阅读者</span>
               <Switch checked={reader} onCheckedChange={setReader} />
             </label>
             <p className="text-muted-foreground text-xs">
-              本项目参与跨项目串联：允许跨项目阅读者聚合本项目洞察、接受别的项目读回来的跨项目经验。与项目无关的项目可以关掉，省配额。
+              本项目参与跨项目串联：允许跨项目阅读者读到本项目的资产重叠与任务图、并把打法 adopt 到本项目正在运行的任务。与项目无关的项目可以关掉，省配额。
             </p>
             <label className="flex items-center justify-between gap-3 text-sm">
               <span>只出一个项目报告（汇总）</span>

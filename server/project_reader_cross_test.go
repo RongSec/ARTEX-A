@@ -138,7 +138,7 @@ func TestReadAllProjectInsightsCrossProjectAssets(t *testing.T) {
 	}
 
 	s := &Server{m: &Manager{pg: pg}}
-	tool := s.toolReadAllProjectInsights()
+	tool := s.toolReadCrossProjectAssets()
 	res, err := tool.Call(context.Background(), json.RawMessage(`{}`), nil)
 	if err != nil || res.IsError {
 		t.Fatalf("工具调用失败: err=%v res=%+v", err, res)
@@ -148,16 +148,11 @@ func TestReadAllProjectInsightsCrossProjectAssets(t *testing.T) {
 	}
 	var out struct {
 		CrossProjectAssets []db.CrossProjectAssetRow `json:"cross_project_assets"`
-		Projects           []map[string]any          `json:"projects"`
 	}
 	text := res.Content[0].Text
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
 		t.Fatalf("返回体不是预期对象结构: %v（原文 %s）", err, text)
 	}
-	if out.Projects == nil {
-		t.Fatal("返回体缺 projects 字段（向后兼容被破坏）")
-	}
-
 	var hit *db.CrossProjectAssetRow
 	for i := range out.CrossProjectAssets {
 		if out.CrossProjectAssets[i].AssetID == assetID {

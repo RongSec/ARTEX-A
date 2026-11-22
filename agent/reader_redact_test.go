@@ -40,7 +40,7 @@ func TestRequestsIn(t *testing.T) {
 }
 
 // TestWorkerAskReaderContract 锁住 worker 侧的两条硬约束：工具必须在
-// WorkerTools 里，提示词必须写明「只要方法/只许路径/禁止 host/每意图 2 次」。
+// WorkerTools 里，提示词必须写明「只要方法/只许路径/禁止 host/上限随采纳数放宽」。
 func TestWorkerAskReaderContract(t *testing.T) {
 	names := map[string]bool{}
 	for _, tool := range NewToolSet(nil, "worker").WorkerTools() {
@@ -50,7 +50,7 @@ func TestWorkerAskReaderContract(t *testing.T) {
 		t.Fatal("WorkerTools 必须包含 ask_reader（worker 要能向阅读者下钻）")
 	}
 	spec := workerReaderSpec()
-	for _, want := range []string{"只允许问", "禁止追问 host", "query 只写路径", "最多 2 次"} {
+	for _, want := range []string{"只允许问", "禁止追问 host", "query 只写路径", "总上限按已采纳数放宽"} {
 		if !strings.Contains(spec, want) {
 			t.Errorf("worker 阅读者规约缺少 %q: %s", want, spec)
 		}

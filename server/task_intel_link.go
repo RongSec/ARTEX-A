@@ -29,6 +29,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"golang.org/x/net/publicsuffix"
 	"github.com/Autumn-27/artex/guard"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -1419,4 +1420,23 @@ func (s *Server) taskIntelReaderTools() []actool.CoreTool {
 		s.toolAdoptRelatedTask(),
 		s.toolDismissRelatedTask(),
 	}
+}
+
+// validGoalHost 判定抽出来的 host 是否值得当资产键：IP 字面量合法，或域名的
+// 公共后缀是 ICANN 注册后缀（"login.php" 的 "php" 不是，直接丢弃）。
+//
+// V12-CLEANUP 从 project_insight.go 迁来（那个文件随洞察表删除）：本函数只服务
+// 情报表的面提取，与洞察无关，当初放在那里只是历史巧合。
+func validGoalHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	if !strings.Contains(host, ".") {
+		return false
+	}
+	_, icann := publicsuffix.PublicSuffix(host)
+	return icann
 }

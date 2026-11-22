@@ -1,15 +1,15 @@
 package server
 
-// 项目大图 / 洞察面板 API（artex-hs T13，架构 §2.1 投影 / §2.4 注入 / §6 文件清单）。
+// 项目大图 API（artex-hs T13，架构 §2.1 投影 / §6 文件清单）。
 //
 // 数据源是 project_index 投影（[已核实 T12 定稿] 投影常开：observer_enabled
-// 只 gate 触发与 insight 注入，**不 gate 这里**——关着跨任务阅读者的项目照样能看
-// 大图）。四个端点：
+// 只 gate 触发与 hint，**不 gate 这里**——关着跨任务阅读者的项目照样能看
+// 大图）。两个端点：
 //   GET  /api/projects/{id}/graph           按任务分组的投影节点
 //   POST /api/projects/{id}/graph/rebuild   全量重建投影（RebuildProjectIndex，
 //        T12(0) 定稿的「挂/摘项目后补投影」入口，低频同步调用可接受）
-//   GET  /api/projects/{id}/insights        跨任务阅读者洞察列表
-//   DELETE /api/projects/{id}/insights/{iid} 删一条（项目作用域 SQL，防越权）
+//
+// 洞察面板的 GET/DELETE 两个端点在 V12-CLEANUP 移除（project_insights 表已删）。
 //
 // 分组逻辑抽成纯函数 groupProjectIndexRows（DB 行 → DTO 分组），单测直接
 // 断言，无需库。
@@ -174,47 +174,3 @@ func (s *Server) projectGraphRebuild(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"rebuilt": n})
 }
 
-// projectInsightsList GET /api/projects/{id}/insights —— 跨任务阅读者经验面板。
-// 不做关键词命中排序（那是 planner 注入侧的事），恒 created_at 新在前。
-func (s *Server) projectInsightsList(w http.ResponseWriter, r *http.Request) {
-	pid, ok := projectIDParam(w, r)
-	if !ok {
-		return
-	}
-	if _, err := s.m.PG().GetProject(pid); errors.Is(err, db.ErrProjectNotFound) {
-		writeErr(w, 404, "项目不存在")
-		return
-	} else if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	list, err := s.m.PG().ListInsights(r.Context(), pid, nil, 200)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]any{"insights": list})
-}
-
-// projectInsightDelete DELETE /api/projects/{id}/insights/{iid}。
-// iid 与项目作用域同 WHERE 删除（db.DeleteProjectInsight）：不存在或不属于
-// 本项目都回 404，错误信息不区分两态（防探测他项目洞察是否存在）。
-func (s *Server) projectInsightDelete(w http.ResponseWriter, r *http.Request) {
-	pid, ok := projectIDParam(w, r)
-	if !ok {
-		return
-	}
-	iid, ok := pathInt(r, "iid")
-	if !ok || iid <= 0 {
-		writeErr(w, 400, "洞察 id 无效")
-		return
-	}
-	if err := s.m.PG().DeleteProjectInsight(r.Context(), pid, iid); errors.Is(err, db.ErrInsightNotFound) {
-		writeErr(w, 404, "洞察不存在")
-		return
-	} else if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]any{"deleted": iid})
-}

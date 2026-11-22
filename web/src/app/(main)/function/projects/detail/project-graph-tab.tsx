@@ -2,9 +2,9 @@
 
 // 全项目大图 tab（artex-hs T13，架构 §2.1 投影常开定稿）。数据源 = GET /api/projects/{id}/graph
 // （project_index 投影，[已核实 T12 定稿] 投影常开——observer_enabled 关了也看得到，
-// 该开关只管触发与 insight 注入）。不强求力导向布局（拍板1：无跨任务边投影）：
+// 该开关只管触发与 hint）。不强求力导向布局（拍板1：无跨任务边投影）：
 // 按任务分组卡片网格，卡内 kind 着色节点行；点 finding/fact 行新 tab 下钻该任务
-// 探索链路（?tab=graph）。右侧洞察面板读 project_insights（observer 产出）可删。
+// 探索链路（?tab=graph）。V12-CLEANUP：右侧洞察面板已随 project_insights 删除。
 //
 // 与 T12(0) 语义对齐的 UX 已知项：任务挂/摘项目不即时改投影——批量下发/移出
 // 操作后 toast「投影将在任务重启或重建后更新」，本页「重建投影」按钮即补账入口。
@@ -16,7 +16,6 @@ import {
   PauseIcon,
   PlayIcon,
   RefreshCwIcon,
-  Trash2Icon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -35,7 +34,7 @@ import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { api } from "@/lib/api";
-import type { GraphTaskGroup, Project, ProjectGraphNode, ProjectInsight } from "@/lib/types";
+import type { GraphTaskGroup, Project, ProjectGraphNode } from "@/lib/types";
 
 const POLL_MS = 10_000; // 自动刷新周期（任务书钉 10s）
 
@@ -130,7 +129,7 @@ export function ProjectGraphTab({ project, onChanged }: { project: Project; onCh
       await api.updateProject(project.id, { observer_enabled: on });
       toast.success(
         on
-          ? "已开启跨任务阅读者（项目内触发与洞察注入生效；投影本就常开）"
+          ? "已开启跨任务阅读者（项目内触发与 hint 生效；投影本就常开）"
           : "已关闭跨任务阅读者（停止项目内触发与注入；大图投影保留）",
       );
       onChanged();
@@ -189,7 +188,6 @@ export function ProjectGraphTab({ project, onChanged }: { project: Project; onCh
         )}
       </div>
 
-      <InsightsPanel projectID={project.id} />
     </div>
   );
 }
@@ -246,86 +244,3 @@ function GraphTaskCard({ g }: { g: GraphTaskGroup }) {
   );
 }
 
-// InsightsPanel 跨任务阅读者经验：列表 + keywords 徽章 + 来源任务回链 + 删除。
-function InsightsPanel({ projectID }: { projectID: number }) {
-  const [list, setList] = React.useState<ProjectInsight[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [deleting, setDeleting] = React.useState<number | null>(null);
-
-  const load = React.useCallback(
-    (silent = false) => {
-      if (!silent) setLoading(true);
-      api
-        .projectInsights(projectID)
-        .then((r) => setList(r.insights))
-        .catch((e) => !silent && toast.error("加载洞察失败：" + (e as Error).message))
-        .finally(() => !silent && setLoading(false));
-    },
-    [projectID],
-  );
-  React.useEffect(() => {
-    load();
-  }, [load]);
-
-  async function remove(id: number) {
-    setDeleting(id);
-    try {
-      await api.deleteProjectInsight(projectID, id);
-      setList((l) => l.filter((x) => x.id !== id));
-      toast.success("洞察已删除");
-    } catch (e) {
-      toast.error("删除失败：" + (e as Error).message);
-    } finally {
-      setDeleting(null);
-    }
-  }
-
-  return (
-    <Card size="sm" className="max-h-[calc(100vh-12rem)] self-start">
-      <CardHeader>
-        <CardTitle className="text-sm">跨任务阅读者洞察{list.length ? `（${list.length}）` : ""}</CardTitle>
-        <CardDescription className="text-xs">跨任务可借鉴经验（planner 按资产命中限量注入）</CardDescription>
-        <CardAction>
-          <Button variant="ghost" size="icon" onClick={() => load()} aria-label="刷新洞察">
-            <RefreshCwIcon className={loading ? "animate-spin" : ""} />
-          </Button>
-        </CardAction>
-      </CardHeader>
-      <CardContent className="grid gap-2 overflow-y-auto">
-        {!loading && list.length === 0 && (
-          <p className="text-muted-foreground py-6 text-center text-xs">
-            还没有洞察。开启项目「跨任务阅读者」后，跨任务阅读者会在图变更时自动沉淀可借鉴经验。
-          </p>
-        )}
-        {list.map((it) => (
-          <div key={it.id} className="rounded-lg border p-2.5 text-xs">
-            <p className="leading-relaxed break-words">{it.content}</p>
-            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-              {it.source_task_id ? (
-                <a
-                  className="text-primary hover:underline"
-                  href={`/function/tasks/detail?id=${encodeURIComponent(String(it.source_task_id))}&tab=graph`}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  来源任务#{it.source_task_id}
-                </a>
-              ) : (
-                <span className="text-muted-foreground">来源未知</span>
-              )}
-              {it.keywords.map((k) => (
-                <Badge key={k} variant="secondary" className="px-1.5 py-0 text-[10px]">
-                  {k}
-                </Badge>
-              ))}
-              <span className="text-muted-foreground ml-auto">{new Date(it.created_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}</span>
-              <Button variant="ghost" size="icon-xs" className="text-destructive" onClick={() => remove(it.id)} disabled={deleting === it.id} aria-label="删除洞察">
-                <Trash2Icon />
-              </Button>
-            </div>
-          </div>
-        ))}
-      </CardContent>
-    </Card>
-  );
-}

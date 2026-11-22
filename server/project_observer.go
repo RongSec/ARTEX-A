@@ -8,22 +8,23 @@ package server
 // （OnProjectGraph + IntervalSec 双条件）、一份 prompt（按触发前缀判别作用域）。
 // observer agent 行保留作只读别名，但不再新建触发（seedObserverAgent 早退）。
 //
-// 六工具名不变：observer 四件（query_project_index / get_task_graph_digest /
-// write_project_insight / push_task_hint）+ reader 两件（read_all_project_insights /
-// write_global_insight）。两个聚合出口 projectObserverTools()/
-// projectReaderTools() 保持原样（装配单测按数量断言），统一绑定用
-// unifiedReaderToolKeys（六件全绑到 reader）。
+// V12-CLEANUP 后的工具集（写洞察的两件已随 project_insights 表删除）：
 //
-// V7-LINK 追加两件 reader 工具（read_task_intel / link_tasks），由
-// taskIntelReaderTools() 单独 seed 绑定，不进 unifiedReaderToolKeys——那条
-// 列表的「六件」语义与历史绑定收敛逻辑保持不动。
+//	projectObserverTools  query_project_index / get_task_graph_digest / push_task_hint
+//	projectReaderTools    read_cross_project_assets
+//	unifiedReaderToolKeys 以上四件 + judge_related_tasks（另有 taskIntelReaderTools
+//	                      的 read_task_intel / request_reader_links / adopt_related_task
+//	                      / dismiss_related_task / link_tasks 单独 seed）
+//
+// 跨任务经验复用的落点从「洞察表」改成「对方任务的探索图」：阅读者判定勾连后
+// adopt_related_task 写 hint，规划者按 hint 下发合并工单。可下钻、有相关度分、
+// 可回溯——不再维护一张没人读的散文表。
 //
 // 工具经 SeedTool 入库 + AddAgentToToolBinding 绑定到 reader；触发运行策略
 // serial+merge=all（整波合并）；tool_base='none'（只读红线，两 key 都保留）。
 // 两个尺度各自独立开关（V6-DUAL）：projects.observer_enabled 管跨任务/项目内
-// 那一路（write_project_insight / on_project_graph / 项目段注入），
-// projects.reader_enabled 管跨项目那一路（read_all_project_insights /
-// write_global_insight / 跨项目段注入）。同一个 agent、两把闸。
+// 那一路（图变更触发 + hint 下发），projects.reader_enabled 管跨项目那一路
+// （read_cross_project_assets 的可见项目集 + 跨项目勾连）。同一个 agent、两把闸。
 
 import (
 	"context"
@@ -99,42 +100,6 @@ func (s *Server) toolGetTaskGraphDigest() actool.CoreTool {
 		})
 }
 
-// toolWriteProjectInsight 写一条项目级洞察（observer 的产出面）。keywords
-// 必填至少 1 个——planner 侧注入靠 keywords ∩ 任务锚定 asset_keys 命中，
-// 无关键词的洞察永远不会被复用（拒写防垃圾行，与 content 必填同理由）。
-func (s *Server) toolWriteProjectInsight() actool.CoreTool {
-	return wrTool("write_project_insight",
-		"给指定项目写一条【跨任务可借鉴洞察】(project_insights)：短、事实性、可执行，"+
-			"格式如「N任务 canal v1.1.5 未认证RCE已验证，可借鉴至 M任务 10.x:8080」。keywords=组件名/版本/IP/域名等命中键（至少 1 个，注入时与任务锚定资产求交集）。宁少勿滥：没有真发现就别写。",
-		objSchema(map[string]any{
-			"project_id":     map[string]any{"type": "integer", "description": "项目 id"},
-			"content":        strParam("洞察正文(短、事实性、可执行)"),
-			"keywords":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "命中关键词(组件名/版本/IP/域名…，≥1)"},
-			"source_task_id": map[string]any{"type": "integer", "description": "可选：本洞察主要来源任务 id"},
-		}, "project_id", "content", "keywords"),
-		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
-			var a struct {
-				ProjectID    json.RawMessage `json:"project_id"`
-				Content      string          `json:"content"`
-				Keywords     []string        `json:"keywords"`
-				SourceTaskID int64           `json:"source_task_id"`
-			}
-			_ = json.Unmarshal(in, &a)
-			pid := parseProfileID(a.ProjectID)
-			if pid <= 0 {
-				return actool.Errorf("project_id 无效"), nil
-			}
-			if len(a.Keywords) == 0 {
-				return actool.Errorf("keywords 至少 1 个(无关键词的洞察永远不会被注入命中)"), nil
-			}
-			ins, err := s.m.pg.WriteInsight(ctx, pid, a.Content, a.SourceTaskID, a.Keywords)
-			if err != nil {
-				return actool.Errorf(err.Error()), nil
-			}
-			return actool.Text(fmt.Sprintf("project insight %d written (project#%d)", ins.ID, pid)), nil
-		})
-}
-
 // toolPushTaskHint 给目标任务注入战略提示并唤醒其 planner。实现=委托
 // add_task_hint（原版人工插话同一路径：hint 落探索图 + NotifyHint 记「人新
 // 增了提示」触发 planner），保证目标任务 planner 下轮真的读到。每轮 ≤2 条
@@ -163,61 +128,38 @@ func (s *Server) toolPushTaskHint() actool.CoreTool {
 		})
 }
 
-// toolReadAllProjectInsights 读跨项目的项目洞察池（reader 的输入面）。
-// project_ids 可选：空=全部【已开 reader_enabled 的 active 项目】。limit
-// 默认 100（串联是"读一遍再归纳"，不该吞全表）。
+// toolReadCrossProjectAssets 是跨项目阅读者的输入面：同一资产/组件出现在
+// ≥2 个项目里的聚合行（项目数/项目列表/finding 数/最近出现）。
 //
-// T18 reader_enabled=项目级 opt-in：未开启的项目不进 reader 视野（读面收窄，
-// 双闸的全局侧由 reader 触发器 enabled，项目侧由此处过滤）。显式传入的
-// project_ids 同样过滤——只保留开了 reader_enabled 的；被剔除的在返回体里
-// 如实标注 skipped_projects，不静默吞掉（agent 需要知道哪些项目不在视野内，
-// 免得对着空结果反复重试）。
+// V12-CLEANUP：本工具原为 read_all_project_insights，返回「cross_project_assets
+// + 各项目的 project_insights」。洞察表整体删除后，只剩资产聚合这一段——
+// 它查的是 assets/findings，跟洞察表无关，是跨项目串联真正的硬信号
+// （SQL join 出来的重叠，不该让模型从散文里猜）。
 //
-// V4-E「资产优先」：返回体从「纯项目洞察数组」升级为对象，新增
-// cross_project_assets——同一资产出现在 ≥2 个项目里的聚合行（项目数/项目
-// 列表/finding 数/最近出现）。跨项目最强信号是资产重叠，这是 SQL join 的活，
-// 不该让模型从散文里猜；projects/insights 原字段形状不变（向后兼容）。
-// cross_project_assets 同样按 reader_enabled 可见集裁剪（否则会绕过项目级
-// opt-in 把未开闸项目的情报漏给 reader）。
-func (s *Server) toolReadAllProjectInsights() actool.CoreTool {
-	return roTool("read_all_project_insights",
-		"读跨项目阅读输入，两段：① cross_project_assets＝同一资产出现在 ≥2 个项目里的聚合行"+
-			"(资产标签/类型/涉及项目[id+名称]/发现数/最近出现，按项目数降序，最多 20 行)——跨项目信号先看这段；"+
-			"② projects＝各项目的项目洞察(project_insights，跨任务阅读者产出)。"+
+// project_ids 可选：空=全部【已开 reader_enabled 的 active 项目】。未开启的
+// 不进视野，显式传入的同样过滤，被剔除的在返回体里如实标注 skipped_projects
+// （agent 需要知道哪些项目不在视野内，免得对着空结果反复重试）。
+func (s *Server) toolReadCrossProjectAssets() actool.CoreTool {
+	return roTool("read_cross_project_assets",
+		"读跨项目串联输入：cross_project_assets＝同一资产出现在 ≥2 个项目里的聚合行"+
+			"(资产标签/类型/涉及项目[id+名称]/发现数/最近出现，按项目数降序，最多 20 行)。"+
 			"仅覆盖【开启跨项目阅读者开关(reader_enabled)】的 active 项目；project_ids 空=读全部已开启项目。"+
-			"cross_project_assets 为空即无跨项目信号，不必再逐条翻 insights。",
+			"返回空即无跨项目信号，直接空转结束。",
 		objSchema(map[string]any{
 			"project_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "可选：限定项目 id；空=全部已开启项目"},
-			"limit":       map[string]any{"type": "integer", "description": "每项目条数上限(可选，默认 50)"},
 		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				ProjectIDs []int64 `json:"project_ids"`
-				Limit      int     `json:"limit"`
 			}
 			_ = json.Unmarshal(in, &a)
 			ids, skipped, err := s.readerVisibleProjects(a.ProjectIDs)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			if a.Limit <= 0 {
-				a.Limit = 50
-			}
 			visible := make(map[int64]bool, len(ids))
 			for _, pid := range ids {
 				visible[pid] = true
-			}
-			projects := make([]map[string]any, 0, len(ids))
-			for _, pid := range ids {
-				list, err := s.m.pg.ListInsights(ctx, pid, nil, a.Limit)
-				if err != nil {
-					return actool.Errorf(err.Error()), nil
-				}
-				items := make([]map[string]any, 0, len(list))
-				for _, it := range list {
-					items = append(items, map[string]any{"id": it.ID, "content": it.Content, "keywords": it.Keywords, "source_task_id": it.SourceTaskID, "created_at": it.CreatedAt})
-				}
-				projects = append(projects, map[string]any{"project_id": pid, "insights": items})
 			}
 			cross, err := s.m.pg.CrossProjectAssetRows(ctx, 0)
 			if err != nil {
@@ -226,7 +168,6 @@ func (s *Server) toolReadAllProjectInsights() actool.CoreTool {
 			cross = db.FilterCrossProjectAssetsByProjects(cross, visible)
 			out := map[string]any{
 				"cross_project_assets": cross,
-				"projects":             projects,
 			}
 			if len(skipped) > 0 {
 				// 被 reader_enabled 闸剔除的项目如实回报（照 warn 不拒纪律）。
@@ -280,100 +221,41 @@ func (s *Server) readerVisibleProjects(projectIDs []int64) (visible []int64, ski
 	return visible, skipped, nil
 }
 
-// toolWriteGlobalInsight 写一条跨项目全局洞察（reader 产出）。进
-// global_insights；source_projects=串联涉及的项目集，供展示回链。
-//
-// V5-A：asset_keys 是注入 planner 的唯一命中依据（与任务 open 意图锚定资产的
-// 归一化键求交集）。入参缺省时刻意做一次「从正文反查已知资产键」的推导——
-// 候选集=来源项目下出现过的资产键（AssetKeysForProjects，归一化规则与注入侧
-// AssetKeysForIDs 同源），命中=正文里出现该键（大小写不敏感子串）。推导不出
-// 就落空数组 → 该条永不注入（只能人工看），绝不硬塞无关键去骗命中。
-func (s *Server) toolWriteGlobalInsight() actool.CoreTool {
-	return wrTool("write_global_insight",
-		"写一条【跨项目全局洞察】(global_insights)：多个项目里重复出现的同类面（同组件/同类入口/同一打法跨项目可迁移）。source_projects 填涉及的每个项目 id。"+
-			"asset_keys 填洞察点名的资产键（域名/IP/URL，如 [\"canal.example.com\",\"10.0.0.8\"]）——planner 靠它把这条读回正在打该资产的任务；不填则从正文自动匹配来源项目的已知资产，匹配不到就不会被注入。"+
-			"宁少勿滥；单项目内部的事写 write_project_insight，别写这里。",
-		objSchema(map[string]any{
-			"content":         strParam("洞察正文(跨项目证据链式陈述，指明各项目 task/资产)"),
-			"source_projects": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "涉及的项目 id(≥1)"},
-			"asset_keys":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：命中资产键(域名/IP/URL)；缺省从正文匹配来源项目的已知资产"},
-		}, "content", "source_projects"),
-		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
-			var a struct {
-				Content        string   `json:"content"`
-				SourceProjects []int64  `json:"source_projects"`
-				AssetKeys      []string `json:"asset_keys"`
-			}
-			_ = json.Unmarshal(in, &a)
-			if len(a.SourceProjects) == 0 {
-				return actool.Errorf("source_projects 至少 1 个"), nil
-			}
-			// T18：source_projects 剔除未 opt-in（reader_enabled 关/非 active/
-			// 不存在）的项目——warn 不拒，洞察宁少勿滥的纪律不变，但也不因某
-			// 个项目没开开关就把整条合法的全局洞察打回。全被剔除才报错。
-			visible, skipped, err := s.readerVisibleProjects(a.SourceProjects)
-			if err != nil {
-				return actool.Errorf(err.Error()), nil
-			}
-			if len(skipped) > 0 {
-				log.Printf("[reader] write_global_insight 剔除未开启 reader_enabled 的项目: %v", skipped)
-			}
-			if len(visible) == 0 {
-				return actool.Errorf("source_projects 全部未开启 reader_enabled 或不可见，无有效来源项目"), nil
-			}
-			// V5-A：入参缺省 → 从正文推导。候选集查库失败按「推导失败=空」处理
-			// （洞察照写，只是不参与注入；不因一次旁路查询抖动丢掉 reader 的产出）。
-			var derivedNote string
-			if len(a.AssetKeys) == 0 {
-				if cands, err := s.m.pg.AssetKeysForProjects(ctx, visible); err == nil {
-					a.AssetKeys = db.DeriveAssetKeys(a.Content, cands)
-					if len(a.AssetKeys) == 0 {
-						derivedNote = "；正文未匹配到已知资产键，本条不会被注入 planner"
-					}
-				} else {
-					derivedNote = fmt.Sprintf("；资产键推导失败(%v)，本条不会被注入 planner", err)
-				}
-			}
-			g, err := s.m.pg.WriteGlobalInsight(ctx, a.Content, visible, a.AssetKeys)
-			if err != nil {
-				return actool.Errorf(err.Error()), nil
-			}
-			return actool.Text(fmt.Sprintf("global insight %d written (projects %v, asset_keys %v)%s", g.ID, visible, g.AssetKeys, derivedNote)), nil
-		})
-}
-
 // projectObserverTools / projectReaderTools 是两 agent 的工具集（seed 注册与
 // seed 绑定共用同一列表，口径单源）。
+//
+// V12-CLEANUP：write_project_insight / write_global_insight 随 project_insights
+// 表一起移除。跨任务/跨项目的经验复用统一走「阅读者 judge → adopt → hint」：
+// 结论落在对方任务的探索图（hint 节点）里，可下钻、有相关度分、可回溯，
+// 比往一张没有人维护的洞察表里堆散文可靠。
 func (s *Server) projectObserverTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		s.toolQueryProjectIndex(),
 		s.toolGetTaskGraphDigest(),
-		s.toolWriteProjectInsight(),
 		s.toolPushTaskHint(),
 	}
 }
 
 func (s *Server) projectReaderTools() []actool.CoreTool {
 	return []actool.CoreTool{
-		s.toolReadAllProjectInsights(),
-		s.toolWriteGlobalInsight(),
+		s.toolReadCrossProjectAssets(),
 	}
 }
 
-// unifiedReaderToolKeys 是阅读者 agent（key=reader，现名「跨项目阅读者」）绑定的全部六工具
-// （V6-U3）：observer 四件 + reader 两件，工具名一律不变。两个聚合出口
-// projectObserverTools()/projectReaderTools() 仍需按原数量分别服务装配链，
-// 故合并只发生在「绑定集合」这一层，不动那两个函数。
+// unifiedReaderToolKeys 是阅读者 agent（key=reader，现名「跨项目阅读者」）绑定的
+// 工具集合。V12-CLEANUP 起：投影总览 / 图摘要 / 推 hint / 跨项目资产聚合 /
+// 判官 / 情报表与勾连工具 —— 写洞察的两件已删。
 var unifiedReaderToolKeys = []string{
-	"query_project_index", "get_task_graph_digest", "write_project_insight", "push_task_hint",
-	"read_all_project_insights", "write_global_insight", "judge_related_tasks",
+	"query_project_index", "get_task_graph_digest", "push_task_hint",
+	"read_cross_project_assets", "judge_related_tasks",
 }
 
 // ---------- seed（照 reporter 样板 orchestration.go:735） ----------
 
-// observerPrompt 是【跨任务阅读者】system prompt 的默认正文（SeedPromptIfEmpty
-// 播种，DB 里可编辑；要点全部保留：只读红线、五步工作流、insight 格式与克制）。
-// 内部 key 仍是 observer（历史标识不改），对用户/模型统一称「跨任务阅读者」。
+// observerPrompt 是【跨任务阅读者】system prompt 的历史默认正文。observer 别名
+// 在 V6-U3 收敛后只保留只读身份、不再新建触发，本常量仅为存量库回退保留。
+// 正文里提到的 write_project_insight 已随洞察表删除——若某天真的要回退到
+// observer 路径，必须先把它的第 4 步改写成 push_task_hint。
 const observerPrompt = "你是本项目的【跨任务阅读者】：只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
 	"触发时机：本项目的探索图发生变更，触发消息里带本批变更清单（kind/摘要/task_id）。\n" +
 	"工作步骤：\n" +
@@ -544,10 +426,10 @@ const readerUnifiedPromptV11 = "你同时承担两个只读视角：项目内【
 	"  3) 若某个正在运行的任务明显可复用另一项目的打法，用 adopt_related_task 把它关联到该运行中任务（task_id=运行中任务，relevance_score, reason, chains 同 scope=project 的要求）；否则 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
 	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。"
 
-// readerUnifiedPromptV12 是 V11-READER7 的当前默认正文：判定改走
-// judge_related_tasks（每个候选一个独立上下文，并发 3），不再把 N 张候选图
-// 读进同一个会话——实测 6 个候选把上下文从 6.6k 推到 29.3k、累计 13.7 万
-// 输入 token，而候选之间对彼此的判断没有帮助。V11 保留为升级比对基准。
+// readerUnifiedPromptV12 是 V11-READER7 的历史默认正文（升级比对基准，勿改）：
+// 判定改走 judge_related_tasks（每个候选一个独立上下文，并发 3），不再把 N 张
+// 候选图读进同一个会话——实测 6 个候选上下文从 6.6k 推到 29.3k、累计 13.7 万
+// 输入 token，而候选之间对彼此的判断没有帮助。
 const readerUnifiedPromptV12 = "你同时承担两个只读视角：项目内【跨任务阅读者】（scope=project）、跨项目【跨项目阅读者】（scope=cross）。只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
 	"触发时机：项目探索图变更（图变更触发）或定时兜底（每 30 分钟一轮）；一条触发器同时挂这两个条件。\n" +
 	"【先看触发消息前缀判别本轮作用域】\n" +
@@ -566,6 +448,30 @@ const readerUnifiedPromptV12 = "你同时承担两个只读视角：项目内【
 	"  2) 非空时围绕这些行核实：用 read_task_graph 读涉及任务的完整图（接口/组件/漏洞），确认真实可复用；\n" +
 	"  3) 若某个正在运行的任务明显可复用另一项目的打法，用 adopt_related_task 把它关联到该运行中任务（task_id=运行中任务，relevance_score, reason, chains 同 scope=project 的要求）；否则 write_global_insight：正文按「资产 → 项目 → 证据」陈述，source_projects 填全涉及项目 id。\n" +
 	"没有真发现就直接结束本轮，绝不写空洞洞察或客套 hint；单项目内部的事只写 write_project_insight、跨项目的事只写 write_global_insight，别混。"
+
+// readerUnifiedPromptV13 是 V12-CLEANUP 的当前默认正文：project_insights 表
+// 与两个 write_*_insight 工具整体删除。跨项目串联不再「写洞察」——对方任务在
+// 运行就 adopt_related_task，没在运行就 push_task_hint 留一条可执行提示；
+// 结论落在对方任务的探索图里，可下钻、可回溯、有相关度分，而不是堆进一张
+// 没人维护的散文表。
+const readerUnifiedPromptV13 = "你同时承担两个只读视角：项目内【跨任务阅读者】（scope=project）、跨项目【跨项目阅读者】（scope=cross）。只读与总结，禁止执行任何渗透动作（不调用扫描/请求/命令类工具，也没有它们）。\n" +
+	"触发时机：项目探索图变更（图变更触发）或定时兜底（每 30 分钟一轮）；一条触发器同时挂这两个条件。\n" +
+	"【先看触发消息前缀判别本轮作用域】\n" +
+	"· 【scope=project】（项目图变更，消息里还带本批变更清单 kind/摘要/task_id）：做项目内跨任务阅读（你是跨任务阅读者），核心职责是【替规划者读图判定勾连】——\n" +
+	"  1) read_task_intel 读增量情报表（since_rev 传上一轮返回的 next_since_rev；rev 是变更序列，接口细节变丰富也会重新下发）；用触发消息里的 task_id 定位本轮变更任务（发起方）；\n" +
+	"  2) 找候选：request_reader_links(surface=发起方新出现的接口/组件/资产, project_id=发起方项目, exclude_task_id=发起方, scope=project)。候选已按 SQL 命中分排序（match_score / match_strength：精确接口 1.0、模糊路径 0.6、凭据 1.2、资产 0.8、组件 0.3；Σ≥2 strong、Σ≥1 medium）；weak 已被过滤，你只需要判 medium 以上的候选；\n" +
+	"  3) 拿到候选后，调 judge_related_tasks(task_id=发起方, candidate_ids=[候选 id...]) 一次判完：每个候选一个独立上下文（发起方摘要 + 该候选摘要），候选之间互不影响，发起方图也不会被重复读 N 次；只有某项 error（判官说证据不足）时，才用 read_task_graph 单独读那一张图补证；\n" +
+	"  4) 判官返回的 score(0-100) 就是 relevance_score：≥60 同一利用链/≥2 接口同构/已验证组件可复用；40-59 同攻击面部分可迁移；<40 只是键相同或组件同名；\n" +
+	"  5) relevance_score ≥40 才 adopt_related_task(task_id=发起方, related_task_id=候选, relevance_score, reason, chains)；低于 40 一律 dismiss_related_task。reason 必须写「在两边读到了什么」——点名重合的接口/组件/利用链，不能只写「键相同」；40-59 时还要写清「哪部分可迁移、哪部分不行」；\n" +
+	"  6) chains 用判官返回的原样带上（最多 6 条）；判官没给链但你确认可迁移时，再按 entry（method+path，不含 host）/steps/outcome/verified/node_ids 补写。规划者看不到原始边，只看到链摘要；\n" +
+	"  7) 采纳后：规划者只会看到脱敏后的 reader_refs（任务概述、接口 method+path、链摘要、计数、可下钻 id）。它需要细节时会用 ask_reader 找你下钻，你只回【测试细节/方法】——不要把整图、host、凭据写进 reason、chains 或 hint。\n" +
+	"  ★跨项目候选同样可以采纳：request_reader_links(scope=cross) 返回的候选（仅覆盖开启 reader_enabled 的项目）与项目内候选同等对待，采纳不按项目设限；是否外溢由你的评分控制。\n" +
+	"  ★不要把未判定的候选丢给规划者：它不读旧任务、不做下钻，只采信你 adopt 后写入的 hint；你判完才轮到它。\n" +
+	"· 【scope=cross】（定时触发）：做跨项目串联（你是跨项目阅读者）——\n" +
+	"  1) read_cross_project_assets 拿本轮输入，看 cross_project_assets——它已 join 好「同一资产/组件出现在 ≥2 个项目」；为空即无跨项目信号，直接空转结束；\n" +
+	"  2) 非空时围绕这些行核实：用 read_task_graph 读涉及任务的完整图（接口/组件/漏洞），确认真实可复用；\n" +
+	"  3) 若某个正在运行的任务明显可复用另一项目的打法，用 adopt_related_task 把它关联到该运行中任务（task_id=运行中任务，relevance_score, reason, chains 同 scope=project 的要求）；对方不在运行时用 push_task_hint 给该任务留一条可执行提示（每轮 ≤2 条）。\n" +
+	"没有真发现就直接结束本轮，绝不写客套 hint。"
 
 // seedObserverAgent 是 V6 之前的「跨任务观察者」seed（回退路径保留）。
 // V6-U3 起 observer 退化为只读别名：收敛完成后（reader_unified_v1 置位）
@@ -637,7 +543,7 @@ func (s *Server) seedReaderAgent() {
 		log.Printf("[reader] 创建 agent 失败: %v", err)
 		return
 	}
-	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV12); err != nil {
+	if err := s.m.pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV13); err != nil {
 		log.Printf("[reader] seed prompt 失败: %v", err)
 	}
 	// serial+merge=all：整波图变更合并成一次会话（observer 原策略），max_parallel=2。
@@ -749,17 +655,6 @@ func (s *Server) seedProjectTools() {
 			log.Printf("[project-tools] seed %s: %v", t.Name(), err)
 		}
 	}
-	// V5-A：planner 的洞察否决工具。与 observer/reader 工具不同——它默认【只绑
-	// planner】（首插生效：用户日后在工具页取消绑定也不会被重启复活）。旧库首次
-	// 启动由这条 SeedTool 补行，随后 ToolResolve 按 agents 过滤，其他 agent 看不到。
-	rt := s.toolRejectInsight()
-	if schema, err := json.Marshal(rt.InputSchema()); err != nil {
-		log.Printf("[project-tools] seed %s schema: %v", rt.Name(), err)
-	} else if agents, err := json.Marshal([]string{"planner"}); err != nil {
-		log.Printf("[project-tools] seed %s agents: %v", rt.Name(), err)
-	} else if err := s.m.PG().SeedTool(rt.Name(), rt.Description(), schema, agents); err != nil {
-		log.Printf("[project-tools] seed %s: %v", rt.Name(), err)
-	}
 	// V9-READER：情报表勾连工具全部只绑 reader（read_task_intel / link_tasks /
 	// request_reader_links / adopt_related_task / dismiss_related_task）。
 	// 与 reject_insight 的「首插生效」不同——归属迁移必须能改掉存量库的旧绑定
@@ -866,7 +761,7 @@ func (s *Server) reconcileReaderAgentNames() {
 // 标记。V8-NAME 的旧 flag（reader_prompt_names_v8）在存量库已置位，继续用它
 // 会让新流程永远到不了 reader；换 flag 即再执行一次「逐字节比对旧默认才升级」
 // 的幂等收编。
-const readerPromptUpgradeFlagV12 = "reader_prompt_judge_v12"
+const readerPromptUpgradeFlagV13 = "reader_prompt_no_insight_v13"
 
 // readerPromptUpgrade 是 upgradeReaderPrompt 的纯判定结果（无库可单测）。
 type readerPromptUpgrade int
@@ -889,7 +784,7 @@ func readerPromptUpgradeFor(cur string) readerPromptUpgrade {
 	switch strings.TrimSpace(cur) {
 	case "":
 		return readerPromptSeed
-	case readerPromptV1, readerPrompt, readerUnifiedPromptV6, readerUnifiedPrompt, readerUnifiedPromptNames, readerUnifiedPromptV9, readerUnifiedPromptV10, readerUnifiedPromptV11:
+	case readerPromptV1, readerPrompt, readerUnifiedPromptV6, readerUnifiedPrompt, readerUnifiedPromptNames, readerUnifiedPromptV9, readerUnifiedPromptV10, readerUnifiedPromptV11, readerUnifiedPromptV12:
 		return readerPromptReplace
 	default:
 		return readerPromptKeep
@@ -912,7 +807,7 @@ func (s *Server) upgradeReaderPrompt() {
 	if pg == nil {
 		return
 	}
-	if v, _, _ := pg.GetSetting(readerPromptUpgradeFlagV12); v == "true" {
+	if v, _, _ := pg.GetSetting(readerPromptUpgradeFlagV13); v == "true" {
 		return
 	}
 	a, err := pg.GetAgentByKey("reader")
@@ -926,21 +821,21 @@ func (s *Server) upgradeReaderPrompt() {
 	}
 	switch readerPromptUpgradeFor(cur) {
 	case readerPromptSeed:
-		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV12); err != nil {
+		if err := pg.SeedPromptIfEmpty(a.ID, readerUnifiedPromptV13); err != nil {
 			log.Printf("[reader] 播种新默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已播种 V11-READER7 默认 prompt")
+		log.Printf("[reader] 已播种 V12-CLEANUP 默认 prompt")
 	case readerPromptReplace:
-		if _, err := pg.SavePrompt(a.ID, readerUnifiedPromptV12, "V11-READER7 默认正文升级：候选判定改走 judge_related_tasks（每候选独立上下文）", "system"); err != nil {
+		if _, err := pg.SavePrompt(a.ID, readerUnifiedPromptV13, "V12-CLEANUP 默认正文升级：删除洞察工具，跨项目串联改走 adopt/push_task_hint", "system"); err != nil {
 			log.Printf("[reader] 升级默认 prompt 失败: %v", err)
 			return
 		}
-		log.Printf("[reader] 已把未编辑的默认 prompt 升级为 V11-READER7 独立判官版（历史版本保留）")
+		log.Printf("[reader] 已把未编辑的默认 prompt 升级为 V12-CLEANUP 无洞察版（历史版本保留）")
 	default:
 		log.Printf("[reader] 当前 prompt 已是新版或被用户编辑，跳过默认正文升级（如需新流程请手动恢复内置默认）")
 	}
-	if err := pg.SetSetting(readerPromptUpgradeFlagV12, "true"); err != nil {
+	if err := pg.SetSetting(readerPromptUpgradeFlagV13, "true"); err != nil {
 		log.Printf("[reader] 写入 prompt 升级标记失败: %v", err)
 	}
 }
