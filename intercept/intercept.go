@@ -792,18 +792,13 @@ func ruleMatches(r compiledRule, toolName string, input []byte, normalized strin
 	case "tool_name":
 		subjects = []string{toolName}
 	case "tool_input":
+		// raw 与解码后的字段值都扫：raw 覆盖 normalized 没列进白名单的字段，
+		// normalized 覆盖 \u002f 这类 JSON 转义绕过。任一命中即算命中。
 		subjects = []string{string(input)}
 		if normalized != "" {
 			subjects = append(subjects, normalized)
 		}
 	default:
-		return false
-	}
-	// V12-RULES：本机专用规则遇到远程指代就整条跳过。`ssh root@target
-	// 'cat /etc/shadow'` 是打靶战果，不是读本机凭据；反过来，平台自身路径
-	// （jwt.key / dataDir）的规则没有这个标记——靶机上不存在那些文件，
-	// 「远程读它」只可能是本机，套豁免会漏。
-	if r.RemoteExempt && r.MatchTarget == "tool_input" && HasRemoteTargeting(subjects...) {
 		return false
 	}
 	if r.MatchType == "regex" {

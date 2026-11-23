@@ -162,7 +162,6 @@ type RuleForm = {
   timeout_enabled: boolean;
   timeout_seconds: number;
   timeout_action: "deny" | "allow";
-  remote_exempt: boolean;
 };
 
 const defaultForm = (): RuleForm => ({
@@ -177,7 +176,6 @@ const defaultForm = (): RuleForm => ({
   timeout_enabled: true,
   timeout_seconds: 60,
   timeout_action: "deny",
-  remote_exempt: false,
 });
 
 // ---- small components ----
@@ -623,7 +621,7 @@ export function InterceptSection() {
       match_target: rule.match_target, match_type: rule.match_type,
       pattern: rule.pattern, action: rule.action, message: rule.message,
       timeout_enabled: rule.timeout_enabled, timeout_seconds: rule.timeout_seconds,
-      timeout_action: rule.timeout_action, remote_exempt: rule.remote_exempt ?? false,
+      timeout_action: rule.timeout_action,
     });
     setRegexErr("");
     setOpen(true);
@@ -957,25 +955,6 @@ export function InterceptSection() {
                   className="resize-none"
                 />
               </Field>
-            )}
-
-            {form.match_target === "tool_input" && (
-              <>
-                <Separator />
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-sm font-medium">仅针对本机（远程命令跳过）</p>
-                    <p className="text-xs text-muted-foreground">
-                      开启后，命令里出现 ssh / scp / curl / psql -h 等远程指代时跳过本条。
-                      「本机系统凭据」类规则应开启；平台自身路径（jwt.key）不要开。
-                    </p>
-                  </div>
-                  <Switch
-                    checked={form.remote_exempt}
-                    onCheckedChange={(v) => set({ remote_exempt: v })}
-                  />
-                </div>
-              </>
             )}
 
             {form.action === "ask" && (

@@ -125,7 +125,7 @@ func (s *Server) interceptCreateRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	rule, err := pg.CreateInterceptRule(req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction, req.RemoteExempt != nil && *req.RemoteExempt)
+	rule, err := pg.CreateInterceptRule(req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -153,14 +153,7 @@ func (s *Server) interceptUpdateRule(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	// 没传 remote_exempt 时先用库里现值兜底（见 interceptRuleReq 的指针注释）。
-	remoteExempt := false
-	if req.RemoteExempt != nil {
-		remoteExempt = *req.RemoteExempt
-	} else if cur, err := pg.GetInterceptRule(id); err == nil && cur != nil {
-		remoteExempt = cur.RemoteExempt
-	}
-	rule, err := pg.UpdateInterceptRule(id, req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction, remoteExempt)
+	rule, err := pg.UpdateInterceptRule(id, req.Name, req.MatchTarget, req.MatchType, req.Pattern, req.Action, req.Message, req.Priority, req.Enabled, req.TimeoutEnabled, req.TimeoutSeconds, req.TimeoutAction)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -490,9 +483,6 @@ type interceptRuleReq struct {
 	TimeoutEnabled bool   `json:"timeout_enabled"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
 	TimeoutAction  string `json:"timeout_action"`
-	// RemoteExempt 用指针区分「没传」与「显式 false」：老前端/脚本不传时必须
-	// 保留库里原值，否则编辑一次「[本机] 系统凭据」规则就把远程豁免悄悄关掉。
-	RemoteExempt *bool `json:"remote_exempt"`
 }
 
 func validateInterceptRuleReq(req interceptRuleReq) error {

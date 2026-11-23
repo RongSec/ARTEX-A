@@ -3,49 +3,14 @@ package intercept
 // V12-RULES：远程豁免与平台地址占位符的纯函数单测（无需数据库）。
 //
 // 这两条是「规则合并后仍然不能误拦」的关键：
-//   - 远程豁免：`ssh root@target 'cat /etc/shadow'` 必须放过，`cat /etc/shadow`
-//     必须拦下；
+//   - 远程豁免：按命中位置判上下文，用例见 remote_context_test.go；
 //   - 占位符：{{PLATFORM_IPS}} 必须展开成实际地址，且一个候选都没有时不能
 //     退化成「匹配一切」。
 
 import (
 	"regexp"
 	"testing"
-
-	"github.com/Autumn-27/artex/db"
 )
-
-func TestHasRemoteTargeting(t *testing.T) {
-	remote := []string{
-		`ssh root@10.0.0.5 'cat /etc/shadow'`,
-		`scp root@target:/etc/shadow .`,
-		`rsync -av target:/etc/shadow .`,
-		`proxychains4 ssh root@10.1.1.1 cat /etc/shadow`,
-		`mysql -h 10.0.0.9 -u root -p`,
-		`psql --host=db.internal -c 'select 1'`,
-		`curl http://10.0.0.5/anything`,
-		`docker exec web01 cat /etc/shadow`,
-		`kubectl exec pod -- cat /etc/shadow`,
-		`nc 10.0.0.5 22`,
-	}
-	for _, s := range remote {
-		if !HasRemoteTargeting(s) {
-			t.Errorf("应识别为远程指代: %s", s)
-		}
-	}
-	local := []string{
-		`cat /etc/shadow`,
-		`cat /root/.ssh/id_rsa`,
-		`python3 -c "open('/etc/shadow').read()"`,
-		`strings /proc/1/environ`,
-		`echo hello`,
-	}
-	for _, s := range local {
-		if HasRemoteTargeting(s) {
-			t.Errorf("不应识别为远程指代: %s", s)
-		}
-	}
-}
 
 func TestExpandPlatformPlaceholders(t *testing.T) {
 	pat := `(?:{{PLATFORM_IPS}}):(?:{{PLATFORM_PORTS}})/api/settings`
@@ -84,39 +49,6 @@ func TestExpandPlatformPlaceholdersNeverMatchesEverything(t *testing.T) {
 	}
 }
 
-// TestRemoteExemptSkipsOnlyLocalRules 钉死「只跳过本机规则」：
-// 同一条 ssh 命令，本机凭据规则被跳过，平台凭据规则照常命中（靶机上不存在
-// /app/jwt.key，「远程读它」只可能是本机）。
-func TestRemoteExemptSkipsOnlyLocalRules(t *testing.T) {
-	hostRule := compiledRule{InterceptRule: db.InterceptRule{
-		Pattern:      `/etc/shadow`,
-		MatchTarget:  "tool_input",
-		MatchType:    "regex",
-		RemoteExempt: true,
-	}}
-	hostRule.re = regexp.MustCompile(hostRule.Pattern)
-
-	platformRule := compiledRule{InterceptRule: db.InterceptRule{
-		Pattern:      `jwt\.key`,
-		MatchTarget:  "tool_input",
-		MatchType:    "regex",
-		RemoteExempt: false,
-	}}
-	platformRule.re = regexp.MustCompile(platformRule.Pattern)
-
-	sshShadow := []byte(`{"command":"ssh root@10.0.0.5 'cat /etc/shadow'"}`)
-	if ruleMatches(hostRule, "Bash", sshShadow, "") {
-		t.Error("远程读 shadow 应被本机规则跳过")
-	}
-	if !ruleMatches(hostRule, "Bash", []byte(`{"command":"cat /etc/shadow"}`), "") {
-		t.Error("本地读 shadow 必须命中本机规则")
-	}
-
-	sshJwt := []byte(`{"command":"ssh root@10.0.0.5 'cat /app/jwt.key'"}`)
-	if !ruleMatches(platformRule, "Bash", sshJwt, "") {
-		t.Error("平台凭据规则不套远程豁免：远程读 jwt.key 只可能是本机，必须命中")
-	}
-}
 
 // TestProcessEnvironPrecision 钉死用户指出的误拦：/proc/self/environ 是 agent
 // 自己的环境，不该拦；/proc/<pid>/environ 才是别人的。

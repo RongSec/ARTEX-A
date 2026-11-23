@@ -3,7 +3,6 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -23,10 +22,7 @@ type InterceptRule struct {
 	TimeoutEnabled bool      `json:"timeout_enabled"`
 	TimeoutSeconds int       `json:"timeout_seconds"`
 	TimeoutAction  string    `json:"timeout_action"`
-	// RemoteExempt=true 表示本规则只针对本机：文本里出现 ssh/scp/curl/psql -h
-	// 这类远程指代时跳过本条（详见 schema.sql 的列注释）。
-	RemoteExempt bool      `json:"remote_exempt"`
-	CreatedAt    time.Time `json:"created_at"`
+	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
@@ -46,13 +42,13 @@ type InterceptPending struct {
 	CreatedAt      time.Time       `json:"created_at"`
 }
 
-const interceptRuleCols = `id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action, remote_exempt, created_at, updated_at`
+const interceptRuleCols = `id, name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action, created_at, updated_at`
 
 func scanInterceptRule(row interface{ Scan(...any) error }) (InterceptRule, error) {
 	var r InterceptRule
 	err := row.Scan(&r.ID, &r.Name, &r.Enabled, &r.Priority,
 		&r.MatchTarget, &r.MatchType, &r.Pattern, &r.Action, &r.Message,
-		&r.TimeoutEnabled, &r.TimeoutSeconds, &r.TimeoutAction, &r.RemoteExempt,
+		&r.TimeoutEnabled, &r.TimeoutSeconds, &r.TimeoutAction,
 		&r.CreatedAt, &r.UpdatedAt)
 	return r, err
 }
@@ -76,34 +72,25 @@ func (d *DB) ListInterceptRules() ([]InterceptRule, error) {
 }
 
 // CreateInterceptRule inserts a new rule.
-func (d *DB) CreateInterceptRule(name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string, remoteExempt ...bool) (InterceptRule, error) {
-	re := false
-	if len(remoteExempt) > 0 {
-		re = remoteExempt[0]
-	}
+func (d *DB) CreateInterceptRule(name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
 	row := d.QueryRow(`
-INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action, remote_exempt)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 RETURNING `+interceptRuleCols,
-		name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction, re)
+		name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction)
 	return scanInterceptRule(row)
 }
 
 // UpdateInterceptRule replaces all editable fields of an existing rule.
-func (d *DB) UpdateInterceptRule(id int64, name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string, remoteExempt ...bool) (InterceptRule, error) {
-	re := false
-	if len(remoteExempt) > 0 {
-		re = remoteExempt[0]
-	}
+func (d *DB) UpdateInterceptRule(id int64, name, matchTarget, matchType, pattern, action, message string, priority int, enabled bool, timeoutEnabled bool, timeoutSeconds int, timeoutAction string) (InterceptRule, error) {
 	row := d.QueryRow(`
 UPDATE intercept_rules
    SET name=$2, enabled=$3, priority=$4, match_target=$5,
        match_type=$6, pattern=$7, action=$8, message=$9,
-       timeout_enabled=$10, timeout_seconds=$11, timeout_action=$12,
-       remote_exempt=$13
+       timeout_enabled=$10, timeout_seconds=$11, timeout_action=$12
 WHERE id=$1
 RETURNING `+interceptRuleCols,
-		id, name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction, re)
+		id, name, enabled, priority, matchTarget, matchType, pattern, action, message, timeoutEnabled, timeoutSeconds, timeoutAction)
 	return scanInterceptRule(row)
 }
 
@@ -420,16 +407,3 @@ func (d *DB) listInterceptsPage(taskID string, page, size int, filter InterceptA
 	return out, total, rows.Err()
 }
 
-// GetInterceptRule 按 id 取单条规则；不存在返回 (nil, nil)。
-// 更新链路用它兜住「请求体没带 remote_exempt 时保留库内现值」。
-func (d *DB) GetInterceptRule(id int64) (*InterceptRule, error) {
-	row := d.QueryRow(`SELECT `+interceptRuleCols+` FROM intercept_rules WHERE id=$1`, id)
-	r, err := scanInterceptRule(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &r, nil
-}

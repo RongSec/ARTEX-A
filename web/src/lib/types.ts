@@ -1364,9 +1364,6 @@ export interface InterceptRule {
   timeout_enabled: boolean;
   timeout_seconds: number;
   timeout_action: "deny" | "allow";
-  // V12-RULES：true = 本规则只针对本机；命令里出现 ssh/scp/curl 等远程指代
-  // 时跳过（`ssh root@target 'cat /etc/shadow'` 是打靶战果，不该拦）。
-  remote_exempt?: boolean;
   created_at: string;
   updated_at: string;
 }

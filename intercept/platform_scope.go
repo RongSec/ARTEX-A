@@ -1,6 +1,6 @@
 package intercept
 
-// 规则里的「平台自身地址」占位符与远程指代识别（V12-RULES）。
+// 规则里的「平台自身地址」占位符（V12-RULES3）。
 //
 // 背景：合并三类规则后，只剩下 intercept_rules（DB）一套。原先写在短路规则
 // 里的「平台控制面 API」需要匹配平台自己的监听地址，但一台机器往往有多张
@@ -14,9 +14,8 @@ package intercept
 // 地址来源 = 回环 + 本机所有非回环网卡地址 + 设置项 platform_ips 里用户额外
 // 配的。这样换机器、加网卡都不用改规则。
 //
-// 另一个必需的能力是「远程指代」识别：`ssh root@target 'cat /etc/shadow'` 是
-// 合法打靶战果，不该被「本机系统凭据」规则拦下。规则上标 remote_exempt=true，
-// 引擎看到命令里有 ssh/scp/curl/psql -h 这类指向别处的迹象就整条跳过。
+// 规则目前只剩「控制面 API」一条，全部判定都在这里；原先的远程豁免
+// （remote_exempt 列）随「本机凭据」规则一起删除，不再需要「远程指代」识别。
 
 import (
 	"encoding/json"
@@ -124,40 +123,9 @@ func dedupeStrings(in []string) []string {
 	return out
 }
 
-// remoteTargetingRe 是「这条命令指向了另一台机器」的判据。只服务
-// remote_exempt=true 的规则（目前只有「本机系统凭据」一条）：
-//
-//   - ssh / scp / sftp / rsync / ansible / winrm / 各种 nc：参数后面必然跟远端；
-//   - proxychains 包着的命令：目标是代理链对端；
-//   - mysql/psql/mariadb 带 -h/--host：连的是远端库；
-//   - user@host 形态；
-//   - http(s):// 直接打 URL（curl/wget 的常态）；
-//   - docker/podman/kubectl exec：命令跑在容器/远端 Pod 里，读的是那边的文件。
-//
-// 命中就跳过该规则——注意这只是「不拦」，不是「放行」：同一次调用后面还有
-// 其它规则和判官。
-var remoteTargetingRe = []*regexp.Regexp{
-	regexp.MustCompile(`(?:^|[\s"'\x60;&|(<>$])(?:ssh|scp|sftp|rsync|proxychains(?:4|chain)?[0-9]*|netcat|ncat|nc|winrm|ansible)\b`),
-	regexp.MustCompile(`(?:^|[\s"'\x60;&|(<>$])(?:mysql|psql|mariadb)\b[^\n]*?\s-{1,2}h(?:ost)?[=\s]`),
-	regexp.MustCompile(`@(?:\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9][a-z0-9._-]*[a-z0-9])(?:[:/'"\s)|,;-]|$)`),
-	regexp.MustCompile(`https?://\S`),
-	regexp.MustCompile(`(?:^|[\s"'\x60;&|(<>$])(?:docker|podman|kubectl)\b[^\n]*?\bexec\b`),
-}
-
-// HasRemoteTargeting 判断命令文本里是否出现指向远端的迹象。
-func HasRemoteTargeting(texts ...string) bool {
-	for _, t := range texts {
-		if t == "" {
-			continue
-		}
-		for _, re := range remoteTargetingRe {
-			if re.MatchString(t) {
-				return true
-			}
-		}
-	}
-	return false
-}
+// 远程上下文判定已迁到 remote_context.go（V12-RULES2）：旧实现是「出现远程
+// 指代就整条规则跳过」，会把「本地读 + 远程送」一并放行（scp 本地私钥、
+// curl -d @/etc/shadow、管道送 nc）。现在按命中位置判上下文。
 
 // platformScopeFromSettings 读用户额外配置的平台地址与端口。
 //
