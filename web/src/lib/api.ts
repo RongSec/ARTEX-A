@@ -24,6 +24,7 @@ import type {
   BatchTasksResult,
   BuiltinInterceptRule,
   PlatformScope,
+  TaskCredentialPayload,
   ChatAttachment,
   CommandRecord,
   Company,
@@ -385,6 +386,8 @@ export const api = {
     coverageEnabled?: boolean;
     autoReport?: boolean;
     interceptRules?: AssetInterceptRuleInput[];
+    /** 建任务时录入的凭据；落库到目标资产 auth。 */
+    credentials?: TaskCredentialPayload[];
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
@@ -401,6 +404,7 @@ export const api = {
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
       auto_report: input.autoReport ?? false, // R5:完成后自动生成任务级报告;默认关
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
+      credentials: input.credentials ?? [], // 建任务时录入的凭据（落目标资产 auth）
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
@@ -1486,6 +1490,7 @@ export const api = {
     auto_report?: boolean;
     auto_report_tasks?: boolean;
     reader_enabled?: boolean;
+    task_template_id?: number | null;
   }) =>
     post<Project>("/projects", {
       name: input.name,
@@ -1497,6 +1502,7 @@ export const api = {
       auto_report: input.auto_report ?? false,
       auto_report_tasks: input.auto_report_tasks ?? false,
       reader_enabled: input.reader_enabled ?? false,
+      task_template_id: input.task_template_id ?? null,
     }),
   updateProject: (
     id: number | string,
@@ -1513,6 +1519,8 @@ export const api = {
       auto_report?: boolean;
       auto_report_tasks?: boolean;
       reader_enabled?: boolean;
+      /** 三态同 report_template_id：键缺席=不动、null=清除、数字=绑定。 */
+      task_template_id?: number | null;
     },
   ) => patch<Project>(`/projects/${id}`, patchBody),
   // deleteProject 删项目。带 options 时：五个清理开关作用于旗下任务，
@@ -1534,6 +1542,8 @@ export const api = {
         plan_heartbeat_seconds?: number;
         seed_first_intent?: boolean;
         coverage_enabled?: boolean;
+        /** 本批凭据池；每条可带 target 指定适用目标，留空=全部目标。 */
+        credentials?: TaskCredentialPayload[];
       };
     },
   ) => post<BatchTasksResult>(`/projects/${id}/batch-tasks`, input),

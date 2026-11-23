@@ -27,6 +27,9 @@ type Project struct {
 	AutoReport      bool      `json:"auto_report"`
 	AutoReportTasks bool      `json:"auto_report_tasks"`
 	ReaderEnabled   bool      `json:"reader_enabled"` // 跨项目阅读开关（scope='cross' 聚合/来源校验/注入；默认关）
+	// TaskTemplateID 是项目默认任务模板（task_templates.id）；nil=未预设。
+	// 批量下发时作为默认带出，用户仍可在下发弹窗里改。
+	TaskTemplateID  *int64    `json:"task_template_id"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
@@ -59,11 +62,11 @@ func normalizeProjectConcurrency(n int) int {
 	return n
 }
 
-const projectCols = `id, name, description, status, owner, concurrency, observer_enabled, report_template_id, auto_report, auto_report_tasks, reader_enabled, created_at, updated_at`
+const projectCols = `id, name, description, status, owner, concurrency, observer_enabled, report_template_id, auto_report, auto_report_tasks, reader_enabled, task_template_id, created_at, updated_at`
 
 func scanProject(sc interface{ Scan(...any) error }) (*Project, error) {
 	var p Project
-	if err := sc.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Owner, &p.Concurrency, &p.ObserverEnabled, &p.ReportTemplateID, &p.AutoReport, &p.AutoReportTasks, &p.ReaderEnabled, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := sc.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Owner, &p.Concurrency, &p.ObserverEnabled, &p.ReportTemplateID, &p.AutoReport, &p.AutoReportTasks, &p.ReaderEnabled, &p.TaskTemplateID, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &p, nil
@@ -82,6 +85,7 @@ type CreateProjectInput struct {
 	AutoReport       bool   // 只出一个项目汇总报告
 	AutoReportTasks  bool   // 子任务都出报告（可与 AutoReport 同真=叠加）
 	ReaderEnabled    bool
+	TaskTemplateID   *int64 // 项目默认任务模板；nil=未预设
 }
 
 // CreateProject 插入一个项目（status 固定 active 起步；owner 可空）。
@@ -101,11 +105,15 @@ func (d *DB) CreateProject(in CreateProjectInput) (*Project, error) {
 	// V6-DUAL：两个尺度各自独立开关，各写各的列，互不镜像——
 	//   observer_enabled = 跨任务/项目内（scope='project' 洞察的写/触发/注入）
 	//   reader_enabled   = 跨项目（scope='cross' 的聚合/来源校验/注入）
+	var taskTmpl any
+	if in.TaskTemplateID != nil && *in.TaskTemplateID > 0 {
+		taskTmpl = *in.TaskTemplateID
+	}
 	return scanProject(d.QueryRow(`
-INSERT INTO projects(name, description, owner, concurrency, observer_enabled, report_template_id, auto_report, auto_report_tasks, reader_enabled)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+INSERT INTO projects(name, description, owner, concurrency, observer_enabled, report_template_id, auto_report, auto_report_tasks, reader_enabled, task_template_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING `+projectCols, name, strings.TrimSpace(in.Description), strings.TrimSpace(in.Owner),
-		normalizeProjectConcurrency(concurrency), in.ObserverEnabled, tmpl, in.AutoReport, in.AutoReportTasks, in.ReaderEnabled))
+		normalizeProjectConcurrency(concurrency), in.ObserverEnabled, tmpl, in.AutoReport, in.AutoReportTasks, in.ReaderEnabled, taskTmpl))
 }
 
 // GetProject 返回单个项目；不存在时返回 ErrProjectNotFound。
@@ -225,6 +233,10 @@ type UpdateProjectPatch struct {
 	AutoReport          *bool
 	AutoReportTasks     *bool
 	ReaderEnabled       *bool
+	// TaskTemplateIDSet/TaskTemplateID 与 ReportTemplateID 同款：nil 无法区分
+	// 「键缺席」与「显式清除」，由 server 判键后置 Set。
+	TaskTemplateID    *int64
+	TaskTemplateIDSet bool
 }
 
 // UpdateProject 应用局部更新并返回新行。status 非法值返回错误（DDL 有 CHECK，
@@ -255,7 +267,8 @@ func (d *DB) UpdateProject(id int64, patch UpdateProjectPatch) (*Project, error)
 	report_template_id = CASE WHEN $14::boolean THEN $15::bigint ELSE report_template_id END,
 	auto_report   = CASE WHEN $16::boolean THEN $17 ELSE auto_report END,
 	auto_report_tasks = CASE WHEN $18::boolean THEN $19 ELSE auto_report_tasks END,
-	reader_enabled = CASE WHEN $20::boolean THEN $21 ELSE reader_enabled END
+	reader_enabled = CASE WHEN $20::boolean THEN $21 ELSE reader_enabled END,
+	task_template_id = CASE WHEN $22::boolean THEN $23::bigint ELSE task_template_id END
 WHERE id=$1
 RETURNING `+projectCols,
 		id,
@@ -268,11 +281,20 @@ RETURNING `+projectCols,
 		patch.ReportTemplateIDSet, templateAny,
 		patch.AutoReport != nil, derefBool(patch.AutoReport),
 		patch.AutoReportTasks != nil, derefBool(patch.AutoReportTasks),
-		patch.ReaderEnabled != nil, derefBool(patch.ReaderEnabled)))
+		patch.ReaderEnabled != nil, derefBool(patch.ReaderEnabled),
+		patch.TaskTemplateIDSet, taskTmplAny(patch)))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrProjectNotFound
 	}
 	return p, err
+}
+
+// taskTmplAny 把 PATCH 里的模板 id 转成可绑定值：显式清除 → nil（SQL NULL）。
+func taskTmplAny(patch UpdateProjectPatch) any {
+	if patch.TaskTemplateID != nil && *patch.TaskTemplateID > 0 {
+		return *patch.TaskTemplateID
+	}
+	return nil
 }
 
 func derefStr(s *string) string {

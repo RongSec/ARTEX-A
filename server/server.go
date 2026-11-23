@@ -1650,6 +1650,8 @@ type createTaskReq struct {
 	AutoReport           bool     `json:"auto_report,omitempty"`       // R5：完成后自动生成任务级报告（默认关；勾选即生效）
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
+	// Credentials 建任务时录入的凭据（落库到目标资产 auth，agent 可读）。
+	Credentials []TaskCredentialInput `json:"credentials,omitempty"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1712,6 +1714,11 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "任务级拦截规则无效："+err.Error())
 		return
 	}
+	creds, err := normalizeTaskCredentials(req.Credentials)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
 		Name: strings.TrimSpace(req.Name), CategoryID: req.CategoryID, ProjectID: projectID,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
@@ -1735,7 +1742,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
-	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
+	// 凭据按任务目标匹配后写进目标资产；目标解析不出来时 authItemsFor 返回空，
+	// 与无凭据建任务完全一致。
+	s.launchTaskWithAuth(t, req.Description+" "+req.Goal,
+		req.SeedFirstIntent != nil && *req.SeedFirstIntent, authItemsFor(creds, req.Goal))
 	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
 }
 
@@ -1887,7 +1897,12 @@ func (s *Server) llmHost() string {
 	return ""
 }
 
-func (s *Server) seed(t *Task, text string) {
+func (s *Server) seed(t *Task, text string) { s.seedWithAuth(t, text, nil) }
+
+// seedWithAuth 是 seed 的带凭据版本：建站点资产时把 auth 一起写进 assets.auth，
+// agent 用 list_assets / node_detail 就能拿到这轮录入的凭据。auth 为空时行为
+// 与 seed 完全一致。
+func (s *Server) seedWithAuth(t *Task, text string, auth []map[string]any) {
 	scheme, host, port, ok := parseTarget(text)
 	if !ok {
 		log.Printf("[seed] task %s: 未能从 %q 解析出目标 host/IP，不创建站点（请手动配置 scope）", t.ID, text)
@@ -1907,11 +1922,11 @@ func (s *Server) seed(t *Task, text string) {
 	if as := s.m.Assets(); as != nil {
 		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 		if net.ParseIP(host) != nil {
-			rootID, _ = as.UpsertIP(db.UpsertIPReq{IP: host, TaskID: taskID})
+			rootID, _ = as.UpsertIP(db.UpsertIPReq{IP: host, Auth: auth, TaskID: taskID})
 		} else if scheme == "https" || scheme == "http" {
-			rootID, _ = as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: u, TaskID: taskID})
+			rootID, _ = as.UpsertHTTPService(db.UpsertHTTPServiceReq{URL: u, Auth: auth, TaskID: taskID})
 		} else {
-			rootID, _ = as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: host, TaskID: taskID})
+			rootID, _ = as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: host, Auth: auth, TaskID: taskID})
 		}
 		if rootID > 0 {
 			_ = as.SetTaskAssetSource(taskID, rootID, "task", "由任务描述或目标初始化", nil)

@@ -49,6 +49,7 @@ import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { TaskTemplateControls } from "@/components/task-template-controls";
+import { CredentialEditor, credentialsToPayload, type CredentialRow } from "@/components/credential-editor";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -2995,6 +2996,8 @@ function CreateTaskSheet({
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
   const [autoReport, setAutoReport] = React.useState(false); // R5: 完成后自动生成任务级报告;默认关
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
+  // 建任务时录入的凭据：落库到目标资产的 auth，执行者用 list_assets 读取。
+  const [creds, setCreds] = React.useState<CredentialRow[]>([]);
   // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
   const [uploading, setUploading] = React.useState(false);
   const [uploadCount, setUploadCount] = React.useState(0);
@@ -3072,6 +3075,7 @@ function CreateTaskSheet({
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
+        credentials: credentialsToPayload(creds),
       });
       toast.success("任务已创建");
       setName("");
@@ -3089,6 +3093,7 @@ function CreateTaskSheet({
       setCoverageEnabled(true);
       setAutoReport(false);
       setInterceptRules([]);
+      setCreds([]);
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);
@@ -3228,6 +3233,13 @@ function CreateTaskSheet({
                 onChange={(e) => setGoal(e.target.value)}
               />
             </div>
+            <Field>
+              <FieldLabel>凭据（可选）</FieldLabel>
+              <CredentialEditor value={creds} onChange={setCreds} targets={[]} />
+              <FieldDescription>
+                填了会写入目标资产的 auth 字段（执行者用 list_assets 可见）；不填不影响建任务。可指定适用目标，留空=全部。
+              </FieldDescription>
+            </Field>
             <Field>
               <FieldLabel htmlFor="source-tasks">关联任务</FieldLabel>
               <SourceTaskPicker

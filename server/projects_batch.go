@@ -21,23 +21,12 @@ import (
 // 建任务比批量暂停重，给 200）。
 const maxBatchCreate = 200
 
-// splitBatchTargets 把 textarea 文本拆成目标行：按行切、去首尾空白、丢空行、
-// 去重（重复保留首条，后续出现进 skipped）。纯函数，无库单测。
-func splitBatchTargets(text string) (targets []string, skipped []string) {
-	seen := map[string]bool{}
-	for _, line := range strings.Split(text, "\n") {
-		t := strings.TrimSpace(line)
-		if t == "" {
-			continue
-		}
-		if seen[t] {
-			skipped = append(skipped, t)
-			continue
-		}
-		seen[t] = true
-		targets = append(targets, t)
-	}
-	return targets, skipped
+// splitBatchTargets 把 textarea 文本拆成目标行。语义已升级为 ParseTargets
+// （V12-TARGET）：除空行/重复外，还剔除非法的域名/IP/URL，并返回 invalid 供
+// 前端核对。前端「解析」按钮用同一套规则做即时预览。
+func splitBatchTargets(text string) (targets, skipped, invalid []string) {
+	r := ParseTargets(text)
+	return r.Targets, r.Duplicate, r.Invalid
 }
 
 // batchCreateReq 是批量下发入参。common 继承原版建任务参数面（对照
@@ -54,6 +43,9 @@ type batchCreateReq struct {
 		PlanHeartbeatSeconds int     `json:"plan_heartbeat_seconds,omitempty"`
 		SeedFirstIntent      *bool   `json:"seed_first_intent,omitempty"`
 		CoverageEnabled      *bool   `json:"coverage_enabled,omitempty"`
+		// Credentials 是本批任务要用的凭据池。每条可带 target 指定适用目标，
+		// 留空=全部目标；落库到目标资产的 auth（agent 用 list_assets 可读）。
+		Credentials []TaskCredentialInput `json:"credentials,omitempty"`
 	} `json:"common"`
 }
 
@@ -82,7 +74,7 @@ func (s *Server) projectsBatchTasks(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
-	targets, skipped := splitBatchTargets(req.Targets)
+	targets, skipped, invalid := splitBatchTargets(req.Targets)
 	if len(targets) == 0 {
 		writeErr(w, 400, "targets 为空（一行一个目标）")
 		return
@@ -113,6 +105,12 @@ func (s *Server) projectsBatchTasks(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "任务分类不存在或无效")
 			return
 		}
+	}
+	// 凭据整批前置校验：人工录入的少量数据，错了当场 400，不像目标那样静默剔除。
+	creds, err := normalizeTaskCredentials(req.Common.Credentials)
+	if err != nil {
+		writeErr(w, 400, err.Error())
+		return
 	}
 	descTmpl := strings.TrimSpace(req.Common.DescTemplate)
 	if descTmpl == "" {
@@ -148,8 +146,9 @@ func (s *Server) projectsBatchTasks(w http.ResponseWriter, r *http.Request) {
 			failed = append(failed, target)
 			continue
 		}
-		// 与原版建后流程同源的 seed（解析目标建站点资产）；不调 launchTask。
-		s.seed(t, desc+" "+target)
+		// 与原版建后流程同源的 seed（解析目标建站点资产）；本批凭据按 target
+		// 匹配后写进该资产的 auth。不调 launchTask。
+		s.seedWithAuth(t, desc+" "+target, authItemsFor(creds, target))
 		if req.Common.SeedFirstIntent != nil && *req.Common.SeedFirstIntent {
 			s.seedFirstIntent(t)
 		}
@@ -174,6 +173,9 @@ func (s *Server) projectsBatchTasks(w http.ResponseWriter, r *http.Request) {
 		"skipped":     skipped,
 		"project_id":  pid,
 		"concurrency": concurrency,
+	}
+	if invalid != nil {
+		out["invalid"] = invalid
 	}
 	if failed != nil {
 		out["failed"] = failed

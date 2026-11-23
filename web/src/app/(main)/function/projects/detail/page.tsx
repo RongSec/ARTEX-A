@@ -188,7 +188,12 @@ function ProjectDetailInner() {
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <ProjectBatchTasks projectID={p.id} concurrency={p.concurrency} onDone={load} />
+          <ProjectBatchTasks
+            projectID={p.id}
+            concurrency={p.concurrency}
+            defaultTemplateID={p.task_template_id}
+            onDone={load}
+          />
           <Button variant="outline" size="icon" onClick={load} aria-label="刷新" disabled={loading}>
             <RefreshCwIcon className={loading ? "animate-spin" : ""} />
           </Button>

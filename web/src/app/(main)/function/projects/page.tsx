@@ -42,6 +42,7 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { DeleteOptionFields, emptyDeleteOptions } from "@/components/delete-option-fields";
+import { TaskTemplateControls } from "@/components/task-template-controls";
 import { api } from "@/lib/api";
 import type { DeleteTaskOptions, ProjectWithStats } from "@/lib/types";
 
@@ -308,6 +309,8 @@ function CreateProjectDialog({
   const [autoReport, setAutoReport] = React.useState(false);
   const [autoReportTasks, setAutoReportTasks] = React.useState(false);
   const [templateId, setTemplateId] = React.useState<string>(""); // "" = 默认链
+  // 项目默认任务模板（task_templates.id）：只存引用，批量下发时带出。
+  const [taskTemplateID, setTaskTemplateID] = React.useState<number | null>(null);
   const [templates, setTemplates] = React.useState<{ id: number; name: string; is_default: boolean }[]>([]);
   const [saving, setSaving] = React.useState(false);
 
@@ -322,6 +325,7 @@ function CreateProjectDialog({
       setAutoReport(false);
       setAutoReportTasks(false);
       setTemplateId("");
+      setTaskTemplateID(null);
       api
         .reportTemplates()
         .then(setTemplates)
@@ -351,6 +355,7 @@ function CreateProjectDialog({
         auto_report: autoReport,
         auto_report_tasks: autoReportTasks,
         reader_enabled: reader,
+        task_template_id: taskTemplateID,
       });
       toast.success(`项目已创建：${p.name}`);
       onCreated();
@@ -363,7 +368,7 @@ function CreateProjectDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !saving && onOpenChange(o)}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>新建项目</DialogTitle>
         </DialogHeader>
@@ -399,6 +404,16 @@ function CreateProjectDialog({
               ))}
             </NativeSelect>
             <p className="text-muted-foreground text-xs">整项目收官自动写报告时用的模板；留空则用全局默认模板链。</p>
+          </div>
+          <div className="rounded-lg border p-3">
+            <TaskTemplateControls
+              description=""
+              goal=""
+              selectedTemplateID={taskTemplateID}
+              onSelectedTemplateIDChange={setTaskTemplateID}
+              onApply={() => {}}
+              hint="作为本项目的默认任务模板：批量下发时自动带出，可在那时再改。只存引用，不复制模板内容。"
+            />
           </div>
           <div className="grid gap-3 rounded-lg border p-3">
             <label className="flex items-center justify-between gap-3 text-sm">

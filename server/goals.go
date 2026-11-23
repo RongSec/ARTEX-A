@@ -26,10 +26,16 @@ type goalSpec struct {
 //
 // 异步(goroutine)所以调用方立即返回,两条路径行为一致:秒建任务、后台拆目标。
 func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
+	s.launchTaskWithAuth(t, seedText, seedFirstIntent, nil)
+}
+
+// launchTaskWithAuth 是 launchTask 的带凭据版本：种子资产落库时把 auth 一起
+// 写进 assets.auth。普通建任务（无凭据）走的仍是 launchTask → auth=nil。
+func (s *Server) launchTaskWithAuth(t *Task, seedText string, seedFirstIntent bool, auth []map[string]any) {
 	if !s.engine.beginTaskOperation(t.ID) {
 		return
 	}
-	s.seed(t, seedText)
+	s.seedWithAuth(t, seedText, auth)
 	if seedFirstIntent {
 		s.seedFirstIntent(t)
 	}

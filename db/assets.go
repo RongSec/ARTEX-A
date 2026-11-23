@@ -248,6 +248,8 @@ func nullableInt(v int) interface{} {
 type UpsertRootDomainReq struct {
 	Domain string
 	ICP    string
+	// Auth 同 UpsertIPReq.Auth：用户建任务时录入的凭据池。
+	Auth   []map[string]any
 	TaskID int64
 }
 
@@ -278,11 +280,15 @@ func (s *AssetStore) UpsertRootDomain(req UpsertRootDomainReq) (int64, error) {
 	if req.ICP != "" {
 		icpVal = req.ICP
 	}
+	authJSON, err := marshalJSONBArray(req.Auth)
+	if err != nil {
+		return 0, err
+	}
 
 	var id int64
 	err = s.tx.QueryRow(`
-INSERT INTO assets(type, domain, root_domain, icp, company_id, company_source, task_ids)
-VALUES ('root_domain', $1, $1, $2, $3, 'scope', $4::bigint[])
+INSERT INTO assets(type, domain, root_domain, icp, auth, company_id, company_source, task_ids)
+VALUES ('root_domain', $1, $1, $2, $3::jsonb[], $4, 'scope', $5::bigint[])
 ON CONFLICT (domain) WHERE type = 'root_domain' DO UPDATE SET
     icp        = COALESCE(EXCLUDED.icp, assets.icp),
     company_id = CASE
@@ -296,8 +302,14 @@ ON CONFLICT (domain) WHERE type = 'root_domain' DO UPDATE SET
     END,
     task_ids   = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
     extra      = assets.extra || EXCLUDED.extra,
+    auth       = (
+        SELECT ARRAY(
+            SELECT DISTINCT ON (elem::text) elem
+            FROM unnest(assets.auth || EXCLUDED.auth) AS elem
+        )
+    ),
     last_seen  = now()
-RETURNING id`, domain, icpVal, companyID, taskIDs).Scan(&id)
+RETURNING id`, domain, icpVal, authJSON, companyID, taskIDs).Scan(&id)
 	return id, err
 }
 
@@ -331,7 +343,10 @@ type UpsertIPReq struct {
 	IP           string
 	BoundDomains []string
 	OpenPorts    []PortService
-	TaskID       int64
+	// Auth 是挂在资产上的凭据池（{type,username,password,token,description}）。
+	// 建任务时用户录入的凭据走这里落库，agent 用 list_assets / node_detail 读。
+	Auth   []map[string]any
+	TaskID int64
 }
 
 // UpsertIP idempotently inserts or merges an IP asset.
@@ -365,6 +380,10 @@ func (s *AssetStore) UpsertIP(req UpsertIPReq) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	authJSON, err := marshalJSONBArray(req.Auth)
+	if err != nil {
+		return 0, err
+	}
 
 	var csegVal any
 	if cseg != "" {
@@ -373,8 +392,8 @@ func (s *AssetStore) UpsertIP(req UpsertIPReq) (int64, error) {
 
 	var id int64
 	err = s.tx.QueryRow(`
-INSERT INTO assets(type, ip, c_segment, bound_domains, open_ports, company_id, company_source, task_ids)
-VALUES ('ip', $1, $2::cidr, $3::text[], $4::jsonb[], $5, 'scope', $6::bigint[])
+INSERT INTO assets(type, ip, c_segment, bound_domains, open_ports, auth, company_id, company_source, task_ids)
+VALUES ('ip', $1, $2::cidr, $3::text[], $4::jsonb[], $5::jsonb[], $6, 'scope', $7::bigint[])
 ON CONFLICT (ip) WHERE type = 'ip' DO UPDATE SET
     bound_domains = (SELECT ARRAY(SELECT DISTINCT unnest(assets.bound_domains || EXCLUDED.bound_domains))),
     open_ports    = (
@@ -396,8 +415,14 @@ ON CONFLICT (ip) WHERE type = 'ip' DO UPDATE SET
         ELSE assets.company_source
     END,
     task_ids   = (SELECT ARRAY(SELECT DISTINCT unnest(assets.task_ids || EXCLUDED.task_ids))),
+    auth       = (
+        SELECT ARRAY(
+            SELECT DISTINCT ON (elem::text) elem
+            FROM unnest(assets.auth || EXCLUDED.auth) AS elem
+        )
+    ),
     last_seen  = now()
-RETURNING id`, req.IP, csegVal, boundDomains, openPortsJSON, companyID, taskIDs).Scan(&id)
+RETURNING id`, req.IP, csegVal, boundDomains, openPortsJSON, authJSON, companyID, taskIDs).Scan(&id)
 	return id, err
 }
 

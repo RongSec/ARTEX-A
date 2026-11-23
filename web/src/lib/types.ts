@@ -1734,6 +1734,8 @@ export interface Project {
   auto_report: boolean; // 只出一个项目汇总报告（全部任务收官后）
   auto_report_tasks: boolean; // 子任务都出报告（与 auto_report 可同勾=叠加）
   reader_enabled: boolean; // V6-DUAL 跨项目阅读开关：跨项目聚合/来源校验/注入。与 observer_enabled 互相独立
+  /** 项目默认任务模板（task_templates.id）；null=未预设。批量下发时自动带出。 */
+  task_template_id: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -1802,9 +1804,21 @@ export interface PlatformScope {
 export interface BatchTasksResult {
   created: string[];
   skipped?: string[]; // 去重丢弃的重复行（原样回显）
+  invalid?: string[]; // 非法目标（解析后不建任务）
   failed?: string[]; // 单行创建失败的目标行
   project_id: number;
   concurrency: number;
+}
+
+/** 建任务时录入的一条凭据；落库到目标资产的 auth（agent 用 list_assets 可读）。 */
+export interface TaskCredentialPayload {
+  /** 适用目标；空=整批/本条任务通用。允许只写 host。 */
+  target?: string;
+  type: "password" | "hash" | "token" | "cookie" | "key";
+  username?: string;
+  password?: string;
+  token?: string;
+  description?: string;
 }
 
 // =====================================================================

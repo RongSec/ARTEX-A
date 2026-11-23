@@ -167,6 +167,8 @@ func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 		AutoReport       bool   `json:"auto_report"`
 		AutoReportTasks  bool   `json:"auto_report_tasks"`
 		ReaderEnabled    bool   `json:"reader_enabled"`
+		// TaskTemplateID 项目默认任务模板；0/null=不预设。校验存在性后落库。
+		TaskTemplateID *int64 `json:"task_template_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
@@ -189,6 +191,16 @@ func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 项目默认任务模板：传了 >0 就必须是真的模板行（同报告模板校验范式）。
+	if req.TaskTemplateID != nil && *req.TaskTemplateID > 0 {
+		if t, err := s.m.PG().GetTaskTemplate(*req.TaskTemplateID); err != nil {
+			writeErr(w, 500, "读取任务模板失败: "+err.Error())
+			return
+		} else if t == nil {
+			writeErr(w, 400, "任务模板不存在")
+			return
+		}
+	}
 	p, err := s.m.PG().CreateProject(db.CreateProjectInput{
 		Name:             req.Name,
 		Description:      req.Description,
@@ -199,6 +211,7 @@ func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 		AutoReport:       req.AutoReport,
 		AutoReportTasks:  req.AutoReportTasks,
 		ReaderEnabled:    req.ReaderEnabled,
+		TaskTemplateID:   req.TaskTemplateID,
 	})
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -396,6 +409,27 @@ func (s *Server) projectsUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		patch.ReaderEnabled = &b
+	}
+	// 项目默认任务模板：null/0=清除，>0=绑定（校验存在性，与创建同款）。
+	if v, has := raw["task_template_id"]; has {
+		patch.TaskTemplateIDSet = true
+		if string(v) != "null" {
+			var n int64
+			if err := json.Unmarshal(v, &n); err != nil {
+				writeErr(w, 400, "task_template_id 须为整数或 null")
+				return
+			}
+			if n > 0 {
+				if t, err := s.m.PG().GetTaskTemplate(n); err != nil {
+					writeErr(w, 500, "读取任务模板失败: "+err.Error())
+					return
+				} else if t == nil {
+					writeErr(w, 400, "任务模板不存在")
+					return
+				}
+				patch.TaskTemplateID = &n
+			}
+		}
 	}
 	p, err := s.m.PG().UpdateProject(pid, patch)
 	if errors.Is(err, db.ErrProjectNotFound) {

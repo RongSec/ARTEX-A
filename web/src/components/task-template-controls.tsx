@@ -353,6 +353,8 @@ interface TaskTemplateControlsProps {
   onSelectedTemplateIDChange: (id: number | null) => void;
   onApply: (template: TaskTemplate) => void;
   portalContainer?: React.RefObject<HTMLElement | null>;
+  /** 覆盖选择器下方的说明文字（项目创建等「只存引用、不复制内容」的场景用）。 */
+  hint?: string;
 }
 
 export function TaskTemplateControls({
@@ -364,6 +366,7 @@ export function TaskTemplateControls({
   onSelectedTemplateIDChange,
   onApply,
   portalContainer,
+  hint,
 }: TaskTemplateControlsProps) {
   const [templates, setTemplates] = React.useState<TaskTemplate[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -498,7 +501,9 @@ export function TaskTemplateControls({
             </ComboboxList>
           </ComboboxContent>
         </Combobox>
-        <FieldDescription>选择后会复制模板的描述、目标、分类与任务级规则，不与模板保持关联。</FieldDescription>
+        <FieldDescription>
+          {hint ?? "选择后会复制模板的描述、目标、分类与任务级规则，不与模板保持关联。"}
+        </FieldDescription>
       </Field>
 
       <AlertDialog

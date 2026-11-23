@@ -1448,9 +1448,12 @@ CREATE TABLE IF NOT EXISTS projects (
     auto_report       BOOLEAN NOT NULL DEFAULT false,      -- 只出一个项目汇总报告：全部任务收官后建 project 级 job（T18/V9-RPT2）
     auto_report_tasks BOOLEAN NOT NULL DEFAULT false,      -- 子任务都出报告：每个任务终态各建 task 级 job（V9-RPT2，可与 auto_report 同勾=叠加）
     reader_enabled    BOOLEAN NOT NULL DEFAULT false,      -- 跨项目阅读开关：默认关闭=行为等于基线（T18）。管 scope='cross' 洞察的聚合/来源校验/跨项目段注入；与 observer_enabled 互相独立（V6-DUAL）
+    task_template_id  BIGINT,                              -- 项目默认任务模板（task_templates.id）；NULL=不预设。批量下发时若用户未另选则带出。无 FK：模板允许被删，读时判缺回退空
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- V12-TARGET：项目默认任务模板（存量库补列，幂等）。
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS task_template_id BIGINT;
 CREATE INDEX IF NOT EXISTS idx_projects_alive ON projects(created_at DESC) WHERE status='active';
 DROP TRIGGER IF EXISTS trg_projects_upd ON projects;
 CREATE TRIGGER trg_projects_upd BEFORE UPDATE ON projects
