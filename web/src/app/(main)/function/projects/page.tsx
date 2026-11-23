@@ -6,7 +6,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { ArchiveIcon, ArchiveRestoreIcon, FolderKanbanIcon, InboxIcon, MoreHorizontalIcon, PlusIcon, RefreshCwIcon, Trash2Icon } from "lucide-react";
+import { ArchiveIcon, ArchiveRestoreIcon, FolderKanbanIcon, InboxIcon, MoreHorizontalIcon, PlusIcon, RefreshCwIcon, Trash2Icon, WandSparklesIcon } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import {
@@ -43,7 +43,9 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Textarea } from "@/components/ui/textarea";
 import { DeleteOptionFields, emptyDeleteOptions } from "@/components/delete-option-fields";
 import { TaskTemplateControls } from "@/components/task-template-controls";
+import { CredentialEditor, credentialsToPayload, type CredentialRow } from "@/components/credential-editor";
 import { api } from "@/lib/api";
+import { parseTargets } from "@/lib/target-parse";
 import type { DeleteTaskOptions, ProjectWithStats } from "@/lib/types";
 
 // FindingCells finding 分档着色（与任务列表页同一配色口径）。
@@ -312,7 +314,14 @@ function CreateProjectDialog({
   // 项目默认任务模板（task_templates.id）：只存引用，批量下发时带出。
   const [taskTemplateID, setTaskTemplateID] = React.useState<number | null>(null);
   const [templates, setTemplates] = React.useState<{ id: number; name: string; is_default: boolean }[]>([]);
+  // 建项目时直接贴目标：解析清洗 + 右侧凭据，创建成功后同批下发首个批量任务。
+  // 空目标=只建项目（与旧行为一致）。
+  const [targets, setTargets] = React.useState("");
+  const [creds, setCreds] = React.useState<CredentialRow[]>([]);
+  const [lastInvalid, setLastInvalid] = React.useState<string[]>([]);
   const [saving, setSaving] = React.useState(false);
+
+  const parsed = React.useMemo(() => parseTargets(targets), [targets]);
 
   React.useEffect(() => {
     if (open) {
@@ -326,12 +335,30 @@ function CreateProjectDialog({
       setAutoReportTasks(false);
       setTemplateId("");
       setTaskTemplateID(null);
+      setTargets("");
+      setCreds([]);
+      setLastInvalid([]);
       api
         .reportTemplates()
         .then(setTemplates)
         .catch(() => setTemplates([]));
     }
   }, [open]);
+
+  // runParse 与批量下发弹窗同一套语义：清洗文本 → 一行一个有效目标 + 说明剔除了什么。
+  function runParse() {
+    const r = parseTargets(targets);
+    setLastInvalid(r.invalid);
+    if (r.targets.length === 0) {
+      toast.error(`没有有效目标${r.invalid.length ? `（剔除 ${r.invalid.length} 行非法内容）` : ""}`);
+      return;
+    }
+    setTargets(r.targets.join("\n"));
+    const bits = [`有效 ${r.targets.length} 条`];
+    if (r.duplicate.length) bits.push(`去重 ${r.duplicate.length} 条`);
+    if (r.invalid.length) bits.push(`剔除 ${r.invalid.length} 条非法`);
+    toast.success(bits.join("，"));
+  }
 
   async function submit() {
     if (!name.trim()) {
@@ -341,6 +368,10 @@ function CreateProjectDialog({
     const conc = Number(concurrency);
     if (!Number.isFinite(conc) || conc < 1 || conc > 8) {
       toast.error("并发数须为 1-8 的整数");
+      return;
+    }
+    if (parsed.targets.length > 200) {
+      toast.error(`单批最多 200 个目标（当前 ${parsed.targets.length} 个），请分批下发`);
       return;
     }
     setSaving(true);
@@ -358,6 +389,32 @@ function CreateProjectDialog({
         task_template_id: taskTemplateID,
       });
       toast.success(`项目已创建：${p.name}`);
+      // 有目标就顺手下发首轮批量：项目与任务一次成型，不用再进详情页贴一遍。
+      // 批量失败不回滚项目——项目已经建好，用户可在详情页重新下发。
+      const willCreate = parsed.targets.length;
+      if (willCreate > 0) {
+        try {
+          const r = await api.batchProjectTasks(p.id, {
+            targets: parsed.targets.join("\n"),
+            concurrency: conc,
+            common: {
+              category_id: null,
+              credentials: credentialsToPayload(creds),
+              desc_template: description.trim() ? `${description.trim()}\n目标：{target}` : undefined,
+            },
+          });
+          const createdN = r.created?.length ?? 0;
+          const skippedN = r.skipped?.length ?? 0;
+          const failedN = r.failed?.length ?? 0;
+          const bits = [`已下发 ${createdN} 个任务`];
+          if (skippedN) bits.push(`重复跳过 ${skippedN}`);
+          if (failedN) bits.push(`失败 ${failedN}`);
+          if (failedN) toast.warning(bits.join("，"), { duration: 8000 });
+          else toast.success(bits.join("，"));
+        } catch (e) {
+          toast.warning(`项目已创建，但批量下发失败：${(e as Error).message}`, { duration: 10000 });
+        }
+      }
       onCreated();
     } catch (e) {
       toast.error("创建失败：" + (e as Error).message);
@@ -368,7 +425,7 @@ function CreateProjectDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !saving && onOpenChange(o)}>
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>新建项目</DialogTitle>
         </DialogHeader>
@@ -415,6 +472,53 @@ function CreateProjectDialog({
               hint="作为本项目的默认任务模板：批量下发时自动带出，可在那时再改。只存引用，不复制模板内容。"
             />
           </div>
+
+          {/* 初始目标 + 凭据：建项目时一次贴完，创建成功即按项目并发下发。 */}
+          <div className="grid gap-4 rounded-lg border p-3 md:grid-cols-[1.35fr_1fr]">
+            <div className="grid gap-2">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="p-targets">初始目标（可选）</Label>
+                <div className="flex items-center gap-2">
+                  <span className="text-muted-foreground text-xs tabular-nums">
+                    {parsed.targets.length > 0 ? `${parsed.targets.length} 个任务` : "留空=只建项目"}
+                  </span>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 gap-1 px-2 text-xs"
+                    onClick={runParse}
+                    disabled={!targets.trim()}
+                  >
+                    <WandSparklesIcon className="h-3 w-3" />
+                    解析
+                  </Button>
+                </div>
+              </div>
+              <Textarea
+                id="p-targets"
+                rows={8}
+                className="font-mono text-sm"
+                placeholder={"一行一个目标，可混贴 URL / IP / IP:端口 / CIDR / 域名：\nhttp://target-a.example.com\n10.0.0.5\n10.0.0.6:8080\n10.0.0.0/24"}
+                value={targets}
+                onChange={(e) => setTargets(e.target.value)}
+              />
+              <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                {parsed.duplicate.length > 0 && <span className="text-amber-600">重复 {parsed.duplicate.length}</span>}
+                {parsed.invalid.length > 0 && <span className="text-destructive">非法 {parsed.invalid.length}</span>}
+                <span>按项目并发数排队放行</span>
+              </div>
+              {lastInvalid.length > 0 && (
+                <div className="border-destructive/30 bg-destructive/5 rounded-md border px-2 py-1.5">
+                  <p className="text-destructive text-xs">已剔除（不会建任务）：</p>
+                  <p className="text-muted-foreground mt-0.5 line-clamp-3 font-mono text-[11px] break-all">
+                    {lastInvalid.join("  ·  ")}
+                  </p>
+                </div>
+              )}
+            </div>
+            <CredentialEditor value={creds} onChange={setCreds} targets={parsed.targets} compact />
+          </div>
           <div className="grid gap-3 rounded-lg border p-3">
             <label className="flex items-center justify-between gap-3 text-sm">
               <span>跨任务阅读者（项目内）</span>
@@ -449,7 +553,7 @@ function CreateProjectDialog({
             取消
           </Button>
           <Button onClick={submit} disabled={saving}>
-            {saving ? "创建中…" : "创建"}
+            {saving ? "创建中…" : parsed.targets.length > 0 ? `创建并下发 ${parsed.targets.length} 个任务` : "创建"}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -469,7 +573,12 @@ function DeleteProjectDialog({
   onOpenChange: (open: boolean) => void;
   onDeleted: () => void;
 }) {
-  const [options, setOptions] = React.useState<DeleteTaskOptions>(emptyDeleteOptions);
+  const [options, setOptions] = React.useState<DeleteTaskOptions>(() => ({
+    ...emptyDeleteOptions(),
+    // 项目级派生数据（情报表、图谱投影）随项目必删，列表里锁定展示。
+    delete_intel: true,
+    delete_project_graph: true,
+  }));
   const [deleteTasks, setDeleteTasks] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
 
@@ -478,7 +587,7 @@ function DeleteProjectDialog({
 
   React.useEffect(() => {
     if (open) {
-      setOptions(emptyDeleteOptions());
+      setOptions({ ...emptyDeleteOptions(), delete_intel: true, delete_project_graph: true });
       setDeleteTasks(false);
     }
   }, [open]);
@@ -533,11 +642,13 @@ function DeleteProjectDialog({
             idPrefix={`project-${project?.id ?? "x"}`}
             options={options}
             onOptionsChange={setOptions}
-            disabled={deleting || (taskCount > 0 && !deleteTasks)}
+            disabled={deleting}
+            disabledKeys={deleteTasks ? [] : ["delete_assets", "delete_traffic", "delete_files", "delete_findings", "delete_llm_records"]}
+            lockedKeys={["delete_intel", "delete_project_graph"]}
           />
           {taskCount > 0 && !deleteTasks && (
             <p className="text-muted-foreground text-xs">
-              上面这些清理项只对「同时删除旗下任务」生效；当前任务会全部保留。
+              任务保留时，资产/流量/文件/漏洞/LLM 记录没有删除对象，仅「情境与复用记录」「项目图谱投影」随项目清除。
             </p>
           )}
         </div>

@@ -311,21 +311,44 @@ func derefInt(n *int) int {
 }
 func derefBool(b *bool) bool { return b != nil && *b }
 
-// DeleteProject 删项目行。tasks.project_id 的 FK 是 ON DELETE SET NULL：任务
-// 保留、归属自动摘除（任务数据比分组贵重）。其 queued 的 project_batch 任务
-// 由此变为 project_id IS NULL，dispatcher 与 reconcile（跳过 project_batch）
-// 都认不到它，停在队列里等待人工处置：重新挂到某 active 项目即可恢复批量
-// 调度（见 server/projects.go tasksAttachProject——注：挂回后需该行仍处于
-// queue_mode='project_batch'，attach 只动 project_id、不改队列态）。
+// DeleteProject 删项目行，并在同一事务里清掉所有以 project_id 归属的派生数据：
+//   - project_index / project_graph_events：项目图谱投影与事件流（无外键，不删
+//     就永久残留，指向已不存在的项目与任务）
+//   - task_intel / task_intel_links / reader_drills：跨任务比对与阅读者审计
+//     （项目没了就没有比对语境；行里的 task_id 还会变成悬空 id）
+//
+// 这些数据是「项目视图的派生结果」，不是任务自身的探索图：即使调用方选择
+// delete_tasks=false 保留任务，项目级派生数据也必然失效——重新挂到别的项目
+// 后投影会按新项目重建，情报表也会在新任务收官时重抽。
+//
+// tasks.project_id 的 FK 是 ON DELETE SET NULL：默认任务保留、归属自动摘除。
+// 其 queued 的 project_batch 任务由此变为 project_id IS NULL，dispatcher 与
+// reconcile（跳过 project_batch）都认不到它，停在队列里等待人工处置。
 func (d *DB) DeleteProject(id int64) error {
-	res, err := d.Exec(`DELETE FROM projects WHERE id=$1`, id)
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM project_index WHERE project_id=$1`,
+		`DELETE FROM project_graph_events WHERE project_id=$1`,
+		`DELETE FROM task_intel_links WHERE project_id=$1`,
+		`DELETE FROM task_intel WHERE project_id=$1`,
+		`DELETE FROM reader_drills WHERE project_id=$1`,
+	} {
+		if _, err := tx.Exec(q, id); err != nil {
+			return err
+		}
+	}
+	res, err := tx.Exec(`DELETE FROM projects WHERE id=$1`, id)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrProjectNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 // ProjectTasks 返回某项目下的全部存活任务行（新在前），供详情聚合 API。

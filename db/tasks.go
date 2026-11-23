@@ -64,10 +64,32 @@ var ErrTaskProjectNotFound = errors.New("project not found")
 // TaskDeleteResult reports optional related-data cleanup performed in the same
 // transaction as the task/exploration delete.
 type TaskDeleteResult struct {
-	AssetsDeleted     int64
-	AssetsDetached    int64
-	FindingsDeleted   int64
-	LLMRecordsDeleted int64
+	AssetsDeleted      int64
+	AssetsDetached     int64
+	FindingsDeleted    int64
+	LLMRecordsDeleted  int64
+	IntelDeleted       int64 // task_intel 行
+	DrillsDeleted      int64 // reader_drills 行（本任务发起或引用本任务）
+	GraphIndexDeleted  int64 // project_index 投影行
+	GraphEventsDeleted int64 // project_graph_events 事件行
+	SnapshotsDeleted   int64 // 随漏洞删除、且无其他漏洞引用的流量证据快照
+}
+
+// TaskDeleteOptions 是任务拆除的完整开关集。比旧的三参数版本多两个开关：
+//   - DeleteIntel：task_intel（情报表）与 reader_drills（下钻审计）。这两张表
+//     没有指向 tasks 的外键，不显式删就是永久孤儿行。
+//   - DeleteProjectGraph：project_index / project_graph_events（项目图谱投影）。
+//     同理无外键，任务删掉后节点 id 指向不存在的 exploration，项目图谱会悬空。
+//
+// Prepare 与旧版语义一致：在 PostgreSQL 事务内、asset/anchor 写者被排除后执行，
+// 只能做可回滚的外部暂存（流量、工作区目录）。
+type TaskDeleteOptions struct {
+	DeleteAssets       bool
+	DeleteFindings     bool
+	DeleteLLMRecords   bool
+	DeleteIntel        bool
+	DeleteProjectGraph bool
+	Prepare            func(TaskDeletePreparation) error
 }
 
 // TaskDeletePreparation is produced inside the PostgreSQL deletion transaction
@@ -546,10 +568,77 @@ UPDATE tasks
 	return deadline, err
 }
 
+// deletableAssetIDs 返回「勾选删除资产时真正会被删掉」的资产 id，口径必须与
+// 上面的 DELETE 完全一致（同一 CTE）。删除后在事务内用这批 id 清漏洞引用。
+func deletableAssetIDs(tx *sql.Tx, taskID, expID int64) ([]int64, error) {
+	rows, err := tx.Query(`
+WITH candidate_assets AS (
+  SELECT id FROM assets WHERE $1 = ANY(task_ids)
+  UNION
+  SELECT ea.asset_id
+  FROM exploration_anchors ea
+  JOIN exploration_nodes n ON n.id=ea.node_id
+  WHERE n.exploration_id=$2
+)
+SELECT a.id
+FROM assets a
+JOIN candidate_assets c ON c.id=a.id
+WHERE NOT EXISTS (
+  SELECT 1 FROM tasks t
+  WHERE t.id<>$1 AND t.deleted_at IS NULL AND t.id=ANY(a.task_ids)
+) AND NOT EXISTS (
+  SELECT 1
+  FROM exploration_anchors ea
+  JOIN exploration_nodes n ON n.id=ea.node_id
+  JOIN tasks t ON t.exploration_id=n.exploration_id
+  WHERE ea.asset_id=a.id AND t.id<>$1 AND t.deleted_at IS NULL
+)`, taskID, expID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// taskFindingSnapshotIDs 取该任务所有漏洞绑定的流量证据快照 id（去重）。
+// 必须在 DELETE findings 之前调用：bindings 有 ON DELETE CASCADE，删完就查不到了。
+func taskFindingSnapshotIDs(tx *sql.Tx, taskID int64) ([]string, error) {
+	rows, err := tx.Query(`SELECT DISTINCT b.snapshot_id
+FROM finding_traffic_bindings b
+JOIN findings f ON f.id=b.finding_id
+WHERE f.task_id=$1`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // DeleteTask preserves the historical behavior: remove the task and its
 // exploration subgraph while retaining global assets.
 func (d *DB) DeleteTask(id int64) error {
-	_, err := d.DeleteTaskCascade(id, false, false)
+	_, err := d.DeleteTaskCascadeOptions(id, TaskDeleteOptions{
+		// 历史行为：保留全局资产与漏洞；但任务自身的情报表与图谱投影属于该
+		// 任务，任务没了就该一起清，否则留下悬空 id。
+		DeleteIntel:        true,
+		DeleteProjectGraph: true,
+	})
 	return err
 }
 
@@ -577,6 +666,19 @@ func (d *DB) DeleteTaskCascadePrepared(
 	deleteAssets, deleteFindings, deleteLLMRecords bool,
 	prepare func(TaskDeletePreparation) error,
 ) (TaskDeleteResult, error) {
+	return d.DeleteTaskCascadeOptions(id, TaskDeleteOptions{
+		DeleteAssets:     deleteAssets,
+		DeleteFindings:   deleteFindings,
+		DeleteLLMRecords: deleteLLMRecords,
+		Prepare:          prepare,
+	})
+}
+
+// DeleteTaskCascadeOptions 是带完整开关集的级联删除，语义见 TaskDeleteOptions。
+func (d *DB) DeleteTaskCascadeOptions(
+	id int64,
+	o TaskDeleteOptions,
+) (TaskDeleteResult, error) {
 	var result TaskDeleteResult
 	tx, err := d.Begin()
 	if err != nil {
@@ -595,28 +697,34 @@ func (d *DB) DeleteTaskCascadePrepared(
 	// tables and with another coordinated deletion. Taking both in one fixed order
 	// prevents phantoms (a distinct asset row for the same host) as well as new
 	// ownership/anchor references until the deletion transaction commits.
-	if deleteAssets || prepare != nil {
+	if o.DeleteAssets || o.Prepare != nil {
 		if _, err := tx.Exec(`LOCK TABLE assets, exploration_anchors IN SHARE ROW EXCLUSIVE MODE`); err != nil {
 			return result, err
 		}
 	}
-	if prepare != nil {
+	if o.Prepare != nil {
 		hosts, err := hostsForTaskDeletion(tx, id, expID)
 		if err != nil {
 			return result, err
 		}
-		if err := prepare(TaskDeletePreparation{
+		if err := o.Prepare(TaskDeletePreparation{
 			ExplorationID: expID,
 			TrafficHosts:  hosts,
 		}); err != nil {
 			return result, err
 		}
 	}
-	if deleteAssets {
+	if o.DeleteAssets {
 		// Ownership is the union of explicit task_ids and this exploration's anchors.
 		// An asset is deletable only when no other live task references it through
 		// either mechanism. This covers legacy anchor-only seeds without destroying
 		// evidence anchored by another task.
+		// 先取「将被删掉的资产 id」——DELETE 之后这些行就查不到了，而保留的
+		// 漏洞里还要按 id 清引用。
+		ids, err := deletableAssetIDs(tx, id, expID)
+		if err != nil {
+			return result, err
+		}
 		res, err := tx.Exec(`
 WITH candidate_assets AS (
   SELECT id FROM assets WHERE $1 = ANY(task_ids)
@@ -646,21 +754,54 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 			return result, err
 		}
 		result.AssetsDeleted, _ = res.RowsAffected()
+		// findings.asset_ids 存的是 assets.id 数组（无外键）。资产真删掉后，
+		// 保留的漏洞（未勾删除漏洞时）里会留下指向空资产的 id。把被删资产的
+		// id 从所有漏洞的数组里摘掉，前端的「关联资产」才不会显示死链。
+		for _, aid := range ids {
+			if _, err := tx.Exec(`UPDATE findings
+SET asset_ids = COALESCE((
+  SELECT jsonb_agg(v)
+  FROM jsonb_array_elements(CASE WHEN jsonb_typeof(asset_ids)='array' THEN asset_ids ELSE '[]'::jsonb END) v
+  WHERE v <> to_jsonb($1::bigint)
+), '[]'::jsonb)
+WHERE asset_ids @> to_jsonb(ARRAY[$1::bigint])`, aid); err != nil {
+				return result, err
+			}
+		}
+	}
+	// 无论是否删资产，都要把已删任务的 id 从 assets.task_ids 里摘掉：数组里的
+	// 悬空 id 会让资产详情显示「关联任务 #N」而任务早已不存在（前端按 id 反查
+	// 只能得到空）。保留资产 ≠ 保留指向已删任务的引用。
+	res, err := tx.Exec(`UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE $1 = ANY(task_ids)`, id)
+	if err != nil {
+		return result, err
+	}
+	result.AssetsDetached, _ = res.RowsAffected()
 
-		res, err = tx.Exec(`UPDATE assets SET task_ids = array_remove(task_ids, $1) WHERE $1 = ANY(task_ids)`, id)
+	if o.DeleteFindings {
+		// 漏洞的流量证据快照没有 task_id，只靠 finding_traffic_bindings 关联；
+		// 删 findings 会级联掉 bindings，但快照本身会永久留在盘里。必须在级联
+		// 之前把 id 取出来，删完再清掉不再被任何漏洞引用的那些。
+		snapshotIDs, err := taskFindingSnapshotIDs(tx, id)
 		if err != nil {
 			return result, err
 		}
-		result.AssetsDetached, _ = res.RowsAffected()
-	}
-	if deleteFindings {
 		res, err := tx.Exec(`DELETE FROM findings WHERE task_id = $1`, id)
 		if err != nil {
 			return result, err
 		}
 		result.FindingsDeleted, _ = res.RowsAffected()
+		for _, sid := range snapshotIDs {
+			r, err := tx.Exec(`DELETE FROM traffic_evidence_snapshots s
+WHERE s.id=$1 AND NOT EXISTS (SELECT 1 FROM finding_traffic_bindings b WHERE b.snapshot_id=$1)`, sid)
+			if err != nil {
+				return result, err
+			}
+			n, _ := r.RowsAffected()
+			result.SnapshotsDeleted += n
+		}
 	}
-	if deleteLLMRecords {
+	if o.DeleteLLMRecords {
 		res, err := tx.Exec(`DELETE FROM llm_records WHERE COALESCE(task_id,'')=$1`, strconv.FormatInt(id, 10))
 		if err != nil {
 			return result, err
@@ -672,8 +813,48 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 	//
 	// task_intel_links 没有指向 tasks 的外键（表建得比删档流程早），必须在这里
 	// 显式级联：发起方与被勾连方任一被删，记录就失去对端，留着只会在审计面
-	// 里指向不存在的任务（线上曾残留 task_id=54 这类孤儿行）。
+	// 里指向不存在的任务（线上曾残留 task_id=54 这类孤儿行）。这条无条件执行：
+	// 对端已删的关联记录留着必然是悬空引用，没有「保留」的合理语义。
 	if _, err := tx.Exec(`DELETE FROM task_intel_links WHERE task_id=$1 OR related_task_id=$1`, id); err != nil {
+		return result, err
+	}
+	if o.DeleteIntel {
+		// task_intel 与 reader_drills 同样没有外键。task_intel 里 task_id 已不
+		// 存在的行无法再参与任何比对（比对只发生在活任务之间）；reader_drills
+		// 留着会让「参考任务 #N」链接指向空页。
+		r, err := tx.Exec(`DELETE FROM task_intel WHERE task_id=$1`, id)
+		if err != nil {
+			return result, err
+		}
+		result.IntelDeleted, _ = r.RowsAffected()
+		r, err = tx.Exec(`DELETE FROM reader_drills WHERE task_id=$1 OR related_task_id=$1`, id)
+		if err != nil {
+			return result, err
+		}
+		result.DrillsDeleted, _ = r.RowsAffected()
+	}
+	if o.DeleteProjectGraph {
+		// 项目图谱投影与事件流无外键。任务删掉后 exploration_nodes 已不存在，
+		// 投影里留下的 node_id/task_id 都是悬空 id：项目图谱会出现打不开的节点，
+		// observer 也会被已删任务的事件唤醒。按 task_id 精确清理，不碰同项目
+		// 其他任务的投影。
+		r, err := tx.Exec(`DELETE FROM project_index WHERE task_id=$1`, id)
+		if err != nil {
+			return result, err
+		}
+		result.GraphIndexDeleted, _ = r.RowsAffected()
+		r, err = tx.Exec(`DELETE FROM project_graph_events WHERE task_id=$1`, id)
+		if err != nil {
+			return result, err
+		}
+		result.GraphEventsDeleted, _ = r.RowsAffected()
+	}
+	// 任务归档包里的来源清单（task_archives.source_task_ids）没有外键：被引用的
+	// 任务删掉后，数组里会留下一个永远打不开的任务 id，恢复归档时按 id 反查
+	// 来源任务只能得到空。这里把该 id 从所有归档包的数组里摘掉——不是删归档，
+	// 只是解除引用。（活任务的来源关系存在 task_relations，那里是 CASCADE。）
+	if _, err := tx.Exec(`UPDATE task_archives SET source_task_ids = array_remove(source_task_ids, $1)
+WHERE $1 = ANY(source_task_ids)`, id); err != nil {
 		return result, err
 	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {

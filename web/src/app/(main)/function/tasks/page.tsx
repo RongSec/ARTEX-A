@@ -217,7 +217,12 @@ function deleteDetails(result: DeleteCounts): string[] {
   if (result.traffic_deleted > 0) details.push(`删除流量 ${result.traffic_deleted} 条`);
   if (result.files_deleted) details.push("删除任务文件");
   if (result.findings_deleted > 0) details.push(`删除漏洞 ${result.findings_deleted} 条`);
+  if (result.snapshots_deleted > 0) details.push(`删除证据快照 ${result.snapshots_deleted} 条`);
   if (result.llm_records_deleted > 0) details.push(`删除 LLM 请求/响应记录 ${result.llm_records_deleted} 条`);
+  if (result.intel_deleted > 0) details.push(`删除情境情报 ${result.intel_deleted} 条`);
+  if (result.drills_deleted > 0) details.push(`删除下钻记录 ${result.drills_deleted} 条`);
+  if (result.graph_index_deleted > 0) details.push(`删除图谱投影 ${result.graph_index_deleted} 条`);
+  if (result.graph_events_deleted > 0) details.push(`删除图谱事件 ${result.graph_events_deleted} 条`);
   return details;
 }
 
@@ -646,6 +651,11 @@ export default function TasksPage() {
         files_deleted: false,
         findings_deleted: 0,
         llm_records_deleted: 0,
+        intel_deleted: 0,
+        drills_deleted: 0,
+        graph_index_deleted: 0,
+        graph_events_deleted: 0,
+        snapshots_deleted: 0,
       };
       const deleted: string[] = [];
       const failed: { id: string; message: string }[] = [];
@@ -659,7 +669,12 @@ export default function TasksPage() {
           total.traffic_deleted += r.traffic_deleted;
           total.files_deleted = total.files_deleted || r.files_deleted;
           total.findings_deleted += r.findings_deleted;
+          total.snapshots_deleted += r.snapshots_deleted;
           total.llm_records_deleted += r.llm_records_deleted;
+          total.intel_deleted += r.intel_deleted;
+          total.drills_deleted += r.drills_deleted;
+          total.graph_index_deleted += r.graph_index_deleted;
+          total.graph_events_deleted += r.graph_events_deleted;
           if (r.cleanup_warning) warnings.push(`#${id}：${r.cleanup_warning}`);
           deleted.push(id);
         } catch (e) {

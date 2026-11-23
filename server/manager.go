@@ -197,23 +197,30 @@ func (t *Task) setLLMState(profileID, activeID *int64, profileIDs []int64, revis
 // DeleteTaskOptions controls cleanup of data stored outside the task's own
 // exploration graph. All options default to false for backward compatibility.
 type DeleteTaskOptions struct {
-	DeleteAssets     bool `json:"delete_assets"`
-	DeleteTraffic    bool `json:"delete_traffic"`
-	DeleteFiles      bool `json:"delete_files"`
-	DeleteFindings   bool `json:"delete_findings"`
-	DeleteLLMRecords bool `json:"delete_llm_records"`
+	DeleteAssets       bool `json:"delete_assets"`
+	DeleteTraffic      bool `json:"delete_traffic"`
+	DeleteFiles        bool `json:"delete_files"`
+	DeleteFindings     bool `json:"delete_findings"`
+	DeleteLLMRecords   bool `json:"delete_llm_records"`
+	DeleteIntel        bool `json:"delete_intel"`         // 情报表 + 阅读者勾连/下钻记录
+	DeleteProjectGraph bool `json:"delete_project_graph"` // 项目图谱投影 + 图事件
 }
 
 // DeleteTaskResult makes destructive cleanup auditable to API callers.
 type DeleteTaskResult struct {
-	Deleted           string `json:"deleted"`
-	AssetsDeleted     int64  `json:"assets_deleted"`
-	AssetsDetached    int64  `json:"assets_detached"`
-	TrafficDeleted    int64  `json:"traffic_deleted"`
-	FilesDeleted      bool   `json:"files_deleted"`
-	FindingsDeleted   int64  `json:"findings_deleted"`
-	LLMRecordsDeleted int64  `json:"llm_records_deleted"`
-	CleanupWarning    string `json:"cleanup_warning,omitempty"`
+	Deleted            string `json:"deleted"`
+	AssetsDeleted      int64  `json:"assets_deleted"`
+	AssetsDetached     int64  `json:"assets_detached"`
+	TrafficDeleted     int64  `json:"traffic_deleted"`
+	FilesDeleted       bool   `json:"files_deleted"`
+	FindingsDeleted    int64  `json:"findings_deleted"`
+	LLMRecordsDeleted  int64  `json:"llm_records_deleted"`
+	IntelDeleted       int64  `json:"intel_deleted"`
+	DrillsDeleted      int64  `json:"drills_deleted"`
+	GraphIndexDeleted  int64  `json:"graph_index_deleted"`
+	GraphEventsDeleted int64  `json:"graph_events_deleted"`
+	SnapshotsDeleted   int64  `json:"snapshots_deleted"`
+	CleanupWarning     string `json:"cleanup_warning,omitempty"`
 }
 
 // Manager owns the PostgreSQL data source (asset graph + every task's exploration
@@ -1582,8 +1589,15 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 		}
 	}
 
-	dbResult, err := m.pg.DeleteTaskCascadePrepared(
-		n, opts.DeleteAssets, opts.DeleteFindings, opts.DeleteLLMRecords, prepare,
+	dbResult, err := m.pg.DeleteTaskCascadeOptions(
+		n, pgdb.TaskDeleteOptions{
+			DeleteAssets:       opts.DeleteAssets,
+			DeleteFindings:     opts.DeleteFindings,
+			DeleteLLMRecords:   opts.DeleteLLMRecords,
+			DeleteIntel:        opts.DeleteIntel,
+			DeleteProjectGraph: opts.DeleteProjectGraph,
+			Prepare:            prepare,
+		},
 	)
 	if err != nil {
 		return result, rollbackTaskDelete(err, trafficStage, fileStage)
@@ -1592,6 +1606,11 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 	result.AssetsDetached = dbResult.AssetsDetached
 	result.FindingsDeleted = dbResult.FindingsDeleted
 	result.LLMRecordsDeleted = dbResult.LLMRecordsDeleted
+	result.IntelDeleted = dbResult.IntelDeleted
+	result.DrillsDeleted = dbResult.DrillsDeleted
+	result.GraphIndexDeleted = dbResult.GraphIndexDeleted
+	result.GraphEventsDeleted = dbResult.GraphEventsDeleted
+	result.SnapshotsDeleted = dbResult.SnapshotsDeleted
 
 	// PostgreSQL is now authoritative: finalize the staged external deletion and
 	// forget the live task even if a final purge reports an error. Such errors are
@@ -1611,9 +1630,11 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 	m.forgetTask(id, n)
 	// 一行审计：删除是破坏性操作，事后要能回答「勾了哪些、实际删了多少」。
 	// 线上那次「勾了全部却只掉了 DB 行」正是因为这条日志不存在。
-	log.Printf("[task-delete] task %s options=%+v → assets=%d(detach %d) traffic=%d files=%v findings=%d llm=%d",
+	log.Printf("[task-delete] task %s options=%+v → assets=%d(detach %d) traffic=%d files=%v findings=%d(llm %d intel %d drills %d idx %d ev %d snap %d)",
 		id, opts, result.AssetsDeleted, result.AssetsDetached, result.TrafficDeleted,
-		result.FilesDeleted, result.FindingsDeleted, result.LLMRecordsDeleted)
+		result.FilesDeleted, result.FindingsDeleted, result.LLMRecordsDeleted,
+		result.IntelDeleted, result.DrillsDeleted, result.GraphIndexDeleted,
+		result.GraphEventsDeleted, result.SnapshotsDeleted)
 	if err := errors.Join(finalizeErrs...); err != nil {
 		return result, &taskDeleteCommittedError{err: err}
 	}

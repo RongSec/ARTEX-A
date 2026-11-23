@@ -68,6 +68,10 @@ export interface DeleteTaskOptions {
   delete_files: boolean;
   delete_findings: boolean;
   delete_llm_records: boolean;
+  // 任务情报表 + 阅读者勾连/下钻记录（task_intel / task_intel_links / reader_drills）。
+  delete_intel: boolean;
+  // 项目图谱投影与图事件（project_index / project_graph_events）。
+  delete_project_graph: boolean;
 }
 
 /** 删除项目：五个清理开关与任务删除同义；delete_tasks=true 时连旗下任务一起删。 */
@@ -90,6 +94,11 @@ export interface DeleteTaskResult {
   files_deleted: boolean;
   findings_deleted: number;
   llm_records_deleted: number;
+  intel_deleted: number;
+  drills_deleted: number;
+  graph_index_deleted: number;
+  graph_events_deleted: number;
+  snapshots_deleted: number;
   cleanup_warning?: string;
 }
 

@@ -89,15 +89,19 @@ FROM tasks WHERE id = $1`,
 	return err
 }
 
-// ListReaderDrills 返回某任务的全部下钻记录（新在前）。审计接口按
-// related_task_id 分组展示。
+// ListReaderDrills 返回某任务发起过的下钻审计（新在前）。审计接口按
+// related_task_id 分组展示。JOIN tasks 过滤掉参考任务已删档的行：清理开关
+// 没勾时记录还在，但审计面不能给出指向已删任务的链接（前端会渲染成
+// 「参考任务 #N」→ 打开是空页）。
 func (d *DB) ListReaderDrills(ctx context.Context, taskID int64) ([]ReaderDrill, error) {
 	if taskID <= 0 {
 		return nil, nil
 	}
 	rows, err := d.QueryContext(ctx, `
-SELECT id, project_id, task_id, related_task_id, intent_id, node_ids::text, query, mode, item_count, created_at
-FROM reader_drills WHERE task_id=$1 ORDER BY id DESC LIMIT 500`, taskID)
+SELECT d.id, d.project_id, d.task_id, d.related_task_id, d.intent_id, d.node_ids::text, d.query, d.mode, d.item_count, d.created_at
+FROM reader_drills d
+JOIN tasks rt ON rt.id = d.related_task_id AND rt.deleted_at IS NULL
+WHERE d.task_id=$1 ORDER BY d.id DESC LIMIT 500`, taskID)
 	if err != nil {
 		return nil, err
 	}
