@@ -3243,7 +3243,7 @@ export function CreateTaskSheet({
               <FieldDescription>可选，单个分类；用于任务列表筛选和归档，不影响 Agent 执行。</FieldDescription>
             </Field>
             <div className="grid gap-2">
-              <Label htmlFor="description">目的（描述 / 测试范围）</Label>
+              <Label htmlFor="description">目的</Label>
               <Textarea
                 id="description"
                 className="min-h-32"
@@ -3304,7 +3304,6 @@ export function CreateTaskSheet({
               <ConstraintEditor
                 items={constraintItems}
                 onChange={setConstraintItems}
-                targets={rowsToTargets(targetRows)}
                 disabled={creating}
                 rawRows={3}
               />

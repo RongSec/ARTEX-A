@@ -194,7 +194,6 @@ export function ProjectBatchTasks({ projectID, concurrency, defaultTemplateID, o
               <ConstraintEditor
                 items={constraints}
                 onChange={setConstraints}
-                targets={targetList}
                 disabled={submitting}
                 rawRows={3}
               />

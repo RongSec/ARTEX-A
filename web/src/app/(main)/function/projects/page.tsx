@@ -166,7 +166,7 @@ function CreateProjectDialog({
   onCreated: () => void;
 }) {
   const [name, setName] = React.useState("");
-  // 目的 = 描述/测试范围；目标 = 资产列表（行式，含凭据）；约束 = allow/deny。
+  // 目的 = 这次测试要达成什么；目标 = 资产列表（行式，含凭据）；约束 = allow/deny。
   const [purpose, setPurpose] = React.useState("");
   const [targetRaw, setTargetRaw] = React.useState("");
   const [targetRows, setTargetRows] = React.useState<TargetCredRow[]>([]);
@@ -293,7 +293,7 @@ function CreateProjectDialog({
             <Input id="p-name" placeholder="如：2026 春招渗透测试" value={name} onChange={(e) => setName(e.target.value)} />
           </div>
           <div className="grid gap-2">
-            <Label htmlFor="p-purpose">目的（描述 / 测试范围）</Label>
+            <Label htmlFor="p-purpose">目的</Label>
             <Textarea
               id="p-purpose"
               rows={3}
@@ -328,7 +328,6 @@ function CreateProjectDialog({
             <ConstraintEditor
               items={constraintItems}
               onChange={setConstraintItems}
-              targets={targetList}
               disabled={saving}
               rawRows={3}
             />

@@ -30,8 +30,6 @@ export interface ConstraintItem {
 interface Props {
   items: ConstraintItem[];
   onChange: (items: ConstraintItem[]) => void;
-  /** 目标列表（解析时喂给 LLM，把「当前目标」替换成具体地址）。 */
-  targets?: string[];
   disabled?: boolean;
   /** 文本框行数，默认 3。 */
   rawRows?: number;
@@ -39,7 +37,7 @@ interface Props {
 
 // ConstraintEditor 是受控组件；解析结果按 (kind,text) 去重后追加，不覆盖用户
 // 已经手改过的条目。
-export function ConstraintEditor({ items, onChange, targets = [], disabled, rawRows = 3 }: Props) {
+export function ConstraintEditor({ items, onChange, disabled, rawRows = 3 }: Props) {
   const [raw, setRaw] = React.useState("");
   const [parsing, setParsing] = React.useState(false);
   const [conKind, setConKind] = React.useState<ConstraintKind>("deny");
@@ -70,7 +68,7 @@ export function ConstraintEditor({ items, onChange, targets = [], disabled, rawR
     }
     setParsing(true);
     try {
-      const r = await api.parseConstraints({ text: raw.trim(), targets });
+      const r = await api.parseConstraints({ text: raw.trim() });
       if (!r.constraints?.length) {
         toast.warning("模型没有抽到明确约束，可手动添加");
         return;
@@ -154,7 +152,7 @@ export function ConstraintEditor({ items, onChange, targets = [], disabled, rawR
         </NativeSelect>
         <Input
           className="h-7 min-w-52 flex-1 text-sm"
-          placeholder="手动补一条，如『仅测 10.0.0.5 的 443』"
+          placeholder="手动补一条，如『仅测 443 端口』"
           value={conText}
           onChange={(e) => setConText(e.target.value)}
           onKeyDown={(e) => {

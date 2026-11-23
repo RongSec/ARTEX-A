@@ -1554,7 +1554,7 @@ export const api = {
     },
   ) => post<BatchTasksResult>(`/projects/${id}/batch-tasks`, input),
   // ---- V12-CREATE-UNIFY：约束（自然语言 → allow/deny；项目级默认边界）----
-  parseConstraints: (input: { text: string; targets?: string[]; llm_profile_id?: number }) =>
+  parseConstraints: (input: { text: string; llm_profile_id?: number }) =>
     post<{ constraints: { kind: "allow" | "deny"; text: string }[] }>("/constraints/parse", input),
   projectConstraints: (id: number | string) =>
     get<{ constraints: TaskConstraint[] }>(`/projects/${id}/constraints`),

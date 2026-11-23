@@ -3,7 +3,7 @@ package server
 // 自然语言 → 操作约束（V12-CREATE-UNIFY）。
 //
 //	POST /api/constraints/parse
-//	body: {"text":"...", "targets":["10.0.0.5","https://a.example.com"]}
+//	body: {"text":"..."}
 //	resp: {"constraints":[{"kind":"allow|deny","text":"..."}]}
 //
 // 创建项目/任务时，用户在约束框里写一段自然语言，点「解析」调本接口拿结构化
@@ -25,21 +25,21 @@ const constraintParsePrompt = `你是渗透测试「操作约束」抽取器。�
 请把它拆成结构化的操作约束条目。
 
 约束只有两种：
-- allow：明确允许 / 限定在某个范围（例：「只允许被动侦察」「仅测 10.0.0.5 的 443」）。
+- allow：明确允许 / 限定在某个范围（例：「只允许被动侦察」「仅测 443 端口」）。
 - deny：明确禁止做某类操作（例：「禁止爆破」「不得删改生产数据」「不扫其他端口」）。
 
 规则：
 1. 只抽取用户**明确写出或强调**的要求，严禁臆造。没有约束就返回空数组。
-2. 每条必须自包含：把「当前目标 / 本站 / 这个端口 / 该 IP」替换成给定目标里的具体值。
+2. 用**通用表述**指代测试对象，不要写具体 IP / 域名 / 主机名 / URL，统一写「目标」「目标主机」。
+   约束会随任务下发，落到哪个目标上就指哪个目标；端口、协议、路径这类与资产无关的限定可以保留具体值。
 3. 约束是操作边界，不是测试步骤、不是目标、不是漏洞类型。
 4. 同义合并；最多 30 条；每条一句话，不超过 80 字。
 5. 输出**严格 JSON**，不要 Markdown 代码块、不要解释：
 {"constraints":[{"kind":"allow","text":"..."},{"kind":"deny","text":"..."}]}`
 
 type constraintParseReq struct {
-	Text        string   `json:"text"`
-	Targets     []string `json:"targets,omitempty"`
-	LLMProfileID int64   `json:"llm_profile_id,omitempty"`
+	Text         string `json:"text"`
+	LLMProfileID int64  `json:"llm_profile_id,omitempty"`
 }
 
 // parseConstraints POST /api/constraints/parse。
@@ -65,15 +65,11 @@ func (s *Server) parseConstraints(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "LLM 未配置：请先在「系统 → LLM」配置模型")
 		return
 	}
-	targets := strings.TrimSpace(strings.Join(req.Targets, "\n"))
-	if targets == "" {
-		targets = "（未提供目标列表，请保留原文里的具体地址，不要写「当前目标」）"
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 	msg, _, _, err := prov.Complete(ctx, llm.CompletionRequest{
 		System:    []string{constraintParsePrompt},
-		Messages:  []llm.Message{llm.UserText("测试目标：\n" + targets + "\n\n用户原文：\n" + text)},
+		Messages:  []llm.Message{llm.UserText("用户原文：\n" + text)},
 		MaxTokens: 3000,
 		Thinking:  "disabled",
 	})
