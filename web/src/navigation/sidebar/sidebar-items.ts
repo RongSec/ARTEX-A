@@ -10,7 +10,6 @@ import {
   FileText,
   FolderKanban,
   FolderOpen,
-  FolderSync,
   LayoutDashboard,
   type LucideIcon,
   MessageSquare,
@@ -21,7 +20,6 @@ import {
   Settings2,
   ShieldAlert,
   Sparkles,
-  Target,
   Terminal,
   Wrench,
 } from "lucide-react";
@@ -71,14 +69,13 @@ export const sidebarItems: NavGroup[] = [
     items: [
       { id: "dashboard", title: "仪表盘", url: "/dashboard", icon: LayoutDashboard },
       { id: "chat", title: "对话", url: "/chat", icon: MessageSquare },
-      { id: "projects", title: "项目", url: "/function/projects", icon: FolderKanban },
-      { id: "tasks", title: "任务", url: "/function/tasks", icon: Target },
+      // V12-MERGE：项目与任务合并为一个树状入口；任务详情仍走 /function/tasks/detail。
+      { id: "projects", title: "项目与任务", url: "/function/projects", icon: FolderKanban },
       { id: "findings", title: "发现", url: "/function/findings", icon: Bug },
       { id: "traffic", title: "流量", url: "/function/traffic", icon: Activity },
       { id: "commands", title: "工具执行", url: "/function/commands", icon: Terminal },
       { id: "llm-records", title: "LLM 录制", url: "/function/llm-records", icon: Radio },
       { id: "assets", title: "资产", url: "/function/assets", icon: Network },
-      { id: "sync", title: "资产同步", url: "/function/sync", icon: FolderSync },
       { id: "workspace", title: "工作空间", url: "/function/workspace", icon: FolderOpen },
     ],
   },

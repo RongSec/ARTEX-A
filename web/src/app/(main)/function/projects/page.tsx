@@ -6,7 +6,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { ArchiveIcon, ArchiveRestoreIcon, FolderKanbanIcon, InboxIcon, MoreHorizontalIcon, PlusIcon, RefreshCwIcon, Trash2Icon, WandSparklesIcon } from "lucide-react";
+import { ArchiveIcon, ArchiveRestoreIcon, FolderKanbanIcon, InboxIcon, MoreHorizontalIcon, PlusIcon, RefreshCwIcon, Trash2Icon } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import {
@@ -42,11 +42,19 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { DeleteOptionFields, emptyDeleteOptions } from "@/components/delete-option-fields";
+import { ProjectTaskTree } from "./_components/project-task-tree";
+import { CreateTaskSheet } from "@/app/(main)/function/tasks/page";
 import { TaskTemplateControls } from "@/components/task-template-controls";
-import { CredentialEditor, credentialsToPayload, type CredentialRow } from "@/components/credential-editor";
+import {
+  TargetCredentialEditor,
+  EMPTY_TARGET_ROW,
+  rowsToCredentials,
+  rowsToTargets,
+  type TargetCredRow,
+} from "@/components/target-credential-editor";
+import { ConstraintEditor, type ConstraintItem } from "@/components/constraint-editor";
 import { api } from "@/lib/api";
-import { parseTargets } from "@/lib/target-parse";
-import type { DeleteTaskOptions, ProjectWithStats } from "@/lib/types";
+import type { DeleteTaskOptions, ProjectWithStats, Task, TaskCategory } from "@/lib/types";
 
 // FindingCells finding 分档着色（与任务列表页同一配色口径）。
 function FindingCells({ f }: { f: Record<string, number> }) {
@@ -71,198 +79,40 @@ function FindingCells({ f }: { f: Record<string, number> }) {
 
 export default function ProjectsPage() {
   const [projects, setProjects] = React.useState<ProjectWithStats[]>([]);
+  const [tasks, setTasks] = React.useState<Task[]>([]);
+  const [categories, setCategories] = React.useState<TaskCategory[]>([]);
   const [loading, setLoading] = React.useState(true);
-  const [statusFilter, setStatusFilter] = React.useState<"all" | "active" | "archived">("all");
   const [createOpen, setCreateOpen] = React.useState(false);
+  const [taskCreateOpen, setTaskCreateOpen] = React.useState(false);
   const [deleteTarget, setDeleteTarget] = React.useState<ProjectWithStats | null>(null);
-  const [archivingId, setArchivingId] = React.useState<number | null>(null);
 
+  // 一次拉齐：项目（含统计）+ 全部活任务 + 任务分类（建任务抽屉用）。
   const load = React.useCallback(() => {
     setLoading(true);
-    api
-      .projects(statusFilter === "all" ? undefined : statusFilter)
-      .then((r) => setProjects(r.projects))
-      .catch((e) => toast.error("加载项目失败：" + (e as Error).message))
+    Promise.all([api.projects(), api.tasks(), api.taskCategories().catch(() => [] as TaskCategory[])])
+      .then(([pr, tr, cats]) => {
+        setProjects(pr.projects ?? []);
+        setTasks(tr.tasks ?? []);
+        setCategories(cats);
+      })
+      .catch((e) => toast.error("加载失败：" + (e as Error).message))
       .finally(() => setLoading(false));
-  }, [statusFilter]);
+  }, []);
   React.useEffect(() => {
     load();
   }, [load]);
 
-  // toggleArchive 归档/恢复：与任务侧一致，只切 status，不动任务与产线。
-  const toggleArchive = React.useCallback(
-    async (p: ProjectWithStats) => {
-      const next = p.status === "active" ? "archived" : "active";
-      setArchivingId(p.id);
-      try {
-        await api.updateProject(p.id, { status: next });
-        toast.success(next === "archived" ? `已归档「${p.name}」` : `已恢复「${p.name}」`);
-        load();
-      } catch (e) {
-        toast.error("操作失败：" + (e as Error).message);
-      } finally {
-        setArchivingId(null);
-      }
-    },
-    [load],
-  );
-
   return (
     <div className="p-4 md:p-6">
-      <div className="mb-4 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="font-semibold text-xl">项目</h1>
-          <p className="text-muted-foreground text-sm">批量任务的项目分组与并发调度</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <NativeSelect
-            className="w-32"
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value as typeof statusFilter)}
-            aria-label="状态筛选"
-          >
-            <NativeSelectOption value="all">全部状态</NativeSelectOption>
-            <NativeSelectOption value="active">进行中</NativeSelectOption>
-            <NativeSelectOption value="archived">已归档</NativeSelectOption>
-          </NativeSelect>
-          <Button variant="outline" size="icon" onClick={load} aria-label="刷新" disabled={loading}>
-            <RefreshCwIcon className={loading ? "animate-spin" : ""} />
-          </Button>
-          <Button onClick={() => setCreateOpen(true)}>
-            <PlusIcon data-icon="inline-start" /> 新建项目
-          </Button>
-        </div>
-      </div>
-
-      {!loading && projects.length === 0 ? (
-        <Empty>
-          <EmptyHeader>
-            <EmptyMedia variant="icon">
-              <InboxIcon />
-            </EmptyMedia>
-            <EmptyTitle>还没有项目</EmptyTitle>
-            <EmptyDescription>
-              项目是批量任务的分组调度单位：建项目 → 贴一行一个目标批量下发 → 按项目并发数排队放行。
-            </EmptyDescription>
-          </EmptyHeader>
-        </Empty>
-      ) : (
-        <div className="rounded-xl border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>名称</TableHead>
-                <TableHead className="w-24">状态</TableHead>
-                <TableHead className="w-20 text-center">任务数</TableHead>
-                <TableHead className="w-20 text-center">排队中</TableHead>
-                <TableHead className="w-28 text-center">漏洞 严/高/中/低</TableHead>
-                <TableHead className="w-16 text-center">并发</TableHead>
-                <TableHead className="w-24">负责人</TableHead>
-                <TableHead className="w-36">创建时间</TableHead>
-                <TableHead className="w-12 text-right">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {projects.map((p) => (
-                <TableRow key={p.id}>
-                  <TableCell>
-                    <div className="flex min-w-0 flex-col gap-1">
-                      <Link
-                        href={`/function/projects/detail?id=${p.id}`}
-                        className="text-foreground inline-flex items-center gap-1.5 rounded-sm font-medium hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        <FolderKanbanIcon className="text-muted-foreground size-4 shrink-0" />
-                        <span className="max-w-64 truncate" title={p.description || p.name}>
-                          {p.name}
-                        </span>
-                      </Link>
-                      {/* V6-DUAL 徽章：两个尺度各自一个开关，开哪个显示哪个。 */}
-                      {(p.observer_enabled || p.reader_enabled || p.auto_report) && (
-                        <div className="flex flex-wrap items-center gap-1">
-                          {p.observer_enabled && (
-                            <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400">
-                              跨任务阅读者
-                            </Badge>
-                          )}
-                          {p.reader_enabled && (
-                            <Badge variant="outline" className="text-blue-600 dark:text-blue-400">
-                              跨项目阅读者
-                            </Badge>
-                          )}
-                          {p.auto_report && (
-                            <Badge variant="outline" className="text-purple-600 dark:text-purple-400">
-                              自动报告
-                            </Badge>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant={p.status === "active" ? "default" : "secondary"}>
-                      {p.status === "active" ? "进行中" : "已归档"}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">{p.stats.task_count}</TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">
-                    {p.stats.queued_tasks > 0 ? (
-                      <span className="text-amber-600 font-medium dark:text-amber-400">{p.stats.queued_tasks}</span>
-                    ) : (
-                      <span className="text-muted-foreground">0</span>
-                    )}
-                  </TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">
-                    <FindingCells f={p.stats.findings} />
-                  </TableCell>
-                  <TableCell className="text-center text-xs tabular-nums">{p.concurrency}</TableCell>
-                  <TableCell className="text-muted-foreground max-w-24 truncate text-xs">{p.owner || "—"}</TableCell>
-                  <TableCell className="text-muted-foreground text-xs whitespace-nowrap tabular-nums">
-                    {new Date(p.created_at).toLocaleString("zh-CN", {
-                      month: "2-digit",
-                      day: "2-digit",
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button size="icon" variant="ghost" aria-label="项目操作" disabled={archivingId === p.id}>
-                          <MoreHorizontalIcon />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem onSelect={() => void toggleArchive(p)}>
-                          {p.status === "active" ? (
-                            <>
-                              <ArchiveIcon /> 归档
-                            </>
-                          ) : (
-                            <>
-                              <ArchiveRestoreIcon /> 取消归档
-                            </>
-                          )}
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem variant="destructive" onSelect={() => setDeleteTarget(p)}>
-                          <Trash2Icon /> 删除项目
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </TableCell>
-                </TableRow>
-              ))}
-              {loading && projects.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={8} className="text-muted-foreground py-8 text-center text-sm">
-                    加载中…
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </div>
-      )}
+      <ProjectTaskTree
+        projects={projects}
+        tasks={tasks}
+        loading={loading}
+        onCreateProject={() => setCreateOpen(true)}
+        onCreateTask={() => setTaskCreateOpen(true)}
+        onRefresh={load}
+        onDeleteProject={setDeleteTarget}
+      />
 
       <CreateProjectDialog
         open={createOpen}
@@ -271,6 +121,19 @@ export default function ProjectsPage() {
           setCreateOpen(false);
           load();
         }}
+      />
+
+      <CreateTaskSheet
+        tasks={tasks}
+        categories={categories}
+        open={taskCreateOpen}
+        onOpenChange={setTaskCreateOpen}
+        hideTrigger
+        onCreated={() => {
+          setTaskCreateOpen(false);
+          load();
+        }}
+        onCategoriesChanged={load}
       />
 
       <DeleteProjectDialog
@@ -303,7 +166,12 @@ function CreateProjectDialog({
   onCreated: () => void;
 }) {
   const [name, setName] = React.useState("");
-  const [description, setDescription] = React.useState("");
+  // 目的 = 描述/测试范围；目标 = 资产列表（行式，含凭据）；约束 = allow/deny。
+  const [purpose, setPurpose] = React.useState("");
+  const [targetRaw, setTargetRaw] = React.useState("");
+  const [targetRows, setTargetRows] = React.useState<TargetCredRow[]>([]);
+  const [targetInvalid, setTargetInvalid] = React.useState<string[]>([]);
+  const [constraintItems, setConstraintItems] = React.useState<ConstraintItem[]>([]);
   const [owner, setOwner] = React.useState("");
   const [concurrency, setConcurrency] = React.useState("2");
   const [observer, setObserver] = React.useState(false);
@@ -314,19 +182,18 @@ function CreateProjectDialog({
   // 项目默认任务模板（task_templates.id）：只存引用，批量下发时带出。
   const [taskTemplateID, setTaskTemplateID] = React.useState<number | null>(null);
   const [templates, setTemplates] = React.useState<{ id: number; name: string; is_default: boolean }[]>([]);
-  // 建项目时直接贴目标：解析清洗 + 右侧凭据，创建成功后同批下发首个批量任务。
-  // 空目标=只建项目（与旧行为一致）。
-  const [targets, setTargets] = React.useState("");
-  const [creds, setCreds] = React.useState<CredentialRow[]>([]);
-  const [lastInvalid, setLastInvalid] = React.useState<string[]>([]);
   const [saving, setSaving] = React.useState(false);
 
-  const parsed = React.useMemo(() => parseTargets(targets), [targets]);
+  const targetList = React.useMemo(() => rowsToTargets(targetRows), [targetRows]);
 
   React.useEffect(() => {
     if (open) {
       setName("");
-      setDescription("");
+      setPurpose("");
+      setTargetRaw("");
+      setTargetRows([]);
+      setTargetInvalid([]);
+      setConstraintItems([]);
       setOwner("");
       setConcurrency("2");
       setObserver(false);
@@ -335,30 +202,12 @@ function CreateProjectDialog({
       setAutoReportTasks(false);
       setTemplateId("");
       setTaskTemplateID(null);
-      setTargets("");
-      setCreds([]);
-      setLastInvalid([]);
       api
         .reportTemplates()
         .then(setTemplates)
         .catch(() => setTemplates([]));
     }
   }, [open]);
-
-  // runParse 与批量下发弹窗同一套语义：清洗文本 → 一行一个有效目标 + 说明剔除了什么。
-  function runParse() {
-    const r = parseTargets(targets);
-    setLastInvalid(r.invalid);
-    if (r.targets.length === 0) {
-      toast.error(`没有有效目标${r.invalid.length ? `（剔除 ${r.invalid.length} 行非法内容）` : ""}`);
-      return;
-    }
-    setTargets(r.targets.join("\n"));
-    const bits = [`有效 ${r.targets.length} 条`];
-    if (r.duplicate.length) bits.push(`去重 ${r.duplicate.length} 条`);
-    if (r.invalid.length) bits.push(`剔除 ${r.invalid.length} 条非法`);
-    toast.success(bits.join("，"));
-  }
 
   async function submit() {
     if (!name.trim()) {
@@ -370,15 +219,15 @@ function CreateProjectDialog({
       toast.error("并发数须为 1-8 的整数");
       return;
     }
-    if (parsed.targets.length > 200) {
-      toast.error(`单批最多 200 个目标（当前 ${parsed.targets.length} 个），请分批下发`);
+    if (targetList.length > 200) {
+      toast.error(`单批最多 200 个目标（当前 ${targetList.length} 个），请分批下发`);
       return;
     }
     setSaving(true);
     try {
       const p = await api.createProject({
         name: name.trim(),
-        description: description.trim(),
+        description: purpose.trim(),
         owner: owner.trim(),
         concurrency: conc,
         observer_enabled: observer,
@@ -388,19 +237,28 @@ function CreateProjectDialog({
         reader_enabled: reader,
         task_template_id: taskTemplateID,
       });
+      // 约束先落项目：之后每次批量下发都会复制一份到新任务，作为项目默认边界。
+      if (constraintItems.length > 0) {
+        try {
+          await api.setProjectConstraints(p.id, constraintItems);
+        } catch (e) {
+          toast.warning(`项目已创建，但约束保存失败：${(e as Error).message}`, { duration: 8000 });
+        }
+      }
       toast.success(`项目已创建：${p.name}`);
       // 有目标就顺手下发首轮批量：项目与任务一次成型，不用再进详情页贴一遍。
       // 批量失败不回滚项目——项目已经建好，用户可在详情页重新下发。
-      const willCreate = parsed.targets.length;
+      const willCreate = targetList.length;
       if (willCreate > 0) {
         try {
           const r = await api.batchProjectTasks(p.id, {
-            targets: parsed.targets.join("\n"),
+            targets: targetList.join("\n"),
             concurrency: conc,
             common: {
               category_id: null,
-              credentials: credentialsToPayload(creds),
-              desc_template: description.trim() ? `${description.trim()}\n目标：{target}` : undefined,
+              credentials: rowsToCredentials(targetRows),
+              constraints: constraintItems,
+              desc_template: purpose.trim() ? `${purpose.trim()}\n目标：{target}` : undefined,
             },
           });
           const createdN = r.created?.length ?? 0;
@@ -425,7 +283,7 @@ function CreateProjectDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !saving && onOpenChange(o)}>
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
+      <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>新建项目</DialogTitle>
         </DialogHeader>
@@ -435,10 +293,48 @@ function CreateProjectDialog({
             <Input id="p-name" placeholder="如：2026 春招渗透测试" value={name} onChange={(e) => setName(e.target.value)} />
           </div>
           <div className="grid gap-2">
-            <Label htmlFor="p-desc">描述 / 测试范围</Label>
-            <Textarea id="p-desc" rows={3} value={description} onChange={(e) => setDescription(e.target.value)} />
+            <Label htmlFor="p-purpose">目的（描述 / 测试范围）</Label>
+            <Textarea
+              id="p-purpose"
+              rows={3}
+              placeholder="这次测试要达成什么、背景与范围说明；会作为每个子任务的描述前缀。"
+              value={purpose}
+              onChange={(e) => setPurpose(e.target.value)}
+            />
           </div>
-          <div className="grid grid-cols-2 gap-4">
+
+          {/* 目标 + 凭据：粘贴 → 解析 → 一行一个目标，每行带账号密码。 */}
+          <div className="rounded-lg border p-3">
+            <TargetCredentialEditor
+              rows={targetRows}
+              onChange={setTargetRows}
+              raw={targetRaw}
+              onRawChange={setTargetRaw}
+              invalid={targetInvalid}
+              onInvalidChange={setTargetInvalid}
+              onParsed={({ count, duplicate, invalid }) => {
+                const bits = [`有效 ${count} 条`];
+                if (duplicate) bits.push(`去重 ${duplicate} 条`);
+                if (invalid) bits.push(`剔除 ${invalid} 条非法`);
+                toast.success(bits.join("，"));
+              }}
+              disabled={saving}
+              rawRows={5}
+            />
+          </div>
+
+          {/* 约束：自然语言 → LLM 编成 allow/deny；随项目保存并复制给每个任务。 */}
+          <div className="rounded-lg border p-3">
+            <ConstraintEditor
+              items={constraintItems}
+              onChange={setConstraintItems}
+              targets={targetList}
+              disabled={saving}
+              rawRows={3}
+            />
+          </div>
+
+          <div className="grid grid-cols-2 items-start gap-4">
             <div className="grid gap-2">
               <Label htmlFor="p-owner">负责人</Label>
               <Input id="p-owner" placeholder="可留空" value={owner} onChange={(e) => setOwner(e.target.value)} />
@@ -446,9 +342,9 @@ function CreateProjectDialog({
             <div className="grid gap-2">
               <Label htmlFor="p-conc">批量任务并发数</Label>
               <Input id="p-conc" type="number" min={1} max={8} value={concurrency} onChange={(e) => setConcurrency(e.target.value)} />
-              <p className="text-muted-foreground text-xs">1=严格串行，2=同时两任务（默认）</p>
             </div>
           </div>
+          <p className="text-muted-foreground -mt-2 text-xs">并发数：1=严格串行，2=同时两任务（默认）。</p>
           <div className="grid gap-2">
             <Label htmlFor="p-template">报告模板</Label>
             <NativeSelect id="p-template" value={templateId} onChange={(e) => setTemplateId(e.target.value)}>
@@ -466,59 +362,19 @@ function CreateProjectDialog({
             <TaskTemplateControls
               description=""
               goal=""
+              constraints={constraintItems}
               selectedTemplateID={taskTemplateID}
               onSelectedTemplateIDChange={setTaskTemplateID}
-              onApply={() => {}}
+              onApply={(t) => {
+                if (t.constraints?.length) {
+                  setConstraintItems(t.constraints.map((c) => ({ kind: c.kind, text: c.text })));
+                }
+              }}
               hint="作为本项目的默认任务模板：批量下发时自动带出，可在那时再改。只存引用，不复制模板内容。"
             />
           </div>
 
-          {/* 初始目标 + 凭据：建项目时一次贴完，创建成功即按项目并发下发。 */}
-          <div className="grid gap-4 rounded-lg border p-3 md:grid-cols-[1.35fr_1fr]">
-            <div className="grid gap-2">
-              <div className="flex items-center justify-between">
-                <Label htmlFor="p-targets">初始目标（可选）</Label>
-                <div className="flex items-center gap-2">
-                  <span className="text-muted-foreground text-xs tabular-nums">
-                    {parsed.targets.length > 0 ? `${parsed.targets.length} 个任务` : "留空=只建项目"}
-                  </span>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="h-7 gap-1 px-2 text-xs"
-                    onClick={runParse}
-                    disabled={!targets.trim()}
-                  >
-                    <WandSparklesIcon className="h-3 w-3" />
-                    解析
-                  </Button>
-                </div>
-              </div>
-              <Textarea
-                id="p-targets"
-                rows={8}
-                className="font-mono text-sm"
-                placeholder={"一行一个目标，可混贴 URL / IP / IP:端口 / CIDR / 域名：\nhttp://target-a.example.com\n10.0.0.5\n10.0.0.6:8080\n10.0.0.0/24"}
-                value={targets}
-                onChange={(e) => setTargets(e.target.value)}
-              />
-              <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-                {parsed.duplicate.length > 0 && <span className="text-amber-600">重复 {parsed.duplicate.length}</span>}
-                {parsed.invalid.length > 0 && <span className="text-destructive">非法 {parsed.invalid.length}</span>}
-                <span>按项目并发数排队放行</span>
-              </div>
-              {lastInvalid.length > 0 && (
-                <div className="border-destructive/30 bg-destructive/5 rounded-md border px-2 py-1.5">
-                  <p className="text-destructive text-xs">已剔除（不会建任务）：</p>
-                  <p className="text-muted-foreground mt-0.5 line-clamp-3 font-mono text-[11px] break-all">
-                    {lastInvalid.join("  ·  ")}
-                  </p>
-                </div>
-              )}
-            </div>
-            <CredentialEditor value={creds} onChange={setCreds} targets={parsed.targets} compact />
-          </div>
+          {/* 初始目标 + 凭据已在上面按行式录入，这里不再重复。 */}
           <div className="grid gap-3 rounded-lg border p-3">
             <label className="flex items-center justify-between gap-3 text-sm">
               <span>跨任务阅读者（项目内）</span>
@@ -553,7 +409,7 @@ function CreateProjectDialog({
             取消
           </Button>
           <Button onClick={submit} disabled={saving}>
-            {saving ? "创建中…" : parsed.targets.length > 0 ? `创建并下发 ${parsed.targets.length} 个任务` : "创建"}
+            {saving ? "创建中…" : targetList.length > 0 ? `创建并下发 ${targetList.length} 个任务` : "创建"}
           </Button>
         </DialogFooter>
       </DialogContent>

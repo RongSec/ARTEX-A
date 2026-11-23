@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -174,4 +175,54 @@ func constraintDTOs(in []db.Constraint) []ConstraintDTO {
 		})
 	}
 	return out
+}
+
+// ---------- 项目级约束（V12-CREATE-UNIFY） ----------
+
+// listProjectConstraints GET /api/projects/{id}/constraints。
+func (s *Server) listProjectConstraints(w http.ResponseWriter, r *http.Request) {
+	pid, ok := projectIDParam(w, r)
+	if !ok {
+		return
+	}
+	rows, err := s.m.PG().ListProjectConstraints(pid)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"constraints": constraintDTOs(rows)})
+}
+
+// replaceProjectConstraints PUT /api/projects/{id}/constraints，全量替换。
+// body {"constraints":[{"kind":"allow|deny","text":"..."}]}
+func (s *Server) replaceProjectConstraints(w http.ResponseWriter, r *http.Request) {
+	pid, ok := projectIDParam(w, r)
+	if !ok {
+		return
+	}
+	if _, err := s.m.PG().GetProject(pid); err != nil {
+		if errors.Is(err, db.ErrProjectNotFound) {
+			writeErr(w, 404, "项目不存在")
+			return
+		}
+		writeErr(w, 500, err.Error())
+		return
+	}
+	var body struct {
+		Constraints []db.ConstraintInput `json:"constraints"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, "invalid JSON")
+		return
+	}
+	if err := s.m.PG().ReplaceProjectConstraints(pid, body.Constraints); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	rows, err := s.m.PG().ListProjectConstraints(pid)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"constraints": constraintDTOs(rows)})
 }

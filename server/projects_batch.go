@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 
@@ -46,6 +47,9 @@ type batchCreateReq struct {
 		// Credentials 是本批任务要用的凭据池。每条可带 target 指定适用目标，
 		// 留空=全部目标；落库到目标资产的 auth（agent 用 list_assets 可读）。
 		Credentials []TaskCredentialInput `json:"credentials,omitempty"`
+		// Constraints 本批任务的操作约束（创建表单里录入/解析的）。
+		// 项目级约束另行从 project_constraints 复制，两者在任务内去重。
+		Constraints []db.ConstraintInput `json:"constraints,omitempty"`
 	} `json:"common"`
 }
 
@@ -131,8 +135,14 @@ func (s *Server) projectsBatchTasks(w http.ResponseWriter, r *http.Request) {
 	var failed []string
 	for _, target := range targets {
 		desc := strings.TrimSpace(strings.ReplaceAll(descTmpl, "{target}", target))
+		// 任务名：没给前缀时直接用目标本身（URL/IP/CIDR）——这是最能代表资产
+		// 的默认名，树状列表里一眼能认出是哪台机器；给了前缀才拼前缀。
+		name := target
+		if prefix := strings.TrimSpace(req.Common.NamePrefix); prefix != "" {
+			name = prefix + target
+		}
 		t, err := s.m.CreateTaskWithOptions(desc, target, db.TaskCreateOptions{
-			Name:                 strings.TrimSpace(req.Common.NamePrefix + target),
+			Name:                 name,
 			CategoryID:           req.Common.CategoryID,
 			LLMProfileIDs:        req.Common.LLMProfileIDs,
 			TimeoutSeconds:       req.Common.TimeoutSeconds,
@@ -149,6 +159,14 @@ func (s *Server) projectsBatchTasks(w http.ResponseWriter, r *http.Request) {
 		// 与原版建后流程同源的 seed（解析目标建站点资产）；本批凭据按 target
 		// 匹配后写进该资产的 auth。不调 launchTask。
 		s.seedWithAuth(t, desc+" "+target, authItemsFor(creds, target))
+		// 项目级约束 + 本批约束：项目约束是「项目默认边界」，每个任务继承一份；
+		// 之后任务里单独增删不回写项目。两批都按 kind+text 去重。
+		if _, err := s.m.PG().CopyProjectConstraintsToTask(pid, t.ExpID); err != nil {
+			log.Printf("[batch] 复制项目约束失败 project=%d task=#%s: %v", pid, t.ID, err)
+		}
+		if _, err := s.m.PG().InsertTaskConstraints(t.ExpID, req.Common.Constraints); err != nil {
+			log.Printf("[batch] 写入本批约束失败 task=#%s: %v", t.ID, err)
+		}
 		if req.Common.SeedFirstIntent != nil && *req.Common.SeedFirstIntent {
 			s.seedFirstIntent(t)
 		}

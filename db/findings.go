@@ -163,6 +163,7 @@ type FindingFilter struct {
 	Status    string // pending | false_positive | ignored | resolved
 	VulnClass string
 	TaskID    string // 任务 id(字符串形式;空/非法 = 不按任务筛选)
+	ProjectID string // 项目 id(字符串形式;空/非法 = 不按项目筛选)
 	Query     string // 名称/类型/摘要/证据/报告正文的模糊检索关键词
 	Sort      string // "severity" | "time"
 	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
@@ -202,6 +203,14 @@ func (f FindingFilter) where() (string, []any) {
 	} else if tid, err := strconv.ParseInt(f.TaskID, 10, 64); err == nil && tid > 0 {
 		args = append(args, tid)
 		conds = append(conds, fmt.Sprintf("f.task_id = $%d", len(args)))
+	}
+	// 项目筛选:findings 没有 project_id,经 task 归属反查;任务已删(或未归属)
+	// 的发现不属于任何项目,选中项目时自然被排除。
+	if f.ProjectID != "" && f.ProjectID != FindingUnassignedTask {
+		if pid, err := strconv.ParseInt(f.ProjectID, 10, 64); err == nil && pid > 0 {
+			args = append(args, pid)
+			conds = append(conds, fmt.Sprintf("t.project_id = $%d", len(args)))
+		}
 	}
 	// 资产筛选:asset_ids 是 jsonb 数组,@> ANY(...) 能走 idx_findings_asset_ids。
 	switch {

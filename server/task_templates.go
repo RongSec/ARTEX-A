@@ -24,6 +24,7 @@ type taskTemplateRequest struct {
 	Goal           *string                `json:"goal"`
 	CategoryID     *int64                 `json:"category_id"`
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules"`
+	Constraints    []db.ConstraintInput   `json:"constraints"`
 }
 
 // decodeTaskTemplateRequest decodes the body into req and returns the set of
@@ -131,6 +132,7 @@ func (s *Server) pgCreateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 		Goal:           stringValue(req.Goal),
 		CategoryID:     req.CategoryID,
 		InterceptRules: rules,
+		Constraints:    req.Constraints,
 	})
 	if err != nil {
 		writeTaskTemplateErr(w, err)
@@ -160,8 +162,9 @@ func (s *Server) pgUpdateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	_, catPresent := present["category_id"]
 	_, rulesPresent := present["intercept_rules"]
-	if req.Name == nil && req.Description == nil && req.Goal == nil && !catPresent && !rulesPresent {
-		writeErr(w, http.StatusBadRequest, "至少需要提供 name、description、goal、category_id 或 intercept_rules")
+	_, constraintsPresent := present["constraints"]
+	if req.Name == nil && req.Description == nil && req.Goal == nil && !catPresent && !rulesPresent && !constraintsPresent {
+		writeErr(w, http.StatusBadRequest, "至少需要提供 name、description、goal、category_id、intercept_rules 或 constraints")
 		return
 	}
 	patch := db.TaskTemplatePatch{Name: req.Name, Description: req.Description, Goal: req.Goal}
@@ -177,6 +180,10 @@ func (s *Server) pgUpdateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 		}
 		patch.SetInterceptRules = true
 		patch.InterceptRules = rules
+	}
+	if constraintsPresent {
+		patch.SetConstraints = true
+		patch.Constraints = req.Constraints
 	}
 	template, err := pg.PatchTaskTemplate(id, patch)
 	if err != nil {

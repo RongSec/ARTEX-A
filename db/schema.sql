@@ -630,6 +630,9 @@ CREATE TABLE IF NOT EXISTS task_templates (
 -- 补旧库(已发版,加列带 IF NOT EXISTS)。
 ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES task_categories(id) ON DELETE SET NULL;
 ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS intercept_rules JSONB NOT NULL DEFAULT '[]';
+-- V12-CREATE-UNIFY：模板也带操作约束（与 project_constraints 同构），应用模板时
+-- 原样灌进任务创建表单，用户可改后再建任务。
+ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS constraints JSONB NOT NULL DEFAULT '[]';
 CREATE INDEX IF NOT EXISTS idx_task_templates_updated ON task_templates(updated_at DESC, id DESC);
 DROP TRIGGER IF EXISTS trg_task_templates_upd ON task_templates;
 CREATE TRIGGER trg_task_templates_upd BEFORE UPDATE ON task_templates
@@ -863,12 +866,9 @@ DROP TRIGGER IF EXISTS trg_mcp_upd ON mcp_servers;
 CREATE TRIGGER trg_mcp_upd BEFORE UPDATE ON mcp_servers
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
--- 默认数据源占位：ScopeSentry 资产同步 MCP（地址与认证均留空、未启用）。
--- 供「资产同步」页检测数据源是否已配置；用户在页面填入 url 与 X-API-Key 后再启用。
--- 仅在缺失时插入，绝不覆盖用户已配置/已启用的服务器（schema.sql 每次启动都会 Exec）。
-INSERT INTO mcp_servers (name, transport, url, env, enabled)
-VALUES ('ScopeSentry', 'http', NULL, '{"X-API-Key":""}', false)
-ON CONFLICT (name) DO NOTHING;
+-- V12-MCP-CLEAN：ScopeSentry 数据源 MCP 已下线，不再播种。启动时幂等删除
+-- 历史占位行（用户明确要求删除且不恢复）；其 skill/工具缓存随 FK 级联清掉。
+DELETE FROM mcp_servers WHERE name='ScopeSentry';
 
 CREATE TABLE IF NOT EXISTS mcp_tools_cache (
     id            BIGSERIAL PRIMARY KEY,
@@ -1475,6 +1475,19 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id, created_at DES
 -- 批量调度取「某项目 FIFO 队首」用（partial 只索引在排队的行，命中集小）：
 CREATE INDEX IF NOT EXISTS idx_tasks_project_queued ON tasks(project_id, queued_at ASC)
     WHERE deleted_at IS NULL AND queued = true AND project_id IS NOT NULL;
+
+-- 项目级操作约束（V12-CREATE-UNIFY）：建项目时录入的 allow/deny 条目，批量下发
+-- 时逐条复制进每个任务的 task_constraints（origin=project），作为任务的初始边界。
+-- 与任务约束同构；项目删除时 CASCADE 清掉。
+CREATE TABLE IF NOT EXISTS project_constraints (
+    id         BIGSERIAL PRIMARY KEY,
+    project_id BIGINT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL CHECK (kind IN ('allow','deny')),
+    text       TEXT NOT NULL,
+    origin     TEXT NOT NULL DEFAULT 'human',   -- human=人工/LLM 解析；project=批量继承
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_pcon_project ON project_constraints(project_id, id);
 
 -- =====================================================================
 -- O. 项目大图 + 观察者/阅读者（artex-hs F2，T09）

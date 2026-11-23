@@ -19,6 +19,7 @@ import {
 import { toast } from "sonner";
 
 import { ProjectBatchTasks } from "@/components/project-batch-tasks";
+import { ConstraintEditor, type ConstraintItem } from "@/components/constraint-editor";
 import { ProjectGraphTab } from "./project-graph-tab";
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
@@ -258,6 +259,76 @@ function ProjectDetailInner() {
 // TasksTab 任务列表：读详情聚合 API 的 task 行，口径与任务列表页一致。
 // 每行「移出」= PATCH /tasks/{id}/project 摘归属（T05 挂/摘）；操作后 toast
 // 提示投影更新时机（对齐 T12(0)：摘除后大图靠下次重建清旧行、任务重启重绑）。
+// ProjectConstraintsCard：项目级操作约束（批量下发时复制进每个新任务的
+// task_constraints）。创建项目时录入过的会在这里显示，可继续增删改后保存。
+function ProjectConstraintsCard({ projectID }: { projectID: number }) {
+  const [items, setItems] = React.useState<ConstraintItem[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+  const [dirty, setDirty] = React.useState(false);
+
+  React.useEffect(() => {
+    let disposed = false;
+    api
+      .projectConstraints(projectID)
+      .then((r) => {
+        if (disposed) return;
+        setItems((r.constraints ?? []).map((c) => ({ kind: c.kind as ConstraintItem["kind"], text: c.text })));
+        setDirty(false);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!disposed) setLoading(false);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [projectID]);
+
+  async function save() {
+    setSaving(true);
+    try {
+      const r = await api.setProjectConstraints(projectID, items);
+      setItems((r.constraints ?? []).map((c) => ({ kind: c.kind as ConstraintItem["kind"], text: c.text })));
+      setDirty(false);
+      toast.success("项目约束已保存，之后下发的任务会继承");
+    } catch (e) {
+      toast.error("保存失败：" + (e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="rounded-xl border p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium">操作约束（项目默认边界）</p>
+          <p className="text-muted-foreground mt-1 text-xs">
+            批量下发时逐条复制进每个新任务的约束表；任务内后续增删不回写这里。
+          </p>
+        </div>
+        <Button size="sm" variant="outline" onClick={() => void save()} disabled={saving || loading || !dirty}>
+          {saving ? "保存中…" : "保存约束"}
+        </Button>
+      </div>
+      {loading ? (
+        <p className="text-muted-foreground text-sm">加载中…</p>
+      ) : (
+        <ConstraintEditor
+          items={items}
+          onChange={(next) => {
+            setItems(next);
+            setDirty(true);
+          }}
+          disabled={saving}
+          rawRows={3}
+        />
+      )}
+    </div>
+  );
+}
+
 function TasksTab({ tasks, onChanged }: { tasks: Task[]; onChanged: () => void }) {
   const [detaching, setDetaching] = React.useState<string | null>(null);
 
@@ -397,6 +468,7 @@ function OverviewTab({ detail, templates }: { detail: ProjectDetail; templates: 
           自动写报告：{p.auto_report ? "开（全部任务收官后按下方模板生成）" : "关"}
         </p>
       </div>
+      <ProjectConstraintsCard projectID={p.id} />
       <div className="flex items-center justify-between gap-4 rounded-xl border p-4 text-sm">
         <div className="min-w-0">
           <p className="text-muted-foreground text-xs">项目报告模板</p>

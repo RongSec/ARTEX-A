@@ -107,10 +107,14 @@ func DecomposeGoals(ctx context.Context, prov llm.Provider, dataDir, goalText, d
 // ordered provider chain. It preserves the same tools and write behavior while
 // letting the caller own provider selection/failover. maxTokens is the profile's
 // per-reply output cap (0 = send none).
-func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir, goalText, desc string, as *db.AssetStore, ts *db.ExplorationStore, taskID int64, nonStreaming bool, maxTokens int, emit func(db.Activity)) []GoalSpec {
+func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir, goalText, desc string, as *db.AssetStore, ts *db.ExplorationStore, taskID int64, nonStreaming bool, maxTokens int, emit func(db.Activity), skipConstraints ...bool) []GoalSpec {
 	if prov == nil {
 		return nil
 	}
+	// V12-CREATE-UNIFY：任务创建/模板/项目已经带入了操作约束时，拆解器不再自己
+	// 抽一遍——用户解析出的约束还要人工改，重复抽取只会产生近似重复条目。此时
+	// 不挂 set_constraints 工具，并在 prompt 末尾明确告知。
+	skipCon := len(skipConstraints) > 0 && skipConstraints[0]
 	// 目标拆解是一次性调用：不挂 transcript store，所以 agentcore 不会往 ctx 上挂
 	// session id（它只在有 writer 时才挂，见 agentcore.Prompt）。而按 session-id 头
 	// 做提示缓存/粘性路由的网关（opencode zen 缺 x-opencode-session 直接 400
@@ -130,7 +134,12 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 	sys := renderSystem("goals", goalsDefaultTmpl, GoalsVars{DataDir: dataDir, Now: nowStr()})
 	// set_constraints 始终可用(不依赖 asset store):正文已含「先抽操作约束再拆目标」这步
 	// (可在 agent 编辑页改措辞),这里只需接上工具。
-	tools := []actool.CoreTool{tsx.setGoals(), tsx.setConstraints()}
+	tools := []actool.CoreTool{tsx.setGoals()}
+	if !skipCon {
+		tools = append(tools, tsx.setConstraints())
+	} else {
+		sys += "\n\n**本任务的操作约束已由操作员在创建时录入并写入约束表，禁止再调用 set_constraints，直接进入目标拆分。**"
+	}
 	// Wire add_task_scope only when we have a real asset store + task to write to.
 	// The scope-extraction tail is appended in lockstep so the prompt never asks for
 	// a tool that isn't present.

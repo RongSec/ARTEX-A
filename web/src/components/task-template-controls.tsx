@@ -6,6 +6,7 @@ import { LibraryIcon, PlusIcon, SaveIcon, Settings2Icon, Trash2Icon } from "luci
 import { toast } from "sonner";
 
 import { AssetInterceptRulesEditor } from "@/components/asset-intercept-rules-editor";
+import { ConstraintEditor, type ConstraintItem } from "@/components/constraint-editor";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -42,10 +43,11 @@ interface TemplateDraft {
   goal: string;
   categoryID: number | null;
   interceptRules: AssetInterceptRuleInput[];
+  constraints: ConstraintItem[];
 }
 
 // TemplateSeed 是「另存为模板」时从创建表单带入的初值。
-type TemplateSeed = Pick<TemplateDraft, "description" | "goal" | "categoryID" | "interceptRules">;
+type TemplateSeed = Pick<TemplateDraft, "description" | "goal" | "categoryID" | "interceptRules" | "constraints">;
 
 interface TaskTemplateManagerProps {
   open: boolean;
@@ -63,6 +65,7 @@ const emptyDraft = (): TemplateDraft => ({
   goal: "",
   categoryID: null,
   interceptRules: [],
+  constraints: [],
 });
 
 function templateDraft(template: TaskTemplate): TemplateDraft {
@@ -72,6 +75,7 @@ function templateDraft(template: TaskTemplate): TemplateDraft {
     goal: template.goal,
     categoryID: template.category_id ?? null,
     interceptRules: template.intercept_rules ?? [],
+    constraints: (template.constraints ?? []).map((c) => ({ kind: c.kind, text: c.text })),
   };
 }
 
@@ -110,6 +114,7 @@ function TaskTemplateManager({
           goal: seed.goal,
           categoryID: seed.categoryID,
           interceptRules: seed.interceptRules,
+          constraints: seed.constraints,
         });
       } else if (templates[0]) {
         setSelectedID(templates[0].id);
@@ -149,6 +154,7 @@ function TaskTemplateManager({
       intercept_rules: draft.interceptRules
         .map((r) => ({ ...r, pattern: r.pattern.trim() }))
         .filter((r) => r.pattern !== ""),
+      constraints: draft.constraints,
     };
     if (!input.name || !input.description || !input.goal) {
       toast.error("请填写模板名称、描述和目标");
@@ -289,6 +295,16 @@ function TaskTemplateManager({
                   <FieldDescription>应用模板时预填此分类（可再改）。</FieldDescription>
                 </Field>
                 <Field>
+                  <FieldLabel>操作约束</FieldLabel>
+                  <ConstraintEditor
+                    items={draft.constraints}
+                    onChange={(next) => patchDraft({ constraints: next })}
+                  />
+                  <FieldDescription>
+                    应用模板时预填这些 allow/deny 约束；任务创建时已有约束，目标拆解器就不再重复抽取。
+                  </FieldDescription>
+                </Field>
+                <Field>
                   <FieldLabel>任务级拦截 / 允许规则</FieldLabel>
                   <AssetInterceptRulesEditor
                     value={draft.interceptRules}
@@ -349,6 +365,8 @@ interface TaskTemplateControlsProps {
   goal: string;
   categoryID?: number;
   interceptRules?: AssetInterceptRuleInput[];
+  /** 当前创建表单里的操作约束；「另存为模板」时一并存进去。 */
+  constraints?: ConstraintItem[];
   selectedTemplateID: number | null;
   onSelectedTemplateIDChange: (id: number | null) => void;
   onApply: (template: TaskTemplate) => void;
@@ -362,6 +380,7 @@ export function TaskTemplateControls({
   goal,
   categoryID,
   interceptRules,
+  constraints,
   selectedTemplateID,
   onSelectedTemplateIDChange,
   onApply,
@@ -460,6 +479,7 @@ export function TaskTemplateControls({
                   goal,
                   categoryID: categoryID ?? null,
                   interceptRules: interceptRules ?? [],
+                  constraints: constraints ?? [],
                 })
               }
             >

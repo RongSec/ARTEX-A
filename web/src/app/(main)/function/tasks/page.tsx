@@ -49,7 +49,14 @@ import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { TaskTemplateControls } from "@/components/task-template-controls";
-import { CredentialEditor, credentialsToPayload, type CredentialRow } from "@/components/credential-editor";
+import {
+  TargetCredentialEditor,
+  EMPTY_TARGET_ROW,
+  rowsToCredentials,
+  rowsToTargets,
+  type TargetCredRow,
+} from "@/components/target-credential-editor";
+import { ConstraintEditor, type ConstraintItem } from "@/components/constraint-editor";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -2056,7 +2063,7 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
   );
 }
 
-function DeleteTaskDialog({
+export function DeleteTaskDialog({
   task,
   onDelete,
 }: {
@@ -2978,18 +2985,34 @@ function CategoryManagementSheet({
   );
 }
 
-function CreateTaskSheet({
+export function CreateTaskSheet({
   tasks,
   categories,
   onCreated,
   onCategoriesChanged,
+  open: openProp,
+  onOpenChange,
+  hideTrigger,
 }: {
   tasks: Task[];
   categories: TaskCategory[];
   onCreated: () => void;
   onCategoriesChanged: () => void;
+  /** 受控模式：外部「新建任务」按钮把抽屉拉起来。 */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  hideTrigger?: boolean;
 }) {
-  const [open, setOpen] = React.useState(false);
+  const [internalOpen, setInternalOpen] = React.useState(false);
+  const controlled = openProp !== undefined;
+  const open = controlled ? openProp : internalOpen;
+  const setOpen = React.useCallback(
+    (next: boolean) => {
+      if (controlled) onOpenChange?.(next);
+      else setInternalOpen(next);
+    },
+    [controlled, onOpenChange],
+  );
   const [name, setName] = React.useState("");
   const [categoryID, setCategoryID] = React.useState<number | undefined>(undefined);
   // 归属项目：undefined = 未选择 → 后端落「未分类」项目。任务必须挂在项目下，
@@ -3011,8 +3034,12 @@ function CreateTaskSheet({
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
   const [autoReport, setAutoReport] = React.useState(false); // R5: 完成后自动生成任务级报告;默认关
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
-  // 建任务时录入的凭据：落库到目标资产的 auth，执行者用 list_assets 读取。
-  const [creds, setCreds] = React.useState<CredentialRow[]>([]);
+  // 目标资产（行式，每行带凭据）。凭据落库到目标资产 auth，执行者用 list_assets 读取。
+  const [targetRaw, setTargetRaw] = React.useState("");
+  const [targetRows, setTargetRows] = React.useState<TargetCredRow[]>([]);
+  const [targetInvalid, setTargetInvalid] = React.useState<string[]>([]);
+  // 操作约束：自然语言经 LLM 编成 allow/deny，建任务时直接落 task_constraints。
+  const [constraintItems, setConstraintItems] = React.useState<ConstraintItem[]>([]);
   // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
   const [uploading, setUploading] = React.useState(false);
   const [uploadCount, setUploadCount] = React.useState(0);
@@ -3061,8 +3088,10 @@ function CreateTaskSheet({
   }
 
   async function createTask() {
-    if (!description.trim() || !goal.trim()) {
-      toast.error("请填写描述与目标");
+    const targets = rowsToTargets(targetRows);
+    const goalText = goal.trim() || (targets.length > 0 ? `对以下目标完成安全测试：\n${targets.join("\n")}` : "");
+    if (!description.trim() || !goalText) {
+      toast.error("请填写目的（描述）与目标");
       return;
     }
     if (sourceTaskIDs.length > MAX_SOURCE_TASKS) {
@@ -3078,7 +3107,7 @@ function CreateTaskSheet({
         categoryId: categoryID,
         projectId: projectID,
         description: description.trim(),
-        goal: goal.trim(),
+        goal: goalText,
         llmProfileIds: llmProfileIDs.map(Number),
         sourceTaskIds: sourceTaskIDs,
         companyIds: companyIDs,
@@ -3090,7 +3119,8 @@ function CreateTaskSheet({
         interceptRules: interceptRules
           .map((r) => ({ ...r, pattern: r.pattern.trim() }))
           .filter((r) => r.pattern !== ""),
-        credentials: credentialsToPayload(creds),
+        credentials: rowsToCredentials(targetRows),
+        constraints: constraintItems,
       });
       toast.success("任务已创建");
       setName("");
@@ -3098,6 +3128,10 @@ function CreateTaskSheet({
       setProjectID(undefined);
       setDescription("");
       setGoal("");
+      setTargetRaw("");
+      setTargetRows([]);
+      setTargetInvalid([]);
+      setConstraintItems([]);
       setSelectedTemplateID(null);
       setSourceTaskIDs([]);
       setCompanyIDs([]);
@@ -3108,7 +3142,6 @@ function CreateTaskSheet({
       setCoverageEnabled(true);
       setAutoReport(false);
       setInterceptRules([]);
-      setCreds([]);
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);
@@ -3122,11 +3155,13 @@ function CreateTaskSheet({
 
   return (
     <Sheet open={open} onOpenChange={setOpen}>
-      <SheetTrigger asChild>
-        <Button size="sm">
-          <PlusIcon /> 新建任务
-        </Button>
-      </SheetTrigger>
+      {!hideTrigger && (
+        <SheetTrigger asChild>
+          <Button size="sm">
+            <PlusIcon /> 新建任务
+          </Button>
+        </SheetTrigger>
+      )}
       {/* 45vw 宽的右侧抽屉:整屏高度可滚动,长表单不再受弹窗高度限制。窄屏退化为全宽。
             内容为 flex 列:头/脚固定,中间字段区 flex-1 独立滚动。 */}
       <SheetContent
@@ -3146,6 +3181,7 @@ function CreateTaskSheet({
               goal={goal}
               categoryID={categoryID}
               interceptRules={interceptRules}
+              constraints={constraintItems}
               selectedTemplateID={selectedTemplateID}
               onSelectedTemplateIDChange={setSelectedTemplateID}
               onApply={(template) => {
@@ -3153,6 +3189,9 @@ function CreateTaskSheet({
                 setGoal(template.goal);
                 setCategoryID(template.category_id ?? undefined);
                 setInterceptRules(template.intercept_rules ?? []);
+                setConstraintItems(
+                  (template.constraints ?? []).map((c) => ({ kind: c.kind, text: c.text })),
+                );
                 setUploadCount(0);
               }}
               portalContainer={sheetContentRef}
@@ -3204,11 +3243,11 @@ function CreateTaskSheet({
               <FieldDescription>可选，单个分类；用于任务列表筛选和归档，不影响 Agent 执行。</FieldDescription>
             </Field>
             <div className="grid gap-2">
-              <Label htmlFor="description">描述</Label>
+              <Label htmlFor="description">目的（描述 / 测试范围）</Label>
               <Textarea
                 id="description"
                 className="min-h-32"
-                placeholder="测试对象与背景，例如：测试 example.com 这个站点"
+                placeholder="这次测试要达成什么、背景与范围说明，例如：测试 example.com 这个站点"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
               />
@@ -3238,23 +3277,51 @@ function CreateTaskSheet({
                 </span>
               </div>
             </div>
+            <Field>
+              <FieldLabel>目标与凭据</FieldLabel>
+              <TargetCredentialEditor
+                rows={targetRows}
+                onChange={setTargetRows}
+                raw={targetRaw}
+                onRawChange={setTargetRaw}
+                invalid={targetInvalid}
+                onInvalidChange={setTargetInvalid}
+                onParsed={({ count, duplicate, invalid }) => {
+                  const bits = [`有效 ${count} 条`];
+                  if (duplicate) bits.push(`去重 ${duplicate} 条`);
+                  if (invalid) bits.push(`剔除 ${invalid} 条非法`);
+                  toast.success(bits.join("，"));
+                }}
+                disabled={creating}
+                rawRows={4}
+              />
+              <FieldDescription>
+                一行一个目标，行内填账号密码；同一目标多套口令点「＋」。凭据写入目标资产 auth，执行者用 list_assets 读取。
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>操作约束</FieldLabel>
+              <ConstraintEditor
+                items={constraintItems}
+                onChange={setConstraintItems}
+                targets={rowsToTargets(targetRows)}
+                disabled={creating}
+                rawRows={3}
+              />
+              <FieldDescription>
+                用自然语言写边界，点「解析」由模型编成 allow/deny；建任务时直接写入约束表。
+              </FieldDescription>
+            </Field>
             <div className="grid gap-2">
-              <Label htmlFor="goal">目标</Label>
+              <Label htmlFor="goal">目标说明（可选）</Label>
               <Textarea
                 id="goal"
-                className="min-h-32"
-                placeholder="要达成什么，例如：拿下后台管理权限、获取服务器权限"
+                className="min-h-24"
+                placeholder="要达成什么，例如：拿下后台管理权限、获取服务器权限。留空则按目标列表自动生成。"
                 value={goal}
                 onChange={(e) => setGoal(e.target.value)}
               />
             </div>
-            <Field>
-              <FieldLabel>凭据（可选）</FieldLabel>
-              <CredentialEditor value={creds} onChange={setCreds} targets={[]} />
-              <FieldDescription>
-                填了会写入目标资产的 auth 字段（执行者用 list_assets 可见）；不填不影响建任务。可指定适用目标，留空=全部。
-              </FieldDescription>
-            </Field>
             <Field>
               <FieldLabel htmlFor="source-tasks">关联任务</FieldLabel>
               <SourceTaskPicker

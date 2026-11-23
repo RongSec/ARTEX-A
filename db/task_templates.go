@@ -33,7 +33,9 @@ type TaskTemplate struct {
 	Goal           string                   `json:"goal"`
 	CategoryID     *int64                   `json:"category_id"`
 	InterceptRules []TaskInterceptRuleInput `json:"intercept_rules"`
-	CreatedAt      time.Time                `json:"created_at"`
+	// Constraints 模板自带的操作约束；应用模板时原样带进创建表单。
+	Constraints []ConstraintInput `json:"constraints"`
+	CreatedAt   time.Time         `json:"created_at"`
 	UpdatedAt      time.Time                `json:"updated_at"`
 }
 
@@ -44,6 +46,7 @@ type TaskTemplateInput struct {
 	Goal           string
 	CategoryID     *int64
 	InterceptRules []TaskInterceptRuleInput
+	Constraints    []ConstraintInput
 }
 
 // TaskTemplatePatch changes only fields flagged as set. Name/Description/Goal use
@@ -57,15 +60,26 @@ type TaskTemplatePatch struct {
 	SetCategoryID     bool
 	InterceptRules    []TaskInterceptRuleInput
 	SetInterceptRules bool
+	Constraints       []ConstraintInput
+	SetConstraints    bool
 }
 
-const taskTemplateCols = `id, name, nkey, description, goal, category_id, intercept_rules, created_at, updated_at`
+const taskTemplateCols = `id, name, nkey, description, goal, category_id, intercept_rules, constraints, created_at, updated_at`
 
 func scanTaskTemplate(row interface{ Scan(...any) error }) (TaskTemplate, error) {
 	var t TaskTemplate
-	var rulesRaw []byte
-	if err := row.Scan(&t.ID, &t.Name, &t.NKey, &t.Description, &t.Goal, &t.CategoryID, &rulesRaw, &t.CreatedAt, &t.UpdatedAt); err != nil {
+	var rulesRaw, constraintsRaw []byte
+	if err := row.Scan(&t.ID, &t.Name, &t.NKey, &t.Description, &t.Goal, &t.CategoryID, &rulesRaw, &constraintsRaw, &t.CreatedAt, &t.UpdatedAt); err != nil {
 		return t, err
+	}
+	t.Constraints = []ConstraintInput{}
+	if len(constraintsRaw) > 0 {
+		if err := json.Unmarshal(constraintsRaw, &t.Constraints); err != nil {
+			return t, err
+		}
+		if t.Constraints == nil {
+			t.Constraints = []ConstraintInput{}
+		}
 	}
 	t.InterceptRules = []TaskInterceptRuleInput{}
 	if len(rulesRaw) > 0 {
@@ -86,6 +100,43 @@ func marshalTemplateRules(rules []TaskInterceptRuleInput) ([]byte, error) {
 		rules = []TaskInterceptRuleInput{}
 	}
 	return json.Marshal(rules)
+}
+
+// normalizeTemplateConstraints 校验并去重模板约束（kind allow/deny、text 非空，
+// 去重按 kind+text；上限 100 条，防止把模板当约束仓库）。
+func normalizeTemplateConstraints(items []ConstraintInput) ([]ConstraintInput, error) {
+	out := make([]ConstraintInput, 0, len(items))
+	seen := map[string]bool{}
+	for _, it := range items {
+		kind := strings.ToLower(strings.TrimSpace(it.Kind))
+		text := strings.TrimSpace(it.Text)
+		if kind != "allow" && kind != "deny" {
+			return nil, fmt.Errorf("%w: constraint kind must be allow or deny", ErrTaskTemplateInvalid)
+		}
+		if text == "" {
+			continue
+		}
+		if utf8.RuneCountInString(text) > 200 {
+			return nil, fmt.Errorf("%w: constraint text exceeds 200 characters", ErrTaskTemplateInvalid)
+		}
+		key := kind + "\x00" + text
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, ConstraintInput{Kind: kind, Text: text})
+	}
+	if len(out) > 100 {
+		return nil, fmt.Errorf("%w: too many constraints (max 100)", ErrTaskTemplateInvalid)
+	}
+	return out, nil
+}
+
+func marshalTemplateConstraints(items []ConstraintInput) ([]byte, error) {
+	if items == nil {
+		items = []ConstraintInput{}
+	}
+	return json.Marshal(items)
 }
 
 // taskTemplateName normalizes display whitespace while preserving the user's case.
@@ -112,11 +163,16 @@ func normalizeTaskTemplateInput(in TaskTemplateInput) (TaskTemplateInput, string
 	case utf8.RuneCountInString(in.Goal) > MaxTaskTemplateTextRunes:
 		return in, "", fmt.Errorf("%w: goal exceeds %d characters", ErrTaskTemplateInvalid, MaxTaskTemplateTextRunes)
 	}
+	constraints, err := normalizeTemplateConstraints(in.Constraints)
+	if err != nil {
+		return in, "", err
+	}
+	in.Constraints = constraints
 	return in, taskTemplateNKey(in.Name), nil
 }
 
 func normalizeTaskTemplatePatch(patch TaskTemplatePatch) (TaskTemplatePatch, *string, error) {
-	if patch.Name == nil && patch.Description == nil && patch.Goal == nil && !patch.SetCategoryID && !patch.SetInterceptRules {
+	if patch.Name == nil && patch.Description == nil && patch.Goal == nil && !patch.SetCategoryID && !patch.SetInterceptRules && !patch.SetConstraints {
 		return patch, nil, fmt.Errorf("%w: no fields supplied", ErrTaskTemplateInvalid)
 	}
 	var nkey *string
@@ -131,6 +187,13 @@ func normalizeTaskTemplatePatch(patch TaskTemplatePatch) (TaskTemplatePatch, *st
 		key := taskTemplateNKey(name)
 		patch.Name = &name
 		nkey = &key
+	}
+	if patch.SetConstraints {
+		constraints, err := normalizeTemplateConstraints(patch.Constraints)
+		if err != nil {
+			return patch, nil, err
+		}
+		patch.Constraints = constraints
 	}
 	if patch.Description != nil {
 		description := strings.TrimSpace(*patch.Description)
@@ -170,11 +233,15 @@ func (d *DB) CreateTaskTemplate(in TaskTemplateInput) (*TaskTemplate, error) {
 	if err != nil {
 		return nil, err
 	}
+	constraintsJSON, err := marshalTemplateConstraints(in.Constraints)
+	if err != nil {
+		return nil, err
+	}
 	t, err := scanTaskTemplate(d.QueryRow(`
-INSERT INTO task_templates(name, nkey, description, goal, category_id, intercept_rules)
-VALUES ($1,$2,$3,$4,$5,$6)
+INSERT INTO task_templates(name, nkey, description, goal, category_id, intercept_rules, constraints)
+VALUES ($1,$2,$3,$4,$5,$6,$7)
 ON CONFLICT (nkey) DO NOTHING
-RETURNING `+taskTemplateCols, in.Name, nkey, in.Description, in.Goal, in.CategoryID, rulesJSON))
+RETURNING `+taskTemplateCols, in.Name, nkey, in.Description, in.Goal, in.CategoryID, rulesJSON, constraintsJSON))
 	if err == sql.ErrNoRows {
 		return nil, ErrTaskTemplateNameConflict
 	}
@@ -222,6 +289,7 @@ func (d *DB) UpdateTaskTemplate(id int64, in TaskTemplateInput) (*TaskTemplate, 
 	}
 	return d.PatchTaskTemplate(id, TaskTemplatePatch{
 		Name: &in.Name, Description: &in.Description, Goal: &in.Goal,
+		Constraints: in.Constraints, SetConstraints: true,
 	})
 }
 
@@ -237,13 +305,18 @@ func (d *DB) PatchTaskTemplate(id int64, patch TaskTemplatePatch) (*TaskTemplate
 	if err != nil {
 		return nil, err
 	}
+	constraintsJSON, err := marshalTemplateConstraints(patch.Constraints)
+	if err != nil {
+		return nil, err
+	}
 	t, err := scanTaskTemplate(d.QueryRow(`UPDATE task_templates
 SET name=CASE WHEN $2 THEN $3::text ELSE name END,
     nkey=CASE WHEN $2 THEN $4::text ELSE nkey END,
     description=CASE WHEN $5 THEN $6::text ELSE description END,
     goal=CASE WHEN $7 THEN $8::text ELSE goal END,
     category_id=CASE WHEN $9 THEN $10::bigint ELSE category_id END,
-    intercept_rules=CASE WHEN $11 THEN $12::jsonb ELSE intercept_rules END
+    intercept_rules=CASE WHEN $11 THEN $12::jsonb ELSE intercept_rules END,
+    constraints=CASE WHEN $13 THEN $14::jsonb ELSE constraints END
 WHERE id=$1
 RETURNING `+taskTemplateCols,
 		id,
@@ -252,6 +325,7 @@ RETURNING `+taskTemplateCols,
 		patch.Goal != nil, patch.Goal,
 		patch.SetCategoryID, patch.CategoryID,
 		patch.SetInterceptRules, rulesJSON,
+		patch.SetConstraints, constraintsJSON,
 	))
 	if err == sql.ErrNoRows {
 		return nil, ErrTaskTemplateNotFound

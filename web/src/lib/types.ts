@@ -58,6 +58,8 @@ export interface TaskTemplate {
   goal: string;
   category_id?: number | null; // 预设分类；null/缺省=无
   intercept_rules?: AssetInterceptRuleInput[]; // 预设的任务级拦截/允许规则
+  // 模板自带操作约束；应用模板时带进创建表单（可改后建任务）。
+  constraints?: { kind: "allow" | "deny"; text: string }[];
   created_at: string;
   updated_at: string;
 }
@@ -603,6 +605,7 @@ export interface FindingQuery {
   status?: "all" | FindingStatus;
   vulnclass?: string;
   task?: string; // 任务 id;"all"/空 = 不按任务筛选
+  project?: string; // 项目 id;"all"/空 = 不按项目筛选（经任务归属反查）
   query?: string;
   sort?: "severity" | "time";
   // 资产树节点 key;选中一个节点 = 选中它的整棵子树。空 = 不按资产筛选。

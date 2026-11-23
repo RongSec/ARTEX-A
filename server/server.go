@@ -815,6 +815,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/{id}/constraints", s.addConstraint)            // 约束管理:新增约束(不通知 planner)
 	mux.HandleFunc("PATCH /api/tasks/{id}/constraints/{cid}", s.editConstraint)    // 约束管理:修改约束
 	mux.HandleFunc("DELETE /api/tasks/{id}/constraints/{cid}", s.deleteConstraint) // 约束管理:删除约束
+	mux.HandleFunc("POST /api/constraints/parse", s.parseConstraints)              // 自然语言 → allow/deny 约束（建项目/建任务共用）
+	mux.HandleFunc("GET /api/projects/{id}/constraints", s.listProjectConstraints) // 项目级约束（批量下发时复制进任务）
+	mux.HandleFunc("PUT /api/projects/{id}/constraints", s.replaceProjectConstraints)
 	mux.HandleFunc("POST /api/tasks/{id}/control", s.control)
 	mux.HandleFunc("PUT /api/tasks/{id}/llm", s.updateTaskLLMProfiles)
 	mux.HandleFunc("GET /api/tasks/{id}/llm/resolution", s.taskLLMResolutionHandler)
@@ -982,11 +985,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mcp/{id}/tools", s.pgMCPTools)
 	mux.HandleFunc("POST /api/mcp/{id}/refresh", s.pgRefreshMCP)
 	// 资产同步 — ScopeSentry 数据源
-	mux.HandleFunc("GET /api/sync/scopesentry/status", s.syncSSStatus)
-	mux.HandleFunc("POST /api/sync/scopesentry/datasource", s.syncSSDatasource)
-	mux.HandleFunc("GET /api/sync/scopesentry/projects", s.syncSSProjects)
-	mux.HandleFunc("GET /api/sync/scopesentry/tasks", s.syncSSTasks)
-	mux.HandleFunc("POST /api/sync/scopesentry/sync", s.syncSSRun)
 	// Skill CRUD (文件系统)
 	mux.HandleFunc("GET /api/skills", s.fsListSkills)
 	mux.HandleFunc("POST /api/skills", s.fsCreateSkill)
@@ -1652,6 +1650,9 @@ type createTaskReq struct {
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 	// Credentials 建任务时录入的凭据（落库到目标资产 auth，agent 可读）。
 	Credentials []TaskCredentialInput `json:"credentials,omitempty"`
+	// Constraints 建任务时录入的操作约束（allow/deny）。落 task_constraints，
+	// 与 goals 拆解器随后抽取的条目并存（按 kind+text 去重）。
+	Constraints []db.ConstraintInput `json:"constraints,omitempty"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1740,6 +1741,13 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
+	// 手工/LLM 解析的操作约束先落库：goals 拆解器后台跑起来后会再抽一遍，
+	// 两者按 kind+text 去重，不会重复。
+	if n, err := s.m.PG().InsertTaskConstraints(t.ExpID, req.Constraints); err != nil {
+		log.Printf("[task] 写入操作约束失败 task=#%s: %v", t.ID, err)
+	} else if n > 0 {
+		log.Printf("[task] 已写入 %d 条操作约束 task=#%s", n, t.ID)
+	}
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
 	// 凭据按任务目标匹配后写进目标资产；目标解析不出来时 authItemsFor 返回空，

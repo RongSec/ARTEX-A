@@ -141,6 +141,10 @@ export default function FindingsPage() {
   const [status, setStatus] = React.useState<"all" | FindingStatus>("all");
   const [vulnclass, setVulnclass] = React.useState<string>("all");
   const [task, setTask] = React.useState<string>("all");
+  // 项目维度筛选（用户要求「发现能按项目查看」）：findings 无 project_id，
+  // 后端经任务归属反查；任务已删的发现不属于任何项目。
+  const [project, setProject] = React.useState<string>("all");
+  const [projectOptions, setProjectOptions] = React.useState<{ id: number; name: string }[]>([]);
   const [sort, setSort] = React.useState<"severity" | "time">("severity");
   const [search, setSearch] = React.useState("");
   const [query, setQuery] = React.useState("");
@@ -169,9 +173,14 @@ export default function FindingsPage() {
   const retestRefreshVersion = React.useRef(0);
   const [deepenDescription, setDeepenDescription] = React.useState("");
   const [deepening, setDeepening] = React.useState(false);
-  const filterFingerprint = JSON.stringify([severity, status, vulnclass, task, sort, query]);
+  const filterFingerprint = JSON.stringify([severity, status, vulnclass, task, project, sort, query]);
   const activeFilterFingerprint = React.useRef(filterFingerprint);
   activeFilterFingerprint.current = filterFingerprint;
+
+  // 项目筛选下拉的数据源；失败降级为空（只影响筛选项，不影响列表）。
+  React.useEffect(() => {
+    api.projects().then((r) => setProjectOptions(r.projects ?? [])).catch(() => setProjectOptions([]));
+  }, []);
 
   // 一个轻量请求覆盖所有行/视图，避免逐行拉取完整复测历史；等待上一轮完成再轮询。
   React.useEffect(() => {
@@ -295,7 +304,7 @@ export default function FindingsPage() {
       await api.exportFindings({
         format: exportFormat,
         scope: exportScope,
-        filters: { severity, status, vulnclass, task, query, sort },
+        filters: { severity, status, vulnclass, task, project, query, sort },
         ids: [...selectedIds],
       });
       setExportOpen(false);
@@ -337,6 +346,7 @@ export default function FindingsPage() {
         status,
         vulnclass,
         task,
+        project,
         query,
         sort,
         assetScope: activeAssetScope ?? undefined,
@@ -348,7 +358,7 @@ export default function FindingsPage() {
       // Polling keeps the last successful snapshot visible.
       setFlat((current) => ({ ...current, loading: false }));
     }
-  }, [activeAssetScope, filterFingerprint, flatPage, flatPageSize, severity, status, vulnclass, task, query, sort]);
+  }, [activeAssetScope, filterFingerprint, flatPage, flatPageSize, severity, status, vulnclass, task, project, query, sort]);
 
   // loadAssetTree 取整棵资产树。树不随选中节点变化(否则选一下就塌成一条链),
   // 所以这里不带 assetScope。
@@ -358,7 +368,7 @@ export default function FindingsPage() {
     const request = ++assetTreeRequest.current;
     setAssetTree((current) => ({ ...current, loading: true }));
     try {
-      const result = await api.findingAssetTree({ severity, status, vulnclass, task, query, sort });
+      const result = await api.findingAssetTree({ severity, status, vulnclass, task, project, query, sort });
       if (request !== assetTreeRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setAssetTree({
         nodes: result.nodes ?? [],
@@ -373,7 +383,7 @@ export default function FindingsPage() {
       setAssetTree((current) => ({ ...current, loading: false }));
       toast.error(`资产树加载失败：${(e as Error).message}`);
     }
-  }, [filterFingerprint, severity, status, vulnclass, task, query, sort]);
+  }, [filterFingerprint, severity, status, vulnclass, task, project, query, sort]);
 
   const refreshGroups = React.useCallback(async () => {
     const requestFilter = filterFingerprint;
@@ -387,6 +397,7 @@ export default function FindingsPage() {
         status,
         vulnclass,
         task,
+        project,
         query,
         sort,
       });
@@ -397,7 +408,7 @@ export default function FindingsPage() {
     } catch {
       // Polling keeps the last successful snapshot visible.
     }
-  }, [filterFingerprint, page, pageSize, severity, status, vulnclass, task, query, sort]);
+  }, [filterFingerprint, page, pageSize, severity, status, vulnclass, task, project, query, sort]);
 
   const loadGroup = React.useCallback(
     async (key: string, groupPage: number, groupPageSize: number) => {
@@ -1063,6 +1074,22 @@ export default function FindingsPage() {
               {stats.vulnclasses.map((vc) => (
                 <SelectItem key={vc} value={vc}>
                   {vc}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          <Select value={project} onValueChange={setProject}>
+            <SelectTrigger size="sm" className="w-44">
+              <SelectValue placeholder="项目" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部项目</SelectItem>
+              {projectOptions.map((p) => (
+                <SelectItem key={p.id} value={String(p.id)}>
+                  <span className="max-w-[16rem] truncate" title={p.name}>
+                    {p.name}
+                  </span>
                 </SelectItem>
               ))}
             </SelectContent>

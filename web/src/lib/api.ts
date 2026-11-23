@@ -25,6 +25,7 @@ import type {
   BuiltinInterceptRule,
   PlatformScope,
   TaskCredentialPayload,
+  TaskConstraint,
   ChatAttachment,
   CommandRecord,
   Company,
@@ -115,7 +116,6 @@ import type {
   TaskAssetMutation,
   TaskAssetScopeMutation,
   TaskCategory,
-  TaskConstraint,
   TaskGoal,
   TaskLLMResolutions,
   TaskIntelResp,
@@ -343,6 +343,7 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   if (q.status && q.status !== "all") p.set("status", q.status);
   if (q.vulnclass && q.vulnclass !== "all") p.set("vulnclass", q.vulnclass);
   if (q.task && q.task !== "all") p.set("task_id", q.task);
+  if (q.project && q.project !== "all") p.set("project_id", q.project);
   if (q.query?.trim()) p.set("q", q.query.trim());
   if (q.sort) p.set("sort", q.sort);
   if (q.assetScope) p.set("asset_scope", q.assetScope);
@@ -388,6 +389,8 @@ export const api = {
     interceptRules?: AssetInterceptRuleInput[];
     /** 建任务时录入的凭据；落库到目标资产 auth。 */
     credentials?: TaskCredentialPayload[];
+    /** 建任务时录入的操作约束（allow/deny）。 */
+    constraints?: { kind: "allow" | "deny"; text: string }[];
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
@@ -405,6 +408,7 @@ export const api = {
       auto_report: input.autoReport ?? false, // R5:完成后自动生成任务级报告;默认关
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
       credentials: input.credentials ?? [], // 建任务时录入的凭据（落目标资产 auth）
+      constraints: input.constraints ?? [], // 建任务时录入的操作约束（落 task_constraints）
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
@@ -423,11 +427,11 @@ export const api = {
     }),
   taskTemplates: () => get<{ templates: TaskTemplate[] }>("/task-templates").then((r) => arr(r.templates)),
   createTaskTemplate: (
-    input: Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">,
+    input: Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules" | "constraints">,
   ) => post<TaskTemplate>("/task-templates", input),
   updateTaskTemplate: (
     id: number,
-    input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">>,
+    input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules" | "constraints">>,
   ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
   deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
   updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>
@@ -1544,9 +1548,21 @@ export const api = {
         coverage_enabled?: boolean;
         /** 本批凭据池；每条可带 target 指定适用目标，留空=全部目标。 */
         credentials?: TaskCredentialPayload[];
+        /** 本批任务的操作约束；项目级约束后端另行自动复制。 */
+        constraints?: { kind: "allow" | "deny"; text: string }[];
       };
     },
   ) => post<BatchTasksResult>(`/projects/${id}/batch-tasks`, input),
+  // ---- V12-CREATE-UNIFY：约束（自然语言 → allow/deny；项目级默认边界）----
+  parseConstraints: (input: { text: string; targets?: string[]; llm_profile_id?: number }) =>
+    post<{ constraints: { kind: "allow" | "deny"; text: string }[] }>("/constraints/parse", input),
+  projectConstraints: (id: number | string) =>
+    get<{ constraints: TaskConstraint[] }>(`/projects/${id}/constraints`),
+  setProjectConstraints: (
+    id: number | string,
+    constraints: { kind: "allow" | "deny"; text: string }[],
+  ) => put<{ constraints: TaskConstraint[] }>(`/projects/${id}/constraints`, { constraints }),
+
   // ---- V10-INTEL 漏洞情报（NVD + CISA KEV 公开源）----
   intelStatus: () => get<VulnIntelStatus>("/intel/status"),
   intelSearch: (p: { q?: string; kev?: boolean; minCvss?: number; since?: string; limit?: number; offset?: number }) => {
