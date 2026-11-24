@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/llm"
@@ -25,16 +26,20 @@ const constraintParsePrompt = `你是渗透测试「操作约束」抽取器。�
 请把它拆成结构化的操作约束条目。
 
 约束只有两种：
-- allow：明确允许 / 限定在某个范围（例：「只允许被动侦察」「仅测 443 端口」）。
-- deny：明确禁止做某类操作（例：「禁止爆破」「不得删改生产数据」「不扫其他端口」）。
+- allow：允许 / 限定做某类操作（例：「被动侦察」「仅测 443 端口」「仅修改自身新增的内容」）。
+- deny：禁止做某类操作（例：「密码爆破」「修改目标系统已有数据」「扫描 443 以外的端口」）。
 
 规则：
 1. 只抽取用户**明确写出或强调**的要求，严禁臆造。没有约束就返回空数组。
-2. 用**通用表述**指代测试对象，不要写具体 IP / 域名 / 主机名 / URL，统一写「目标」「目标主机」。
-   约束会随任务下发，落到哪个目标上就指哪个目标；端口、协议、路径这类与资产无关的限定可以保留具体值。
-3. 约束是操作边界，不是测试步骤、不是目标、不是漏洞类型。
-4. 同义合并；最多 30 条；每条一句话，不超过 80 字。
-5. 输出**严格 JSON**，不要 Markdown 代码块、不要解释：
+2. text 只写**动作本身**，一律用肯定式；禁止/允许的极性由 kind 表达，不要重复表达。
+   text 里禁止出现「不允许 / 禁止 / 不得 / 不能 / 不要 / 严禁 / 切勿 / 请勿」等否定词。
+   反例：{"kind":"deny","text":"不允许直连目标数据库"}（读起来是「禁止 不允许…」，双重否定）
+   正例：{"kind":"deny","text":"直连目标数据库"}
+3. 用**通用表述**指代测试对象，不要写具体 IP / 域名 / 主机名 / URL，统一写「资产」「目标资产」。
+   约束会随任务下发，落到哪个资产上就指哪个资产；端口、协议、路径这类与资产无关的限定可以保留具体值。
+4. 约束是操作边界，不是测试步骤、不是目标、不是漏洞类型。
+5. 同义合并；最多 30 条；每条一句话，不超过 80 字。
+6. 输出**严格 JSON**，不要 Markdown 代码块、不要解释：
 {"constraints":[{"kind":"allow","text":"..."},{"kind":"deny","text":"..."}]}`
 
 type constraintParseReq struct {
@@ -114,6 +119,10 @@ func decodeConstraintJSON(out string) ([]db.ConstraintInput, error) {
 		if (kind != "allow" && kind != "deny") || text == "" {
 			continue
 		}
+		text = stripConstraintNegation(text)
+		if text == "" {
+			continue
+		}
 		key := kind + "\x00" + text
 		if seen[key] {
 			continue
@@ -122,6 +131,29 @@ func decodeConstraintJSON(out string) ([]db.ConstraintInput, error) {
 		items = append(items, db.ConstraintInput{Kind: kind, Text: text})
 	}
 	return items, nil
+}
+
+// constraintNegationPrefixes 是 deny 条目里多余的否定前缀。kind 已经表达了
+// 「禁止」，text 再写「不允许…」在界面上会读成「禁止 不允许…」= 双重否定。
+// 只剥开头一层，句中/条件从句不动（「无法回滚时不允许新增」不能被机械改写）。
+var constraintNegationPrefixes = []string{
+	"不允许", "禁止", "严禁", "不得", "不能", "不要", "不可", "切勿", "请勿", "不准", "不许",
+}
+
+// stripConstraintNegation 去掉条目开头的否定词，保留后面的动作短语。
+// 剥完过短（<2 字）或本来就是肯定式时原样返回。
+func stripConstraintNegation(text string) string {
+	for _, prefix := range constraintNegationPrefixes {
+		if !strings.HasPrefix(text, prefix) {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(text, prefix))
+		if utf8.RuneCountInString(rest) < 2 {
+			return text
+		}
+		return rest
+	}
+	return text
 }
 
 // errNoJSON 是「输出里完全没有 JSON 结构」的哨兵，调用方转 502。

@@ -3,13 +3,13 @@
 // 目标 + 凭据行式编辑器（V12-CREATE-UNIFY）。
 //
 // 交互（按用户口径）：
-//   1) 上方大文本框粘贴所有目标（可混 URL/IP/IP:port/CIDR/域名，一行或逗号分隔）；
-//   2) 点「解析」按与后端同语义的 parseTargets 清洗 → 下方一行一个有效目标；
-//   3) 每行默认跟「用户名 + 密码」两个输入位；同一目标有多套口令时点行尾「＋」
-//      再复制一行该目标（target 相同、凭据不同）；
+//   1) 上方大文本框粘贴所有资产（可混 URL/IP/IP:port/CIDR/域名，一行或逗号分隔）；
+//   2) 点「解析」按与后端同语义的 parseTargets 清洗 → 下方一行一个有效资产；
+//   3) 每行默认跟「用户名 + 密码」两个输入位；同一资产有多套口令时点行尾「＋」
+//      再复制一行该资产（target 相同、凭据不同）；
 //   4) 行尾垃圾桶删除这一条凭据行。
 //
-// 提交时：目标列表 = 行内 target 去重；凭据 = 每行一条 {target,type:password,...}。
+// 提交时：资产列表 = 行内 target 去重；凭据 = 每行一条 {target,type:password,...}。
 // 项目创建与任务创建共用，保证两边口径一致。
 
 import * as React from "react";
@@ -29,7 +29,7 @@ export interface TargetCredRow {
 
 export const EMPTY_TARGET_ROW: TargetCredRow = { target: "", username: "", password: "" };
 
-/** rowsToTargets 返回去重后的目标列表（保持首次出现顺序）。 */
+/** rowsToTargets 返回去重后的资产列表（保持首次出现顺序）。 */
 export function rowsToTargets(rows: TargetCredRow[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
@@ -40,6 +40,11 @@ export function rowsToTargets(rows: TargetCredRow[]): string[] {
     out.push(t);
   }
   return out;
+}
+
+/** rowsFromTargets 把一段资产文本解析成行（模板预置资产带出用，无凭据）。 */
+export function rowsFromTargets(text: string): TargetCredRow[] {
+  return parseTargets(text).targets.map((t) => ({ ...EMPTY_TARGET_ROW, target: t }));
 }
 
 /** rowsToCredentials 转成后端 credentials 入参（丢掉没填任何凭据的行）。 */
@@ -57,7 +62,7 @@ export function rowsToCredentials(rows: TargetCredRow[]) {
 interface Props {
   rows: TargetCredRow[];
   onChange: (rows: TargetCredRow[]) => void;
-  /** 目标文本域的内容（受控，方便提交前再解析一次）。 */
+  /** 资产文本域的内容（受控，方便提交前再解析一次）。 */
   raw: string;
   onRawChange: (raw: string) => void;
   /** 解析后被剔除的行（展示给用户看，空数组不渲染）。 */
@@ -68,6 +73,8 @@ interface Props {
   disabled?: boolean;
   /** 文本框行数，默认 6。 */
   rawRows?: number;
+  /** 外层已有「资产」标题时置 true，避免标题重复（计数与解析按钮保留）。 */
+  hideLabel?: boolean;
 }
 
 // TargetCredentialEditor 是受控组件：raw 文本与 rows 都归父组件，避免「解析后
@@ -83,11 +90,12 @@ export function TargetCredentialEditor({
   onParsed,
   disabled,
   rawRows = 6,
+  hideLabel,
 }: Props) {
   function runParse() {
     const r = parseTargets(raw);
     onInvalidChange?.(r.invalid);
-    // 保留按 target 匹配到的旧凭据（多账号行也保留），其余按新目标重建。
+    // 保留按 target 匹配到的旧凭据（多账号行也保留），其余按新资产重建。
     const byTarget = new Map<string, TargetCredRow[]>();
     for (const row of rows) {
       const t = row.target.trim();
@@ -110,7 +118,7 @@ export function TargetCredentialEditor({
     onChange(rows.map((row, idx) => (idx === i ? { ...row, ...next } : row)));
   }
 
-  // 同一目标多账号：复制当前行的 target，凭据留空。
+  // 同一资产多账号：复制当前行的 target，凭据留空。
   function addSameTarget(i: number) {
     const t = rows[i]?.target.trim() ?? "";
     const next = [...rows];
@@ -125,10 +133,14 @@ export function TargetCredentialEditor({
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-center justify-between gap-3">
-        <Label htmlFor="target-cred-raw">目标</Label>
+        {hideLabel ? (
+          <span />
+        ) : (
+          <Label htmlFor="target-cred-raw">资产</Label>
+        )}
         <div className="flex items-center gap-2">
           <span className="text-muted-foreground text-xs tabular-nums">
-            {rowsToTargets(rows).length > 0 ? `${rowsToTargets(rows).length} 个目标` : "粘贴后点解析"}
+            {rowsToTargets(rows).length > 0 ? `${rowsToTargets(rows).length} 个资产` : "粘贴后点解析"}
           </span>
           <Button
             type="button"
@@ -147,7 +159,7 @@ export function TargetCredentialEditor({
         id="target-cred-raw"
         rows={rawRows}
         className="font-mono text-sm"
-        placeholder={"粘贴所有目标，再点「解析」：\nhttp://target-a.example.com\n10.0.0.5\n10.0.0.6:8080\n10.0.0.0/24"}
+        placeholder={"粘贴所有资产，再点「解析」：\nhttp://target-a.example.com\n10.0.0.5\n10.0.0.6:8080\n10.0.0.0/24"}
         value={raw}
         onChange={(e) => onRawChange(e.target.value)}
         disabled={disabled}
@@ -164,12 +176,12 @@ export function TargetCredentialEditor({
 
       {rows.length === 0 ? (
         <div className="text-muted-foreground rounded-md border border-dashed px-3 py-4 text-center text-xs">
-          解析后这里一行一个目标，每行填账号密码；同一目标多套口令点行尾「＋」。
+          解析后这里一行一个资产，每行填账号密码；同一资产多套口令点行尾「＋」。
         </div>
       ) : (
         <div className="flex flex-col gap-1.5">
           <div className="text-muted-foreground grid grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)_minmax(0,1fr)_2rem_2rem] gap-1.5 px-0.5 text-[11px]">
-            <span>目标</span>
+            <span>资产</span>
             <span>用户名</span>
             <span>密码</span>
             <span />
@@ -181,7 +193,7 @@ export function TargetCredentialEditor({
               className="grid grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)_minmax(0,1fr)_2rem_2rem] items-center gap-1.5"
             >
               <Input
-                aria-label="目标"
+                aria-label="资产"
                 className="h-8 font-mono text-xs"
                 placeholder="10.0.0.5 / https://a.example.com"
                 value={row.target}
@@ -208,8 +220,8 @@ export function TargetCredentialEditor({
                 type="button"
                 size="sm"
                 variant="ghost"
-                aria-label="同一目标新增一条凭据"
-                title="同一目标再加一套账号密码"
+                aria-label="同一资产新增一条凭据"
+                title="同一资产再加一套账号密码"
                 className="h-8 w-8 p-0"
                 onClick={() => addSameTarget(i)}
                 disabled={disabled}

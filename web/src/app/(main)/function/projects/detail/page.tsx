@@ -357,7 +357,7 @@ function TasksTab({ tasks, onChanged }: { tasks: Task[]; onChanged: () => void }
             <DatabaseIcon />
           </EmptyMedia>
           <EmptyTitle>项目下还没有任务</EmptyTitle>
-          <EmptyDescription>用右上角「批量下发」贴一行一个目标创建任务。</EmptyDescription>
+          <EmptyDescription>用右上角「批量下发」贴一行一个资产创建任务。</EmptyDescription>
         </EmptyHeader>
       </Empty>
     );

@@ -5,7 +5,7 @@
 //
 // 设计口径：
 //   - 项目行 = 原来的项目列表元素（名称/状态/任务数/排队/漏洞分档/并发/负责人/操作）；
-//   - 任务行 = 原任务列表的核心元素（名称或描述/状态/目标进度/漏洞/队列/最近活动/操作）；
+//   - 任务行 = 原任务列表的核心元素（名称或目的/状态/目标进度/漏洞/队列/最近活动/操作）；
 //   - 顶部同时给「新建项目」「新建任务」，两边共用创建表单的四段口径；
 //   - 未归属任务（project_id 为空）单独一组「未分组」兜底，不丢任务。
 
@@ -227,7 +227,7 @@ export function ProjectTaskTree({
               <TableHead className="w-8" />
               <TableHead className="min-w-64">名称</TableHead>
               <TableHead className="w-24">状态</TableHead>
-              <TableHead className="w-28 text-center">目标 / 任务</TableHead>
+              <TableHead className="w-28 text-center">资产 / 任务</TableHead>
               <TableHead className="w-28 text-center">漏洞（严/高/中/低）</TableHead>
               <TableHead className="w-24 text-center">队列</TableHead>
               <TableHead className="w-32">更新</TableHead>
@@ -238,7 +238,7 @@ export function ProjectTaskTree({
             {rows.length === 0 && (
               <TableRow>
                 <TableCell colSpan={8} className="text-muted-foreground py-10 text-center text-sm">
-                  {loading ? "加载中…" : q ? "没有匹配的项目或任务" : "还没有项目。点「新建项目」贴目标批量下发，或先建一个任务。"}
+                  {loading ? "加载中…" : q ? "没有匹配的项目或任务" : "还没有项目。点「新建项目」贴资产批量下发，或先建一个任务。"}
                 </TableCell>
               </TableRow>
             )}

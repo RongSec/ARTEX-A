@@ -26,23 +26,27 @@ var (
 // TaskTemplate is a reusable task preset (description/goal + optional category
 // and task-level intercept/allow rules).
 type TaskTemplate struct {
-	ID             int64                    `json:"id"`
-	Name           string                   `json:"name"`
-	NKey           string                   `json:"-"`
-	Description    string                   `json:"description"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	NKey        string `json:"-"`
+	Description string `json:"description"`
+	// Targets 模板预置的资产清单（一行一个 URL/IP/域名/CIDR）。应用模板时
+	// 原样填进任务创建的资产框，用户仍可增删后解析。
+	Targets        string                   `json:"targets"`
 	Goal           string                   `json:"goal"`
 	CategoryID     *int64                   `json:"category_id"`
 	InterceptRules []TaskInterceptRuleInput `json:"intercept_rules"`
 	// Constraints 模板自带的操作约束；应用模板时原样带进创建表单。
 	Constraints []ConstraintInput `json:"constraints"`
 	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt      time.Time                `json:"updated_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
 // TaskTemplateInput is the create/update payload after normalization.
 type TaskTemplateInput struct {
 	Name           string
 	Description    string
+	Targets        string
 	Goal           string
 	CategoryID     *int64
 	InterceptRules []TaskInterceptRuleInput
@@ -55,6 +59,7 @@ type TaskTemplateInput struct {
 type TaskTemplatePatch struct {
 	Name              *string
 	Description       *string
+	Targets           *string
 	Goal              *string
 	CategoryID        *int64
 	SetCategoryID     bool
@@ -64,12 +69,12 @@ type TaskTemplatePatch struct {
 	SetConstraints    bool
 }
 
-const taskTemplateCols = `id, name, nkey, description, goal, category_id, intercept_rules, constraints, created_at, updated_at`
+const taskTemplateCols = `id, name, nkey, description, targets, goal, category_id, intercept_rules, constraints, created_at, updated_at`
 
 func scanTaskTemplate(row interface{ Scan(...any) error }) (TaskTemplate, error) {
 	var t TaskTemplate
 	var rulesRaw, constraintsRaw []byte
-	if err := row.Scan(&t.ID, &t.Name, &t.NKey, &t.Description, &t.Goal, &t.CategoryID, &rulesRaw, &constraintsRaw, &t.CreatedAt, &t.UpdatedAt); err != nil {
+	if err := row.Scan(&t.ID, &t.Name, &t.NKey, &t.Description, &t.Targets, &t.Goal, &t.CategoryID, &rulesRaw, &constraintsRaw, &t.CreatedAt, &t.UpdatedAt); err != nil {
 		return t, err
 	}
 	t.Constraints = []ConstraintInput{}
@@ -168,6 +173,10 @@ func normalizeTaskTemplateInput(in TaskTemplateInput) (TaskTemplateInput, string
 		return in, "", err
 	}
 	in.Constraints = constraints
+	in.Targets = strings.TrimSpace(in.Targets)
+	if utf8.RuneCountInString(in.Targets) > MaxTaskTemplateTextRunes {
+		return in, "", fmt.Errorf("%w: targets exceeds %d characters", ErrTaskTemplateInvalid, MaxTaskTemplateTextRunes)
+	}
 	return in, taskTemplateNKey(in.Name), nil
 }
 
@@ -195,6 +204,13 @@ func normalizeTaskTemplatePatch(patch TaskTemplatePatch) (TaskTemplatePatch, *st
 		}
 		patch.Constraints = constraints
 	}
+	if patch.Targets != nil {
+		targets := strings.TrimSpace(*patch.Targets)
+		if utf8.RuneCountInString(targets) > MaxTaskTemplateTextRunes {
+			return patch, nil, fmt.Errorf("%w: targets exceeds %d characters", ErrTaskTemplateInvalid, MaxTaskTemplateTextRunes)
+		}
+		patch.Targets = &targets
+	}
 	if patch.Description != nil {
 		description := strings.TrimSpace(*patch.Description)
 		if description == "" {
@@ -206,10 +222,8 @@ func normalizeTaskTemplatePatch(patch TaskTemplatePatch) (TaskTemplatePatch, *st
 		patch.Description = &description
 	}
 	if patch.Goal != nil {
+		// 目标说明可空：留空时任务侧按资产生成，与任务创建口径一致。
 		goal := strings.TrimSpace(*patch.Goal)
-		if goal == "" {
-			return patch, nil, fmt.Errorf("%w: goal is required", ErrTaskTemplateInvalid)
-		}
 		if utf8.RuneCountInString(goal) > MaxTaskTemplateTextRunes {
 			return patch, nil, fmt.Errorf("%w: goal exceeds %d characters", ErrTaskTemplateInvalid, MaxTaskTemplateTextRunes)
 		}
@@ -238,10 +252,10 @@ func (d *DB) CreateTaskTemplate(in TaskTemplateInput) (*TaskTemplate, error) {
 		return nil, err
 	}
 	t, err := scanTaskTemplate(d.QueryRow(`
-INSERT INTO task_templates(name, nkey, description, goal, category_id, intercept_rules, constraints)
-VALUES ($1,$2,$3,$4,$5,$6,$7)
+INSERT INTO task_templates(name, nkey, description, targets, goal, category_id, intercept_rules, constraints)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 ON CONFLICT (nkey) DO NOTHING
-RETURNING `+taskTemplateCols, in.Name, nkey, in.Description, in.Goal, in.CategoryID, rulesJSON, constraintsJSON))
+RETURNING `+taskTemplateCols, in.Name, nkey, in.Description, in.Targets, in.Goal, in.CategoryID, rulesJSON, constraintsJSON))
 	if err == sql.ErrNoRows {
 		return nil, ErrTaskTemplateNameConflict
 	}
@@ -288,7 +302,7 @@ func (d *DB) UpdateTaskTemplate(id int64, in TaskTemplateInput) (*TaskTemplate, 
 		return nil, err
 	}
 	return d.PatchTaskTemplate(id, TaskTemplatePatch{
-		Name: &in.Name, Description: &in.Description, Goal: &in.Goal,
+		Name: &in.Name, Description: &in.Description, Targets: &in.Targets, Goal: &in.Goal,
 		Constraints: in.Constraints, SetConstraints: true,
 	})
 }
@@ -316,7 +330,8 @@ SET name=CASE WHEN $2 THEN $3::text ELSE name END,
     goal=CASE WHEN $7 THEN $8::text ELSE goal END,
     category_id=CASE WHEN $9 THEN $10::bigint ELSE category_id END,
     intercept_rules=CASE WHEN $11 THEN $12::jsonb ELSE intercept_rules END,
-    constraints=CASE WHEN $13 THEN $14::jsonb ELSE constraints END
+    constraints=CASE WHEN $13 THEN $14::jsonb ELSE constraints END,
+    targets=CASE WHEN $15 THEN $16::text ELSE targets END
 WHERE id=$1
 RETURNING `+taskTemplateCols,
 		id,
@@ -326,6 +341,7 @@ RETURNING `+taskTemplateCols,
 		patch.SetCategoryID, patch.CategoryID,
 		patch.SetInterceptRules, rulesJSON,
 		patch.SetConstraints, constraintsJSON,
+		patch.Targets != nil, patch.Targets,
 	))
 	if err == sql.ErrNoRows {
 		return nil, ErrTaskTemplateNotFound

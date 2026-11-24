@@ -38,7 +38,7 @@ interface ProjectBatchTasksProps {
   onDone: () => void;
 }
 
-// 批量下发卡（项目详情用）：目标 + 凭据行式录入、操作约束、任务参数。
+// 批量下发卡（项目详情用）：资产 + 凭据行式录入、操作约束、任务参数。
 // 与「新建项目」「新建任务」共用同一套编辑器，口径一致。
 export function ProjectBatchTasks({ projectID, concurrency, defaultTemplateID, onDone }: ProjectBatchTasksProps) {
   const [open, setOpen] = React.useState(false);
@@ -102,11 +102,11 @@ export function ProjectBatchTasks({ projectID, concurrency, defaultTemplateID, o
 
   async function submit() {
     if (willCreate === 0) {
-      toast.error("请至少填写一个有效目标");
+      toast.error("请至少填写一个有效资产");
       return;
     }
     if (willCreate > MAX_BATCH) {
-      toast.error(`单批最多 ${MAX_BATCH} 个目标（当前 ${willCreate} 个）`);
+      toast.error(`单批最多 ${MAX_BATCH} 个资产（当前 ${willCreate} 个）`);
       return;
     }
     const conc = Number(concurrencyOverride);
@@ -247,16 +247,16 @@ export function ProjectBatchTasks({ projectID, concurrency, defaultTemplateID, o
             />
             {template && (
               <p className="text-muted-foreground -mt-2 text-xs">
-                已带出模板「{template.name}」；模板里的目标不会覆盖左侧列表（批量以每行目标为准）。
+                已带出模板「{template.name}」；模板里的资产不会覆盖左侧列表（批量以每行资产为准）。
               </p>
             )}
 
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div className="grid gap-2">
-                <Label htmlFor="batch-desc">目的模板（{"{target}"}=每行目标）</Label>
+                <Label htmlFor="batch-desc">目的模板（{"{target}"}=每行资产）</Label>
                 <Input
                   id="batch-desc"
-                  placeholder="目标：{target}"
+                  placeholder="资产：{target}"
                   value={descTemplate}
                   onChange={(e) => setDescTemplate(e.target.value)}
                 />

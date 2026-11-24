@@ -48,6 +48,7 @@ import { TaskTemplateControls } from "@/components/task-template-controls";
 import {
   TargetCredentialEditor,
   EMPTY_TARGET_ROW,
+  rowsFromTargets,
   rowsToCredentials,
   rowsToTargets,
   type TargetCredRow,
@@ -166,7 +167,7 @@ function CreateProjectDialog({
   onCreated: () => void;
 }) {
   const [name, setName] = React.useState("");
-  // 目的 = 这次测试要达成什么；目标 = 资产列表（行式，含凭据）；约束 = allow/deny。
+  // 目的 = 这次测试要达成什么；资产 = URL/IP 清单（行式，含凭据）；约束 = allow/deny。
   const [purpose, setPurpose] = React.useState("");
   const [targetRaw, setTargetRaw] = React.useState("");
   const [targetRows, setTargetRows] = React.useState<TargetCredRow[]>([]);
@@ -220,7 +221,7 @@ function CreateProjectDialog({
       return;
     }
     if (targetList.length > 200) {
-      toast.error(`单批最多 200 个目标（当前 ${targetList.length} 个），请分批下发`);
+      toast.error(`单批最多 200 个资产（当前 ${targetList.length} 个），请分批下发`);
       return;
     }
     setSaving(true);
@@ -246,7 +247,7 @@ function CreateProjectDialog({
         }
       }
       toast.success(`项目已创建：${p.name}`);
-      // 有目标就顺手下发首轮批量：项目与任务一次成型，不用再进详情页贴一遍。
+      // 有资产就顺手下发首轮批量：项目与任务一次成型，不用再进详情页贴一遍。
       // 批量失败不回滚项目——项目已经建好，用户可在详情页重新下发。
       const willCreate = targetList.length;
       if (willCreate > 0) {
@@ -258,7 +259,7 @@ function CreateProjectDialog({
               category_id: null,
               credentials: rowsToCredentials(targetRows),
               constraints: constraintItems,
-              desc_template: purpose.trim() ? `${purpose.trim()}\n目标：{target}` : undefined,
+              desc_template: purpose.trim() ? `${purpose.trim()}\n资产：{target}` : undefined,
             },
           });
           const createdN = r.created?.length ?? 0;
@@ -303,7 +304,7 @@ function CreateProjectDialog({
             />
           </div>
 
-          {/* 目标 + 凭据：粘贴 → 解析 → 一行一个目标，每行带账号密码。 */}
+          {/* 资产 + 凭据：粘贴 → 解析 → 一行一个资产，每行带账号密码。 */}
           <div className="rounded-lg border p-3">
             <TargetCredentialEditor
               rows={targetRows}
@@ -362,18 +363,23 @@ function CreateProjectDialog({
               description=""
               goal=""
               constraints={constraintItems}
+              targets={targetRaw}
               selectedTemplateID={taskTemplateID}
               onSelectedTemplateIDChange={setTaskTemplateID}
               onApply={(t) => {
                 if (t.constraints?.length) {
                   setConstraintItems(t.constraints.map((c) => ({ kind: c.kind, text: c.text })));
                 }
+                // 模板资产填进项目资产框：批量下发以这里的资产为准。
+                setTargetRaw(t.targets ?? "");
+                setTargetRows(rowsFromTargets(t.targets ?? ""));
+                setTargetInvalid([]);
               }}
               hint="作为本项目的默认任务模板：批量下发时自动带出，可在那时再改。只存引用，不复制模板内容。"
             />
           </div>
 
-          {/* 初始目标 + 凭据已在上面按行式录入，这里不再重复。 */}
+          {/* 初始资产 + 凭据已在上面按行式录入，这里不再重复。 */}
           <div className="grid gap-3 rounded-lg border p-3">
             <label className="flex items-center justify-between gap-3 text-sm">
               <span>跨任务阅读者（项目内）</span>

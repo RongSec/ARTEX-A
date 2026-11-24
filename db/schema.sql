@@ -633,6 +633,9 @@ ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS intercept_rules JSONB NOT NU
 -- V12-CREATE-UNIFY：模板也带操作约束（与 project_constraints 同构），应用模板时
 -- 原样灌进任务创建表单，用户可改后再建任务。
 ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS constraints JSONB NOT NULL DEFAULT '[]';
+-- V12-ASSET-TERM：模板预置资产清单（一行一个 URL/IP/域名/CIDR）。应用模板时
+-- 填进任务创建的资产框，与「目的」「目标说明」分开，避免把资产当成目标语义。
+ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS targets TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_task_templates_updated ON task_templates(updated_at DESC, id DESC);
 DROP TRIGGER IF EXISTS trg_task_templates_upd ON task_templates;
 CREATE TRIGGER trg_task_templates_upd BEFORE UPDATE ON task_templates

@@ -40,6 +40,7 @@ import { cn } from "@/lib/utils";
 interface TemplateDraft {
   name: string;
   description: string;
+  targets: string;
   goal: string;
   categoryID: number | null;
   interceptRules: AssetInterceptRuleInput[];
@@ -47,7 +48,7 @@ interface TemplateDraft {
 }
 
 // TemplateSeed 是「另存为模板」时从创建表单带入的初值。
-type TemplateSeed = Pick<TemplateDraft, "description" | "goal" | "categoryID" | "interceptRules" | "constraints">;
+type TemplateSeed = Pick<TemplateDraft, "description" | "targets" | "goal" | "categoryID" | "interceptRules" | "constraints">;
 
 interface TaskTemplateManagerProps {
   open: boolean;
@@ -62,6 +63,7 @@ interface TaskTemplateManagerProps {
 const emptyDraft = (): TemplateDraft => ({
   name: "",
   description: "",
+  targets: "",
   goal: "",
   categoryID: null,
   interceptRules: [],
@@ -72,6 +74,7 @@ function templateDraft(template: TaskTemplate): TemplateDraft {
   return {
     name: template.name,
     description: template.description,
+    targets: template.targets ?? "",
     goal: template.goal,
     categoryID: template.category_id ?? null,
     interceptRules: template.intercept_rules ?? [],
@@ -111,6 +114,7 @@ function TaskTemplateManager({
         setDraft({
           name: "",
           description: seed.description,
+          targets: seed.targets,
           goal: seed.goal,
           categoryID: seed.categoryID,
           interceptRules: seed.interceptRules,
@@ -137,7 +141,7 @@ function TaskTemplateManager({
     setDraft(emptyDraft());
   };
 
-  const updateDraft = (field: "name" | "description" | "goal", value: string) => {
+  const updateDraft = (field: "name" | "description" | "targets" | "goal", value: string) => {
     setDraft((current) => ({ ...current, [field]: value }));
   };
 
@@ -149,6 +153,7 @@ function TaskTemplateManager({
     const input = {
       name: draft.name.trim(),
       description: draft.description.trim(),
+      targets: draft.targets.trim(),
       goal: draft.goal.trim(),
       category_id: draft.categoryID,
       intercept_rules: draft.interceptRules
@@ -156,8 +161,8 @@ function TaskTemplateManager({
         .filter((r) => r.pattern !== ""),
       constraints: draft.constraints,
     };
-    if (!input.name || !input.description || !input.goal) {
-      toast.error("请填写模板名称、目的和目标");
+    if (!input.name || !input.description) {
+      toast.error("请填写模板名称和目的");
       return;
     }
     setSaving(true);
@@ -213,7 +218,7 @@ function TaskTemplateManager({
         <SheetContent className="grid h-full w-full! max-w-none! grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:w-[48rem]! sm:max-w-[48rem]!">
           <SheetHeader className="border-b px-6 py-5">
             <SheetTitle>任务模板管理</SheetTitle>
-            <SheetDescription>模板保存目的、目标、分类、操作约束与任务级拦截/允许规则；修改不会影响已经创建的任务。</SheetDescription>
+            <SheetDescription>模板保存目的、资产、目标说明、分类、操作约束与任务级拦截/允许规则；修改不会影响已经创建的任务。</SheetDescription>
           </SheetHeader>
           <div className="grid min-h-0 overflow-y-auto lg:grid-cols-[15rem_minmax(0,1fr)] lg:overflow-hidden">
             <div className="flex min-h-0 flex-col border-b p-3 lg:border-r lg:border-b-0">
@@ -259,19 +264,30 @@ function TaskTemplateManager({
                   <FieldLabel htmlFor="task-template-description">目的</FieldLabel>
                   <Textarea
                     id="task-template-description"
-                    className="min-h-28"
+                    className="min-h-24"
                     value={draft.description}
-                    placeholder="测试对象与背景"
+                    placeholder="这次测试要达成什么、为什么测、背景与范围（不是资产清单）"
                     onChange={(event) => updateDraft("description", event.target.value)}
                   />
                 </Field>
                 <Field>
-                  <FieldLabel htmlFor="task-template-goal">目标</FieldLabel>
+                  <FieldLabel htmlFor="task-template-targets">资产</FieldLabel>
+                  <Textarea
+                    id="task-template-targets"
+                    className="min-h-24 font-mono text-sm"
+                    value={draft.targets}
+                    placeholder={"一行一个 URL / IP / 域名 / CIDR：\nhttps://a.example.com\n10.0.0.5\n10.0.0.0/24"}
+                    onChange={(event) => updateDraft("targets", event.target.value)}
+                  />
+                  <FieldDescription>应用模板时填进任务的资产框，可再增删、解析。</FieldDescription>
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="task-template-goal">目标说明（可选）</FieldLabel>
                   <Textarea
                     id="task-template-goal"
-                    className="min-h-28"
+                    className="min-h-20"
                     value={draft.goal}
-                    placeholder="任务需要达成的目标"
+                    placeholder="更具体的可核验目标，如拿下后台权限；留空则按资产生成"
                     onChange={(event) => updateDraft("goal", event.target.value)}
                   />
                 </Field>
@@ -365,6 +381,8 @@ interface TaskTemplateControlsProps {
   description: string;
   goal: string;
   categoryID?: number;
+  /** 当前创建表单里的资产文本；「另存为模板」时一并存进去。 */
+  targets?: string;
   interceptRules?: AssetInterceptRuleInput[];
   /** 当前创建表单里的操作约束；「另存为模板」时一并存进去。 */
   constraints?: ConstraintItem[];
@@ -380,6 +398,7 @@ export function TaskTemplateControls({
   description,
   goal,
   categoryID,
+  targets,
   interceptRules,
   constraints,
   selectedTemplateID,
@@ -477,6 +496,7 @@ export function TaskTemplateControls({
               onClick={() =>
                 openManager({
                   description,
+                  targets: targets ?? "",
                   goal,
                   categoryID: categoryID ?? null,
                   interceptRules: interceptRules ?? [],
@@ -523,7 +543,7 @@ export function TaskTemplateControls({
           </ComboboxContent>
         </Combobox>
         <FieldDescription>
-          {hint ?? "选择后会复制模板的目的、目标、分类、操作约束与任务级规则，不与模板保持关联。"}
+          {hint ?? "选择后会复制模板的目的、资产、目标说明、分类、操作约束与任务级规则，不与模板保持关联。"}
         </FieldDescription>
       </Field>
 
@@ -538,7 +558,7 @@ export function TaskTemplateControls({
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>使用模板「{pendingTemplate?.name}」？</AlertDialogTitle>
-            <AlertDialogDescription>当前已填写的目的和目标将被模板内容覆盖。</AlertDialogDescription>
+            <AlertDialogDescription>当前已填写的目的、资产和目标说明将被模板内容覆盖。</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>

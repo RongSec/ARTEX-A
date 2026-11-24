@@ -55,6 +55,8 @@ export interface TaskTemplate {
   id: number;
   name: string;
   description: string;
+  /** 模板预置资产清单（一行一个 URL/IP/域名/CIDR）。 */
+  targets?: string;
   goal: string;
   category_id?: number | null; // 预设分类；null/缺省=无
   intercept_rules?: AssetInterceptRuleInput[]; // 预设的任务级拦截/允许规则

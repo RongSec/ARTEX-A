@@ -52,6 +52,7 @@ import { TaskTemplateControls } from "@/components/task-template-controls";
 import {
   TargetCredentialEditor,
   EMPTY_TARGET_ROW,
+  rowsFromTargets,
   rowsToCredentials,
   rowsToTargets,
   type TargetCredRow,
@@ -837,7 +838,7 @@ export default function TasksPage() {
               <div className="relative w-full sm:max-w-xs">
                 <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
                 <Input
-                  placeholder="搜索目的 / 目标 / ID"
+                  placeholder="搜索目的 / 资产 / ID"
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   className="pl-8"
@@ -988,7 +989,7 @@ export default function TasksPage() {
                     />
                     <TableHead>名称</TableHead>
                     <TableHead>目的</TableHead>
-                    <TableHead>目标</TableHead>
+                    <TableHead>资产</TableHead>
                     <SortableTaskHead
                       field="status"
                       label="状态"
@@ -3089,9 +3090,9 @@ export function CreateTaskSheet({
 
   async function createTask() {
     const targets = rowsToTargets(targetRows);
-    const goalText = goal.trim() || (targets.length > 0 ? `对以下目标完成安全测试：\n${targets.join("\n")}` : "");
+    const goalText = goal.trim() || (targets.length > 0 ? `对以下资产完成安全测试：\n${targets.join("\n")}` : "");
     if (!description.trim() || !goalText) {
-      toast.error("请填写目的与目标");
+      toast.error("请填写目的与资产");
       return;
     }
     if (sourceTaskIDs.length > MAX_SOURCE_TASKS) {
@@ -3171,7 +3172,7 @@ export function CreateTaskSheet({
       >
         <SheetHeader className="border-b p-6">
           <SheetTitle>新建任务</SheetTitle>
-          <SheetDescription>填写测试对象与目标，高级参数可按需展开。</SheetDescription>
+          <SheetDescription>填写目的与资产，高级参数可按需展开。</SheetDescription>
         </SheetHeader>
 
         <div className="flex-1 overflow-y-auto p-6">
@@ -3186,6 +3187,11 @@ export function CreateTaskSheet({
               onSelectedTemplateIDChange={setSelectedTemplateID}
               onApply={(template) => {
                 setDescription(template.description);
+                // 模板里的资产原样送进解析：保留用户多行/逗号混贴的写法，
+                // 解析后每行一个资产，凭据行由用户再补。
+                setTargetRaw(template.targets ?? "");
+                setTargetRows(rowsFromTargets(template.targets ?? ""));
+                setTargetInvalid([]);
                 setGoal(template.goal);
                 setCategoryID(template.category_id ?? undefined);
                 setInterceptRules(template.intercept_rules ?? []);
@@ -3278,7 +3284,7 @@ export function CreateTaskSheet({
               </div>
             </div>
             <Field>
-              <FieldLabel>目标与凭据</FieldLabel>
+              <FieldLabel>资产与凭据</FieldLabel>
               <TargetCredentialEditor
                 rows={targetRows}
                 onChange={setTargetRows}
@@ -3294,9 +3300,10 @@ export function CreateTaskSheet({
                 }}
                 disabled={creating}
                 rawRows={4}
+                hideLabel
               />
               <FieldDescription>
-                一行一个目标，行内填账号密码；同一目标多套口令点「＋」。凭据写入目标资产 auth，执行者用 list_assets 读取。
+                一行一个资产，行内填账号密码；同一资产多套口令点「＋」。凭据写入目标资产 auth，执行者用 list_assets 读取。
               </FieldDescription>
             </Field>
             <Field>
@@ -3317,7 +3324,7 @@ export function CreateTaskSheet({
               <Textarea
                 id="goal"
                 className="min-h-24"
-                placeholder="要达成什么，例如：拿下后台管理权限、获取服务器权限。留空则按目标列表自动生成。"
+                placeholder="要达成什么，例如：拿下后台管理权限、获取服务器权限。留空则按资产列表自动生成。"
                 value={goal}
                 onChange={(e) => setGoal(e.target.value)}
               />

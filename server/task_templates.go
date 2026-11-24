@@ -21,6 +21,7 @@ const maxTaskTemplateRequestBytes = 512 << 10
 type taskTemplateRequest struct {
 	Name           *string                `json:"name"`
 	Description    *string                `json:"description"`
+	Targets        *string                `json:"targets"`
 	Goal           *string                `json:"goal"`
 	CategoryID     *int64                 `json:"category_id"`
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules"`
@@ -65,6 +66,7 @@ func validateTaskTemplateRequest(req taskTemplateRequest) error {
 	}{
 		{name: "name", value: req.Name, limit: db.MaxTaskTemplateNameRunes},
 		{name: "description", value: req.Description, limit: db.MaxTaskTemplateTextRunes},
+		{name: "targets", value: req.Targets, limit: db.MaxTaskTemplateTextRunes},
 		{name: "goal", value: req.Goal, limit: db.MaxTaskTemplateTextRunes},
 	}
 	for _, check := range checks {
@@ -129,6 +131,7 @@ func (s *Server) pgCreateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 	template, err := pg.CreateTaskTemplate(db.TaskTemplateInput{
 		Name:           stringValue(req.Name),
 		Description:    stringValue(req.Description),
+		Targets:        stringValue(req.Targets),
 		Goal:           stringValue(req.Goal),
 		CategoryID:     req.CategoryID,
 		InterceptRules: rules,
@@ -163,11 +166,15 @@ func (s *Server) pgUpdateTaskTemplate(w http.ResponseWriter, r *http.Request) {
 	_, catPresent := present["category_id"]
 	_, rulesPresent := present["intercept_rules"]
 	_, constraintsPresent := present["constraints"]
-	if req.Name == nil && req.Description == nil && req.Goal == nil && !catPresent && !rulesPresent && !constraintsPresent {
-		writeErr(w, http.StatusBadRequest, "至少需要提供 name、description、goal、category_id、intercept_rules 或 constraints")
+	_, targetsPresent := present["targets"]
+	if req.Name == nil && req.Description == nil && req.Goal == nil && !catPresent && !rulesPresent && !constraintsPresent && !targetsPresent {
+		writeErr(w, http.StatusBadRequest, "至少需要提供 name、description、targets、goal、category_id、intercept_rules 或 constraints")
 		return
 	}
 	patch := db.TaskTemplatePatch{Name: req.Name, Description: req.Description, Goal: req.Goal}
+	if targetsPresent {
+		patch.Targets = req.Targets
+	}
 	if catPresent {
 		patch.SetCategoryID = true
 		patch.CategoryID = req.CategoryID
