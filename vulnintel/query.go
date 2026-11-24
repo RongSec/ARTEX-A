@@ -126,9 +126,16 @@ func (s *Store) AssetHits(ctx context.Context, minScore float64, kevOnly bool, l
 		techs []string
 	}
 	// assets 没有统一的 value 列：显示名按 url → domain → ip(+port) 兜底。
+	//
+	// 端口只在用 ip 时拼：url 里通常已经带了 :8088，无条件追加会变成
+	// "http://192.0.2.10:8088:8088"（实测出现过，看着像 bug）。
 	rows, err := s.db.QueryContext(ctx, `SELECT id,
-		COALESCE(NULLIF(url,''), NULLIF(domain,''), NULLIF(ip,''), 'asset#'||id::text)
-		  || COALESCE(':'||NULLIF(port,0)::text,''),
+		CASE
+		  WHEN NULLIF(url,'')  IS NOT NULL THEN url
+		  WHEN NULLIF(domain,'') IS NOT NULL THEN domain
+		  WHEN NULLIF(ip,'')   IS NOT NULL THEN ip || COALESCE(':'||NULLIF(port,0)::text,'')
+		  ELSE 'asset#'||id::text
+		END,
 		COALESCE(array_to_json(technologies)::text,'[]') FROM assets WHERE type='service'`)
 	if err != nil {
 		return nil, err

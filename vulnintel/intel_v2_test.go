@@ -13,6 +13,7 @@ package vulnintel
 //     go test ./vulnintel/ -run 'TestV2'
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -230,5 +231,55 @@ func TestV2ProductUnderscoreForm(t *testing.T) {
 				t.Errorf("用 %q 检索应同时命中两种形态，实际 legacy=%v new=%v", q, got[legacyID], got[newID])
 			}
 		}
+	}
+}
+
+// TestV2AssetDisplayName 验证资产显示名：url 已带端口时不再重复拼端口。
+//
+// 背景：原实现是 COALESCE(url,domain,ip) || ':'||port，url 形式
+// （http://host:8088）会变成 http://host:8088:8088，页面上像 bug。
+func TestV2AssetDisplayName(t *testing.T) {
+	st := testStore(t)
+	ctx := t.Context()
+	d := st.db
+
+	// 先放一条 apache/http_server 的 CVE：AssetHits 只返回「有命中」的资产，
+	// 库里没有对应组件时资产不会出现在结果里。
+	const cveID = "CVE-2099-000020"
+	if err := st.UpsertCVE(ctx, CVE{
+		ID: cveID, Title: "display name probe", Severity: "HIGH",
+		Criteria: []string{"cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM vuln_cves WHERE cve_id=$1`, cveID) })
+
+	var id int64
+	if err := d.QueryRowContext(ctx, `INSERT INTO assets(type, url, port, technologies)
+		VALUES ('service','http://10.9.9.9:8088', 8088, ARRAY['Apache httpd 2.4.49'])
+		RETURNING id`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = d.Exec(`DELETE FROM assets WHERE id=$1`, id) })
+
+	hits, err := st.AssetHits(ctx, 0, false, 300)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, h := range hits {
+		if h.AssetID != id {
+			continue
+		}
+		found = true
+		if strings.Count(h.Asset, ":8088") != 1 {
+			t.Fatalf("资产显示名端口重复: %q", h.Asset)
+		}
+		if h.Asset != "http://10.9.9.9:8088" {
+			t.Fatalf("资产显示名应为 url 原值，实际 %q", h.Asset)
+		}
+	}
+	if !found {
+		t.Fatal("新插入的资产没有出现在命中列表里")
 	}
 }
