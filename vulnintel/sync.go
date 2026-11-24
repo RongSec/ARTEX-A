@@ -140,6 +140,12 @@ func syncPoCs(ctx context.Context, st *Store, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	// 开跑就先落一次状态。PoC 聚合是「400 次搜索 × 限速 6~70s」的长任务
+	// （匿名访问实测 20~40 分钟），只在结束时写的话页面整段时间都显示
+	// 「未同步」，用户以为没跑；中途重启还把这一轮完全抹掉。
+	state.LastSyncAt = nowPtr()
+	state.LastError = ""
+	_ = st.SaveSyncState(ctx, state)
 	// Query pool: KEV first (exploited in the wild → PoC most valuable), then
 	// the latest NVD window records, capped hard by the unauthenticated budget.
 	rows, err := st.db.QueryContext(ctx, `SELECT cve_id FROM vuln_cves
@@ -192,6 +198,11 @@ func syncPoCs(ctx context.Context, st *Store, cfg Config) error {
 			}
 		}
 		fetched++
+		// 每 50 次刷一次进度，别等结束才让页面动。
+		if fetched%50 == 0 {
+			state.TotalSynced = int64(fetched)
+			_ = st.SaveSyncState(ctx, state)
+		}
 		time.Sleep(2 * time.Second) // stay far under the 10/min search cap
 	}
 	state.LastSyncAt = nowPtr()
