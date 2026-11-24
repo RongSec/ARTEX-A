@@ -1,4 +1,14 @@
-# artex 镜像（自带 LibreOffice + 仿宋/黑体/宋体/Times + nuclei/httpx 等 9 个探测工具）
+# artex 镜像（nuclei/httpx 等 10 个探测工具 + Playwright/Chromium）
+
+两种镜像，用途不同：
+
+| 镜像 | 构建文件 | 内容 | 用途 |
+|---|---|---|---|
+| `rongsec/artex-a`（Docker Hub） | 根 `Dockerfile` | 10 个探测工具、Node 20、Playwright + Chromium | 发布/新部署，工具开箱可用 |
+| `artex:local`（本地构建） | `docker/Dockerfile` | LibreOffice Writer + 仿宋/黑体/宋体/Times + python3-docx（工具层有预置才带） | 需要 docx→pdf 预览时 |
+
+> Docker Hub 镜像**不含 LibreOffice 与中文字体**（与现有生产容器一致，PDF 预览会自动降级为不可用）。
+> 要 PDF 预览就用 `docker compose -f docker/docker-compose.yml up -d --build` 本地构建那版。
 
 ## 首次部署（三步）
 
