@@ -1841,3 +1841,118 @@ CREATE TABLE IF NOT EXISTS vuln_pocs (
 );
 CREATE INDEX IF NOT EXISTS idx_vuln_pocs_cve ON vuln_pocs(cve_id);
 CREATE INDEX IF NOT EXISTS idx_vuln_pocs_stars ON vuln_pocs(stars DESC);
+
+-- ---------- 漏洞情报 V2（组件倒排 + 结构化版本区间） ----------
+-- 与 V10-INTEL 的区别：vuln_intel 用 cpe TEXT[] 存 "vendor:product" 片段，
+-- 只能做关键词交集，判不了版本。这里按 (vendor, product) 建倒排行，并把
+-- NVD cpeMatch 的四个版本边界拆成结构化列，让「目标 2.4.49 是否受影响」
+-- 变成一次数值比较，而不是丢给模型读 CPE 字符串。
+--
+-- 旧表 vuln_intel 保留不动：存量数据由启动期的一次性迁移搬到新表
+-- （见 vulnintel/migrate.go），读路径全部切新表，旧表只作为回滚依据。
+CREATE TABLE IF NOT EXISTS vuln_cves (
+    cve_id          TEXT PRIMARY KEY,
+    source          TEXT NOT NULL DEFAULT 'nvd',   -- nvd / ghsa / kev(stub)
+    title           TEXT NOT NULL DEFAULT '',
+    description     TEXT NOT NULL DEFAULT '',
+    severity        TEXT NOT NULL DEFAULT 'UNKNOWN',
+    cvss_score      REAL,
+    cvss_vector     TEXT NOT NULL DEFAULT '',
+    published_at    TIMESTAMPTZ,
+    modified_at     TIMESTAMPTZ,
+    -- cpe_criteria 存 CPE 2.3 原文数组：给人看、给模型读区间语法。
+    cpe_criteria    JSONB NOT NULL DEFAULT '[]'::jsonb,
+    refs            JSONB NOT NULL DEFAULT '[]'::jsonb,
+    cwes            TEXT[] NOT NULL DEFAULT '{}',
+    kev             BOOLEAN NOT NULL DEFAULT false,
+    kev_date_added  TIMESTAMPTZ,
+    synced_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_vuln_cves_published ON vuln_cves(published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vuln_cves_modified ON vuln_cves(modified_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vuln_cves_cvss ON vuln_cves(cvss_score DESC);
+CREATE INDEX IF NOT EXISTS idx_vuln_cves_kev ON vuln_cves(kev) WHERE kev;
+CREATE INDEX IF NOT EXISTS idx_vuln_cves_source ON vuln_cves(source);
+CREATE INDEX IF NOT EXISTS idx_vuln_cves_cwes ON vuln_cves USING gin(cwes);
+
+-- 组件倒排表：一条 cpeMatch 一行。版本边界为空 = 该边界不存在。
+-- 同 (cve,vendor,product) 的多条 cpeMatch 在写入时合并（任一边界命中即算匹配）。
+CREATE TABLE IF NOT EXISTS vuln_cpe_products (
+    cve_id              TEXT NOT NULL REFERENCES vuln_cves(cve_id) ON DELETE CASCADE,
+    vendor              TEXT NOT NULL,
+    product             TEXT NOT NULL,
+    version_start_incl  TEXT,
+    version_start_excl  TEXT,
+    version_end_incl    TEXT,
+    version_end_excl    TEXT,
+    PRIMARY KEY (cve_id, vendor, product)
+);
+CREATE INDEX IF NOT EXISTS idx_vuln_cpe_product ON vuln_cpe_products(product);
+CREATE INDEX IF NOT EXISTS idx_vuln_cpe_vendor ON vuln_cpe_products(vendor);
+
+-- 每个数据源的同步水位（游标 + 分页进度 + 错误）。
+CREATE TABLE IF NOT EXISTS vuln_sync_state (
+    source        TEXT PRIMARY KEY,
+    last_sync_at  TIMESTAMPTZ,
+    cursor        TEXT NOT NULL DEFAULT '',
+    total_synced  BIGINT NOT NULL DEFAULT 0,
+    last_error    TEXT NOT NULL DEFAULT '',
+    enabled       BOOLEAN NOT NULL DEFAULT true,
+    page_cursor   TEXT NOT NULL DEFAULT ''
+);
+
+-- 库配置：每类「库」一行，页面按行渲染，不硬编码在前端。
+-- 现在不加新源，但这张表是骨架——以后加源 = 插一行 + 注册一个 adapter。
+CREATE TABLE IF NOT EXISTS vuln_sources (
+    id                 TEXT PRIMARY KEY,          -- nvd / kev / ghsa / github_poc / nuclei_templates
+    name               TEXT NOT NULL,
+    kind               TEXT NOT NULL,             -- api_json / json_feed / github_api / git_repo
+    enabled            BOOLEAN NOT NULL DEFAULT true,
+    endpoint           TEXT NOT NULL DEFAULT '',
+    credential_setting TEXT NOT NULL DEFAULT '',  -- 凭据存在 settings 的哪个 key
+    credential_hint    TEXT NOT NULL DEFAULT '',  -- 没凭据时的后果，页面直接展示
+    priority           INT NOT NULL DEFAULT 100,  -- 同一 CVE 多源时的取值优先级（小的优先）
+    sync_mode          TEXT NOT NULL DEFAULT 'incremental', -- full / incremental / manual
+    interval_minutes   INT NOT NULL DEFAULT 0,
+    backfill_days      INT NOT NULL DEFAULT 0,
+    note               TEXT NOT NULL DEFAULT '',
+    sort_order         INT NOT NULL DEFAULT 0,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO vuln_sources (id, name, kind, enabled, endpoint, credential_setting, credential_hint, priority, sync_mode, interval_minutes, backfill_days, note, sort_order) VALUES
+ ('nvd', 'NVD 2.0（CVE 主库）', 'api_json', true,
+  'https://services.nvd.nist.gov/rest/json/cves/2.0', 'nvd_api_key',
+  '匿名 5 次/30 秒；填 Key 后 50 次/30 秒，全量回填从 22 分钟降到 3 分钟', 10, 'incremental', 360, 120,
+  '按 lastModifiedDate 窗口增量，游标推进；历史回填手动触发', 10),
+ ('kev', 'CISA KEV（在野利用）', 'json_feed', true,
+  'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json', '',
+  '公开 JSON，无需凭据', 5, 'incremental', 360, 0,
+  '单文件全量拉取，给已有 CVE 打 kev 标记；NVD 未收录的插 stub 行', 20),
+ ('ghsa', 'GitHub Advisory（版本区间补充）', 'github_api', true,
+  'https://api.github.com/advisories', 'vulnintel_github_token',
+  '匿名可读但限速较松；复用 PoC 的同一个 token', 20, 'incremental', 30, 7,
+  'NVD 对新披露 CVE 常留空版本区间，GHSA 的区间是必填的，用来补这块', 30),
+ ('github_poc', 'GitHub PoC 聚合（仅元数据）', 'github_api', true,
+  'https://api.github.com/search/repositories', 'vulnintel_github_token',
+  '匿名 10 次/分钟；配 token 可到 30 次/分钟', 30, 'incremental', 360, 30,
+  '只存仓库名/URL/star/描述，不克隆不执行代码', 40),
+ ('nuclei_templates', 'nuclei 模板库（本地树）', 'git_repo', true,
+  'https://github.com/projectdiscovery/nuclei-templates.git', '',
+  '公开仓库，git clone --depth 1', 40, 'incremental', 1440, 0,
+  '模板即检测件：按 CVE 在本地 yaml 树里找模板，再用 scan_with_nuclei 验证', 50)
+ON CONFLICT (id) DO NOTHING;
+
+-- PoC 线索 V2：与旧 vuln_pocs 的区别是主键改成 (source,url)、多了 kind 与 title，
+-- 因为同一 CVE 可能同时有 GitHub 仓库和 exploit-db 条目。
+CREATE TABLE IF NOT EXISTS vuln_poc_entries (
+    cve_id    TEXT NOT NULL,
+    source    TEXT NOT NULL,          -- github / exploit-db
+    url       TEXT NOT NULL,
+    title     TEXT NOT NULL DEFAULT '',
+    kind      TEXT NOT NULL DEFAULT 'poc', -- poc / exploit
+    stars     INT  NOT NULL DEFAULT 0,
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (source, url)
+);
+CREATE INDEX IF NOT EXISTS idx_vuln_poc_entries_cve ON vuln_poc_entries(cve_id);
+CREATE INDEX IF NOT EXISTS idx_vuln_poc_entries_stars ON vuln_poc_entries(stars DESC);

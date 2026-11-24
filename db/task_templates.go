@@ -163,8 +163,8 @@ func normalizeTaskTemplateInput(in TaskTemplateInput) (TaskTemplateInput, string
 		return in, "", fmt.Errorf("%w: description is required", ErrTaskTemplateInvalid)
 	case utf8.RuneCountInString(in.Description) > MaxTaskTemplateTextRunes:
 		return in, "", fmt.Errorf("%w: description exceeds %d characters", ErrTaskTemplateInvalid, MaxTaskTemplateTextRunes)
-	case in.Goal == "":
-		return in, "", fmt.Errorf("%w: goal is required", ErrTaskTemplateInvalid)
+	// goal 是**可选**字段：UI 上标了「（可选）」，后端就不能强制。
+	// 语义上它只是「更具体的可核验目标」，留空时应用模板会按资产生成。
 	case utf8.RuneCountInString(in.Goal) > MaxTaskTemplateTextRunes:
 		return in, "", fmt.Errorf("%w: goal exceeds %d characters", ErrTaskTemplateInvalid, MaxTaskTemplateTextRunes)
 	}

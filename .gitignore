@@ -79,3 +79,6 @@ web/.next.bak.*/
 /docker/hostbin/chisel
 /docker/hostbin/artex
 /docker/hostbin/VERSIONS.txt
+
+# 本地验收用的运行时数据（容器挂载的 data 目录）
+/_verify_data/

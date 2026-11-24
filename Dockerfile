@@ -12,11 +12,14 @@
 #   docker build -t artex:local .
 FROM python:3.12-slim-bookworm
 ARG TARGETARCH
-# 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
+# 常用工具：ripgrep / curl / vim，加一批 recon 常备件。
+# 包清单在 docker/apt-core.txt：与 hosttools/catalog.go 的 preinstalled 基线对齐，
+# 改这里必须同步改那边，否则页面会把「镜像没装」说成「断网可用」。
 # Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates ripgrep curl wget vim git jq unzip \
-      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+COPY docker/apt-core.txt /tmp/apt-core.txt
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates ripgrep vim git jq unzip iputils-ping inetutils-telnet \
+      $(grep -v '^#' /tmp/apt-core.txt | grep -v '^$' | tr '\n' ' ') \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*

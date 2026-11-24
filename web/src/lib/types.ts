@@ -2258,74 +2258,123 @@ export interface TaskIntelResp {
   hint?: string;
 }
 
-// ---------- V10-INTEL 漏洞情报（NVD + CISA KEV 公开源） ----------
+// ---------- 漏洞情报 V2（组件倒排 + 结构化版本区间） ----------
 
-export interface VulnIntelEntry {
+export interface VulnCVESummary {
   cve_id: string;
-  source: string;
+  title: string;
+  severity: string;
+  cvss_score?: number;
+  kev: boolean;
+  published?: string;
+  source?: string;
+  poc_count: number;
+}
+
+export interface VulnVersionRange {
+  vendor: string;
+  product: string;
+  start_including?: string;
+  start_excluding?: string;
+  end_including?: string;
+  end_excluding?: string;
+  source?: string;
+  raw?: string;
+}
+
+export interface VulnDetail {
+  cve_id: string;
+  severity: string;
+  cvss_score?: number;
+  cvss_vector?: string;
+  kev: boolean;
+  published?: string;
+  modified?: string;
   title: string;
   description: string;
-  severity: string;
-  cvss: number;
-  published_at?: string;
-  modified_at?: string;
-  kev: boolean;
-  kev_due?: string;
-  ransomware?: boolean;
-  cpe?: string[];
-  refs?: string[];
-  /** GitHub 公开仓库线索数（只存元数据，不存代码） */
-  poc_count?: number;
+  cpe_criteria?: string[];
+  references?: string[];
+  source?: string;
+  cwes?: string[];
+  version_ranges?: VulnVersionRange[];
 }
 
-export interface VulnIntelStats {
-  total: number;
-  kev: number;
-  critical: number;
-  last_7_days: number;
-}
-
-export interface VulnPoc {
-  cve_id: string;
-  repo: string;
+export interface VulnPocEntry {
+  source: string;
   url: string;
-  description: string;
+  title: string;
+  kind: string;
   stars: number;
-  lang: string;
-  pushed_at?: string;
 }
 
-export interface GitHubConfig {
+/** 库配置一行：静态配置 + 运行时状态 */
+export interface VulnSource {
+  id: string;
+  name: string;
+  kind: string;
   enabled: boolean;
-  token_set: boolean;
-  token_tip: string;
-  last_sync: string;
+  endpoint: string;
+  credential_setting: string;
+  credential_hint: string;
+  credential_set: boolean;
+  priority: number;
+  sync_mode: string;
+  interval_minutes: number;
+  backfill_days: number;
+  note: string;
+  last_sync_at?: string;
+  cursor?: string;
+  total_synced: number;
+  last_error?: string;
+  error_hint?: string;
+  count: number;
+  status: "ok" | "error" | "never";
+}
+
+export interface VulnIntelConfig {
+  nvd_api_key: string;
+  nvd_key_set: boolean;
+  github_token: string;
+  github_token_set: boolean;
+  proxy: string;
+  poc_enabled: boolean;
+  backfill_days: number;
+  max_runtime_minutes: number;
+  fast_lane_enabled: boolean;
+  fast_lane_minutes: number;
+  fast_lane_days: number;
+}
+
+export interface NucleiTemplatesStatus {
+  dir: string;
+  exists: boolean;
+  is_git: boolean;
+  templates: number;
+  updated_at?: string;
+  hint: string;
 }
 
 export interface VulnIntelStatus {
-  stats: VulnIntelStats;
-  poc?: { repos: number; cves: number; queue: number };
-  github?: GitHubConfig;
-  last_kev_sync: string;
-  last_nvd_sync: string;
-  running: string;
-  last_error: string;
-  last_run: string;
   enabled: boolean;
-  sources: { key: string; name: string; url: string; note: string }[];
+  sources: VulnSource[];
+  counts: { cves: number; kev: number; pocs: number; ghsa: number; products: number };
+  config: VulnIntelConfig;
+  sync_running: boolean;
+  sync_started_at: number;
+  sync_phase: string;
+  nuclei: NucleiTemplatesStatus;
+  next_tick_hint: string;
 }
 
 export interface AssetVulnHit {
-  cve_id: string;
-  title: string;
-  severity: string;
-  cvss: number;
-  kev: boolean;
-  published_at?: string;
-  technology: string;
-  host: string;
   asset_id: number;
-  version_in_range: "yes" | "no" | "unknown";
+  asset: string;
+  cve_id: string;
+  severity: string;
+  cvss_score?: number;
+  kev: boolean;
+  product: string;
+  matched_on: string;
 }
 
 // ---------- V10-HOSTENV 宿主环境体检 ----------
@@ -2342,6 +2391,8 @@ export interface HostTool {
   path?: string;
   version?: string;
   installable: boolean;
+  /** 镜像/挂载卷已预置：断网也能用；缺失说明镜像构建没带上 */
+  offline?: boolean;
 }
 
 export interface HostToolsResult {

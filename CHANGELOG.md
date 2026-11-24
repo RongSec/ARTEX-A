@@ -4,6 +4,40 @@
 
 ## [Unreleased]
 
+## [v27] - 2026-11-24
+
+### 漏洞情报 V2
+
+#### 新增的功能
+
+- **组件倒排 + 结构化版本区间**：新增 `vuln_cves` / `vuln_cpe_products`，把 NVD 的 `cpeMatch` 拆成 `(vendor, product)` 索引行与四个版本边界。「目标 2.4.49 是否受影响」从「让模型读 CPE 字符串」变成一次数值比较，`search_vulns` 返回 `version_in_range` 三态（true / false / 无法判断）。
+- **GHSA 补版本区间**：NVD 对新披露 CVE 常留空区间，GHSA 的区间是必填的。快通道同步时顺带拉 GHSA，把区间补进同一张表（`source` 字段标明来源）。
+- **近期高危快通道**：按 `publishedDate` 拉 7 天窗口，只留 CVSS≥9.0 或 KEV，几十分钟进库，不等主同步游标爬到。
+- **资产指纹联动**：同步完成后把新 CVE 与 service 资产的 `technologies` 求交集（`httpd ↔ http_server` 别名归一），按「任务 × 资产」聚合成一条 `[情报联动]` hint 挂进探索图，24 小时防抖。
+- **库配置页**：`vuln_sources` 表驱动，逐库展示开关、端点、凭据、条数、上次同步、错误与修复建议；支持单库「同步」与逐源连通性探测。加新源 = 插一行 + 注册 adapter。
+- **旧库自动迁移**：启动时把 V10 的 `vuln_intel` / `vuln_pocs` 搬到新结构，只补不覆盖、幂等、旧表保留作回滚依据。
+
+#### 变更
+
+- agent 工具从 2 件扩到 4 件：`search_vulns`（组件+版本）、`get_vuln`（详情+区间）、`get_poc`（PoC 链接）、`list_asset_vuln_hits`（资产命中）。
+- 情报同步出口统一走「上网代理」，不再单独维护 `vulnintel_proxy` 键。
+
+### 宿主工具
+
+#### 变更
+
+- **预置分层**：`docker/apt-core.txt` 声明基础镜像预置的 19 个 apt 包，`docker/hostbin` 声明 7 个必需 Go 二进制 + 2 个可选件（ffuf / dalfox）。缺必需件构建失败并点名；可选件缺失只告警，不阻断发版。
+- 宿主环境页新增「应内置未装」状态：预置清单里应该有但探不到时明确提示检查镜像，而不是显示成普通缺失。
+- `feroxbuster` / `searchsploit` 的安装命令修正：Debian 源没有这两个包，改为官方脚本 / Kali 源提示。
+
+### 任务模板
+
+#### 修复
+
+- **目标说明不再必填**：后端 `CreateTaskTemplate` 的 `goal is required` 校验与前端「管理模板」按钮的 `!goal` 禁用一并去掉，与 UI 上的「（可选）」一致。
+- 资产字段标注「（可选）」并说明可留空、应用模板时再填。
+
+
 ## [0.3.15] - 2026-10-07
 
 ### 拦截

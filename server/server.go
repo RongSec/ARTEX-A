@@ -52,8 +52,8 @@ type Server struct {
 	jwtKeyMu sync.RWMutex
 	keyDir   string // jwt.key 落盘目录（项目根，不在可浏览的工作区里）
 
-	// intel 是漏洞情报同步器（NVD + CISA KEV）。nil=未启用（无 PG 时）。
-	intel *vulnintel.Service
+	// vuln 是漏洞情报运行时（组件倒排库 + 同步循环 + 库配置）。nil=未启用（无 PG）。
+	vuln *vulnIntelRuntime
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -284,15 +284,13 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		m.projectIndexer.Start(s.ctx)
 		// 漏洞情报（V10-INTEL）：NVD + CISA KEV 公开源同步。默认开：只读公开
 		// 数据、无副作用；首次 30 秒后跑快通道，历史回填由页面手动触发。
-		s.intel = vulnintel.New(m.pg)
-		// 情报抓取走「上网代理」：NVD / CISA / GitHub 都是外网检索资源，
-		// 与渗透测试流量（global_proxy）分开。空值=直连。
-		if p := m.OutboundProxy(); p != "" {
-			if err := s.intel.SetProxy(p); err != nil {
-				log.Printf("[vulnintel] 上网代理 %q 无效，情报抓取改为直连: %v", p, err)
-			}
+		// 情报库：组件倒排（vuln_cpe_products）+ 结构化版本区间，数据源 NVD /
+		// CISA KEV / GHSA / GitHub PoC。出网走「上网代理」，与渗透流量分开。
+		s.vuln = &vulnIntelRuntime{
+			store:     vulnintel.New(m.pg),
+			nucleiDir: vulnintel.TemplatesDir(m.dir),
 		}
-		s.intel.Start(s.ctx)
+		s.startVulnIntelLoops(s.ctx)
 		// 运行中任务的情报增量构建：让 endpoints 在跑的过程中就参与比对。
 		s.startTaskIntelTicker(s.ctx)
 		// 任务终态→整项目自动报告钩子（artex-hs T18）。nil 守卫在装配内部，
@@ -914,8 +912,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intel/search", s.intelSearch)
 	mux.HandleFunc("GET /api/intel/asset-hits", s.intelAssetHits)
 	mux.HandleFunc("POST /api/intel/sync", s.intelSync)
-	mux.HandleFunc("GET /api/intel/config", s.intelConfig)
+	mux.HandleFunc("POST /api/intel/sync/cancel", s.intelSyncCancel)
+	mux.HandleFunc("GET /api/intel/config", s.intelStatus)
 	mux.HandleFunc("POST /api/intel/config", s.intelConfigSave)
+	mux.HandleFunc("GET /api/intel/sources", s.intelSources)
+	mux.HandleFunc("PATCH /api/intel/sources/{id}", s.intelSourceUpdate)
+	mux.HandleFunc("POST /api/intel/probe", s.intelProbe)
+	mux.HandleFunc("GET /api/intel/vuln", s.intelVuln)
 	mux.HandleFunc("GET /api/intel/pocs", s.intelPocs)
 	// V10-HOSTENV：宿主环境体检 + 一键安装（目录白名单，安装命令只由服务端决定）
 	mux.HandleFunc("GET /api/system/host-tools", s.hostToolsStatus)
@@ -3815,12 +3818,6 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		if err := s.m.SetOutboundProxy(*req.OutboundProxy); err != nil {
 			writeErr(w, 400, err.Error())
 			return
-		}
-		if s.intel != nil {
-			if err := s.intel.SetProxy(strings.TrimSpace(*req.OutboundProxy)); err != nil {
-				writeErr(w, 400, err.Error())
-				return
-			}
 		}
 		// 搜索工具在 agent 构建时读 WebSearchOpts，重建以让新代理生效。
 		changed = true

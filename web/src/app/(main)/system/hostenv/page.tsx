@@ -230,6 +230,10 @@ export default function HostEnvPage() {
                       <Badge variant="outline" className="border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
                         就绪
                       </Badge>
+                    ) : t.offline ? (
+                      <Badge variant="outline" className="border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                        应内置未装
+                      </Badge>
                     ) : (
                       <Badge variant="outline" className="border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400">
                         缺失
@@ -243,8 +247,14 @@ export default function HostEnvPage() {
                   <TableCell className="text-xs">
                     {t.present ? (
                       <span className="text-muted-foreground break-all">{t.version || t.path || "已安装"}</span>
+                    ) : t.offline ? (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        镜像基线应内置这件工具，实际未探到：检查镜像 tag，或构建时是否漏了 apt-core.txt / hostbin 层
+                      </span>
                     ) : (
-                      <span className="text-muted-foreground">{t.hint || t.note || "—"}</span>
+                      <span className="text-muted-foreground">
+                        {t.hint || t.note || "需联网安装（go/pip/apt 都要出网）"}
+                      </span>
                     )}
                   </TableCell>
                   <TableCell className="text-right">

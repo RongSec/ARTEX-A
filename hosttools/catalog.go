@@ -34,6 +34,32 @@ type Tool struct {
 	Install   string   `json:"-"`              // 安装命令（sh -c），空=无自动安装
 	Hint      string   `json:"hint,omitempty"` // 手工安装提示
 	Note      string   `json:"note,omitempty"`
+	// Offline=true 表示镜像/挂载卷里**已经预置**，断网环境开箱即用。
+	// false 表示只能联网安装（apt / go install / pip 都要出网）。
+	// 前端据此区分「安装」按钮和「需联网」提示，运维据此判断离线部署缺什么。
+	Offline bool `json:"offline"`
+}
+
+// preinstalled 是镜像默认预置的工具集合（与 docker/apt-core.txt、
+// docker/hostbin/fetch.sh 的 VERSIONS 表保持一致）。
+//
+// 为什么单独维护：catalog 是「能装什么」的能力清单，不是「装了什么」的事实清单。
+// 把两者混在一起，只要 Dockerfile 改了一行，页面就会说谎。这里显式声明基线，
+// 探测结果仍然以 exec.LookPath 为准——预置了但探不到，说明镜像构建有问题，
+// 页面会显示「应内置但缺失」，而不是假装能离线装。
+var preinstalled = map[string]bool{
+	// apt 核心层（docker/apt-core.txt）：只放 Debian bookworm 仓库里确实存在的包。
+	// feroxbuster / exploitdb 是 Kali 专有包，Debian 源里没有，不能写进清单——
+	// 一个包名不存在会让整条 apt install 失败，镜像直接构建不出来。
+	"nmap": true, "masscan": true, "nc": true, "socat": true, "curl": true,
+	"wget": true, "tcpdump": true, "tshark": true, "fping": true, "arp-scan": true,
+	"dig": true, "whois": true, "smbclient": true, "sshpass": true,
+	"whatweb": true, "nikto": true, "sqlmap": true, "gobuster": true,
+	"proxychains4": true,
+	// Go 二进制层（docker/hostbin/fetch.sh VERSIONS）
+	"nuclei": true, "httpx": true, "subfinder": true, "katana": true,
+	"dnsx": true, "tlsx": true, "chisel": true,
+	// ffuf / dalfox 是可选件：镜像里有就装，没有也不阻断构建（见 Dockerfile.hostbin）。
 }
 
 // ToolStatus 是探测结果。
@@ -155,7 +181,7 @@ func Catalog() []Tool {
 		return "pip3 install --break-system-packages -q " + pkg
 	}
 
-	return []Tool{
+	tools := []Tool{
 		// ---- 网络与主机 ----
 		{Key: "nmap", Name: "nmap", Bin: "nmap", Category: "网络与主机", Install: apt("nmap"), Note: "端口/服务识别，-sS 需要 root"},
 		{Key: "masscan", Name: "masscan", Bin: "masscan", Category: "网络与主机", Install: apt("masscan"), Note: "大网段快速扫描"},
@@ -181,7 +207,7 @@ func Catalog() []Tool {
 		{Key: "katana", Name: "katana", Bin: "katana", Category: "Web 与 API", Install: goInstall("github.com/projectdiscovery/katana/cmd/katana")},
 		{Key: "ffuf", Name: "ffuf", Bin: "ffuf", Category: "Web 与 API", VersionIn: []string{"-V"}, Install: goInstall("github.com/ffuf/ffuf/v2")},
 		{Key: "gobuster", Name: "gobuster", Bin: "gobuster", Category: "Web 与 API", Install: apt("gobuster")},
-		{Key: "feroxbuster", Name: "feroxbuster", Bin: "feroxbuster", Category: "Web 与 API", Install: apt("feroxbuster")},
+		{Key: "feroxbuster", Name: "feroxbuster", Bin: "feroxbuster", Category: "Web 与 API", Hint: "Debian 源无此包；用官方脚本：curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash -s /usr/local/bin"},
 		{Key: "dirsearch", Name: "dirsearch", Bin: "dirsearch", Category: "Web 与 API", Install: pipx("dirsearch")},
 		{Key: "nuclei", Name: "nuclei", Bin: "nuclei", Category: "Web 与 API", Install: goInstall("github.com/projectdiscovery/nuclei/v3/cmd/nuclei")},
 		{Key: "nikto", Name: "nikto", Bin: "nikto", Category: "Web 与 API", Install: apt("nikto")},
@@ -195,7 +221,7 @@ func Catalog() []Tool {
 		{Key: "medusa", Name: "medusa", Bin: "medusa", Category: "注入与利用", Install: apt("medusa")},
 		{Key: "john", Name: "john", Bin: "john", Category: "注入与利用", Install: apt("john")},
 		{Key: "hashcat", Name: "hashcat", Bin: "hashcat", Category: "注入与利用", Install: apt("hashcat")},
-		{Key: "searchsploit", Name: "searchsploit", Bin: "searchsploit", Category: "注入与利用", Install: apt("exploitdb")},
+		{Key: "searchsploit", Name: "searchsploit", Bin: "searchsploit", Category: "注入与利用", Hint: "exploitdb 是 Kali 源专有包；Debian 下改用 apt 源 kali-archive-keyring 或手工放 /usr/share/exploitdb"},
 		{Key: "msfconsole", Name: "metasploit", Bin: "msfconsole", Category: "注入与利用", Install: "", Hint: "官方源安装：https://docs.metasploit.com/docs/using-metasploit/getting-started/nightly-installers.html"},
 
 		// ---- 后渗透 ----
@@ -227,6 +253,12 @@ func Catalog() []Tool {
 		{Key: "seclists", Name: "SecLists 字典", Bin: "/usr/share/seclists", Category: "语料", Kind: "dir", Install: apt("seclists"), Note: "约 2.5G，装之前确认磁盘"},
 		{Key: "nuclei-templates", Name: "nuclei 模板", Bin: filepath.Join(homeDir(), "nuclei-templates"), Category: "语料", Kind: "dir", Install: "nuclei -update-templates", Note: "nuclei 首次运行也会自动拉"},
 	}
+	// 基线标记：与 docker/apt-core.txt、docker/hostbin/fetch.sh 对齐。
+	// 只影响页面提示，不改变探测结果。
+	for i := range tools {
+		tools[i].Offline = preinstalled[tools[i].Key]
+	}
+	return tools
 }
 
 func homeDir() string {

@@ -271,7 +271,7 @@ function TaskTemplateManager({
                   />
                 </Field>
                 <Field>
-                  <FieldLabel htmlFor="task-template-targets">资产</FieldLabel>
+                  <FieldLabel htmlFor="task-template-targets">资产（可选）</FieldLabel>
                   <Textarea
                     id="task-template-targets"
                     className="min-h-24 font-mono text-sm"
@@ -279,7 +279,9 @@ function TaskTemplateManager({
                     placeholder={"一行一个 URL / IP / 域名 / CIDR：\nhttps://a.example.com\n10.0.0.5\n10.0.0.0/24"}
                     onChange={(event) => updateDraft("targets", event.target.value)}
                   />
-                  <FieldDescription>应用模板时填进任务的资产框，可再增删、解析。</FieldDescription>
+                  <FieldDescription>
+                    可留空：应用模板时再填。填了会预填进任务的资产框，仍可增删、解析。
+                  </FieldDescription>
                 </Field>
                 <Field>
                   <FieldLabel htmlFor="task-template-goal">目标说明（可选）</FieldLabel>
@@ -492,7 +494,7 @@ export function TaskTemplateControls({
               type="button"
               variant="ghost"
               size="sm"
-              disabled={!description.trim() || !goal.trim()}
+              disabled={!description.trim()}
               onClick={() =>
                 openManager({
                   description,

@@ -133,10 +133,11 @@ import type {
   TrafficResp,
   UpdateCheck,
   UsageStats,
-  GitHubConfig,
-  VulnIntelEntry,
+  VulnCVESummary,
+  VulnDetail,
   VulnIntelStatus,
-  VulnPoc,
+  VulnPocEntry,
+  VulnSource,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
@@ -1563,26 +1564,37 @@ export const api = {
     constraints: { kind: "allow" | "deny"; text: string }[],
   ) => put<{ constraints: TaskConstraint[] }>(`/projects/${id}/constraints`, { constraints }),
 
-  // ---- V10-INTEL 漏洞情报（NVD + CISA KEV 公开源）----
+  // ---- 漏洞情报 V2（组件倒排 + 库配置）----
   intelStatus: () => get<VulnIntelStatus>("/intel/status"),
-  intelSearch: (p: { q?: string; kev?: boolean; minCvss?: number; since?: string; limit?: number; offset?: number }) => {
+  intelSearch: (p: { q?: string; kev?: boolean; minCvss?: number; severity?: string; since?: string; limit?: number; offset?: number }) => {
     const qs = new URLSearchParams();
     if (p.q) qs.set("q", p.q);
     if (p.kev) qs.set("kev", "1");
     if (p.minCvss) qs.set("min_cvss", String(p.minCvss));
+    if (p.severity) qs.set("severity", p.severity);
     if (p.since) qs.set("since", p.since);
     qs.set("limit", String(p.limit ?? 50));
     qs.set("offset", String(p.offset ?? 0));
-    return get<{ items: VulnIntelEntry[]; total: number }>(`/intel/search?${qs.toString()}`);
+    return get<{ items: VulnCVESummary[]; total: number }>(`/intel/search?${qs.toString()}`);
   },
-  intelAssetHits: (limit = 100) =>
-    get<{ items: AssetVulnHit[] }>(`/intel/asset-hits?limit=${limit}`).then((r) => ({ items: arr(r.items) })),
-  intelSync: (mode: "kev" | "recent" | "full" | "poc", days?: number) =>
+  intelAssetHits: (p: { limit?: number; minCvss?: number; kevOnly?: boolean } = {}) => {
+    const qs = new URLSearchParams();
+    qs.set("limit", String(p.limit ?? 100));
+    if (p.minCvss) qs.set("min_cvss", String(p.minCvss));
+    if (p.kevOnly) qs.set("kev", "1");
+    return get<{ items: AssetVulnHit[] }>(`/intel/asset-hits?${qs.toString()}`).then((r) => ({ items: arr(r.items) }));
+  },
+  intelSync: (mode: "all" | "kev" | "recent" | "full" | "poc" | "ghsa" | "templates", days?: number) =>
     post<{ accepted: boolean; mode: string }>("/intel/sync", { mode, days }),
-  // GitHub 配置：token 只回末四位；保存时省略 token = 不改，"" = 清空。
-  intelConfig: () => get<GitHubConfig>("/intel/config"),
-  intelConfigSave: (p: { enabled?: boolean; token?: string }) => post<GitHubConfig>("/intel/config", p),
-  intelPocs: (cve: string) => get<{ cve_id: string; items: VulnPoc[] }>(`/intel/pocs?cve=${encodeURIComponent(cve)}`),
+  intelSyncCancel: () => post<{ cancelling: boolean }>("/intel/sync/cancel", {}),
+  intelSources: () => get<{ items: VulnSource[] }>("/intel/sources").then((r) => ({ items: arr(r.items) })),
+  intelSourceUpdate: (id: string, patch: Partial<Pick<VulnSource, "enabled" | "endpoint" | "priority" | "sync_mode" | "interval_minutes" | "backfill_days">>) =>
+    http<{ ok: boolean; items: VulnSource[] }>(`/intel/sources/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  intelConfigSave: (p: Partial<{ enabled: boolean; nvd_api_key: string; github_token: string; poc_enabled: boolean; backfill_days: number; max_runtime_minutes: number; fast_lane_enabled: boolean; fast_lane_minutes: number; fast_lane_days: number }>) =>
+    post<{ ok: boolean }>("/intel/config", p),
+  intelProbe: (proxy?: string) => post<{ proxy: string; effective: boolean; results: { source: string; target: string; ok: boolean; status: number; latency_ms: number; error?: string; hint?: string }[] }>("/intel/probe", proxy ? { proxy } : {}),
+  intelVuln: (cve: string) => get<VulnDetail>(`/intel/vuln?cve=${encodeURIComponent(cve)}`),
+  intelPocs: (cve: string) => get<{ cve_id: string; items: VulnPocEntry[] }>(`/intel/pocs?cve=${encodeURIComponent(cve)}`),
 
   // ---- V10-HOSTENV 宿主环境体检 ----
   hostTools: (refresh = false) =>

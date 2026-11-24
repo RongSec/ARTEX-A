@@ -1,13 +1,28 @@
 "use client";
 
-// 漏洞情报（V10-INTEL）：NVD 全量 + CISA KEV 在野利用，两个公开源。
+// 漏洞情报 V2：组件倒排（vendor/product + 结构化版本区间）+ 库配置。
 //
-// 页面只有三件事：看（情报库/命中我的资产）、筛（KEV / CVSS / 时间 / 关键词）、
-// 触发同步。情报本身是「候选」：组件名匹配不带版本，命中了也要实测。
+// 页面的三件事：
+//   1. 看：情报库 / 命中我的资产
+//   2. 筛：KEV / CVSS / 关键词 / 时间
+//   3. 配：每类库的开关、端点、同步状态、连通性
+//
+// 情报只给候选：组件匹配不等于可利用，版本区间才是「该打」的硬信号。
 
 import * as React from "react";
 
-import { AlertTriangleIcon, CloudDownloadIcon, DatabaseIcon, ExternalLinkIcon, FlameIcon, GitBranchIcon, RefreshCwIcon, SaveIcon, SearchIcon } from "lucide-react";
+import {
+  AlertTriangleIcon,
+  CloudDownloadIcon,
+  DatabaseIcon,
+  FlameIcon,
+  GitBranchIcon,
+  PlugZapIcon,
+  RefreshCwIcon,
+  SaveIcon,
+  SearchIcon,
+  SquareIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -21,7 +36,7 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import type { AssetVulnHit, GitHubConfig, VulnIntelEntry, VulnIntelStatus, VulnPoc } from "@/lib/types";
+import type { AssetVulnHit, VulnCVESummary, VulnDetail, VulnIntelStatus, VulnPocEntry } from "@/lib/types";
 
 const PAGE_SIZE = 50;
 
@@ -40,198 +55,109 @@ function fmtDate(s?: string) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
+function fmtTime(s?: string) {
+  if (!s) return "从未";
+  const d = new Date(s);
+  if (isNaN(d.getTime()) || d.getFullYear() < 1990) return "从未";
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+const sourceTone: Record<string, string> = {
+  ok: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30 dark:text-emerald-400",
+  error: "bg-rose-500/10 text-rose-600 border-rose-500/30 dark:text-rose-400",
+  never: "bg-muted text-muted-foreground",
+};
+
+const kindLabel: Record<string, string> = {
+  api_json: "REST API",
+  json_feed: "JSON feed",
+  github_api: "GitHub API",
+  git_repo: "Git 仓库",
+};
+
+type SyncMode = "all" | "kev" | "recent" | "full" | "poc" | "ghsa" | "templates";
+
 export default function IntelPage() {
   const [status, setStatus] = React.useState<VulnIntelStatus | null>(null);
-  const [items, setItems] = React.useState<VulnIntelEntry[]>([]);
-  const [total, setTotal] = React.useState(0);
-  const [page, setPage] = React.useState(0);
-  const [q, setQ] = React.useState("");
-  const [kevOnly, setKevOnly] = React.useState(false);
-  const [minCvss, setMinCvss] = React.useState("0");
-  const [loading, setLoading] = React.useState(false);
   const [syncing, setSyncing] = React.useState(false);
-  const [hits, setHits] = React.useState<AssetVulnHit[]>([]);
-  const [hitsLoaded, setHitsLoaded] = React.useState(false);
-  // GitHub PoC 聚合：token 只在保存时上送，读回只有末四位。
-  const [gh, setGh] = React.useState<GitHubConfig | null>(null);
-  const [ghToken, setGhToken] = React.useState("");
-  const [ghEnabled, setGhEnabled] = React.useState(true);
-  const [savingCfg, setSavingCfg] = React.useState(false);
-  const [pocCVE, setPocCVE] = React.useState<string | null>(null);
-  const [pocItems, setPocItems] = React.useState<VulnPoc[]>([]);
-  const [pocLoading, setPocLoading] = React.useState(false);
 
   const loadStatus = React.useCallback(async () => {
     try {
-      const s = await api.intelStatus();
-      setStatus(s);
-      if (s.github) {
-        setGh(s.github);
-        setGhEnabled(s.github.enabled);
-      }
+      setStatus(await api.intelStatus());
     } catch (e) {
       toast.error("读取情报状态失败：" + (e as Error).message);
     }
   }, []);
 
-  const loadPage = React.useCallback(
-    async (nextPage: number, query: string, kev: boolean, cvss: string) => {
-      setLoading(true);
-      try {
-        const r = await api.intelSearch({
-          q: query.trim() || undefined,
-          kev,
-          minCvss: Number(cvss) || 0,
-          limit: PAGE_SIZE,
-          offset: nextPage * PAGE_SIZE,
-        });
-        setItems(r.items);
-        setTotal(r.total);
-        setPage(nextPage);
-      } catch (e) {
-        toast.error("查询失败：" + (e as Error).message);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [],
-  );
-
   React.useEffect(() => {
     void loadStatus();
-    void loadPage(0, "", false, "0");
-  }, [loadStatus, loadPage]);
-
-  // 同步在后台跑，running 非空时每 5 秒刷一次状态与列表。
-  React.useEffect(() => {
-    if (!status?.running) return;
-    const t = setInterval(() => {
-      void loadStatus();
-      void loadPage(page, q, kevOnly, minCvss);
-    }, 5000);
+    const t = setInterval(() => void loadStatus(), 8000);
     return () => clearInterval(t);
-  }, [status?.running, loadStatus, loadPage, page, q, kevOnly, minCvss]);
+  }, [loadStatus]);
 
-  async function sync(mode: "kev" | "recent" | "full" | "poc") {
+  const startSync = async (mode: SyncMode) => {
     setSyncing(true);
     try {
-      await api.intelSync(mode, mode === "full" ? 120 : undefined);
-      toast.success(
-        mode === "full"
-          ? "已开始回填最近 120 天（后台执行，可继续用页面）"
-          : mode === "poc"
-            ? "已开始聚合 PoC 线索（后台按配额逐条查，star 高的先入库）"
-            : "已触发同步（后台执行）",
-      );
+      await api.intelSync(mode);
+      toast.success(mode === "all" ? "已开始一轮完整同步" : `已触发 ${mode} 同步`);
       setTimeout(() => void loadStatus(), 1500);
     } catch (e) {
       toast.error("触发失败：" + (e as Error).message);
     } finally {
       setSyncing(false);
     }
-  }
+  };
 
-  async function saveGitHub(next?: { enabled?: boolean; token?: string }) {
-    setSavingCfg(true);
+  const cancelSync = async () => {
     try {
-      const cfg = await api.intelConfigSave(next ?? {
-        enabled: ghEnabled,
-        // 空输入 = 不改（避免误清空已存的 token）；显式清空要走「清除」按钮。
-        ...(ghToken.trim() ? { token: ghToken.trim() } : {}),
-      });
-      setGh(cfg);
-      setGhEnabled(cfg.enabled);
-      setGhToken("");
-      toast.success("GitHub 配置已保存，下一轮同步生效");
-      void loadStatus();
+      await api.intelSyncCancel();
+      toast.warning("已请求中断，当前请求结束后停止");
     } catch (e) {
-      toast.error("保存失败：" + (e as Error).message);
-    } finally {
-      setSavingCfg(false);
+      toast.error("中断失败：" + (e as Error).message);
     }
-  }
+  };
 
-  async function openPocs(cve: string) {
-    setPocCVE(cve);
-    setPocItems([]);
-    setPocLoading(true);
-    try {
-      const r = await api.intelPocs(cve);
-      setPocItems(r.items);
-    } catch (e) {
-      toast.error("读取 PoC 线索失败：" + (e as Error).message);
-    } finally {
-      setPocLoading(false);
-    }
-  }
-
-  async function loadHits() {
-    try {
-      const r = await api.intelAssetHits(200);
-      setHits(r.items);
-      setHitsLoaded(true);
-    } catch (e) {
-      toast.error("读取资产命中失败：" + (e as Error).message);
-    }
-  }
-
-  const stats = status?.stats;
-  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const counts = status?.counts;
 
   return (
-    <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
+    <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold">漏洞情报</h1>
-          <p className="text-muted-foreground text-sm">
-            NVD 全量 + CISA KEV 在野利用 + GitHub 公开仓库线索，都是公开数据；情报只给候选，可利用性必须在授权目标上实测。
+          <h1 className="flex items-center gap-2 text-lg font-medium">
+            <DatabaseIcon className="size-5" /> 漏洞情报
+          </h1>
+          <p className="text-muted-foreground mt-1 text-xs">
+            公开源：NVD 2.0 · CISA KEV · GitHub Advisory · GitHub PoC · nuclei 模板。
+            组件匹配只给候选，能否利用必须实测。
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button variant="outline" size="sm" onClick={() => void loadStatus()} disabled={loading}>
-            <RefreshCwIcon /> 刷新状态
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => void sync("kev")} disabled={syncing || Boolean(status?.running)}>
-            <FlameIcon /> 同步 KEV
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => void sync("recent")} disabled={syncing || Boolean(status?.running)}>
-            <CloudDownloadIcon /> 同步近 7 天
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => void sync("poc")} disabled={syncing || Boolean(status?.running)}>
-            <GitBranchIcon /> 聚合 PoC
-          </Button>
-          <Button size="sm" onClick={() => void sync("full")} disabled={syncing || Boolean(status?.running)}>
-            {status?.running ? <Spinner data-icon="inline-start" /> : <DatabaseIcon />}
-            {status?.running ? `同步中（${status.running}）` : "回填 120 天"}
-          </Button>
+        <div className="flex items-center gap-2">
+          {status?.sync_running ? (
+            <>
+              <span className="text-muted-foreground text-xs">{status.sync_phase || "同步中…"}</span>
+              <Button variant="outline" size="sm" onClick={() => void cancelSync()}>
+                <SquareIcon /> 中断
+              </Button>
+            </>
+          ) : (
+            <Button size="sm" disabled={syncing} onClick={() => void startSync("all")}>
+              {syncing ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon />} 立即同步
+            </Button>
+          )}
         </div>
       </div>
 
-      {status?.last_error && (
-        <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm">
-          <AlertTriangleIcon className="text-destructive mt-0.5 size-4 shrink-0" />
-          <div>
-            <p className="font-medium">上次同步报错</p>
-            <p className="text-muted-foreground break-all text-xs">{status.last_error}</p>
-          </div>
-        </div>
-      )}
-
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         {[
-          { label: "情报条目", value: stats?.total ?? 0, hint: "NVD + KEV 去重后" },
-          { label: "KEV 在野利用", value: stats?.kev ?? 0, hint: "CISA 已确认被利用" },
-          { label: "CVSS ≥ 9", value: stats?.critical ?? 0, hint: "严重" },
-          { label: "近 7 天新增", value: stats?.last_7_days ?? 0, hint: "按发布时间" },
-          {
-            label: "PoC 线索",
-            value: status?.poc?.repos ?? 0,
-            hint: `覆盖 ${status?.poc?.cves ?? 0} 个 CVE · 待查 ${status?.poc?.queue ?? 0}`,
-          },
+          { label: "CVE 记录", value: counts?.cves ?? 0, hint: "NVD + GHSA 去重后" },
+          { label: "KEV 在野利用", value: counts?.kev ?? 0, hint: "CISA 已确认被利用" },
+          { label: "PoC 线索", value: counts?.pocs ?? 0, hint: "仅仓库元数据" },
+          { label: "组件索引", value: counts?.products ?? 0, hint: "vendor/product 倒排行" },
         ].map((c) => (
-          <Card key={c.label} className="gap-0 py-4">
-            <CardHeader className="px-4 pb-1">
-              <CardDescription className="text-xs">{c.label}</CardDescription>
+          <Card key={c.label}>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-muted-foreground text-sm font-medium">{c.label}</CardTitle>
             </CardHeader>
             <CardContent className="px-4">
               <div className="text-2xl font-semibold tabular-nums">{c.value.toLocaleString()}</div>
@@ -244,314 +170,819 @@ export default function IntelPage() {
       <Tabs defaultValue="library" className="flex flex-1 flex-col gap-3">
         <TabsList>
           <TabsTrigger value="library">情报库</TabsTrigger>
-          <TabsTrigger value="hits" onClick={() => { if (!hitsLoaded) void loadHits(); }}>
-            命中我的资产
+          <TabsTrigger value="hits">命中我的资产</TabsTrigger>
+          <TabsTrigger value="sources">
+            库配置
+            {status?.sources?.some((s) => s.status === "error") && (
+              <AlertTriangleIcon className="ml-1 size-3.5 text-rose-500" />
+            )}
           </TabsTrigger>
-          <TabsTrigger value="github">GitHub 配置</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="library" className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="relative">
-              <SearchIcon className="text-muted-foreground pointer-events-none absolute top-2.5 left-2.5 size-4" />
-              <Input
-                className="w-72 pl-8"
-                placeholder="组件 / 产品 / CVE 编号，如 nginx、CVE-2024-3094"
-                value={q}
-                onChange={(e) => setQ(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void loadPage(0, q, kevOnly, minCvss);
-                }}
-              />
-            </div>
-            <Select value={minCvss} onValueChange={(v) => { setMinCvss(v); void loadPage(0, q, kevOnly, v); }}>
-              <SelectTrigger className="w-32">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="0">全部等级</SelectItem>
-                <SelectItem value="9">CVSS ≥ 9</SelectItem>
-                <SelectItem value="7">CVSS ≥ 7</SelectItem>
-                <SelectItem value="4">CVSS ≥ 4</SelectItem>
-              </SelectContent>
-            </Select>
-            <label className="flex items-center gap-2 text-sm">
-              <Switch
-                checked={kevOnly}
-                onCheckedChange={(v) => { setKevOnly(v === true); void loadPage(0, q, v === true, minCvss); }}
-              />
-              只看 KEV
-            </label>
-            <Button variant="outline" size="sm" onClick={() => void loadPage(0, q, kevOnly, minCvss)} disabled={loading}>
-              {loading ? <Spinner data-icon="inline-start" /> : <SearchIcon />} 查询
-            </Button>
-            <span className="text-muted-foreground ml-auto text-xs tabular-nums">共 {total.toLocaleString()} 条</span>
-          </div>
-
-          <div className="overflow-hidden rounded-lg border">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-44">CVE</TableHead>
-                  <TableHead className="w-24">等级</TableHead>
-                  <TableHead className="w-16 text-right">CVSS</TableHead>
-                  <TableHead>标题</TableHead>
-                  <TableHead className="w-28">发布</TableHead>
-                  <TableHead className="w-20">KEV</TableHead>
-                  <TableHead className="w-20">PoC</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {items.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={7} className="text-muted-foreground py-10 text-center text-sm">
-                      {loading ? "查询中…" : "还没有情报。点右上角「同步 KEV」先拉一份在野利用目录（约 1800 条，几秒）。"}
-                    </TableCell>
-                  </TableRow>
-                )}
-                {items.map((e) => (
-                  <TableRow key={e.cve_id}>
-                    <TableCell className="font-mono text-xs">{e.cve_id}</TableCell>
-                    <TableCell>
-                      <Badge variant="outline" className={severityTone[e.severity?.toUpperCase()] ?? ""}>
-                        {e.severity || "—"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">{e.cvss ? e.cvss.toFixed(1) : "—"}</TableCell>
-                    <TableCell className="max-w-[520px]">
-                      <p className="truncate text-sm" title={e.title || e.description}>
-                        {e.title || e.description || "—"}
-                      </p>
-                    </TableCell>
-                    <TableCell className="text-muted-foreground text-xs">{fmtDate(e.published_at)}</TableCell>
-                    <TableCell>
-                      {e.kev ? (
-                        <Badge variant="outline" className="border-red-500/40 bg-red-500/10 text-red-600 dark:text-red-400">
-                          在野
-                        </Badge>
-                      ) : (
-                        <span className="text-muted-foreground text-xs">—</span>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {e.poc_count ? (
-                        <button
-                          type="button"
-                          className="text-primary text-xs font-medium underline-offset-2 hover:underline"
-                          onClick={() => void openPocs(e.cve_id)}
-                        >
-                          {e.poc_count} 个
-                        </button>
-                      ) : (
-                        <span className="text-muted-foreground text-xs">—</span>
-                      )}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-
-          <div className="flex items-center justify-between">
-            <span className="text-muted-foreground text-xs">
-              第 {page + 1} / {pages} 页
-            </span>
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={page === 0 || loading}
-                onClick={() => void loadPage(page - 1, q, kevOnly, minCvss)}
-              >
-                上一页
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={page + 1 >= pages || loading}
-                onClick={() => void loadPage(page + 1, q, kevOnly, minCvss)}
-              >
-                下一页
-              </Button>
-            </div>
-          </div>
+        <TabsContent value="library">
+          <LibraryTab />
         </TabsContent>
-
-        <TabsContent value="hits" className="flex flex-col gap-3">
-          <div className="flex items-center justify-between">
-            <p className="text-muted-foreground text-xs">
-              拿资产台账里的 technologies 反查情报库（CVSS ≥ 7 或在 KEV）。版本未采集，命中一律「可能受影响」。
-            </p>
-            <Button variant="outline" size="sm" onClick={() => void loadHits()}>
-              <RefreshCwIcon /> 重新匹配
-            </Button>
-          </div>
-          <div className="overflow-hidden rounded-lg border">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-40">资产</TableHead>
-                  <TableHead className="w-40">技术指纹</TableHead>
-                  <TableHead className="w-44">CVE</TableHead>
-                  <TableHead className="w-20">等级</TableHead>
-                  <TableHead>标题</TableHead>
-                  <TableHead className="w-24">版本判定</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {hits.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={6} className="text-muted-foreground py-10 text-center text-sm">
-                      {hitsLoaded ? "没有命中：要么资产没采到技术指纹，要么情报库还没同步。" : "加载中…"}
-                    </TableCell>
-                  </TableRow>
-                )}
-                {hits.map((h) => (
-                  <TableRow key={`${h.asset_id}-${h.cve_id}`}>
-                    <TableCell className="font-mono text-xs">{h.host || `#${h.asset_id}`}</TableCell>
-                    <TableCell className="text-xs">{h.technology}</TableCell>
-                    <TableCell className="font-mono text-xs">{h.cve_id}</TableCell>
-                    <TableCell>
-                      <Badge variant="outline" className={severityTone[h.severity?.toUpperCase()] ?? ""}>
-                        {h.severity || "—"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="max-w-[420px]">
-                      <p className="truncate text-sm" title={h.title}>{h.title || "—"}</p>
-                    </TableCell>
-                    <TableCell>
-                      <span className="text-muted-foreground text-xs">未知（无版本）</span>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+        <TabsContent value="hits">
+          <AssetHitsTab />
         </TabsContent>
-
-        <TabsContent value="github" className="flex flex-col gap-3">
-          <Card className="max-w-3xl">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <GitBranchIcon className="size-4" /> GitHub PoC 线索
-              </CardTitle>
-              <CardDescription>
-                拿 CVE 编号在 GitHub 公开搜索里查仓库名/描述，只落元数据（repo、star、描述、URL），
-                不克隆、不执行、不托管任何代码。带 token 时 30 次/分钟，匿名 10 次/分钟。
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-4">
-              <div className="flex items-center justify-between rounded-lg border p-3">
-                <div>
-                  <p className="text-sm font-medium">自动聚合</p>
-                  <p className="text-muted-foreground text-xs">
-                    每 30 分钟随 KEV/NVD 快通道补一批（KEV 与 CVSS ≥ 9 优先，只查没查过的）。
-                  </p>
-                </div>
-                <Switch
-                  checked={ghEnabled}
-                  onCheckedChange={(v) => {
-                    setGhEnabled(v === true);
-                    void saveGitHub({ enabled: v === true });
-                  }}
-                  disabled={savingCfg}
-                />
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <label htmlFor="gh-token" className="text-sm font-medium">
-                  Personal access token
-                </label>
-                <div className="flex gap-2">
-                  <Input
-                    id="gh-token"
-                    className="min-w-0 flex-1"
-                    type="password"
-                    autoComplete="off"
-                    placeholder={gh?.token_set ? `已配置 ${gh.token_tip}（留空 = 不修改）` : "ghp_… 或 github_pat_…（可留空，匿名也能跑但更慢）"}
-                    value={ghToken}
-                    onChange={(e) => setGhToken(e.target.value)}
-                  />
-                  <Button onClick={() => void saveGitHub()} disabled={savingCfg}>
-                    {savingCfg ? <Spinner data-icon="inline-start" /> : <SaveIcon />} 保存
-                  </Button>
-                  {gh?.token_set && (
-                    <Button
-                      variant="outline"
-                      onClick={() => void saveGitHub({ token: "" })}
-                      disabled={savingCfg}
-                    >
-                      清除
-                    </Button>
-                  )}
-                </div>
-                <p className="text-muted-foreground text-[11px]">
-                  只需 public_repo 读权限（fine-grained token 勾 Public repositories 即可）。token 存库、只在服务端使用，
-                  页面上只回显末四位。上次聚合：{gh?.last_sync || "从未"}
-                </p>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2 border-t pt-3">
-                <Button variant="outline" onClick={() => void sync("poc")} disabled={syncing || Boolean(status?.running)}>
-                  <GitBranchIcon /> 立即聚合一批
-                </Button>
-                <span className="text-muted-foreground text-xs">
-                  待查 {status?.poc?.queue ?? 0} 个 CVE · 已有线索 {status?.poc?.repos ?? 0} 条（覆盖{" "}
-                  {status?.poc?.cves ?? 0} 个 CVE）
-                </span>
-              </div>
-            </CardContent>
-          </Card>
+        <TabsContent value="sources">
+          <SourcesTab status={status} reload={loadStatus} onSync={startSync} />
         </TabsContent>
       </Tabs>
-
-      <Dialog open={pocCVE !== null} onOpenChange={(v) => { if (!v) setPocCVE(null); }}>
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle className="font-mono text-base">{pocCVE}</DialogTitle>
-            <DialogDescription>
-              公开仓库线索，按 star 排序。这是「别人写了 EXP」的信号，不是可利用性结论；陌生代码不要直接执行。
-            </DialogDescription>
-          </DialogHeader>
-          {pocLoading ? (
-            <div className="text-muted-foreground flex items-center gap-2 py-6 text-sm">
-              <Spinner /> 加载中…
-            </div>
-          ) : pocItems.length === 0 ? (
-            <p className="text-muted-foreground py-6 text-sm">没有查到公开仓库线索（或还没聚合到这条）。</p>
-          ) : (
-            <ul className="flex flex-col gap-2">
-              {pocItems.map((p) => (
-                <li key={p.repo} className="rounded-lg border p-3">
-                  <div className="flex items-center gap-2">
-                    <a
-                      href={p.url}
-                      target="_blank"
-                      rel="noreferrer noopener"
-                      className="text-primary flex items-center gap-1 font-mono text-sm hover:underline"
-                    >
-                      {p.repo} <ExternalLinkIcon className="size-3" />
-                    </a>
-                    <Badge variant="outline" className="text-[10px]">★ {p.stars}</Badge>
-                    {p.lang && <span className="text-muted-foreground text-[11px]">{p.lang}</span>}
-                  </div>
-                  {p.description && (
-                    <p className="text-muted-foreground mt-1 text-xs">{p.description}</p>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </DialogContent>
-      </Dialog>
-
-      {status && (
-        <p className="text-muted-foreground text-[11px]">
-          数据源：NVD API 2.0 / CISA KEV · 上次 KEV 同步 {status.last_kev_sync || "从未"} · 上次 NVD 同步{" "}
-          {status.last_nvd_sync || "从未"}
-          {status.enabled ? "" : " · 自动同步已关闭"}
-        </p>
-      )}
     </div>
+  );
+}
+
+// ── 情报库 ────────────────────────────────────────────────────────────
+
+function LibraryTab() {
+  const [items, setItems] = React.useState<VulnCVESummary[]>([]);
+  const [total, setTotal] = React.useState(0);
+  const [page, setPage] = React.useState(0);
+  const [q, setQ] = React.useState("");
+  const [kevOnly, setKevOnly] = React.useState(false);
+  const [minCvss, setMinCvss] = React.useState("0");
+  const [loading, setLoading] = React.useState(false);
+  const [openCVE, setOpenCVE] = React.useState<string | null>(null);
+
+  const load = React.useCallback(
+    async (p: number, query: string, kev: boolean, cvss: string) => {
+      setLoading(true);
+      try {
+        const r = await api.intelSearch({
+          q: query,
+          kev,
+          minCvss: Number(cvss) || 0,
+          limit: PAGE_SIZE,
+          offset: p * PAGE_SIZE,
+        });
+        setItems(r.items);
+        setTotal(r.total);
+      } catch (e) {
+        toast.error("查询失败：" + (e as Error).message);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  React.useEffect(() => {
+    void load(0, "", false, "0");
+  }, [load]);
+
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative">
+          <SearchIcon className="text-muted-foreground pointer-events-none absolute top-2.5 left-2.5 size-4" />
+          <Input
+            className="w-80 pl-8"
+            placeholder="组件 / 产品 / CVE 编号，如 nginx、http_server、CVE-2024-3094"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                setPage(0);
+                void load(0, q, kevOnly, minCvss);
+              }
+            }}
+          />
+        </div>
+        <Select
+          value={minCvss}
+          onValueChange={(v) => {
+            setMinCvss(v);
+            setPage(0);
+            void load(0, q, kevOnly, v);
+          }}
+        >
+          <SelectTrigger className="w-32">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="0">全部等级</SelectItem>
+            <SelectItem value="9">CVSS ≥ 9</SelectItem>
+            <SelectItem value="7">CVSS ≥ 7</SelectItem>
+            <SelectItem value="4">CVSS ≥ 4</SelectItem>
+          </SelectContent>
+        </Select>
+        <label className="flex items-center gap-2 text-sm">
+          <Switch
+            checked={kevOnly}
+            onCheckedChange={(v) => {
+              const on = v === true;
+              setKevOnly(on);
+              setPage(0);
+              void load(0, q, on, minCvss);
+            }}
+          />
+          只看 KEV
+        </label>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={loading}
+          onClick={() => {
+            setPage(0);
+            void load(0, q, kevOnly, minCvss);
+          }}
+        >
+          {loading ? <Spinner data-icon="inline-start" /> : <SearchIcon />} 查询
+        </Button>
+        <span className="text-muted-foreground ml-auto text-xs tabular-nums">共 {total.toLocaleString()} 条</span>
+      </div>
+
+      <div className="overflow-hidden rounded-lg border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-44">CVE</TableHead>
+              <TableHead className="w-24">等级</TableHead>
+              <TableHead className="w-16 text-right">CVSS</TableHead>
+              <TableHead>标题</TableHead>
+              <TableHead className="w-16 text-right">PoC</TableHead>
+              <TableHead className="w-28">发布</TableHead>
+              <TableHead className="w-20">KEV</TableHead>
+              <TableHead className="w-20">来源</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {items.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={8} className="text-muted-foreground py-8 text-center text-sm">
+                  {loading ? "查询中…" : "没有数据：先点右上「立即同步」，或换个关键词"}
+                </TableCell>
+              </TableRow>
+            )}
+            {items.map((it) => (
+              <TableRow key={it.cve_id} className="cursor-pointer" onClick={() => setOpenCVE(it.cve_id)}>
+                <TableCell className="font-mono text-xs">{it.cve_id}</TableCell>
+                <TableCell>
+                  <Badge variant="outline" className={severityTone[it.severity?.toUpperCase()] || ""}>
+                    {it.severity || "—"}
+                  </Badge>
+                </TableCell>
+                <TableCell className="text-right text-xs tabular-nums">
+                  {it.cvss_score != null ? it.cvss_score.toFixed(1) : "—"}
+                </TableCell>
+                <TableCell className="max-w-[420px] truncate text-sm">{it.title || "—"}</TableCell>
+                <TableCell className="text-right text-xs tabular-nums">{it.poc_count || 0}</TableCell>
+                <TableCell className="text-muted-foreground text-xs">{fmtDate(it.published)}</TableCell>
+                <TableCell>
+                  {it.kev ? (
+                    <Badge variant="outline" className="border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400">
+                      <FlameIcon className="size-3" /> KEV
+                    </Badge>
+                  ) : (
+                    <span className="text-muted-foreground text-xs">—</span>
+                  )}
+                </TableCell>
+                <TableCell className="text-muted-foreground text-xs uppercase">{it.source || "—"}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+
+      <div className="flex items-center justify-end gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={page <= 0 || loading}
+          onClick={() => {
+            setPage(page - 1);
+            void load(page - 1, q, kevOnly, minCvss);
+          }}
+        >
+          上一页
+        </Button>
+        <span className="text-muted-foreground text-xs tabular-nums">
+          {page + 1} / {pages}
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={page + 1 >= pages || loading}
+          onClick={() => {
+            setPage(page + 1);
+            void load(page + 1, q, kevOnly, minCvss);
+          }}
+        >
+          下一页
+        </Button>
+      </div>
+
+      <VulnDialog cve={openCVE} onClose={() => setOpenCVE(null)} />
+    </div>
+  );
+}
+
+function VulnDialog({ cve, onClose }: { cve: string | null; onClose: () => void }) {
+  const [detail, setDetail] = React.useState<VulnDetail | null>(null);
+  const [pocs, setPocs] = React.useState<VulnPocEntry[]>([]);
+  const [loading, setLoading] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!cve) {
+      setDetail(null);
+      setPocs([]);
+      return;
+    }
+    setLoading(true);
+    Promise.all([api.intelVuln(cve), api.intelPocs(cve)])
+      .then(([d, p]) => {
+        setDetail(d);
+        setPocs(p.items);
+      })
+      .catch((e) => toast.error("读取详情失败：" + (e as Error).message))
+      .finally(() => setLoading(false));
+  }, [cve]);
+
+  return (
+    <Dialog
+      open={!!cve}
+      onOpenChange={(o) => {
+        if (!o) onClose();
+      }}
+    >
+      <DialogContent className="max-h-[80vh] max-w-3xl overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle className="font-mono text-sm">{cve}</DialogTitle>
+          <DialogDescription className="text-xs">
+            {detail
+              ? `${detail.severity} · CVSS ${detail.cvss_score?.toFixed(1) ?? "—"}${detail.kev ? " · KEV 在野利用" : ""} · 来源 ${detail.source || "—"}`
+              : "加载中…"}
+          </DialogDescription>
+        </DialogHeader>
+        {loading && <Spinner />}
+        {detail && (
+          <div className="flex flex-col gap-3 text-sm">
+            <p className="leading-relaxed">{detail.description || "（无描述）"}</p>
+
+            <div>
+              <div className="mb-1 text-xs font-medium">受影响版本区间</div>
+              {(detail.version_ranges?.length ?? 0) === 0 ? (
+                <p className="text-muted-foreground text-xs">
+                  无结构化区间（NVD 未填）：需按 cpe_criteria 自行判断，或等 GHSA 补齐。
+                </p>
+              ) : (
+                <div className="overflow-hidden rounded border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="w-48">组件</TableHead>
+                        <TableHead>区间</TableHead>
+                        <TableHead className="w-20">来源</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {detail.version_ranges!.map((r, i) => (
+                        <TableRow key={`${r.vendor}/${r.product}/${i}`}>
+                          <TableCell className="font-mono text-xs">
+                            {r.vendor}/{r.product}
+                          </TableCell>
+                          <TableCell className="font-mono text-xs">
+                            {[
+                              r.start_including && `>= ${r.start_including}`,
+                              r.start_excluding && `> ${r.start_excluding}`,
+                              r.end_including && `<= ${r.end_including}`,
+                              r.end_excluding && `< ${r.end_excluding}`,
+                            ]
+                              .filter(Boolean)
+                              .join("  ") ||
+                              r.raw ||
+                              "—"}
+                          </TableCell>
+                          <TableCell className="text-muted-foreground text-xs uppercase">{r.source || "—"}</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              )}
+            </div>
+
+            {(detail.cwes?.length ?? 0) > 0 && (
+              <div className="flex flex-wrap items-center gap-1">
+                <span className="text-xs font-medium">CWE：</span>
+                {detail.cwes!.map((c) => (
+                  <Badge key={c} variant="outline" className="text-[11px]">
+                    {c}
+                  </Badge>
+                ))}
+              </div>
+            )}
+
+            <div>
+              <div className="mb-1 text-xs font-medium">PoC 线索（{pocs.length}）</div>
+              {pocs.length === 0 ? (
+                <p className="text-muted-foreground text-xs">没有聚合到公开仓库（或该 CVE 未被 PoC 聚合覆盖）。</p>
+              ) : (
+                <ul className="flex flex-col gap-1">
+                  {pocs.map((p) => (
+                    <li key={p.url} className="flex items-center gap-2 text-xs">
+                      <Badge variant="outline" className="shrink-0 text-[10px]">
+                        {p.source}
+                      </Badge>
+                      <a
+                        className="truncate text-blue-600 hover:underline dark:text-blue-400"
+                        href={p.url}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        {p.title || p.url}
+                      </a>
+                      <span className="text-muted-foreground ml-auto shrink-0 tabular-nums">{p.stars}★</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            {(detail.references?.length ?? 0) > 0 && (
+              <div>
+                <div className="mb-1 text-xs font-medium">参考链接</div>
+                <ul className="flex flex-col gap-1">
+                  {detail.references!.slice(0, 8).map((u) => (
+                    <li key={u} className="truncate text-xs">
+                      <a className="text-blue-600 hover:underline dark:text-blue-400" href={u} target="_blank" rel="noreferrer">
+                        {u}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ── 命中我的资产 ──────────────────────────────────────────────────────
+
+function AssetHitsTab() {
+  const [hits, setHits] = React.useState<AssetVulnHit[]>([]);
+  const [loading, setLoading] = React.useState(false);
+  const [loaded, setLoaded] = React.useState(false);
+  const [kevOnly, setKevOnly] = React.useState(false);
+  const [minCvss, setMinCvss] = React.useState("7");
+
+  const load = React.useCallback(async (kev: boolean, cvss: string) => {
+    setLoading(true);
+    try {
+      const r = await api.intelAssetHits({ limit: 300, minCvss: Number(cvss) || 0, kevOnly: kev });
+      setHits(r.items);
+      setLoaded(true);
+    } catch (e) {
+      toast.error("读取命中失败：" + (e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (!loaded) void load(false, "7");
+  }, [load, loaded]);
+
+  return (
+    <div className="flex flex-col gap-3">
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="text-sm font-medium">资产指纹 × 组件倒排</CardTitle>
+          <CardDescription className="text-xs">
+            拿资产台账的 technologies 与 vuln_cpe_products 求交集（含别名归一：httpd ↔ http_server）。
+            版本不保证可靠，命中一律是「可能受影响」，必须实测。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-center gap-2">
+          <Select
+            value={minCvss}
+            onValueChange={(v) => {
+              setMinCvss(v);
+              void load(kevOnly, v);
+            }}
+          >
+            <SelectTrigger className="w-32">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="0">全部等级</SelectItem>
+              <SelectItem value="9">CVSS ≥ 9</SelectItem>
+              <SelectItem value="7">CVSS ≥ 7</SelectItem>
+              <SelectItem value="4">CVSS ≥ 4</SelectItem>
+            </SelectContent>
+          </Select>
+          <label className="flex items-center gap-2 text-sm">
+            <Switch
+              checked={kevOnly}
+              onCheckedChange={(v) => {
+                const on = v === true;
+                setKevOnly(on);
+                void load(on, minCvss);
+              }}
+            />
+            只看 KEV
+          </label>
+          <Button variant="outline" size="sm" disabled={loading} onClick={() => void load(kevOnly, minCvss)}>
+            {loading ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon />} 刷新
+          </Button>
+          <span className="text-muted-foreground ml-auto text-xs tabular-nums">{hits.length} 条命中</span>
+        </CardContent>
+      </Card>
+
+      <div className="overflow-hidden rounded-lg border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-56">资产</TableHead>
+              <TableHead className="w-40">命中指纹</TableHead>
+              <TableHead className="w-44">CVE</TableHead>
+              <TableHead className="w-24">等级</TableHead>
+              <TableHead className="w-16 text-right">CVSS</TableHead>
+              <TableHead className="w-20">KEV</TableHead>
+              <TableHead>组件</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {hits.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={7} className="text-muted-foreground py-8 text-center text-sm">
+                  {loading ? "计算中…" : "没有命中：要么资产没采到技术指纹，要么情报库还没同步。"}
+                </TableCell>
+              </TableRow>
+            )}
+            {hits.map((h, i) => (
+              <TableRow key={`${h.asset_id}-${h.cve_id}-${i}`}>
+                <TableCell className="max-w-[220px] truncate font-mono text-xs">{h.asset || `asset#${h.asset_id}`}</TableCell>
+                <TableCell className="text-muted-foreground font-mono text-xs">{h.matched_on}</TableCell>
+                <TableCell className="font-mono text-xs">{h.cve_id}</TableCell>
+                <TableCell>
+                  <Badge variant="outline" className={severityTone[h.severity?.toUpperCase()] || ""}>
+                    {h.severity || "—"}
+                  </Badge>
+                </TableCell>
+                <TableCell className="text-right text-xs tabular-nums">
+                  {h.cvss_score != null ? h.cvss_score.toFixed(1) : "—"}
+                </TableCell>
+                <TableCell>
+                  {h.kev ? (
+                    <Badge variant="outline" className="border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400">
+                      KEV
+                    </Badge>
+                  ) : (
+                    <span className="text-muted-foreground text-xs">—</span>
+                  )}
+                </TableCell>
+                <TableCell className="font-mono text-xs">{h.product}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+    </div>
+  );
+}
+
+// ── 库配置 ────────────────────────────────────────────────────────────
+
+function SourcesTab({
+  status,
+  reload,
+  onSync,
+}: {
+  status: VulnIntelStatus | null;
+  reload: () => Promise<void>;
+  onSync: (mode: SyncMode) => Promise<void>;
+}) {
+  const sources = status?.sources ?? [];
+  const [drafts, setDrafts] = React.useState<Record<string, string>>({});
+  const [saving, setSaving] = React.useState<string | null>(null);
+  const [probing, setProbing] = React.useState(false);
+  const [probes, setProbes] = React.useState<
+    { source: string; ok: boolean; status: number; latency_ms: number; error?: string; hint?: string }[] | null
+  >(null);
+
+  const patch = async (id: string, p: Parameters<typeof api.intelSourceUpdate>[1]) => {
+    setSaving(id);
+    try {
+      await api.intelSourceUpdate(id, p);
+      await reload();
+      toast.success("已保存");
+    } catch (e) {
+      toast.error("保存失败：" + (e as Error).message);
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  const probe = async () => {
+    setProbing(true);
+    try {
+      const r = await api.intelProbe();
+      setProbes(r.results);
+      const bad = r.results.filter((x) => !x.ok).length;
+      if (bad === 0) toast.success("所有数据源连通正常");
+      else toast.warning(`${bad} 个数据源不可用，展开看修复建议`);
+    } catch (e) {
+      toast.error("探测失败：" + (e as Error).message);
+    } finally {
+      setProbing(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <Card>
+        <CardHeader className="pb-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <CardTitle className="flex items-center gap-2 text-sm font-medium">
+                <GitBranchIcon className="size-4" /> 已接入的库
+              </CardTitle>
+              <CardDescription className="text-xs">
+                每类库一行：开关、端点、凭据、条数、上次同步都在这。加新源由后端注册 adapter，页面自动出现。
+              </CardDescription>
+            </div>
+            <Button variant="outline" size="sm" disabled={probing} onClick={() => void probe()}>
+              {probing ? <Spinner data-icon="inline-start" /> : <PlugZapIcon />} 测试连通性
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="px-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-56 pl-4">库</TableHead>
+                <TableHead className="w-16">启用</TableHead>
+                <TableHead>端点</TableHead>
+                <TableHead className="w-40">凭据</TableHead>
+                <TableHead className="w-20 text-right">条数</TableHead>
+                <TableHead className="w-28">上次同步</TableHead>
+                <TableHead className="w-24">状态</TableHead>
+                <TableHead className="w-24 pr-4 text-right">操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {sources.map((s) => (
+                <TableRow key={s.id}>
+                  <TableCell className="pl-4">
+                    <div className="text-sm font-medium">{s.name}</div>
+                    <div className="text-muted-foreground text-[11px]">
+                      {kindLabel[s.kind] || s.kind} · id={s.id} · 优先级 {s.priority}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <Switch
+                      checked={s.enabled}
+                      disabled={saving === s.id}
+                      onCheckedChange={(v) => void patch(s.id, { enabled: v === true })}
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <Input
+                      className="h-8 font-mono text-[11px]"
+                      value={drafts[s.id] ?? s.endpoint}
+                      onChange={(e) => setDrafts((d) => ({ ...d, [s.id]: e.target.value }))}
+                      onBlur={() => {
+                        const v = drafts[s.id];
+                        if (v != null && v !== s.endpoint) void patch(s.id, { endpoint: v });
+                      }}
+                    />
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    {s.credential_setting ? (
+                      s.credential_set ? (
+                        <Badge
+                          variant="outline"
+                          className="border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                        >
+                          已配置
+                        </Badge>
+                      ) : (
+                        <span className="text-muted-foreground">{s.credential_hint || "未配置凭据"}</span>
+                      )
+                    ) : (
+                      <span className="text-muted-foreground">无需凭据</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right text-xs tabular-nums">{s.count.toLocaleString()}</TableCell>
+                  <TableCell className="text-muted-foreground text-xs">{fmtTime(s.last_sync_at)}</TableCell>
+                  <TableCell>
+                    <Badge variant="outline" className={sourceTone[s.status]}>
+                      {s.status === "ok" ? "正常" : s.status === "error" ? "异常" : "未同步"}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="pr-4 text-right">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={status?.sync_running}
+                      onClick={() => {
+                        const mode: SyncMode =
+                          s.id === "nvd"
+                            ? "recent"
+                            : s.id === "kev"
+                              ? "kev"
+                              : s.id === "ghsa"
+                                ? "ghsa"
+                                : s.id === "github_poc"
+                                  ? "poc"
+                                  : "templates";
+                        void onSync(mode);
+                      }}
+                    >
+                      <CloudDownloadIcon /> 同步
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+
+          {sources
+            .filter((s) => s.last_error)
+            .map((s) => (
+              <div key={`err-${s.id}`} className="mx-4 mt-3 rounded border border-rose-500/30 bg-rose-500/5 p-2 text-xs">
+                <span className="font-medium text-rose-600 dark:text-rose-400">{s.name}：</span>
+                <span className="text-muted-foreground">{s.error_hint || s.last_error}</span>
+                <div className="text-muted-foreground/70 mt-1 font-mono text-[10px] break-all">{s.last_error}</div>
+              </div>
+            ))}
+        </CardContent>
+      </Card>
+
+      {probes && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium">连通性诊断</CardTitle>
+            <CardDescription className="text-xs">
+              走当前「上网代理」逐源探测；失败时给的是可执行建议，不是错误码。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="px-0">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="pl-4">数据源</TableHead>
+                  <TableHead className="w-20">结果</TableHead>
+                  <TableHead className="w-20 text-right">耗时</TableHead>
+                  <TableHead>说明</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {probes.map((p) => (
+                  <TableRow key={p.source}>
+                    <TableCell className="pl-4 font-mono text-xs">{p.source}</TableCell>
+                    <TableCell>
+                      <Badge variant="outline" className={p.ok ? sourceTone.ok : sourceTone.error}>
+                        {p.ok ? "通" : p.status || "失败"}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="text-right text-xs tabular-nums">{p.latency_ms}ms</TableCell>
+                    <TableCell className="text-xs">
+                      {p.ok ? (
+                        <span className="text-muted-foreground">正常</span>
+                      ) : (
+                        <span className="text-rose-600 dark:text-rose-400">{p.hint || p.error}</span>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
+
+      <GlobalConfig status={status} reload={reload} />
+    </div>
+  );
+}
+
+function GlobalConfig({ status, reload }: { status: VulnIntelStatus | null; reload: () => Promise<void> }) {
+  const cfg = status?.config;
+  const [nvdKey, setNvdKey] = React.useState("");
+  const [ghToken, setGhToken] = React.useState("");
+  const [backfill, setBackfill] = React.useState("0");
+  const [maxRuntime, setMaxRuntime] = React.useState("30");
+  const [fastMin, setFastMin] = React.useState("30");
+  const [fastDays, setFastDays] = React.useState("7");
+  const [saving, setSaving] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!cfg) return;
+    setBackfill(String(cfg.backfill_days));
+    setMaxRuntime(String(cfg.max_runtime_minutes));
+    setFastMin(String(cfg.fast_lane_minutes));
+    setFastDays(String(cfg.fast_lane_days));
+  }, [cfg]);
+
+  const save = async (extra: Record<string, unknown> = {}) => {
+    setSaving(true);
+    try {
+      await api.intelConfigSave({
+        backfill_days: Number(backfill) || 0,
+        max_runtime_minutes: Number(maxRuntime) || 30,
+        fast_lane_minutes: Number(fastMin) || 30,
+        fast_lane_days: Number(fastDays) || 7,
+        ...(nvdKey.trim() ? { nvd_api_key: nvdKey.trim() } : {}),
+        ...(ghToken.trim() ? { github_token: ghToken.trim() } : {}),
+        ...extra,
+      });
+      setNvdKey("");
+      setGhToken("");
+      await reload();
+      toast.success("已保存，下一轮同步生效");
+    } catch (e) {
+      toast.error("保存失败：" + (e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="flex items-center gap-2 text-sm font-medium">
+          <SaveIcon className="size-4" /> 全局参数
+        </CardTitle>
+        <CardDescription className="text-xs">
+          凭据留空 = 保持不变；填了才覆盖。同步出口复用「系统 → 设置」里的上网代理。
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-3 md:grid-cols-2">
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-medium">NVD API Key</span>
+          <Input
+            className="font-mono text-xs"
+            placeholder={cfg?.nvd_key_set ? `已配置 ${cfg.nvd_api_key}` : "未配置：匿名 5 次/30 秒"}
+            value={nvdKey}
+            onChange={(e) => setNvdKey(e.target.value)}
+          />
+          <span className="text-muted-foreground text-[11px]">
+            {cfg?.nvd_key_set ? "留空保持不变，填 - 清除" : "填 Key 后限速提升 10 倍"}
+          </span>
+        </div>
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-medium">GitHub Token（GHSA + PoC 共用）</span>
+          <Input
+            className="font-mono text-xs"
+            placeholder={cfg?.github_token_set ? `已配置 ${cfg.github_token}` : "未配置：匿名 10 次/分钟"}
+            value={ghToken}
+            onChange={(e) => setGhToken(e.target.value)}
+          />
+          <span className="text-muted-foreground text-[11px]">
+            {cfg?.github_token_set ? "留空保持不变，填 - 清除" : "public_repo 读权限即可"}
+          </span>
+        </div>
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-medium">上网代理</span>
+          <Input className="font-mono text-xs" value={cfg?.proxy || "（直连）"} readOnly />
+          <span className="text-muted-foreground text-[11px]">在「系统 → 设置 → 上网代理」修改</span>
+        </div>
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-medium">回填天数（首次/手动全量）</span>
+          <Input type="number" value={backfill} onChange={(e) => setBackfill(e.target.value)} />
+          <span className="text-muted-foreground text-[11px]">0 = 从最早目录开始（按游标推进，一轮跑不完下轮续）</span>
+        </div>
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-medium">单轮上限（分钟）</span>
+          <Input type="number" value={maxRuntime} onChange={(e) => setMaxRuntime(e.target.value)} />
+          <span className="text-muted-foreground text-[11px]">到点保存游标退出，下轮续跑</span>
+        </div>
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-medium">快通道（近期高危）</span>
+          <div className="flex items-center gap-2">
+            <Switch
+              checked={cfg?.fast_lane_enabled ?? true}
+              onCheckedChange={(v) => void save({ fast_lane_enabled: v === true })}
+            />
+            <Input className="w-20" type="number" value={fastMin} onChange={(e) => setFastMin(e.target.value)} />
+            <span className="text-muted-foreground text-xs">分钟一轮，回看</span>
+            <Input className="w-16" type="number" value={fastDays} onChange={(e) => setFastDays(e.target.value)} />
+            <span className="text-muted-foreground text-xs">天</span>
+          </div>
+          <span className="text-muted-foreground text-[11px]">按 publishedDate 拉新披露的 CRITICAL，不等主同步游标</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-3 md:col-span-2">
+          <Button size="sm" disabled={saving} onClick={() => void save()}>
+            {saving ? <Spinner data-icon="inline-start" /> : <SaveIcon />} 保存参数
+          </Button>
+          <label className="flex items-center gap-2 text-sm">
+            <Switch checked={status?.enabled ?? true} onCheckedChange={(v) => void save({ enabled: v === true })} />
+            启用情报同步
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <Switch checked={cfg?.poc_enabled ?? false} onCheckedChange={(v) => void save({ poc_enabled: v === true })} />
+            聚合 GitHub PoC（仅元数据）
+          </label>
+        </div>
+      </CardContent>
+    </Card>
   );
 }

@@ -10,14 +10,18 @@
 #   cd /root/Desktop/sec/artex-hs/hostbin
 #   docker build -f Dockerfile.hostbin -t artex-hs-local:v15 .
 #
-# 校验：RUN 里逐个 `--version`，任何一个跑不起来就让构建失败，
+# 校验：逐件 test -f + 逐个 `--version`，任何一个跑不起来就让构建失败，
 #       不留「镜像构建成功但工具是坏的」这种坑。
 
 FROM artex-hs-local:v14
 
-# 目标目录 /usr/local/bin 已在镜像 PATH 里（v14 的 ENV PATH 含它），
-# 且 hosttools 的探测是 exec.LookPath——落在这里页面立刻能看到「已安装」。
-COPY nuclei httpx subfinder katana dnsx tlsx ffuf dalfox chisel /usr/local/bin/
+# 拷整个目录到暂存区再逐件校验。
+#
+# 为什么不用 `COPY nuclei httpx ... /usr/local/bin/`：
+#   COPY 遇到不存在的源文件只报「file not found」，不说是哪个；真缺件时
+#   已存在的文件仍会写进层里，得到一个「部分工具可用」的半残镜像。
+#   逐件 test -f 能在构建日志里直接点名缺哪个，并提示去跑 fetch.sh。
+COPY . /tmp/hostbin/
 
 # 同一层顺带换掉 artex 主程序：工具层和业务层一起发版，避免「镜像里工具是新的、
 # 二进制还是旧的」这种半更新态。artex 由本机交叉编译（CGO_ENABLED=0），
@@ -25,10 +29,25 @@ COPY nuclei httpx subfinder katana dnsx tlsx ffuf dalfox chisel /usr/local/bin/
 COPY artex /app/artex
 
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/nuclei /usr/local/bin/httpx /usr/local/bin/subfinder \
-               /usr/local/bin/katana /usr/local/bin/dnsx /usr/local/bin/tlsx \
-               /usr/local/bin/ffuf /usr/local/bin/dalfox /usr/local/bin/chisel \
-               /app/artex; \
+    # 必需件：缺任何一个都让构建失败（这些是主力扫描件，缺了等于功能残废）。
+    for f in nuclei httpx subfinder katana dnsx tlsx chisel; do \
+      test -f "/tmp/hostbin/$f" || { \
+        echo "缺少预编译二进制: $f —— 在构建机执行 bash docker/hostbin/fetch.sh 后重试" >&2; \
+        exit 1; \
+      }; \
+      install -m 0755 "/tmp/hostbin/$f" "/usr/local/bin/$f"; \
+    done; \
+    # 可选件：ffuf/dalfox 走目录爆破与 XSS，页面也能联网装。缺了只告警，
+    # 不阻断发版——把「构建机拿不到 GitHub release」变成发版阻塞点不划算。
+    for f in ffuf dalfox; do \
+      if [ -f "/tmp/hostbin/$f" ]; then \
+        install -m 0755 "/tmp/hostbin/$f" "/usr/local/bin/$f"; \
+      else \
+        echo "WARN: 可选件 $f 未预置（运行时可通过「宿主环境」页安装）" >&2; \
+      fi; \
+    done; \
+    chmod 0755 /app/artex; \
+    rm -rf /tmp/hostbin; \
     # 逐个自检：能打印版本才算装好（静态二进制不依赖 libc，正常不会有动态库缺失）
     nuclei -version | head -1; \
     httpx -version | head -1; \
@@ -36,8 +55,8 @@ RUN set -eux; \
     katana -version | head -1; \
     dnsx -version | head -1; \
     tlsx -version | head -1; \
-    ffuf -V | head -1; \
-    dalfox version 2>&1 | head -1; \
+    command -v ffuf >/dev/null && ffuf -V | head -1 || true; \
+    command -v dalfox >/dev/null && dalfox version 2>&1 | head -1 || true; \
     chisel --version | head -1
 
 # nuclei 的版本自检/模板自动更新在内网会卡住（连不上 GitHub），默认关掉；

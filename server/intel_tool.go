@@ -1,118 +1,179 @@
 package server
 
-// 给 agent 用的漏洞情报工具（V10-INTEL）。
+// 给 agent 用的漏洞情报工具（V2 组件倒排结构）。
 //
-// 两个只读工具，数据全部来自公开源（NVD + CISA KEV）：
-//   search_vulns          按组件/关键词/CVSS/在野利用筛情报库
-//   list_asset_vuln_hits  拿当前资产的技术指纹反查候选 CVE（命中我的资产）
+// 四件只读工具：
+//   search_vulns           按组件（vendor/product）+ 目标版本查已知漏洞，返回三态版本判定
+//   get_vuln               单条详情：完整描述、CVSS 向量、结构化版本区间、参考链接
+//   get_poc                该 CVE 的公开 PoC 仓库（只给链接，不下载不执行）
+//   list_asset_vuln_hits   资产台账技术指纹反查情报库（命中我的资产）
 //
-// 语义红线：这两件只产出「候选」。命中不等于可利用——组件名匹配不带版本，
-// 版本区间一律 unknown，必须由 worker 在授权目标上实测确认后才能 report_finding。
+// 语义红线：命中不等于可利用。search_vulns 的 version_in_range 才是「该打」的
+// 硬信号；字段缺失（无结构化区间）必须由 worker 用实际请求验证后才能 report_finding。
 
 import (
 	"context"
 	"encoding/json"
 
-	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
 func (s *Server) intelTools() []actool.CoreTool {
-	return []actool.CoreTool{s.toolSearchVulns(), s.toolListAssetVulnHits()}
+	return []actool.CoreTool{
+		s.toolSearchVulns(),
+		s.toolGetVuln(),
+		s.toolGetPoc(),
+		s.toolListAssetVulnHits(),
+	}
 }
 
 func (s *Server) toolSearchVulns() actool.CoreTool {
 	return roTool("search_vulns",
-		"查漏洞情报库（公开源：NVD 全量 + CISA KEV 在野利用）。用于「这个组件/产品最近爆了什么洞」「EXP 是否在野被用」。\n"+
-			"返回 cve_id/severity/cvss/kev/published/描述摘要。注意：情报库只有组件名维度，没有你目标的版本；"+
-			"命中的条目一律是【候选】，必须用实际请求验证后才能 report_finding。",
+		"按组件名检索【公开已知漏洞】库（NVD + GitHub Advisory + CISA KEV 在野利用清单）。\n"+
+			"识别出目标组件（Web 中间件/框架/服务/固件等）后先查这里：有 KEV 标记=已在野利用、优先考虑。\n"+
+			"给 version 参数可做版本判定：\n"+
+			"  - version_in_range=true → 目标版本落在受影响区间内（该打）\n"+
+			"  - version_in_range=false → 不在区间（通常不用打）\n"+
+			"  - 字段缺失 → 无结构化区间，需用 get_vuln 看 cpe_criteria 自行判断\n"+
+			"**false 不等于绝对安全**：部分库的区间填错或缺失，拿不准时用 get_vuln 复核。\n"+
+			"source 字段标明来自 nvd 还是 ghsa：GHSA 的版本区间必填（可信度更高），NVD 对新披露 CVE 常留空。\n"+
+			"product 用 CPE 命名（http_server / nginx / tomcat），不是自然语言；命中为空时换常见写法再试。",
 		objSchema(map[string]any{
-			"query":    strParam("关键词：组件名/产品名/CVE 编号，如 nginx、Next.js、CVE-2024-3094"),
-			"kev_only": map[string]any{"type": "boolean", "description": "只看 CISA KEV（确认在野被利用）"},
-			"min_cvss": map[string]any{"type": "number", "description": "CVSS 下限，如 9 只看严重"},
-			"since":    strParam("发布时间下限 YYYY-MM-DD；查「最近爆的洞」时用"),
-			"limit":    map[string]any{"type": "integer", "description": "返回条数，默认 20，上限 100"},
-		}, "query"),
+			"product": strParam("组件名（CPE product 段），如 http_server / nginx / thinkphp / tomcat / weblogic；支持 % 通配"),
+			"vendor":  strParam("厂商名过滤（可选），如 apache / oracle，用于区分同名组件"),
+			"version": strParam("目标版本号（可选），如 2.4.49；给了才做区间判定"),
+			"limit":   map[string]any{"type": "integer", "description": "返回条数上限（默认 20，最大 50）"},
+		}, "product"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			if s.vuln == nil {
+				return actool.Errorf("search_vulns 未启用: 漏洞情报库未初始化"), nil
+			}
 			var a struct {
-				Query   string  `json:"query"`
-				KEVOnly bool    `json:"kev_only"`
-				MinCVSS float64 `json:"min_cvss"`
-				Since   string  `json:"since"`
-				Limit   int     `json:"limit"`
+				Product string `json:"product"`
+				Vendor  string `json:"vendor"`
+				Version string `json:"version"`
+				Limit   int    `json:"limit"`
 			}
 			_ = json.Unmarshal(in, &a)
-			limit := a.Limit
-			if limit <= 0 || limit > 100 {
-				limit = 20
+			hits, err := s.vuln.store.SearchVulns(ctx, a.Vendor, a.Product, a.Version, a.Limit)
+			if err != nil {
+				return actool.Errorf("检索漏洞失败: " + err.Error()), nil
 			}
-			items, total, err := s.m.PG().SearchVulnIntel(ctx, db.VulnIntelSearch{
-				Query: a.Query, KEVOnly: a.KEVOnly, MinCVSS: a.MinCVSS, Since: a.Since, Limit: limit,
+			if len(hits) == 0 {
+				return jsonResult(map[string]any{
+					"count": 0,
+					"note": "该组件名在情报库无命中：可能拼写与 CPE 命名不符（试 http_server / httpd / IIS / tomcat），" +
+						"或该组件近期无已知漏洞。",
+				})
+			}
+			kev := 0
+			for _, h := range hits {
+				if h.KEV {
+					kev++
+				}
+			}
+			return jsonResult(map[string]any{
+				"count":           len(hits),
+				"kev_count":       kev,
+				"vulnerabilities": hits,
+				"note": "kev=true 表示 CISA 已确认在野利用，价值最高；下一步用 get_vuln 看影响区间、" +
+					"get_poc 找现成利用，再决定是否值得派意图验证。",
 			})
+		})
+}
+
+func (s *Server) toolGetVuln() actool.CoreTool {
+	return roTool("get_vuln",
+		"取一条 CVE 的完整详情：描述、CVSS 向量、**结构化受影响版本区间**、参考链接、CWE。\n"+
+			"search_vulns 的 version_in_range 缺失或你怀疑区间不对时用它复核；"+
+			"version_ranges 里 source=nvd/ghsa 标明区间来自哪个源（两源可能不一致）。",
+		objSchema(map[string]any{
+			"cve_id": strParam("CVE 编号，如 CVE-2021-41773"),
+		}, "cve_id"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			if s.vuln == nil {
+				return actool.Errorf("get_vuln 未启用: 漏洞情报库未初始化"), nil
+			}
+			var a struct {
+				CVEID string `json:"cve_id"`
+			}
+			_ = json.Unmarshal(in, &a)
+			d, err := s.vuln.store.GetVuln(ctx, a.CVEID)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			out := make([]map[string]any, 0, len(items))
-			ids := make([]string, 0, len(items))
-			for _, e := range items {
-				ids = append(ids, e.CVEID)
+			if d == nil {
+				return jsonResult(map[string]any{"found": false, "note": "库里没有这条 CVE（可能尚未同步）"})
 			}
-			// PoC 线索一次批量取（每 CVE 最多 2 条）：全量查询会给 planner 塞几百行，
-			// 它只想知道「有没有现成 EXP」，具体仓库让它自己按 url 看。
-			pocs, _ := s.m.PG().PoCByCVE(ctx, ids, 2)
-			for _, e := range items {
-				row := map[string]any{
-					"cve_id": e.CVEID, "severity": e.Severity, "cvss": e.CVSS,
-					"kev": e.KEV, "title": e.Title,
-				}
-				if !e.PublishedAt.IsZero() {
-					row["published"] = e.PublishedAt.Format("2006-01-02")
-				}
-				if len(e.Refs) > 0 {
-					row["refs"] = e.Refs[:min(3, len(e.Refs))]
-				}
-				if e.PocCount > 0 {
-					row["poc_count"] = e.PocCount
-					top := make([]map[string]any, 0, 2)
-					for _, p := range pocs[e.CVEID] {
-						top = append(top, map[string]any{"repo": p.Repo, "url": p.URL, "stars": p.Stars})
-					}
-					row["poc_top"] = top
-				}
-				out = append(out, row)
+			return jsonResult(d)
+		})
+}
+
+func (s *Server) toolGetPoc() actool.CoreTool {
+	return roTool("get_poc",
+		"查该 CVE 的公开 PoC / Exploit 线索（GitHub 仓库元数据，按 star 排序）。\n"+
+			"返回的是链接与说明，**不下载、不执行代码**。先 search_vulns 确认漏洞成立，再取弹药。\n"+
+			"注意：陌生仓库的代码不要直接跑；优先用 nuclei 模板做无损验证。",
+		objSchema(map[string]any{
+			"cve_id": strParam("CVE 编号，如 CVE-2021-41773"),
+		}, "cve_id"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			if s.vuln == nil {
+				return actool.Errorf("get_poc 未启用: 漏洞情报库未初始化"), nil
+			}
+			var a struct {
+				CVEID string `json:"cve_id"`
+			}
+			_ = json.Unmarshal(in, &a)
+			items, err := s.vuln.store.GetPoCs(ctx, a.CVEID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
 			}
 			return jsonResult(map[string]any{
-				"total": total, "returned": len(out), "items": out,
-				"note": "候选不等于可利用：情报库无你的目标版本，必须实测确认后再 report_finding。" +
-					" poc_count/poc_top 是 GitHub 公开仓库线索（别人写的 EXP），只作参考，不要直接跑陌生代码。",
+				"cve_id": a.CVEID,
+				"count":  len(items),
+				"items":  items,
+				"note":   "只作参考线索，不代表可利用；不要直接执行陌生 PoC。",
 			})
 		})
 }
 
 func (s *Server) toolListAssetVulnHits() actool.CoreTool {
 	return roTool("list_asset_vuln_hits",
-		"把当前资产台账里的技术指纹（technologies）反查情报库，列出「命中我的资产」的高危/在野利用候选 CVE。\n"+
-			"只读、只看 CVSS>=7 或在 KEV 的条目；version_in_range 恒为 unknown（我们没采到版本），"+
-			"所以这是【排查线索】，不是漏洞结论。",
+		"把当前资产台账的技术指纹（technologies）反查情报库，列出「命中我的资产」的候选 CVE。\n"+
+			"默认只看 CVSS>=7 或在 KEV 的条目。技术指纹只有组件名、版本不保证可靠，"+
+			"所以这是【排查线索】，不是漏洞结论——必须实测确认。",
 		objSchema(map[string]any{
-			"limit": map[string]any{"type": "integer", "description": "返回条数，默认 50，上限 200"},
+			"limit":    map[string]any{"type": "integer", "description": "返回条数，默认 50，上限 200"},
+			"min_cvss": map[string]any{"type": "number", "description": "CVSS 下限，默认 7"},
+			"kev_only": map[string]any{"type": "boolean", "description": "只看 CISA KEV"},
 		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			if s.vuln == nil {
+				return actool.Errorf("list_asset_vuln_hits 未启用: 漏洞情报库未初始化"), nil
+			}
 			var a struct {
-				Limit int `json:"limit"`
+				Limit   int     `json:"limit"`
+				MinCVSS float64 `json:"min_cvss"`
+				KEVOnly bool    `json:"kev_only"`
 			}
 			_ = json.Unmarshal(in, &a)
 			limit := a.Limit
 			if limit <= 0 || limit > 200 {
 				limit = 50
 			}
-			hits, err := s.m.PG().VulnIntelAssetHits(ctx, limit)
+			minScore := a.MinCVSS
+			if minScore <= 0 {
+				minScore = 7
+			}
+			hits, err := s.vuln.store.AssetHits(ctx, minScore, a.KEVOnly, limit)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			return jsonResult(map[string]any{
-				"returned": len(hits), "items": hits,
-				"note": "技术指纹只到组件名，没有版本；命中只代表「这个组件有已知高危洞」，需要实测版本与利用条件。",
+				"returned": len(hits),
+				"items":    hits,
+				"note":     "命中只代表「这个组件有已知高危洞」，版本与利用条件必须在授权目标上实测。",
 			})
 		})
 }
