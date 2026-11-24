@@ -177,6 +177,8 @@ func (s *Store) SearchVulns(ctx context.Context, vendor, product, version string
 	// Fixed placeholders: optional filters are always passed (empty = no filter).
 	// Conditionally appended $N breaks PostgreSQL when the numbers skip a slot.
 	args := []any{pattern, strings.TrimSpace(vendor), strings.TrimSpace(version), limit}
+	// product 比对忽略下划线：历史数据是 httpserver、新数据是 http_server，
+	// 两种形态必须互搜得到。ILIKE 带前导 % 本来就是全表扫，replace 不额外损失。
 	rows, err := s.db.QueryContext(ctx, `
 SELECT c.cve_id, c.severity, c.cvss_score, c.kev, COALESCE(c.published_at::text,''),
        COALESCE(c.title,''), c.kev_date_added IS NOT NULL AS kev_row,
@@ -188,7 +190,8 @@ SELECT c.cve_id, c.severity, c.cvss_score, c.kev, COALESCE(c.published_at::text,
        MIN(p.product) AS hit_product,
        c.source
 FROM vuln_cves c
-JOIN vuln_cpe_products p ON p.cve_id = c.cve_id AND p.product ILIKE $1
+JOIN vuln_cpe_products p ON p.cve_id = c.cve_id
+                        AND replace(p.product,'_','') ILIKE replace($1,'_','')
                         AND ($2 = '' OR p.vendor ILIKE '%' || $2 || '%')
 GROUP BY c.cve_id
 ORDER BY c.kev DESC,

@@ -186,3 +186,49 @@ func TestV2PocOrdering(t *testing.T) {
 		t.Fatalf("PoC 应 2 条且 star 降序，实际 %+v", items)
 	}
 }
+
+// TestV2ProductUnderscoreForm 验证下划线形态互搜。
+//
+// 背景：历史数据（V10 迁移）的 product 是 `httpserver`（旧 normalizeCPE 去掉
+// 下划线），新 NVD 同步写 `http_server`。两种形态必须能互相检索到，否则迁移
+// 进来的数据等于从检索结果里消失。
+func TestV2ProductUnderscoreForm(t *testing.T) {
+	st := testStore(t)
+	ctx := t.Context()
+	const legacyID = "CVE-2099-000010"
+	const newID = "CVE-2099-000011"
+
+	// 历史形态（无下划线）
+	if err := st.UpsertCVE(ctx, CVE{
+		ID: legacyID, Title: "legacy form", Severity: "HIGH",
+		Criteria: []string{"cpe:2.3:a:apache:httpserver:*:*:*:*:*:*:*:*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 新形态（有下划线）
+	if err := st.UpsertCVE(ctx, CVE{
+		ID: newID, Title: "new form", Severity: "HIGH",
+		Criteria: []string{"cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = st.db.Exec(`DELETE FROM vuln_cves WHERE cve_id IN ($1,$2)`, legacyID, newID)
+	})
+
+	for _, q := range []string{"http_server", "httpserver", "http"} {
+		hits, err := st.SearchVulns(ctx, "", q, "", 20)
+		if err != nil {
+			t.Fatalf("search %q: %v", q, err)
+		}
+		got := map[string]bool{}
+		for _, h := range hits {
+			got[h.CVEID] = true
+		}
+		if q == "http_server" || q == "httpserver" {
+			if !got[legacyID] || !got[newID] {
+				t.Errorf("用 %q 检索应同时命中两种形态，实际 legacy=%v new=%v", q, got[legacyID], got[newID])
+			}
+		}
+	}
+}

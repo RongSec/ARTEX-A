@@ -84,6 +84,18 @@ func techTokens(s string) []string {
 					seen[sub] = true
 					out = append(out, sub)
 				}
+				// 同时带上去下划线的紧凑形态。
+				//
+				// 为什么必须：历史数据（V10 迁移来的）product 是 `httpserver`
+				// （旧 normalizeCPE 把 `_` 去掉了），新 NVD 同步写的是
+				// `http_server`。只给一种形态，另一种永远命不中——
+				// 实测迁移后 2976 条 CVE 里 http_server 全部漏掉。
+				if compact := strings.ReplaceAll(strings.ToLower(alt), "_", ""); compact != strings.ToLower(alt) && len(compact) >= 2 {
+					if !seen[compact] {
+						seen[compact] = true
+						out = append(out, compact)
+					}
+				}
 			}
 		}
 	}
