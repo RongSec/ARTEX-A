@@ -78,6 +78,14 @@ func run() int {
 		return selfupdate.ExitRestart
 	}
 
+	// 首次部署自动落一份 config.json 模板（有 ARTEX_PG_DSN 或文件已存在则不写）。
+	// 用户拿到的是一个能直接改的文件，而不是「配置文件不存在」的日志。
+	if p, created, err := config.EnsureFile(); err != nil {
+		log.Printf("[config] 生成模板失败: %v", err)
+	} else if created {
+		log.Printf("[config] 已生成配置模板: %s（填好 database 后重启）", p)
+	}
+
 	// surface which config file the binary reads (absolute, so `go run`'s relative
 	// "config.json" — resolved against the CWD — is unambiguous).
 	cfgPath := config.Path()

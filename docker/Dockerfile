@@ -79,6 +79,24 @@ RUN fc-cache -f \
     && fc-list | grep -Ei "simfang|simhei|simsun|times new roman" >/dev/null
 
 WORKDIR /app
+
+# 预置探测工具（可选）：docker/hostbin/<arch>/ 存在才装。本地没跑 fetch.sh
+# 也能构建（只告警），正式发布镜像由根目录 Dockerfile 负责带全套工具。
+ARG TARGETARCH=amd64
+COPY docker/hostbin/ /tmp/hostbin/
+RUN set -eux; \
+    dir="/tmp/hostbin/${TARGETARCH}"; \
+    if [ -d "$dir" ]; then \
+      for f in "$dir"/*; do \
+        case "$f" in *VERSIONS.txt) continue ;; esac; \
+        install -m 0755 "$f" "/usr/local/bin/$(basename "$f")"; \
+      done; \
+      echo "工具层(${TARGETARCH}): $(ls -1 "$dir" | grep -v VERSIONS.txt | tr '\n' ' ')"; \
+    else \
+      echo "WARN: 未预置 ${TARGETARCH} 工具二进制（只影响 nuclei 等，不影响主程序）" >&2; \
+    fi; \
+    rm -rf /tmp/hostbin
+
 COPY --from=build /out/artex /app/artex
 COPY skills/ /app/skills/
 RUN mkdir -p /app/data && chmod +x /app/artex

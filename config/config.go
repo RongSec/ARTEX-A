@@ -190,3 +190,45 @@ func Redact(dsn string) string {
 	}
 	return fmt.Sprintf("%s", u.String())
 }
+
+// starterConfig 是首次启动自动生成的模板。字段与 config.example.json 对齐，
+// 但只保留真正需要改的部分；未知字段（_comment）会被 Unmarshal 忽略。
+const starterConfig = `{
+  "_comment": "首次启动自动生成。填好 database（或设置环境变量 ARTEX_PG_DSN）后重启即可。本文件可能含口令，不要提交到版本库。",
+  "database": {
+    "host": "127.0.0.1",
+    "port": 5432,
+    "user": "artex",
+    "password": "",
+    "dbname": "artex",
+    "sslmode": "disable"
+  },
+  "skill_dir": ""
+}
+`
+
+// EnsureFile 在「没有任何配置文件」且「未设置 ARTEX_PG_DSN」时，于可执行文件
+// 旁生成一份模板 config.json（0600），让新部署的用户有东西可改，而不是只看到
+// 一行「配置文件不存在」。
+//
+// 三种情况直接返回、不写文件：
+//   - 已设置 ARTEX_PG_DSN（Docker/编排部署，配置来自环境变量）；
+//   - 配置文件已存在（不覆盖用户改动）；
+//   - 只读目录（写失败不算致命，调用方按原流程继续）。
+func EnsureFile() (string, bool, error) {
+	if strings.TrimSpace(os.Getenv("ARTEX_PG_DSN")) != "" {
+		return Path(), false, nil
+	}
+	if _, err := os.Stat(Path()); err == nil {
+		return Path(), false, nil
+	}
+	// 显式 ARTEX_CONFIG 指向哪就写哪；否则写在可执行文件旁（分发二进制的锚点）。
+	path := filepath.Join(BaseDir(), "config.json")
+	if v := strings.TrimSpace(os.Getenv("ARTEX_CONFIG")); v != "" {
+		path = v
+	}
+	if err := os.WriteFile(path, []byte(starterConfig), 0o600); err != nil {
+		return path, false, err
+	}
+	return path, true, nil
+}

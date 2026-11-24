@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+## [v0.3.16-hs.4] - 2026-11-25
+
+### 镜像与工具
+
+- **镜像内置探测工具**：主 `Dockerfile` 增加工具层，预置 `nuclei / httpx / subfinder / katana / dnsx / tlsx / chisel / ffuf / dalfox`（amd64 与 arm64 各一份，约 380MB）。新部署不再需要手工点「一键补齐」才有 nuclei。
+- **取件脚本支持双架构**：`docker/hostbin/fetch.sh --arch amd64|arm64`，产物落到 `docker/hostbin/<arch>/`；CI 在构建镜像前现取并校验必需件（缺一即失败，dalfox 缺 arm64 产物只告警）。
+
+### 漏洞情报
+
+- **连通性探测带凭据**：按源注入 NVD `apiKey` 与 GitHub `Authorization`，并在结果里标出「已认证 / 匿名」。此前明明配了 Token 仍按匿名探测，GHSA 恒报 403。
+- **PoC 探针换成真实端点**：原来探 `/rate_limit`（不消耗额度、必然 200），属于假通过；改为与同步一致的 `/search/repositories`。
+- **模板同步走代理的 DNS 修正**：`socks5://` 转 `socks5h://` 再交给 git。原来由本机解析域名，企业网下 github.com 解析不可达，报「Failed to connect … after 134980 ms」，而 Go 侧探测却正常。
+- **NVD 单页超时 60s → 120s**：`startIndex` 15 万之后的 2000 条大页经常 60s 以上，会在同一页反复超时。
+
+### 敏感配置
+
+- **删除仓库内写死的数据库口令**：`docker/docker-compose.hs.yml` 改为从 `docker/.env` 读取，缺变量直接报错。
+- **首启自动生成**：`docker/init-env.sh` 随机生成 `.env`（0600，幂等）；程序首次启动在没有配置文件且未设 `ARTEX_PG_DSN` 时，在可执行文件旁生成 `config.json` 模板（0600）。
+- **兜底闸门**：新增 `secret-scan` 工作流，扫描 `ghp_ / github_pat_ / sk- / AKIA / PRIVATE KEY` 等高置信度模式，并阻止 `.env / config.json / jwt.key` 被提交。
+
 ## [v0.3.16-hs.3] - 2026-11-24
 
 ### 修复

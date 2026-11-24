@@ -40,3 +40,46 @@ func TestPostgresDSNPrecedence(t *testing.T) {
 		t.Fatalf("file dsn verbatim, got %q err %v", got, err)
 	}
 }
+
+func TestEnsureFileCreatesTemplate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	t.Setenv("ARTEX_CONFIG", path)
+	t.Setenv("ARTEX_PG_DSN", "")
+
+	got, created, err := EnsureFile()
+	if err != nil {
+		t.Fatalf("EnsureFile: %v", err)
+	}
+	if !created || got != path {
+		t.Fatalf("应生成模板到 %s，实际 created=%v path=%s", path, created, got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("模板未落盘: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("模板权限应为 0600，实际 %o", perm)
+	}
+	c := Load()
+	if c.Database.User != "artex" || c.Database.Port != 5432 {
+		t.Fatalf("模板内容不可解析或默认值不对: %+v", c.Database)
+	}
+
+	// 幂等：第二次不应再写（created=false，内容不变）。
+	before, _ := os.ReadFile(path)
+	_, created2, _ := EnsureFile()
+	after, _ := os.ReadFile(path)
+	if created2 || string(before) != string(after) {
+		t.Fatalf("重复调用不应覆盖已有配置")
+	}
+}
+
+func TestEnsureFileSkipsWhenDSNSet(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ARTEX_CONFIG", filepath.Join(dir, "config.json"))
+	t.Setenv("ARTEX_PG_DSN", "postgres://u:p@h:5432/d?sslmode=disable")
+	if _, created, err := EnsureFile(); err != nil || created {
+		t.Fatalf("有 ARTEX_PG_DSN 时不应生成文件: created=%v err=%v", created, err)
+	}
+}

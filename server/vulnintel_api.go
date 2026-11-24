@@ -348,6 +348,7 @@ type probeResult struct {
 	OK        bool   `json:"ok"`
 	Status    int    `json:"status"`
 	LatencyMS int64  `json:"latency_ms"`
+	Auth      string `json:"auth,omitempty"`
 	Error     string `json:"error,omitempty"`
 	Hint      string `json:"hint,omitempty"`
 	ProxyUsed string `json:"proxy_used,omitempty"`
@@ -356,6 +357,12 @@ type probeResult struct {
 // POST /api/intel/probe {proxy?}
 //
 // 逐源真实探测：区分「源挂了 / 代理挂了 / 网络不通」。
+//
+// 两条硬要求：
+//   - 探的必须是**真正会请求的地址**（库配置改过就用改过的），否则诊断通过、
+//     同步失败会互相打脸；
+//   - 必须带**与同步相同的凭据**。此前探测按匿名发请求，明明配了 token 仍报
+//     403；PoC 那行探的是 /rate_limit——该端点不消耗额度、必然 200，等于假通过。
 func (s *Server) intelProbe(w http.ResponseWriter, r *http.Request) {
 	if !s.intelReady(w) {
 		return
@@ -382,17 +389,38 @@ func (s *Server) intelProbe(w http.ResponseWriter, r *http.Request) {
 		}
 		return def
 	}
+
+	// 凭据与同步共用同一份设置：探测显示「通」就必须代表同步也能通。
+	nvdHeaders := map[string]string{}
+	nvdAuth := "匿名"
+	if key := settingString(s.m.pg, settingNvdApiKey); key != "" {
+		nvdHeaders["apiKey"] = key
+		nvdAuth = "已认证"
+	}
+	ghHeaders := map[string]string{"Accept": "application/vnd.github+json"}
+	ghAuth := "匿名"
+	if tok := settingString(s.m.pg, settingVulnIntelGitHubToken); tok != "" {
+		ghHeaders["Authorization"] = "Bearer " + tok
+		ghAuth = "已认证"
+	}
+
 	repo := strings.TrimRight(pick("nuclei_templates", vulnintel.DefaultNucleiRepo), "/")
-	checks := []struct{ source, target string }{
-		{"nvd", pick("nvd", "https://services.nvd.nist.gov") + "/rest/json/cves/2.0?resultsPerPage=1"},
-		{"kev", pick("kev", "https://www.cisa.gov") + "/sites/default/files/feeds/known_exploited_vulnerabilities.json"},
-		{"github_poc", pick("github_poc", "https://api.github.com") + "/rate_limit"},
-		{"ghsa", pick("ghsa", "https://api.github.com") + "/advisories?per_page=1"},
-		{"nuclei_templates", strings.TrimSuffix(repo, ".git") + ".git/info/refs?service=git-upload-pack"},
+	checks := []struct {
+		source  string
+		target  string
+		headers map[string]string
+		auth    string
+	}{
+		{"nvd", pick("nvd", "https://services.nvd.nist.gov") + "/rest/json/cves/2.0?resultsPerPage=1", nvdHeaders, nvdAuth},
+		{"kev", pick("kev", "https://www.cisa.gov") + "/sites/default/files/feeds/known_exploited_vulnerabilities.json", nil, "公开"},
+		// PoC 同步走 search/repositories，探针必须打同一个端点。
+		{"github_poc", pick("github_poc", "https://api.github.com") + "/search/repositories?q=CVE-2021-41773&per_page=1", ghHeaders, ghAuth},
+		{"ghsa", pick("ghsa", "https://api.github.com") + "/advisories?per_page=1", ghHeaders, ghAuth},
+		{"nuclei_templates", strings.TrimSuffix(repo, ".git") + ".git/info/refs?service=git-upload-pack", nil, "公开"},
 	}
 	results := make([]probeResult, 0, len(checks))
 	for _, c := range checks {
-		results = append(results, probeURL(r.Context(), client.HTTP, c.source, c.target, proxy))
+		results = append(results, probeURL(r.Context(), client.HTTP, c.source, c.target, c.headers, c.auth, proxy))
 	}
 	writeJSON(w, 200, map[string]any{
 		"proxy":     proxy,
@@ -401,8 +429,8 @@ func (s *Server) intelProbe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func probeURL(ctx context.Context, hc *http.Client, source, target, proxy string) probeResult {
-	res := probeResult{Source: source, Target: target, ProxyUsed: proxy}
+func probeURL(ctx context.Context, hc *http.Client, source, target string, headers map[string]string, auth, proxy string) probeResult {
+	res := probeResult{Source: source, Target: target, ProxyUsed: proxy, Auth: auth}
 	if hc == nil {
 		hc = &http.Client{Timeout: 10 * time.Second}
 	}
@@ -414,6 +442,9 @@ func probeURL(ctx context.Context, hc *http.Client, source, target, proxy string
 		res.Hint = vulnIntelErrorHint(res.Error)
 		return res
 	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	start := time.Now()
 	resp, err := hc.Do(req)
 	res.LatencyMS = time.Since(start).Milliseconds()
@@ -423,13 +454,20 @@ func probeURL(ctx context.Context, hc *http.Client, source, target, proxy string
 		return res
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 	res.Status = resp.StatusCode
 	res.OK = resp.StatusCode == http.StatusOK
 	if !res.OK {
 		res.Error = "HTTP " + strconv.Itoa(resp.StatusCode)
+		if resp.StatusCode == http.StatusForbidden && auth == "匿名" {
+			// 匿名额度用尽是最常见的 403：明确说清是「没带凭据」而不是权限问题。
+			res.Hint = "403：匿名额度已用尽（GitHub 60 次/小时，NVD 5 次/30 秒）。在「同步配置」填 Token / Key 后重试。"
+		} else if resp.StatusCode == http.StatusForbidden && strings.Contains(strings.ToLower(string(body)), "rate limit") {
+			res.Hint = "403：当前 Token 额度已用尽，等下一小时窗口或换 Token。"
+		} else {
+			res.Hint = vulnIntelErrorHint(res.Error + " " + string(body))
+		}
 	}
-	res.Hint = vulnIntelErrorHint(res.Error)
 	return res
 }
 
@@ -454,6 +492,9 @@ func vulnIntelErrorHint(err string) string {
 	case strings.Contains(e, "proxyconnect") || strings.Contains(e, "socks") ||
 		strings.Contains(e, "proxy is unreachable"):
 		return "代理连不上：检查「上网代理」地址/端口，或清空改直连。"
+	case strings.Contains(e, "failed to connect to") || strings.Contains(e, "couldn't connect to server") ||
+		strings.Contains(e, "connection timed out"):
+		return "连不上目标：让「上网代理」指向能出网的节点；git 拉模板还要求代理支持远端域名解析（socks5h）。"
 	case strings.Contains(e, "no such host") || strings.Contains(e, "dial tcp: lookup"):
 		return "DNS 解析失败：填一个能出网的代理。"
 	case strings.Contains(e, "context deadline") || strings.Contains(e, "client.timeout"):

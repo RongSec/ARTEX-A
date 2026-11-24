@@ -664,7 +664,7 @@ function SourcesTab({
   const [saving, setSaving] = React.useState<string | null>(null);
   const [probing, setProbing] = React.useState(false);
   const [probes, setProbes] = React.useState<
-    { source: string; ok: boolean; status: number; latency_ms: number; error?: string; hint?: string }[] | null
+    { source: string; ok: boolean; status: number; latency_ms: number; auth?: string; error?: string; hint?: string }[] | null
   >(null);
 
   const patch = async (id: string, p: Parameters<typeof api.intelSourceUpdate>[1]) => {
@@ -832,6 +832,7 @@ function SourcesTab({
               <TableHeader>
                 <TableRow>
                   <TableHead className="pl-4">数据源</TableHead>
+                  <TableHead className="w-24">凭据</TableHead>
                   <TableHead className="w-20">结果</TableHead>
                   <TableHead className="w-20 text-right">耗时</TableHead>
                   <TableHead>说明</TableHead>
@@ -841,6 +842,20 @@ function SourcesTab({
                 {probes.map((p) => (
                   <TableRow key={p.source}>
                     <TableCell className="pl-4 font-mono text-xs">{p.source}</TableCell>
+                    <TableCell>
+                      {p.auth && p.auth !== "公开" ? (
+                        <Badge
+                          variant="outline"
+                          className={
+                            p.auth === "已认证"
+                              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                              : "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                          }
+                        >
+                          {p.auth}
+                        </Badge>
+                      ) : null}
+                    </TableCell>
                     <TableCell>
                       <Badge variant="outline" className={p.ok ? sourceTone.ok : sourceTone.error}>
                         {p.ok ? "通" : p.status || "失败"}

@@ -1,7 +1,9 @@
 *.bat text eol=crlf
 *.sh  text eol=lf
 # 镜像构建文件必须 LF（Dockerfile 行尾续行遇 CRLF 会拼错指令）
+Dockerfile text eol=lf
 docker/Dockerfile text eol=lf
+*.yml text eol=lf
 docker/*.yml text eol=lf
 docker/*.md text eol=lf
 docker/.env.example text eol=lf

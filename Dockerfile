@@ -32,6 +32,28 @@ RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@late
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
+# ---- 预置探测工具层（nuclei / httpx / subfinder / katana / dnsx / tlsx / chisel / ffuf …
+#      共 9 件，约 380MB）----
+# 二进制由 docker/hostbin/fetch.sh 在构建前现取，不入库；CI 会为 amd64 与 arm64
+# 各取一份放进 docker/hostbin/<arch>/。这里按 TARGETARCH 选择对应目录。
+# 位置刻意放在业务二进制之前：工具层极少变，改代码只重建后面的小层。
+COPY docker/hostbin/ /tmp/hostbin/
+RUN set -eux; \
+    dir="/tmp/hostbin/${TARGETARCH}"; \
+    if [ -d "$dir" ]; then \
+      for f in "$dir"/*; do \
+        case "$f" in *VERSIONS.txt) continue ;; esac; \
+        install -m 0755 "$f" "/usr/local/bin/$(basename "$f")"; \
+      done; \
+      echo "工具层(${TARGETARCH}): $(ls -1 "$dir" | grep -v VERSIONS.txt | tr '\n' ' ')"; \
+    else \
+      echo "WARN: docker/hostbin/${TARGETARCH} 不存在；本镜像不含 nuclei 等工具，需在「宿主环境」页安装" >&2; \
+    fi; \
+    rm -rf /tmp/hostbin; \
+    for b in nuclei httpx subfinder katana dnsx tlsx chisel; do \
+      if command -v "$b" >/dev/null 2>&1; then "$b" -version 2>&1 | head -1 || true; fi; \
+    done
+
 WORKDIR /app
 # 预编译好的对应架构二进制（dist/amd64/artex 或 dist/arm64/artex）
 COPY dist/${TARGETARCH}/artex /app/artex

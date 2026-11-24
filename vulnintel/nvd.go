@@ -30,7 +30,9 @@ func NewNvdClient(apiKey string, proxyURL string) (*NvdClient, error) {
 	return &NvdClient{
 		Base:   "https://services.nvd.nist.gov",
 		APIKey: strings.TrimSpace(apiKey),
-		HTTP:   &http.Client{Timeout: 60 * time.Second, Transport: transport},
+		// 120s：NVD 在 startIndex 15 万之后的单页（2000 条）经代理常要 60s+，
+		// 60s 会在同一页反复超时，看着像「同步卡住」。超时只会重试同一页，不会跳数据。
+		HTTP: &http.Client{Timeout: 120 * time.Second, Transport: transport},
 	}, nil
 }
 

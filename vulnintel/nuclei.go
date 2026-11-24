@@ -48,9 +48,18 @@ func EnsureTemplates(ctx context.Context, dir, proxy, repo string) error {
 	if proxy != "" {
 		// git 认的是 http_proxy/https_proxy（大小写都设一份，不同版本读的不一样），
 		// socks5 代理只有 ALL_PROXY 走得通。
+		//
+		// socks5:// 必须转成 socks5h://：前者由本机解析域名，企业网/污染 DNS 下
+		// github.com 会解析到不可达地址（实测报 "Failed to connect to github.com
+		// port 443 after 134980 ms"），而 Go 的 socks5 拨号是把域名交给代理解析，
+		// 所以「探测通过、git 拉不动」正是这个差异造成的。socks5h 让代理解析。
+		gp := proxy
+		if strings.HasPrefix(strings.ToLower(gp), "socks5://") {
+			gp = "socks5h://" + gp[len("socks5://"):]
+		}
 		env = append(env,
-			"http_proxy="+proxy, "https_proxy="+proxy, "HTTP_PROXY="+proxy, "HTTPS_PROXY="+proxy,
-			"ALL_PROXY="+proxy, "all_proxy="+proxy)
+			"http_proxy="+gp, "https_proxy="+gp, "HTTP_PROXY="+gp, "HTTPS_PROXY="+gp,
+			"ALL_PROXY="+gp, "all_proxy="+gp)
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		// 换了端点（镜像/私有 fork）就等于换源：origin 还指旧地址时 pull 只会

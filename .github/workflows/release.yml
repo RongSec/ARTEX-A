@@ -116,6 +116,26 @@ jobs:
         with:
           name: bin-linux-arm64
           path: dist/arm64
+      # 取工具二进制（约 380MB/架构）：buildx 的多架构构建上下文里必须有
+      # docker/hostbin/<arch>/，否则镜像只装 apt 层，nuclei 等全靠用户手工装。
+      # 用 GITHUB_TOKEN 调 API，避免匿名 60 次/小时被打满。
+      - name: Fetch host tools (amd64)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash docker/hostbin/fetch.sh --arch amd64
+      - name: Fetch host tools (arm64)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash docker/hostbin/fetch.sh --arch arm64
+      - name: Verify host tools present
+        run: |
+          set -e
+          for a in amd64 arm64; do
+            for b in nuclei httpx subfinder katana dnsx tlsx chisel; do
+              test -x "docker/hostbin/$a/$b" || { echo "缺少 $a/$b"; exit 1; }
+            done
+            echo "$a: $(ls -1 docker/hostbin/$a | tr '\n' ' ')"
+          done
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
