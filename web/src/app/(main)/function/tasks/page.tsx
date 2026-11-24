@@ -837,7 +837,7 @@ export default function TasksPage() {
               <div className="relative w-full sm:max-w-xs">
                 <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
                 <Input
-                  placeholder="搜索描述 / 目标 / ID"
+                  placeholder="搜索目的 / 目标 / ID"
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   className="pl-8"
@@ -987,7 +987,7 @@ export default function TasksPage() {
                       onSort={sortTasksBy}
                     />
                     <TableHead>名称</TableHead>
-                    <TableHead>描述</TableHead>
+                    <TableHead>目的</TableHead>
                     <TableHead>目标</TableHead>
                     <SortableTaskHead
                       field="status"
@@ -1850,7 +1850,7 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
                 setQuery(event.target.value);
                 setPage(1);
               }}
-              placeholder="搜索任务名称 / 描述 / ID"
+              placeholder="搜索任务名称 / 目的 / ID"
               className="pl-8"
             />
           </div>
@@ -2329,7 +2329,7 @@ function SourceTaskPicker({
         </ComboboxValue>
         <ComboboxChipsInput
           id="source-tasks"
-          placeholder={atLimit ? `最多关联 ${MAX_SOURCE_TASKS} 个任务` : "搜索任务 ID、描述或目标"}
+          placeholder={atLimit ? `最多关联 ${MAX_SOURCE_TASKS} 个任务` : "搜索任务 ID、目的或目标"}
           disabled={atLimit}
         />
       </ComboboxChips>
@@ -3091,7 +3091,7 @@ export function CreateTaskSheet({
     const targets = rowsToTargets(targetRows);
     const goalText = goal.trim() || (targets.length > 0 ? `对以下目标完成安全测试：\n${targets.join("\n")}` : "");
     if (!description.trim() || !goalText) {
-      toast.error("请填写目的（描述）与目标");
+      toast.error("请填写目的与目标");
       return;
     }
     if (sourceTaskIDs.length > MAX_SOURCE_TASKS) {
@@ -3272,8 +3272,8 @@ export function CreateTaskSheet({
                 </Button>
                 <span className="text-muted-foreground text-xs">
                   {uploadCount > 0
-                    ? `已上传 ${uploadCount} 个文件，绝对路径已追加到描述末尾（可编辑）`
-                    : "可多选；上传后把文件的绝对路径追加到描述，供 worker 用 Read/Bash 打开"}
+                    ? `已上传 ${uploadCount} 个文件，绝对路径已追加到目的末尾（可编辑）`
+                    : "可多选；上传后把文件的绝对路径追加到目的，供 worker 用 Read/Bash 打开"}
                 </span>
               </div>
             </div>
@@ -3305,6 +3305,7 @@ export function CreateTaskSheet({
                 items={constraintItems}
                 onChange={setConstraintItems}
                 disabled={creating}
+                hideLabel
                 rawRows={3}
               />
               <FieldDescription>
@@ -3412,10 +3413,10 @@ export function CreateTaskSheet({
                       checked={seedFirstIntent}
                       onCheckedChange={(v) => setSeedFirstIntent(!!v)}
                     />
-                    直接下发首个意图（描述+目标）
+                    直接下发首个意图（目的+目标）
                   </label>
                   <p className="text-muted-foreground text-xs">
-                    开启后创建即把「描述+目标」作为一条意图下发，worker 免等首轮规划直接开跑，跑完再由 planner
+                    开启后创建即把「目的+目标说明」作为一条意图下发，worker 免等首轮规划直接开跑，跑完再由 planner
                     接手判定/补充。CTF 等常一个 work 直接解决的场景推荐开启；关闭则走标准的先规划再执行。
                   </p>
                 </div>

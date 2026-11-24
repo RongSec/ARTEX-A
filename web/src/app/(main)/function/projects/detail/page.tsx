@@ -323,6 +323,7 @@ function ProjectConstraintsCard({ projectID }: { projectID: number }) {
           }}
           disabled={saving}
           rawRows={3}
+          hideLabel
         />
       )}
     </div>
@@ -500,7 +501,7 @@ function OverviewTab({ detail, templates }: { detail: ProjectDetail; templates: 
   );
 }
 
-// EditProjectDialog PATCH 项目名/描述/负责人/并发 + 四设置开关
+// EditProjectDialog PATCH 项目名/目的/负责人/并发 + 四设置开关
 //（跨任务阅读者/跨项目阅读者/自动报告 + 报告模板绑定，T19 与建项目对话框同构）。
 // report_template_id 三态：保持原值不动时不传键；选「默认模板」传 null=清绑定；
 // 选具体模板传数字=绑定（后端 *int64+Set 语义）。
@@ -598,7 +599,7 @@ function EditProjectDialog({
             </div>
           </div>
           <div className="grid gap-2">
-            <Label htmlFor="ep-desc">描述</Label>
+            <Label htmlFor="ep-desc">目的</Label>
             <Input id="ep-desc" value={description} onChange={(e) => setDescription(e.target.value)} />
           </div>
           <div className="grid gap-2">

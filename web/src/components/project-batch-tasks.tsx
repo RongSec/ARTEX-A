@@ -253,7 +253,7 @@ export function ProjectBatchTasks({ projectID, concurrency, defaultTemplateID, o
 
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div className="grid gap-2">
-                <Label htmlFor="batch-desc">描述模板（{"{target}"}=每行目标）</Label>
+                <Label htmlFor="batch-desc">目的模板（{"{target}"}=每行目标）</Label>
                 <Input
                   id="batch-desc"
                   placeholder="目标：{target}"

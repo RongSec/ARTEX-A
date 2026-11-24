@@ -157,7 +157,7 @@ function TaskTemplateManager({
       constraints: draft.constraints,
     };
     if (!input.name || !input.description || !input.goal) {
-      toast.error("请填写模板名称、描述和目标");
+      toast.error("请填写模板名称、目的和目标");
       return;
     }
     setSaving(true);
@@ -213,7 +213,7 @@ function TaskTemplateManager({
         <SheetContent className="grid h-full w-full! max-w-none! grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:w-[48rem]! sm:max-w-[48rem]!">
           <SheetHeader className="border-b px-6 py-5">
             <SheetTitle>任务模板管理</SheetTitle>
-            <SheetDescription>模板保存描述、目标、分类与任务级拦截/允许规则；修改不会影响已经创建的任务。</SheetDescription>
+            <SheetDescription>模板保存目的、目标、分类、操作约束与任务级拦截/允许规则；修改不会影响已经创建的任务。</SheetDescription>
           </SheetHeader>
           <div className="grid min-h-0 overflow-y-auto lg:grid-cols-[15rem_minmax(0,1fr)] lg:overflow-hidden">
             <div className="flex min-h-0 flex-col border-b p-3 lg:border-r lg:border-b-0">
@@ -256,7 +256,7 @@ function TaskTemplateManager({
                   />
                 </Field>
                 <Field>
-                  <FieldLabel htmlFor="task-template-description">描述</FieldLabel>
+                  <FieldLabel htmlFor="task-template-description">目的</FieldLabel>
                   <Textarea
                     id="task-template-description"
                     className="min-h-28"
@@ -299,6 +299,7 @@ function TaskTemplateManager({
                   <ConstraintEditor
                     items={draft.constraints}
                     onChange={(next) => patchDraft({ constraints: next })}
+                    hideLabel
                   />
                   <FieldDescription>
                     应用模板时预填这些 allow/deny 约束；任务创建时已有约束，目标拆解器就不再重复抽取。
@@ -522,7 +523,7 @@ export function TaskTemplateControls({
           </ComboboxContent>
         </Combobox>
         <FieldDescription>
-          {hint ?? "选择后会复制模板的描述、目标、分类与任务级规则，不与模板保持关联。"}
+          {hint ?? "选择后会复制模板的目的、目标、分类、操作约束与任务级规则，不与模板保持关联。"}
         </FieldDescription>
       </Field>
 
@@ -537,7 +538,7 @@ export function TaskTemplateControls({
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>使用模板「{pendingTemplate?.name}」？</AlertDialogTitle>
-            <AlertDialogDescription>当前已填写的描述和目标将被模板内容覆盖。</AlertDialogDescription>
+            <AlertDialogDescription>当前已填写的目的和目标将被模板内容覆盖。</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>

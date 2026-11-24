@@ -150,7 +150,7 @@ export default function ProjectsPage() {
   );
 }
 
-// CreateProjectDialog 新建项目：名称必填，描述/负责人/并发数可选。
+// CreateProjectDialog 新建项目：名称必填，目的/负责人/并发数可选。
 // T19 新增四设置控件：跨任务阅读（项目内）/ 跨项目阅读 / 自动写报告
 // （三 Switch，默认关）+ 报告模板（下拉，可留空=默认链）。后端 create 字段集
 // 已与 PATCH 对齐（方案 A），四控件值直接进 POST body。
@@ -297,7 +297,7 @@ function CreateProjectDialog({
             <Textarea
               id="p-purpose"
               rows={3}
-              placeholder="这次测试要达成什么、背景与范围说明；会作为每个子任务的描述前缀。"
+              placeholder="这次测试要达成什么、背景与范围说明；会作为每个子任务的目的前缀。"
               value={purpose}
               onChange={(e) => setPurpose(e.target.value)}
             />

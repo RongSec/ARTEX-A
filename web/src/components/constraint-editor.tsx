@@ -33,11 +33,13 @@ interface Props {
   disabled?: boolean;
   /** 文本框行数，默认 3。 */
   rawRows?: number;
+  /** 外层已有「操作约束」标题时置 true，避免标题重复（计数仍保留）。 */
+  hideLabel?: boolean;
 }
 
 // ConstraintEditor 是受控组件；解析结果按 (kind,text) 去重后追加，不覆盖用户
 // 已经手改过的条目。
-export function ConstraintEditor({ items, onChange, disabled, rawRows = 3 }: Props) {
+export function ConstraintEditor({ items, onChange, disabled, rawRows = 3, hideLabel }: Props) {
   const [raw, setRaw] = React.useState("");
   const [parsing, setParsing] = React.useState(false);
   const [conKind, setConKind] = React.useState<ConstraintKind>("deny");
@@ -106,10 +108,14 @@ export function ConstraintEditor({ items, onChange, disabled, rawRows = 3 }: Pro
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-center justify-between gap-3">
-        <Label className="flex items-center gap-1.5">
-          <ShieldAlertIcon className="size-3.5 text-amber-500" />
-          操作约束
-        </Label>
+        {hideLabel ? (
+          <span />
+        ) : (
+          <Label className="flex items-center gap-1.5">
+            <ShieldAlertIcon className="size-3.5 text-amber-500" />
+            操作约束
+          </Label>
+        )}
         <span className="text-muted-foreground text-xs tabular-nums">
           {items.length > 0 ? `${items.length} 条` : "可留空"}
         </span>
