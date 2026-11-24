@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [v0.3.16-hs.5] - 2026-11-25
+
+### 修复
+
+- **镜像构建失败**：`apt-core.txt` 里的 `nikto` 在 Debian bookworm 不存在，`apt-get install` 整条失败（首次镜像构建卡在这里）。同时清掉 catalog 里同样不存在的 `evil-winrm` / `radare2` / `seclists` 三条 `apt()` 安装命令，改为可执行的手工提示。
+- **补 amass**：唯一没有随镜像预置的 Go 工具，补进 `fetch.sh`（v5.1.3，双架构），页面不再需要 Go 才能装。
+
 ## [v0.3.16-hs.4] - 2026-11-25
 
 ### 镜像与工具

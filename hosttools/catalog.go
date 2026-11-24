@@ -54,11 +54,11 @@ var preinstalled = map[string]bool{
 	"nmap": true, "masscan": true, "nc": true, "socat": true, "curl": true,
 	"wget": true, "tcpdump": true, "tshark": true, "fping": true, "arp-scan": true,
 	"dig": true, "whois": true, "smbclient": true, "sshpass": true,
-	"whatweb": true, "nikto": true, "sqlmap": true, "gobuster": true,
+	"whatweb": true, "sqlmap": true, "gobuster": true,
 	"proxychains4": true,
 	// Go 二进制层（docker/hostbin/fetch.sh VERSIONS）
 	"nuclei": true, "httpx": true, "subfinder": true, "katana": true,
-	"dnsx": true, "tlsx": true, "chisel": true,
+	"dnsx": true, "tlsx": true, "chisel": true, "amass": true,
 	// ffuf / dalfox 是可选件：镜像里有就装，没有也不阻断构建（见 Dockerfile.hostbin）。
 }
 
@@ -210,7 +210,7 @@ func Catalog() []Tool {
 		{Key: "feroxbuster", Name: "feroxbuster", Bin: "feroxbuster", Category: "Web 与 API", Hint: "Debian 源无此包；用官方脚本：curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash -s /usr/local/bin"},
 		{Key: "dirsearch", Name: "dirsearch", Bin: "dirsearch", Category: "Web 与 API", Install: pipx("dirsearch")},
 		{Key: "nuclei", Name: "nuclei", Bin: "nuclei", Category: "Web 与 API", Install: goInstall("github.com/projectdiscovery/nuclei/v3/cmd/nuclei")},
-		{Key: "nikto", Name: "nikto", Bin: "nikto", Category: "Web 与 API", Install: apt("nikto")},
+		{Key: "nikto", Name: "nikto", Bin: "nikto", Category: "Web 与 API", Hint: "Debian 源无 nikto；用官方 Perl 版：git clone https://github.com/sullo/nikto /opt/nikto"},
 		{Key: "whatweb", Name: "whatweb", Bin: "whatweb", Category: "Web 与 API", Install: apt("whatweb")},
 		{Key: "wafw00f", Name: "wafw00f", Bin: "wafw00f", Category: "Web 与 API", Install: pipx("wafw00f")},
 		{Key: "sqlmap", Name: "sqlmap", Bin: "sqlmap", Category: "Web 与 API", Install: apt("sqlmap")},
@@ -227,7 +227,7 @@ func Catalog() []Tool {
 		// ---- 后渗透 ----
 		{Key: "impacket", Name: "impacket (secretsdump.py)", Bin: "secretsdump.py", Category: "后渗透", Install: pipx("impacket"), Note: "smbexec/wmiexec/secretsdump 一族"},
 		{Key: "nxc", Name: "netexec", Bin: "nxc", Category: "后渗透", Install: pipx("netexec")},
-		{Key: "evil-winrm", Name: "evil-winrm", Bin: "evil-winrm", Category: "后渗透", Install: apt("evil-winrm")},
+		{Key: "evil-winrm", Name: "evil-winrm", Bin: "evil-winrm", Category: "后渗透", Hint: "Debian 源无此包；用 gem install evil-winrm（需 ruby）"},
 		{Key: "chisel", Name: "chisel", Bin: "chisel", Category: "后渗透", Install: goInstall("github.com/jpillora/chisel")},
 		{Key: "ligolo-ng", Name: "ligolo-ng (proxy)", Bin: "ligolo-proxy", Category: "后渗透", Install: "", Hint: "下载 release：https://github.com/nicocha30/ligolo-ng/releases"},
 		{Key: "proxychains4", Name: "proxychains4", Bin: "proxychains4", Category: "后渗透", Install: apt("proxychains4")},
@@ -242,7 +242,7 @@ func Catalog() []Tool {
 		{Key: "binwalk", Name: "binwalk", Bin: "binwalk", Category: "逆向与取证", Install: apt("binwalk")},
 		{Key: "exiftool", Name: "exiftool", Bin: "exiftool", Category: "逆向与取证", Install: apt("libimage-exiftool-perl")},
 		{Key: "gdb", Name: "gdb", Bin: "gdb", Category: "逆向与取证", Install: apt("gdb")},
-		{Key: "radare2", Name: "radare2", Bin: "r2", Category: "逆向与取证", Install: apt("radare2")},
+		{Key: "radare2", Name: "radare2", Bin: "r2", Category: "逆向与取证", Hint: "bookworm 已移除 radare2；用官方脚本 https://github.com/radareorg/radare2/blob/master/sys/install.sh"},
 
 		// ---- 容器与云 ----
 		{Key: "docker", Name: "docker", Bin: "docker", Category: "容器与云", Install: "", Hint: "按官方文档装 docker-ce；本机若已在容器里跑，可能没有宿主机 docker"},
@@ -250,7 +250,7 @@ func Catalog() []Tool {
 		{Key: "aws", Name: "awscli", Bin: "aws", Category: "容器与云", Install: apt("awscli")},
 
 		// ---- 语料 ----
-		{Key: "seclists", Name: "SecLists 字典", Bin: "/usr/share/seclists", Category: "语料", Kind: "dir", Install: apt("seclists"), Note: "约 2.5G，装之前确认磁盘"},
+		{Key: "seclists", Name: "SecLists 字典", Bin: "/usr/share/seclists", Category: "语料", Kind: "dir", Hint: "Debian 源无此包；git clone https://github.com/danielmiessler/SecLists /usr/share/seclists（约 2.5G）"},
 		{Key: "nuclei-templates", Name: "nuclei 模板", Bin: filepath.Join(homeDir(), "nuclei-templates"), Category: "语料", Kind: "dir", Install: "nuclei -update-templates", Note: "nuclei 首次运行也会自动拉"},
 	}
 	// 基线标记：与 docker/apt-core.txt、docker/hostbin/fetch.sh 对齐。

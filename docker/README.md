@@ -33,5 +33,5 @@ docker compose -f docker/docker-compose.yml down            # 停止（数据在
 
 ## 镜像里的工具
 
-镜像已预置 `nuclei / httpx / subfinder / katana / dnsx / tlsx / chisel / ffuf / dalfox`（按架构各取一份）。
+镜像已预置 `nuclei / httpx / subfinder / katana / dnsx / tlsx / chisel / ffuf / dalfox / amass`（按架构各取一份）。
 其余 apt 类工具见 `docker/apt-core.txt`；go/pip 类工具在「系统 → 宿主环境」页可持久化安装到 `data/hostbin`、`data/pyenv`。

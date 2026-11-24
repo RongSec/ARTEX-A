@@ -131,7 +131,7 @@ jobs:
         run: |
           set -e
           for a in amd64 arm64; do
-            for b in nuclei httpx subfinder katana dnsx tlsx chisel; do
+            for b in nuclei httpx subfinder katana dnsx tlsx chisel amass; do
               test -x "docker/hostbin/$a/$b" || { echo "缺少 $a/$b"; exit 1; }
             done
             echo "$a: $(ls -1 docker/hostbin/$a | tr '\n' ' ')"

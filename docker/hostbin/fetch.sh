@@ -56,6 +56,7 @@ katana|projectdiscovery/katana|v1.8.0|katana_.*_linux_<arch>\.zip|zip|1
 dnsx|projectdiscovery/dnsx|v1.3.1|dnsx_.*_linux_<arch>\.zip|zip|1
 tlsx|projectdiscovery/tlsx|v1.5.0|tlsx_.*_linux_<arch>\.zip|zip|1
 chisel|jpillora/chisel|v1.12.0|chisel_.*linux_<arch>\.gz|gz|1
+amass|owasp-amass/amass|v5.1.3|amass_linux_<arch>\.tar\.gz|tgz|1
 ffuf|ffuf/ffuf|v2.3.0|ffuf_.*_linux_<arch>\.tar\.gz|tgz|1
 dalfox|hahwul/dalfox|v3.3.0|dalfox-v.*-linux-<dalfoxarch>\.tar\.gz|tgz|0
 '

@@ -2,13 +2,15 @@
 #
 # 选包原则：只放 Debian bookworm 官方源里确实存在的包。
 # 不存在的包名会让整条 apt-get install 失败，镜像直接构建不出来——
-# Kali 专有包（exploitdb / feroxbuster）和第三方源包不进这份清单。
+# Kali 专有包（exploitdb / feroxbuster / nikto）和第三方源包不进这份清单。
+# 每次改动都在 debian:bookworm-slim 里跑一遍
+#   apt-get install --dry-run $(grep -v '^#' docker/apt-core.txt)
+# 确认没有 "Unable to locate package" 再提交——CI 的镜像构建就是被 nikto 卡住的。
 #
 # 体积敏感件单独说明：
 #   tshark        约 100MB（含 wireshark-common），是这份清单里最大的一件
 #   smbclient     约 20MB（含 samba-common）
 #   whatweb       约 30MB（ruby 运行时）
-#   nikto         约 30MB（perl 运行时）
 # 合计约 350-400MB。重量级工具（hashcat/john/radare2/gdb/seclists）
 # 不在这里，走页面按需安装。
 arp-scan
@@ -18,7 +20,6 @@ fping
 gobuster
 masscan
 netcat-openbsd
-nikto
 nmap
 proxychains4
 smbclient
