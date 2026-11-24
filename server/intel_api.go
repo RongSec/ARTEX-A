@@ -76,8 +76,10 @@ func (s *Server) intelSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Mode string `json:"mode"`
-		Days int    `json:"days"`
+		Mode  string `json:"mode"`
+		Days  int    `json:"days"`
+		Since string `json:"since"` // mode=range 时必填，YYYY-MM-DD
+		Until string `json:"until"` // mode=range 时可选，默认 Since+100 天
 	}
 	_ = decode(r, &req)
 	mode := strings.TrimSpace(req.Mode)
@@ -109,6 +111,31 @@ func (s *Server) intelSync(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[vulnintel] 手动全量同步失败: %v", err)
 			}
 		}()
+	case "range":
+		// 按时间段回填（测试/补历史用）：NVD 单查询窗口 ≤120 天，SyncNVD 内部
+		// 会按 100 天切窗，所以这里允许给任意跨度。
+		since, err := time.Parse("2006-01-02", strings.TrimSpace(req.Since))
+		if err != nil {
+			writeErr(w, 400, "since 需要 YYYY-MM-DD")
+			return
+		}
+		until := since.AddDate(0, 0, 100)
+		if v := strings.TrimSpace(req.Until); v != "" {
+			until, err = time.Parse("2006-01-02", v)
+			if err != nil {
+				writeErr(w, 400, "until 需要 YYYY-MM-DD")
+				return
+			}
+		}
+		if !until.After(since) {
+			writeErr(w, 400, "until 必须晚于 since")
+			return
+		}
+		go func(a, b time.Time) {
+			if _, err := s.intel.SyncNVD(ctx, a, b); err != nil {
+				log.Printf("[vulnintel] 手动区间同步失败: %v", err)
+			}
+		}(since, until)
 	case "poc":
 		// PoC 聚合：一次最多 200 个 CVE（认证 25/轮，靠多轮补齐）；前端点一次
 		// 「聚合 PoC」就把这一轮跑满，比等后台快很多。
@@ -125,7 +152,7 @@ func (s *Server) intelSync(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[vulnintel] 手动 PoC 聚合完成：查 %d，命中 %d", checked, added)
 		}()
 	default:
-		writeErr(w, 400, "mode 只能是 kev / recent / full / poc")
+		writeErr(w, 400, "mode 只能是 kev / recent / range / full / poc")
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "mode": mode})

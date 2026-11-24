@@ -28,8 +28,8 @@ export default function SystemSettingsPage() {
   const [tavilyKeySet, setTavilyKeySet] = React.useState(false);
   const [tavilyKeyInput, setTavilyKeyInput] = React.useState("");
   const [savingTavilyKey, setSavingTavilyKey] = React.useState(false);
-  const [proxyInput, setProxyInput] = React.useState("");
-  const [savingProxy, setSavingProxy] = React.useState(false);
+  const [outboundProxyInput, setOutboundProxyInput] = React.useState("");
+  const [savingOutboundProxy, setSavingOutboundProxy] = React.useState(false);
   const [globalProxyInput, setGlobalProxyInput] = React.useState("");
   const [savingGlobalProxy, setSavingGlobalProxy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
@@ -55,7 +55,7 @@ export default function SystemSettingsPage() {
     setBackend(s.web_search_backend || "ddgs");
     setBraveKeySet(!!s.brave_key_set);
     setTavilyKeySet(!!s.tavily_key_set);
-    setProxyInput(s.web_search_proxy ?? "");
+    setOutboundProxyInput(s.outbound_proxy ?? s.web_search_proxy ?? "");
     setGlobalProxyInput(s.global_proxy ?? "");
     setPyInterp(s.python_interpreter ?? "");
     setWorkers(String(s.workers ?? 3));
@@ -218,16 +218,20 @@ export default function SystemSettingsPage() {
       .finally(() => setSavingTavilyKey(false));
   };
 
-  const saveProxy = () => {
-    setSavingProxy(true);
+  const saveOutboundProxy = () => {
+    setSavingOutboundProxy(true);
     api
-      .setSettings({ web_search_proxy: proxyInput.trim() })
+      .setSettings({ outbound_proxy: outboundProxyInput.trim() })
       .then((s) => {
         apply(s);
-        toast.success(proxyInput.trim() ? "已保存出口代理" : "已清除出口代理（改为直连）");
+        toast.success(
+          outboundProxyInput.trim()
+            ? "已保存上网代理（搜索 / 情报 / 自更新走它）"
+            : "已清除上网代理（检索流量回落全局代理，未配则直连）",
+        );
       })
       .catch((e) => toast.error("保存失败：" + (e as Error).message))
-      .finally(() => setSavingProxy(false));
+      .finally(() => setSavingOutboundProxy(false));
   };
 
   const saveGlobalProxy = () => {
@@ -249,7 +253,7 @@ export default function SystemSettingsPage() {
     api
       .testWebSearch({
         web_search_backend: backend,
-        web_search_proxy: proxyInput.trim(),
+        web_search_proxy: outboundProxyInput.trim(),
         brave_search_api_key: braveKeyInput,
         tavily_search_api_key: tavilyKeyInput,
       })
@@ -372,8 +376,10 @@ export default function SystemSettingsPage() {
               全局代理
             </CardTitle>
             <CardDescription>
-              所有 Agent 的<b>目标流量</b>经此代理出网（隐藏源 IP / 走跳板）。支持 <b>http / https / socks5</b>，可带{" "}
-              <code>user:pass</code> 认证。留空=直连。
+              所有 Agent 的<b>渗透测试 / 扫描目标流量</b>经此代理出网（隐藏源 IP / 走跳板）。支持{" "}
+              <b>http / https / socks5</b>，可带 <code>user:pass</code> 认证。留空=直连。
+              <br />
+              与「上网代理」的分工：<b>打目标走这里，查资料走上网代理</b>；上网代理留空时检索流量也回落到这里。
               <br />
               开启<b>流量捕获</b>时，它作为记录代理的<b>上游</b>（流量仍全量落库，再经此代理出网）；关闭捕获时，直接注入
               Agent 的 bash / WebFetch 出网。与网络搜索代理、LLM 代理相互独立。
@@ -402,6 +408,48 @@ export default function SystemSettingsPage() {
             </div>
             <p className="text-muted-foreground text-xs">
               {globalProxyInput.trim() ? "已配置 · 所有目标流量经此代理出网" : "未配置 · 目标流量直连出网"}
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <SearchIcon className="size-4" />
+              上网代理
+            </CardTitle>
+            <CardDescription>
+              用于<b>访问外网检索资源</b>：搜索引擎（web_search）、漏洞情报同步（NVD / CISA KEV）、
+              PoC 线索聚合（GitHub）、平台自更新。
+              <br />
+              <b>渗透测试流量不走这里</b>——打目标始终走上面的「全局代理」，未配置则直连。
+              需要访问 Google / GitHub / NVD 而内网只有特定出口时，填这里即可，不必把测试流量也绕出去。
+              <br />
+              支持 <b>http / https / socks5</b>，可带 <code>user:pass</code> 认证。留空=不单独配置：
+              检索流量回落到全局代理，全局代理也为空则直连。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-2">
+            <Label htmlFor="outbound-proxy" className="text-sm font-normal text-muted-foreground">
+              代理地址
+            </Label>
+            <div className="flex items-center gap-2">
+              <Input
+                id="outbound-proxy"
+                autoComplete="off"
+                placeholder="http://user:pass@host:port 或 socks5://host:1080（留空=回落全局/直连）"
+                value={outboundProxyInput}
+                disabled={!loaded || savingOutboundProxy}
+                onChange={(e) => setOutboundProxyInput(e.target.value)}
+              />
+              <Button type="button" onClick={saveOutboundProxy} disabled={!loaded || savingOutboundProxy}>
+                保存
+              </Button>
+            </div>
+            <p className="text-muted-foreground text-xs">
+              {outboundProxyInput.trim()
+                ? "已配置 · 搜索 / 情报 / 自更新经此代理出网"
+                : "未配置 · 检索流量回落全局代理，全局也为空则直连"}
             </p>
           </CardContent>
         </Card>
@@ -614,30 +662,6 @@ export default function SystemSettingsPage() {
                   </p>
                 )}
                 <p className="text-muted-foreground text-xs">前往 https://tavily.com 注册并获取 API Key。</p>
-              </div>
-            )}
-
-            {webSearch && (
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="ws-proxy" className="text-sm font-normal text-muted-foreground">
-                  出口代理（可选）
-                </Label>
-                <div className="flex items-center gap-2">
-                  <Input
-                    id="ws-proxy"
-                    autoComplete="off"
-                    placeholder="http://host:port 或 socks5://host:port（留空=直连）"
-                    value={proxyInput}
-                    disabled={!loaded || savingProxy}
-                    onChange={(e) => setProxyInput(e.target.value)}
-                  />
-                  <Button type="button" onClick={saveProxy} disabled={!loaded || savingProxy}>
-                    保存
-                  </Button>
-                </div>
-                <p className="text-muted-foreground text-xs">
-                  独立出口代理，仅用于访问搜索端点（VPN/SOCKS 等）。与记录流量的 MITM 代理无关；网络不通时经此代理访问。
-                </p>
               </div>
             )}
 

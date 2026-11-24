@@ -285,6 +285,13 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 漏洞情报（V10-INTEL）：NVD + CISA KEV 公开源同步。默认开：只读公开
 		// 数据、无副作用；首次 30 秒后跑快通道，历史回填由页面手动触发。
 		s.intel = vulnintel.New(m.pg)
+		// 情报抓取走「上网代理」：NVD / CISA / GitHub 都是外网检索资源，
+		// 与渗透测试流量（global_proxy）分开。空值=直连。
+		if p := m.OutboundProxy(); p != "" {
+			if err := s.intel.SetProxy(p); err != nil {
+				log.Printf("[vulnintel] 上网代理 %q 无效，情报抓取改为直连: %v", p, err)
+			}
+		}
 		s.intel.Start(s.ctx)
 		// 运行中任务的情报增量构建：让 endpoints 在跑的过程中就参与比对。
 		s.startTaskIntelTicker(s.ctx)
@@ -3561,7 +3568,8 @@ func (s *Server) settingsPayload() map[string]any {
 		"web_search_backend":       backend,
 		"brave_key_set":            strings.TrimSpace(braveKey) != "",
 		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":         proxy,                       // 独立出口代理(http/https/socks5)，空=直连
+		"web_search_proxy":         proxy,                       // 兼容字段：等同 outbound_proxy
+		"outbound_proxy":           s.m.OutboundProxy(),         // 上网代理(http/https/socks5)：搜索/情报/自更新；空=回落全局/直连
 		"global_proxy":             s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
 		"python_interpreter":       strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
 		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
@@ -3637,7 +3645,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		WebSearchBackend *string `json:"web_search_backend"`
 		BraveKey         *string `json:"brave_search_api_key"`
 		TavilyKey        *string `json:"tavily_search_api_key"`
-		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
+		WebSearchProxy   *string `json:"web_search_proxy"`   // 兼容字段：等同 outbound_proxy
+		OutboundProxy    *string `json:"outbound_proxy"`     // 上网代理(http/https/socks5)；null=不改，""=清空
 		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
 		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
 		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
@@ -3800,6 +3809,20 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
+		changed = true
+	}
+	if req.OutboundProxy != nil {
+		if err := s.m.SetOutboundProxy(*req.OutboundProxy); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		if s.intel != nil {
+			if err := s.intel.SetProxy(strings.TrimSpace(*req.OutboundProxy)); err != nil {
+				writeErr(w, 400, err.Error())
+				return
+			}
+		}
+		// 搜索工具在 agent 构建时读 WebSearchOpts，重建以让新代理生效。
 		changed = true
 	}
 	if req.GlobalProxy != nil {

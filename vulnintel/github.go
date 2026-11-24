@@ -173,7 +173,7 @@ func (s *Service) searchGitHubPoc(ctx context.Context, cveID, token string) ([]d
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := s.client.Do(req)
+	resp, err := s.httpClient().Do(req)
 	if err != nil {
 		return nil, err
 	}

@@ -269,15 +269,33 @@ WITH tech AS (
   FROM assets a
   CROSS JOIN LATERAL unnest(a.technologies) AS t(tech)
   WHERE a.technologies IS NOT NULL AND cardinality(a.technologies) > 0
+),
+-- 指纹名 → NVD CPE product 的别名归一。NVD 的 product 是 httpserver / tomcat /
+-- openssh 这类规范名，而扫描器/人工写的是 Apache / httpd / Apache Tomcat，直接
+-- 等值匹配会漏掉绝大多数。这里把一条指纹展开成多个候选 product（保留原值）。
+techx AS (
+  SELECT asset_id, host, raw, prod,
+         unnest(
+           CASE
+             WHEN prod IN ('httpd','apache','apache2','apachehttpserver','apachehttpd','apacheserver') THEN ARRAY[prod,'httpserver']
+             WHEN prod IN ('tomcat','apachetomcat','catalina') THEN ARRAY[prod,'tomcat']
+             WHEN prod IN ('ssh','opensshserver','openssh') THEN ARRAY[prod,'openssh']
+             WHEN prod IN ('iis','microsoftiis','windowsiis') THEN ARRAY[prod,'internetinformationservices']
+             WHEN prod IN ('struts','struts2','apachestruts') THEN ARRAY[prod,'struts']
+             WHEN prod IN ('nginx','nginxserver') THEN ARRAY[prod,'nginx']
+             ELSE ARRAY[prod]
+           END
+         ) AS cand
+  FROM tech
 )
 SELECT DISTINCT ON (t.asset_id, v.cve_id)
        v.cve_id, v.title, v.severity, v.cvss, v.kev,
        COALESCE(v.published_at, 'epoch'::timestamptz),
        t.raw, t.host, t.asset_id
-FROM tech t
+FROM techx t
 JOIN vuln_intel v ON EXISTS (
   SELECT 1 FROM unnest(v.cpe) AS c
-  WHERE split_part(c, ':', 2) = t.prod
+  WHERE split_part(c, ':', 2) = t.cand
 )
 WHERE v.cvss >= 7 OR v.kev
 ORDER BY t.asset_id, v.cve_id, v.cvss DESC

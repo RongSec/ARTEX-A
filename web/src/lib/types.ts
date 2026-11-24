@@ -1032,8 +1032,11 @@ export interface Settings {
   // write-only: only sent on PUT to store/clear the key.
   brave_search_api_key?: string;
   tavily_search_api_key?: string;
-  // 独立出口代理(http/https/socks5)，用于访问搜索端点；与记录流量的 MITM 代理无关。空=直连。
+  // 兼容字段：等同 outbound_proxy（老版本只认这个键）。
   web_search_proxy?: string;
+  // 上网代理(http/https/socks5)：搜索引擎、漏洞情报同步、PoC 聚合、平台自更新等
+  // 「访问外网检索资源」的流量走它；渗透测试流量不走（走 global_proxy）。空=回落全局/直连。
+  outbound_proxy?: string;
   // 全局出口代理(http/https/socks5，可带 user:pass)，所有目标流量走它。开启流量捕获时作为
   // MITM 上游；关闭捕获时直接注入 agent 的 bash/WebFetch。空=直连。
   global_proxy?: string;

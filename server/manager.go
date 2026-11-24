@@ -250,6 +250,7 @@ type Manager struct {
 	braveKey         string
 	tavilyKey        string
 	webSearchProxy   string
+	outboundProxy    string // 上网代理（检索/情报/自更新），空=回落 webSearchProxy→globalProxy
 	// globalProxy is the egress proxy all target traffic routes through
 	// (http/https/socks5, optional user:pass). Empty = direct. When traffic
 	// capture is on it becomes the MITM's upstream; when capture is off it is
@@ -289,6 +290,10 @@ const (
 	settingBraveKey            = "brave_search_api_key"
 	settingTavilyKey           = "tavily_search_api_key"
 	settingWebSearchProxy      = "web_search_proxy"
+	// settingOutboundProxy 是「上网代理」：搜索引擎、漏洞情报同步、PoC 聚合、
+	// 自更新这类**访问外网检索资源**的流量走它；渗透测试流量不走（那走 global_proxy）。
+	// 兼容旧值：outbound 为空时回落到 web_search_proxy，再回落到 global_proxy。
+	settingOutboundProxy = "outbound_proxy"
 	// settingGlobalProxy is the global egress proxy for all target traffic
 	// (http/https/socks5). Empty = direct. Distinct from web_search_proxy (which
 	// only routes the search backend) and the per-profile LLM proxy.
@@ -469,6 +474,12 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if v, ok, _ := pg.GetSetting(settingWebSearchProxy); ok {
 		m.webSearchProxy = v
 	}
+	if v, ok, _ := pg.GetSetting(settingOutboundProxy); ok && strings.TrimSpace(v) != "" {
+		m.outboundProxy = strings.TrimSpace(v)
+	} else {
+		// 老库没有 outbound_proxy：把旧的搜索代理当成上网代理，语义等价。
+		m.outboundProxy = strings.TrimSpace(m.webSearchProxy)
+	}
 	// Global egress proxy (default: direct). When capture is on, feed it to the
 	// MITM as its upstream so recorded traffic exits through it; when capture is
 	// off, ProxyAddr hands it to agents directly (bash env / WebFetch).
@@ -586,7 +597,44 @@ func (m *Manager) WebSearch() (on bool, backend, braveKey, tavilyKey, proxy stri
 	if backend == "" {
 		backend = defaultWebSearchBackend
 	}
-	return m.webSearchOn, backend, m.braveKey, m.tavilyKey, m.webSearchProxy
+	return m.webSearchOn, backend, m.braveKey, m.tavilyKey, m.outboundProxyLocked()
+}
+
+// outboundProxyLocked 计算检索类流量应走的代理。调用方需持有 m.mu（读锁即可）：
+// 上网代理优先，其次兼容旧的 web_search_proxy，最后回落到全局代理——全局代理的
+// 语义是「所有出网流量」，检索流量自然包含在内。
+func (m *Manager) outboundProxyLocked() string {
+	if m.outboundProxy != "" {
+		return m.outboundProxy
+	}
+	if m.webSearchProxy != "" {
+		return m.webSearchProxy
+	}
+	return m.globalProxy
+}
+
+// OutboundProxy 返回「上网代理」的生效值（已按优先级回落）。
+func (m *Manager) OutboundProxy() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.outboundProxyLocked()
+}
+
+// SetOutboundProxy 保存上网代理。空字符串=清空（检索流量回落全局代理/直连）。
+func (m *Manager) SetOutboundProxy(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw != "" {
+		if _, err := traffic.ValidateProxyURL(raw); err != nil {
+			return err
+		}
+	}
+	if err := m.pg.SetSetting(settingOutboundProxy, raw); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.outboundProxy = raw
+	m.mu.Unlock()
+	return nil
 }
 
 // WebSearchOpts returns the config as the agent-package struct the server pushes
@@ -658,11 +706,22 @@ func (m *Manager) SetWebSearch(on bool, backend string, braveKey, tavilyKey, pro
 		m.mu.Unlock()
 	}
 	if proxy != nil {
+		// 旧字段 web_search_proxy 现在等同「上网代理」：写新键并保持旧字段同步，
+		// 避免老版本回滚后读到空配置。
 		p := strings.TrimSpace(*proxy)
+		if p != "" {
+			if _, err := traffic.ValidateProxyURL(p); err != nil {
+				return err
+			}
+		}
+		if err := m.pg.SetSetting(settingOutboundProxy, p); err != nil {
+			return err
+		}
 		if err := m.pg.SetSetting(settingWebSearchProxy, p); err != nil {
 			return err
 		}
 		m.mu.Lock()
+		m.outboundProxy = p
 		m.webSearchProxy = p
 		m.mu.Unlock()
 	}

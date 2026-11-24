@@ -15,12 +15,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	xproxy "golang.org/x/net/proxy"
 )
 
 const (
@@ -45,7 +49,7 @@ const (
 // 两轮重叠只会互相抢 NVD 配额。
 type Service struct {
 	pg     *db.DB
-	client *http.Client
+	client atomic.Pointer[http.Client]
 
 	mu      sync.Mutex
 	running string // "" | kev | nvd | full
@@ -54,10 +58,67 @@ type Service struct {
 }
 
 func New(pg *db.DB) *Service {
-	return &Service{
-		pg:     pg,
-		client: &http.Client{Timeout: 90 * time.Second},
+	s := &Service{pg: pg}
+	c, err := intelHTTPClient("")
+	if err != nil {
+		c = &http.Client{Timeout: 90 * time.Second}
 	}
+	s.client.Store(c)
+	return s
+}
+
+// httpClient 返回当前生效的抓取客户端（SetProxy 可热替换，无需重启服务）。
+func (s *Service) httpClient() *http.Client {
+	if c := s.client.Load(); c != nil {
+		return c
+	}
+	return &http.Client{Timeout: 90 * time.Second}
+}
+
+// SetProxy 设置检索类出网代理（http/https/socks5），空字符串=直连。
+// 只影响 NVD / CISA / GitHub 这些公开源抓取，不影响渗透测试流量。
+func (s *Service) SetProxy(raw string) error {
+	c, err := intelHTTPClient(strings.TrimSpace(raw))
+	if err != nil {
+		return err
+	}
+	s.client.Store(c)
+	return nil
+}
+
+// intelHTTPClient 按代理串构造客户端。socks5 走 x/net/proxy 的拨号器，
+// http/https 走 Transport.Proxy；空串=直连。
+func intelHTTPClient(raw string) (*http.Client, error) {
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	tr := &http.Transport{DialContext: dialer.DialContext}
+	client := &http.Client{Timeout: 90 * time.Second, Transport: tr}
+	if raw == "" {
+		return client, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("代理地址无效: %w", err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		tr.Proxy = http.ProxyURL(u)
+	case "socks5", "socks5h":
+		var auth *xproxy.Auth
+		if u.User != nil {
+			pass, _ := u.User.Password()
+			auth = &xproxy.Auth{User: u.User.Username(), Password: pass}
+		}
+		d, err := xproxy.SOCKS5("tcp", u.Host, auth, dialer)
+		if err != nil {
+			return nil, fmt.Errorf("socks5 代理初始化失败: %w", err)
+		}
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return d.Dial(network, addr)
+		}
+	default:
+		return nil, fmt.Errorf("不支持的代理协议 %q（支持 http/https/socks5）", u.Scheme)
+	}
+	return client, nil
 }
 
 // Start 起后台循环：首次延迟 30 秒（让服务先对外可用），之后每 30 分钟一轮快通道。
@@ -332,6 +393,11 @@ type nvdResponse struct {
 			Published    string `json:"published"`
 			LastModified string `json:"lastModified"`
 			VulnStatus   string `json:"vulnStatus"`
+			// NVD 2.0 会为 CISA KEV 条目回填这几个字段：即使 CISA 全量源拉不动，
+			// NVD 同步也能把「在野利用」标出来。
+			CisaExploitAdd   string `json:"cisaExploitAdd"`
+			CisaActionDue    string `json:"cisaActionDue"`
+			CisaRequiredAct  string `json:"cisaRequiredAction"`
 			Descriptions []struct {
 				Lang  string `json:"lang"`
 				Value string `json:"value"`
@@ -400,6 +466,11 @@ func (r nvdResponse) toEntries() []db.VulnIntelEntry {
 			Description: desc,
 			Severity:    strings.ToUpper(sev),
 			CVSS:        score,
+		}
+		// CISA KEV 标记来自 NVD 回填字段（CISA 全量 JSON 拿不到时的兜底）。
+		if strings.TrimSpace(c.CisaExploitAdd) != "" {
+			e.KEV = true
+			e.KEVDue = strings.TrimSpace(c.CisaExploitAdd)
 		}
 		if t, err := time.Parse("2006-01-02T15:04:05.000", c.Published); err == nil {
 			e.PublishedAt = t
@@ -507,7 +578,7 @@ func (s *Service) getJSONWithKey(ctx context.Context, url string, dst any) error
 	if key := s.nvdKey(); key != "" && strings.Contains(url, "nvd.nist.gov") {
 		req.Header.Set("apiKey", key)
 	}
-	resp, err := s.client.Do(req)
+	resp, err := s.httpClient().Do(req)
 	if err != nil {
 		return err
 	}
