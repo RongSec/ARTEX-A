@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [v0.3.16-hs.2] - 2026-11-24
+
+### 修复
+
+- **PoC 聚合状态长时间空白**：400 次 GitHub 搜索在匿名限速下要 20~40 分钟，原来只在结束时写 `vuln_sync_state`，期间页面显示「未同步 / 上次同步 —」，中途重启还会把整轮状态丢掉、永远停在 never。改为开跑即记录 `LastSyncAt`，每 50 次成功查询刷一次 `TotalSynced`。
+- **发布流程**：`build.sh` 等 14 个 shell 脚本在 git 里缺可执行位，CI 执行 `./build.sh` 直接 Permission denied，上一版 release 的 5 个平台全部失败；未配置 Docker Hub 凭据时 docker 任务改为按仓库变量 `DOCKERHUB_ENABLED` 跳过，避免制品已发布却把整次运行标红。
+
 ## [v0.3.16-hs.1] - 2026-11-24
 
 ### 漏洞情报 V2
