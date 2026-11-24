@@ -64,17 +64,17 @@ func NewGhsaClient(token string, proxyURL string) (*GhsaClient, error) {
 
 // GhsaAdvisory 是 GHSA API 返回的 advisory 子集。
 type GhsaAdvisory struct {
-	GHSID      string   `json:"ghsa_id"`
-	CVEID      string   `json:"cve_id"`
-	URL        string   `json:"html_url"`
-	Summary    string   `json:"summary"`
-	Description string  `json:"description"`
-	Severity   string   `json:"severity"`
-	CVSS       *GhsaCVSS `json:"cvss"`
+	GHSID        string            `json:"ghsa_id"`
+	CVEID        string            `json:"cve_id"`
+	URL          string            `json:"html_url"`
+	Summary      string            `json:"summary"`
+	Description  string            `json:"description"`
+	Severity     string            `json:"severity"`
+	CVSS         *GhsaCVSS         `json:"cvss"`
 	CVSSSeverity *GhsaCVSSSeverity `json:"cvss_severity"`
-	Published  string   `json:"published_at"`
-	Updated    string   `json:"updated_at"`
-	Withdrawn  string   `json:"withdrawn_at"`
+	Published    string            `json:"published_at"`
+	Updated      string            `json:"updated_at"`
+	Withdrawn    string            `json:"withdrawn_at"`
 	// Vulnerabilities 是受影响的包与版本区间。
 	Vulnerabilities []GhsaVulnerability `json:"vulnerabilities"`
 	// References 是厂商公告等外部链接——模型据此去确认影响范围。

@@ -61,7 +61,7 @@ func (s *Store) SyncPoCOnly(ctx context.Context, cfg Config) error {
 // 为什么不动：手动补历史（比如只补 2021 年）不应把 lastModified 增量游标
 // 推到那个时间点——一推，下次增量就从两年前开始重扫。
 func syncNVDRange(ctx context.Context, st *Store, cfg Config, since, until time.Time) error {
-	client, err := NewNvdClient(cfg.NvdAPIKey, cfg.ProxyURL)
+	client, err := newNvdClient(cfg, false)
 	if err != nil {
 		return err
 	}

@@ -47,17 +47,17 @@ func (s *Server) intelStatus(w http.ResponseWriter, r *http.Request) {
 	running, startedAt := s.VulnIntelSyncState()
 
 	cfg := map[string]any{
-		"nvd_api_key":       maskSecret(settingString(s.m.pg, settingNvdApiKey)),
-		"nvd_key_set":       settingString(s.m.pg, settingNvdApiKey) != "",
-		"github_token":      maskSecret(settingString(s.m.pg, settingVulnIntelGitHubToken)),
-		"github_token_set":  settingString(s.m.pg, settingVulnIntelGitHubToken) != "",
-		"proxy":             s.VulnIntelProxy(),
-		"poc_enabled":       s.m.pg.GetBool(settingVulnIntelPocEnabled, false),
-		"backfill_days":     intSetting(s.m.pg, settingVulnIntelBackfillDays, 0),
+		"nvd_api_key":         maskSecret(settingString(s.m.pg, settingNvdApiKey)),
+		"nvd_key_set":         settingString(s.m.pg, settingNvdApiKey) != "",
+		"github_token":        maskSecret(settingString(s.m.pg, settingVulnIntelGitHubToken)),
+		"github_token_set":    settingString(s.m.pg, settingVulnIntelGitHubToken) != "",
+		"proxy":               s.VulnIntelProxy(),
+		"poc_enabled":         s.m.pg.GetBool(settingVulnIntelPocEnabled, false),
+		"backfill_days":       intSetting(s.m.pg, settingVulnIntelBackfillDays, 0),
 		"max_runtime_minutes": intSetting(s.m.pg, settingVulnIntelMaxRuntimeMin, defaultVulnIntelMaxRuntimeMin),
-		"fast_lane_enabled": s.m.pg.GetBool(settingVulnIntelFastLaneOn, true),
-		"fast_lane_minutes": intSetting(s.m.pg, settingVulnIntelFastLaneMin, 30),
-		"fast_lane_days":    intSetting(s.m.pg, settingVulnIntelFastLaneDays, 7),
+		"fast_lane_enabled":   s.m.pg.GetBool(settingVulnIntelFastLaneOn, true),
+		"fast_lane_minutes":   intSetting(s.m.pg, settingVulnIntelFastLaneMin, 30),
+		"fast_lane_days":      intSetting(s.m.pg, settingVulnIntelFastLaneDays, 7),
 	}
 	writeJSON(w, 200, map[string]any{
 		"enabled":         s.vulnIntelEnabled(),
@@ -256,7 +256,8 @@ func (s *Server) intelSourceUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/intel/config { enabled?, nvd_api_key?, github_token?, poc_enabled?,
-//                         backfill_days?, max_runtime_minutes?, fast_lane_*? }
+//
+//	backfill_days?, max_runtime_minutes?, fast_lane_*? }
 //
 // 凭据语义：省略字段 = 不改；传 "-" = 清除；空串 = 保持不变。
 func (s *Server) intelConfigSave(w http.ResponseWriter, r *http.Request) {
@@ -264,15 +265,15 @@ func (s *Server) intelConfigSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Enabled        *bool   `json:"enabled"`
-		NvdAPIKey      *string `json:"nvd_api_key"`
-		GitHubToken    *string `json:"github_token"`
-		PocEnabled     *bool   `json:"poc_enabled"`
-		BackfillDays   *int    `json:"backfill_days"`
-		MaxRuntimeMin  *int    `json:"max_runtime_minutes"`
-		FastLaneOn     *bool   `json:"fast_lane_enabled"`
-		FastLaneMin    *int    `json:"fast_lane_minutes"`
-		FastLaneDays   *int    `json:"fast_lane_days"`
+		Enabled       *bool   `json:"enabled"`
+		NvdAPIKey     *string `json:"nvd_api_key"`
+		GitHubToken   *string `json:"github_token"`
+		PocEnabled    *bool   `json:"poc_enabled"`
+		BackfillDays  *int    `json:"backfill_days"`
+		MaxRuntimeMin *int    `json:"max_runtime_minutes"`
+		FastLaneOn    *bool   `json:"fast_lane_enabled"`
+		FastLaneMin   *int    `json:"fast_lane_minutes"`
+		FastLaneDays  *int    `json:"fast_lane_days"`
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, "请求格式错误")
@@ -372,12 +373,22 @@ func (s *Server) intelProbe(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// 探测目标来自库配置（用户可能已换成镜像）：探的必须是实际会请求的地址，
+	// 否则「诊断通过、同步失败」会互相打脸。
+	eps := s.vulnSourceEndpoints(r.Context())
+	pick := func(id, def string) string {
+		if v := eps[id]; v != "" {
+			return v
+		}
+		return def
+	}
+	repo := strings.TrimRight(pick("nuclei_templates", vulnintel.DefaultNucleiRepo), "/")
 	checks := []struct{ source, target string }{
-		{"nvd", "https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=1"},
-		{"kev", "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"},
-		{"github_poc", "https://api.github.com/rate_limit"},
-		{"ghsa", "https://api.github.com/advisories?per_page=1"},
-		{"nuclei_templates", "https://github.com/projectdiscovery/nuclei-templates.git/info/refs?service=git-upload-pack"},
+		{"nvd", pick("nvd", "https://services.nvd.nist.gov") + "/rest/json/cves/2.0?resultsPerPage=1"},
+		{"kev", pick("kev", "https://www.cisa.gov") + "/sites/default/files/feeds/known_exploited_vulnerabilities.json"},
+		{"github_poc", pick("github_poc", "https://api.github.com") + "/rate_limit"},
+		{"ghsa", pick("ghsa", "https://api.github.com") + "/advisories?per_page=1"},
+		{"nuclei_templates", strings.TrimSuffix(repo, ".git") + ".git/info/refs?service=git-upload-pack"},
 	}
 	results := make([]probeResult, 0, len(checks))
 	for _, c := range checks {
@@ -455,6 +466,11 @@ func vulnIntelErrorHint(err string) string {
 		return "404：数据源路径变了，或代理返回了拦截页。"
 	case strings.Contains(e, "429") || strings.Contains(e, "rate limit"):
 		return "被限速：游标会续跑，或配置 NVD Key / GitHub Token 提升配额。"
+	case strings.Contains(e, "was not closed cleanly") || strings.Contains(e, "unexpected eof") ||
+		strings.Contains(e, "handshake") || strings.Contains(e, "connection reset"):
+		// GitHub 主站在不少企业网/校园网是被策略阻断的（api.github.com 通、
+		// github.com 不通是常见组合）——模板 clone 正好走 github.com。
+		return "连接被重置：多为网络策略阻断。给模板库配镜像端点，或让「上网代理」能到 github.com。"
 	case strings.Contains(e, "x509") || strings.Contains(e, "tls"):
 		return "TLS 校验失败：多半是代理做了 MITM，换普通 http 代理。"
 	default:

@@ -80,9 +80,9 @@ func (s *Store) GetPoCs(ctx context.Context, cveID string) ([]PoCHit, error) {
 // result sets, well within budget). An optional token lifts limits. Base is
 // overridable for tests.
 type GitHubClient struct {
-	Base   string
-	HTTP   *http.Client
-	Token  string
+	Base  string
+	HTTP  *http.Client
+	Token string
 }
 
 func NewGitHubClient(token string, proxyURL string) (*GitHubClient, error) {

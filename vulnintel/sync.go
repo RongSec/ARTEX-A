@@ -12,19 +12,60 @@ import (
 
 // Config controls one sync run.
 type Config struct {
-	NvdAPIKey    string        // optional; lifts the 5 req/30s anonymous cap
-	ProxyURL     string        // global egress proxy for outbound fetches (empty = direct)
-	GitHubToken  string        // optional; lifts GitHub search limits for PoC aggregation
-	PocEnabled   bool          // aggregate GitHub PoC repos for recently synced CVEs
-	BackfillDays int           // first-run lookback; 0 (default) = full catalog (~409k records,
-	                           // ≈205 pages: ~22 min anonymous / ~3 min with a key, split across runs)
-	PageDelay    time.Duration // inter-request delay; 0 = derived from the key
-	MaxRuntime   time.Duration // per-run ceiling (default 30m) — the rest waits for the next tick
+	NvdAPIKey    string // optional; lifts the 5 req/30s anonymous cap
+	ProxyURL     string // global egress proxy for outbound fetches (empty = direct)
+	GitHubToken  string // optional; lifts GitHub search limits for PoC aggregation
+	PocEnabled   bool   // aggregate GitHub PoC repos for recently synced CVEs
+	BackfillDays int    // first-run lookback; 0 (default) = full catalog (~409k records,
+	// ≈205 pages: ~22 min anonymous / ~3 min with a key, split across runs)
+	PageDelay  time.Duration // inter-request delay; 0 = derived from the key
+	MaxRuntime time.Duration // per-run ceiling (default 30m) — the rest waits for the next tick
 
 	// SkipKEV / SkipNVD 来自「库配置」页每行的启用开关。
 	// 关掉一个源不等于停掉整条链路：另一个源照常跑，游标各自保留。
 	SkipKEV bool
 	SkipNVD bool
+
+	// 下面四个是「库配置」页可改的请求基址（空 = 用官方地址）。
+	//
+	// 为什么要它们：端点写死在代码里，页面上的「端点」就是摆设——内网部署
+	// 换镜像源（NVD 全量镜像 / 企业 GitHub Enterprise / gitea 上的模板镜像）
+	// 只能改代码重编译。基址与具体路径分开：程序拼 /rest/json/cves/2.0 这类
+	// 后缀，用户只填到域名（或镜像的 API 根）。
+	NvdBase    string
+	KevBase    string
+	GitHubBase string
+	NucleiRepo string
+}
+
+// newNvdClient 统一构造 NVD/KEV 客户端并应用库配置里的基址。
+// KEV 与 NVD 共用一个客户端类型（KEV 是 cisa.gov 的单个 JSON 文件），
+// 所以基址按用途分别覆盖，不能一处覆盖两处都用。
+func newNvdClient(cfg Config, forKEV bool) (*NvdClient, error) {
+	c, err := NewNvdClient(cfg.NvdAPIKey, cfg.ProxyURL)
+	if err != nil {
+		return nil, err
+	}
+	base := cfg.NvdBase
+	if forKEV {
+		base = cfg.KevBase
+	}
+	if base = strings.TrimRight(strings.TrimSpace(base), "/"); base != "" {
+		c.Base = base
+	}
+	return c, nil
+}
+
+// newGitHubClient 同 newNvdClient：库配置里改了 GitHub 端点就用改过的。
+func newGitHubClient(cfg Config) (*GitHubClient, error) {
+	c, err := NewGitHubClient(cfg.GitHubToken, cfg.ProxyURL)
+	if err != nil {
+		return nil, err
+	}
+	if base := strings.TrimRight(strings.TrimSpace(cfg.GitHubBase), "/"); base != "" {
+		c.Base = base
+	}
+	return c, nil
 }
 
 // Run executes one full sync: KEV flags first (cheap, high signal), then the
@@ -89,11 +130,13 @@ func Run(ctx context.Context, st *Store, cfg Config) error {
 // vuln_cves are queried — the pool of KEV + recent high-severity first, since
 // 409k × 1 search each is neither feasible nor useful.
 func syncPoCs(ctx context.Context, st *Store, cfg Config) error {
-	client, err := NewGitHubClient(cfg.GitHubToken, cfg.ProxyURL)
+	client, err := newGitHubClient(cfg)
 	if err != nil {
 		return err
 	}
-	state, err := st.GetSyncState(ctx, "poc")
+	// 状态键必须与「库配置」行 id 一致（github_poc）：键写 "poc" 时页面
+	// LEFT JOIN 不上，PoC 明明每小时都在拉，状态列却永远显示「未同步」。
+	state, err := st.GetSyncState(ctx, "github_poc")
 	if err != nil {
 		return err
 	}
@@ -172,7 +215,7 @@ func syncPoCs(ctx context.Context, st *Store, cfg Config) error {
 // faster than NVD, so entries absent from vuln_cves get a stub row visible to
 // search until the NVD sync fills in details.
 func syncKEV(ctx context.Context, st *Store, cfg Config) error {
-	client, err := NewNvdClient(cfg.NvdAPIKey, cfg.ProxyURL)
+	client, err := newNvdClient(cfg, true)
 	if err != nil {
 		return err
 	}
@@ -213,7 +256,7 @@ func syncKEV(ctx context.Context, st *Store, cfg Config) error {
 // The cursor advances per completed WINDOW (not per run), so a run cut short by
 // MaxRuntime resumes from the next window instead of starting over.
 func syncNVD(ctx context.Context, st *Store, cfg Config) error {
-	client, err := NewNvdClient(cfg.NvdAPIKey, cfg.ProxyURL)
+	client, err := newNvdClient(cfg, false)
 	if err != nil {
 		return err
 	}

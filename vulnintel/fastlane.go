@@ -146,6 +146,8 @@ type FastLaneConfig struct {
 	MaxRuntime time.Duration
 	// PageDelay 是页间隔（NVD 匿名访问限速约 5 次/30s）。
 	PageDelay time.Duration
+	// NvdBase 是库配置页里 NVD 的请求基址（空 = 官方）。
+	NvdBase string
 }
 
 // FastLaneResult 是一轮快通道的结果。
@@ -174,7 +176,7 @@ type FastLaneResult struct {
 // 查的还是同一个库，只是多了一条「近期高危」的查询。
 func RunFastLane(ctx context.Context, st *Store, cfg FastLaneConfig) (FastLaneResult, error) {
 	var res FastLaneResult
-	client, err := NewNvdClient(cfg.NvdAPIKey, cfg.ProxyURL)
+	client, err := newNvdClient(Config{NvdAPIKey: cfg.NvdAPIKey, ProxyURL: cfg.ProxyURL, NvdBase: cfg.NvdBase}, false)
 	if err != nil {
 		return res, err
 	}

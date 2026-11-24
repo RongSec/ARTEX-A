@@ -11,6 +11,7 @@ package vulnintel
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"os/exec"
@@ -18,6 +19,10 @@ import (
 	"strings"
 	"time"
 )
+
+// DefaultNucleiRepo 是模板树官方地址。内网/镜像部署可在「库配置」页把
+// nuclei_templates 的端点换成镜像（等价于 git clone <端点>），不必改代码。
+const DefaultNucleiRepo = "https://github.com/projectdiscovery/nuclei-templates.git"
 
 // TemplatesDir 是模板树位置(默认可执行文件旁 nuclei-templates/)。
 func TemplatesDir(dataDir string) string {
@@ -35,7 +40,10 @@ func TemplatesDir(dataDir string) string {
 // 自愈语义（v0.3.96）：clone/pull 失败时清理半成品目录——git 中断残留的 .git
 // 空壳会让目录「存在但没有模板」，状态页永远显示 0 个模板且无法自愈（Kali 实测）。
 // 成功后校验 yaml 模板数 >0，空树同样按失败清理，下一轮重clone。
-func EnsureTemplates(ctx context.Context, dir, proxy string) error {
+func EnsureTemplates(ctx context.Context, dir, proxy, repo string) error {
+	if strings.TrimSpace(repo) == "" {
+		repo = DefaultNucleiRepo
+	}
 	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_HTTP_LOW_SPEED_LIMIT=1000", "GIT_HTTP_LOW_SPEED_TIME=30")
 	if proxy != "" {
 		// git 认的是 http_proxy/https_proxy（大小写都设一份，不同版本读的不一样），
@@ -45,7 +53,17 @@ func EnsureTemplates(ctx context.Context, dir, proxy string) error {
 			"ALL_PROXY="+proxy, "all_proxy="+proxy)
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		// 换了端点（镜像/私有 fork）就等于换源：origin 还指旧地址时 pull 只会
+		// 拉到旧仓库的内容，页面看着「同步成功」其实没换。这里直接删了重建。
+		if cur := gitOriginURL(dir); cur != "" && strings.TrimRight(cur, "/") != strings.TrimRight(repo, "/") {
+			log.Printf("[vulnintel] nuclei 模板源变更 %s -> %s，重建模板树", cur, repo)
+			os.RemoveAll(dir)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		// update: fetch + fast-forward only, ignore local drift
+		// pull 用 origin 里记的地址：clone 时写的 repo 已固化，改配置要重建目录
+		// （update 分支只做 fetch+ff，不换 remote——换源属于重装，见 EnsureTemplates 注释）。
 		cmd := exec.CommandContext(ctx, "git", "-C", dir, "pull", "--ff-only", "--quiet")
 		cmd.Env = env
 		out, err := cmd.CombinedOutput()
@@ -65,8 +83,7 @@ func EnsureTemplates(ctx context.Context, dir, proxy string) error {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--single-branch", "--quiet",
-		"https://github.com/projectdiscovery/nuclei-templates.git", dir)
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--single-branch", "--quiet", repo, dir)
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -80,6 +97,15 @@ func EnsureTemplates(ctx context.Context, dir, proxy string) error {
 
 // verifyTemplates 克隆/拉取成功后的内容校验：模板树一个 yaml 都没有 = 无效
 // （网络代理返回了错误页、磁盘满等场景产出过空工作树），按失败清理。
+// gitOriginURL 读已克隆模板树的 origin 地址（读不到返回空）。
+func gitOriginURL(dir string) string {
+	out, err := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func verifyTemplates(dir string) error {
 	if n := CountTemplates(dir); n == 0 {
 		os.RemoveAll(dir)

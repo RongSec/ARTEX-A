@@ -108,12 +108,20 @@ func (s *Server) VulnIntelProxy() string {
 // vulnIntelConfig 组装一轮主同步的配置。每次读库：页面改完下一轮即生效。
 func (s *Server) vulnIntelConfig() vulnintel.Config {
 	cfg := vulnintel.Config{
-		ProxyURL:     s.VulnIntelProxy(),
-		PocEnabled:   s.m.pg.GetBool(settingVulnIntelPocEnabled, false),
+		ProxyURL: s.VulnIntelProxy(),
+		// 默认开：v26 是无条件每 30 分钟聚一次，升级后悄悄变默认关
+		// = 行为倒退（页面上 PoC 条数不再增长，用户以为坏了）。
+		PocEnabled:   s.m.pg.GetBool(settingVulnIntelPocEnabled, true),
 		BackfillDays: intSetting(s.m.pg, settingVulnIntelBackfillDays, 0),
 		NvdAPIKey:    settingString(s.m.pg, settingNvdApiKey),
 		GitHubToken:  settingString(s.m.pg, settingVulnIntelGitHubToken),
 	}
+	// 库配置页可改的请求基址。空 = 官方地址（vulnintel 包里兜底）。
+	eps := s.vulnSourceEndpoints(context.Background())
+	cfg.NvdBase = eps["nvd"]
+	cfg.KevBase = eps["kev"]
+	cfg.GitHubBase = eps["github_poc"]
+	cfg.NucleiRepo = eps["nuclei_templates"]
 	// 环境变量兜底：容器化部署更习惯把凭据放 env，而不是进数据库。
 	if cfg.NvdAPIKey == "" {
 		cfg.NvdAPIKey = strings.TrimSpace(os.Getenv("NVD_API_KEY"))
@@ -290,8 +298,23 @@ func (s *Server) refreshNucleiTemplates(proxyURL string) {
 	// clone 会留半成品目录，正是「0 个模板」事故的根因。
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	if err := vulnintel.EnsureTemplates(ctx, s.vuln.nucleiDir, proxyURL); err != nil {
+	repo := s.vulnSourceEndpoint("nuclei_templates", vulnintel.DefaultNucleiRepo)
+	err := vulnintel.EnsureTemplates(ctx, s.vuln.nucleiDir, proxyURL, repo)
+	// 结果落 sync_state：不落的话模板树明明有 1.4 万个 yaml，页面还显示
+	// 「未同步、上次同步 —」，用户无法判断是没跑还是跑失败了。
+	st, _ := s.vuln.store.GetSyncState(ctx, "nuclei_templates")
+	st.Source = "nuclei_templates"
+	st.TotalSynced = int64(vulnintel.CountTemplates(s.vuln.nucleiDir))
+	if err != nil {
+		st.LastError = err.Error()
 		log.Printf("[vulnintel] nuclei 模板树更新失败: %v", err)
+	} else {
+		now := time.Now()
+		st.LastSyncAt = &now
+		st.LastError = ""
+	}
+	if serr := s.vuln.store.SaveSyncState(ctx, st); serr != nil {
+		log.Printf("[vulnintel] 模板同步状态写入失败: %v", serr)
 	}
 }
 
@@ -310,6 +333,7 @@ func (s *Server) fastLaneConfig() vulnintel.FastLaneConfig {
 		NvdAPIKey:  settingString(s.m.pg, settingNvdApiKey),
 		WindowDays: intSetting(s.m.pg, settingVulnIntelFastLaneDays, 7),
 		MaxRuntime: 5 * time.Minute,
+		NvdBase:    s.vulnSourceEndpoint("nvd", ""),
 	}
 	if cfg.NvdAPIKey == "" {
 		cfg.NvdAPIKey = strings.TrimSpace(os.Getenv("NVD_API_KEY"))
@@ -380,6 +404,10 @@ func (s *Server) syncGhsaVersions(ctx context.Context) {
 	if err != nil {
 		log.Printf("[vulnintel] GHSA 客户端初始化失败: %v", err)
 		return
+	}
+	// 端点走库配置（企业 GitHub / 镜像），空则保持官方 api.github.com。
+	if base := s.vulnSourceEndpoint("ghsa", ""); base != "" {
+		client.Base = base
 	}
 	since := time.Now().Add(-7 * 24 * time.Hour)
 	if v := settingString(s.m.pg, settingVulnIntelGhsaCursor); v != "" {

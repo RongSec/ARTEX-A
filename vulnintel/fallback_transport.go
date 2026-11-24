@@ -92,9 +92,9 @@ func isTransportFailure(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	for _, m := range []string{
-		"eof",                     // TLS 握手/读取时对端断开（代理隧道不转发的典型症状）
-		"connection reset",        // 目标或中间设备重置
-		"connection refused",      // 端口没人听
+		"eof",                // TLS 握手/读取时对端断开（代理隧道不转发的典型症状）
+		"connection reset",   // 目标或中间设备重置
+		"connection refused", // 端口没人听
 		"broken pipe",
 		"no route to host",
 		"network is unreachable",

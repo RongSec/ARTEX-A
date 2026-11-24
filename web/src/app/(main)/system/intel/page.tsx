@@ -706,6 +706,9 @@ function SourcesTab({
               </CardTitle>
               <CardDescription className="text-xs">
                 每类库一行：开关、端点、凭据、条数、上次同步都在这。加新源由后端注册 adapter，页面自动出现。
+                <br />
+                端点填<b>基址</b>：NVD / KEV / GitHub 填到域名或镜像根（具体路径由程序拼），模板库填 git 地址；
+                改完保存即生效，模板库换源会自动重建模板树。
               </CardDescription>
             </div>
             <Button variant="outline" size="sm" disabled={probing} onClick={() => void probe()}>

@@ -56,10 +56,10 @@ func (s *Store) MigrateLegacy(ctx context.Context) (LegacyMigrateResult, error) 
 	}
 	type legacyRow struct {
 		id, source, title, desc, severity string
-		score                            float64
-		published, modified, kevDue      *time.Time
-		kev                              bool
-		cpeJSON, refsJSON                string
+		score                             float64
+		published, modified, kevDue       *time.Time
+		kev                               bool
+		cpeJSON, refsJSON                 string
 	}
 	var legacy []legacyRow
 	for rows.Next() {

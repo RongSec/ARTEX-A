@@ -13,19 +13,19 @@ import (
 
 // KevEntry is one record of the CISA Known Exploited Vulnerabilities catalog.
 type KevEntry struct {
-	CVEID        string
-	Vendor       string
-	Product      string
-	DateAdded    time.Time
-	Description  string
+	CVEID         string
+	Vendor        string
+	Product       string
+	DateAdded     time.Time
+	Description   string
 	RansomwareUse string
 }
 
 // KevCatalog is the parsed feed (also carries catalogVersion for the watermark).
 type KevCatalog struct {
-	Version        string
-	DateReleased   time.Time
-	Count          int
+	Version         string
+	DateReleased    time.Time
+	Count           int
 	Vulnerabilities []KevEntry
 }
 
@@ -66,12 +66,12 @@ func (c *NvdClient) FetchKEV(ctx context.Context) (*KevCatalog, error) {
 		DateReleased    string `json:"dateReleased"`
 		Count           int    `json:"count"`
 		Vulnerabilities []struct {
-			CVEID               string `json:"cveID"`
-			VendorProject       string `json:"vendorProject"`
-			Product             string `json:"product"`
-			DateAdded           string `json:"dateAdded"`
-			ShortDescription    string `json:"shortDescription"`
-			KnownRansomwareUse  string `json:"knownRansomwareCampaignUse"`
+			CVEID              string `json:"cveID"`
+			VendorProject      string `json:"vendorProject"`
+			Product            string `json:"product"`
+			DateAdded          string `json:"dateAdded"`
+			ShortDescription   string `json:"shortDescription"`
+			KnownRansomwareUse string `json:"knownRansomwareCampaignUse"`
 		} `json:"vulnerabilities"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {

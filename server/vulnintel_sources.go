@@ -21,10 +21,10 @@ import (
 
 // vulnSource 是库配置的一行（含运行时状态）。
 type vulnSource struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Kind  string `json:"kind"` // api_json / json_feed / github_api / git_repo
-	Enabled bool `json:"enabled"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"` // api_json / json_feed / github_api / git_repo
+	Enabled  bool   `json:"enabled"`
 	Endpoint string `json:"endpoint"`
 	// CredentialSetting 是凭据在 settings 表里的键名；CredentialHint 说明
 	// 没凭据会怎样（限速、不可用），页面直接展示。
@@ -100,6 +100,64 @@ ORDER BY s.sort_order, s.id`)
 		out[i].Count = s.vulnSourceCount(ctx, out[i].ID)
 	}
 	return out, nil
+}
+
+// 端点归一：把「整条请求 URL」压成基址。
+//
+// 为什么需要：库配置表里预置的是**完整请求地址**（NVD 那行写的是
+// https://services.nvd.nist.gov/rest/json/cves/2.0），这样页面上看得懂
+// 「它到底请求什么」。但客户端只接受基址、自己拼路径，所以读到配置后
+// 要把已知后缀剥掉。老库里已经存了完整地址，这一步保证不迁移也能用。
+var endpointSuffix = map[string]string{
+	"nvd":              "/rest/json/cves/2.0",
+	"kev":              "/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+	"ghsa":             "/advisories",
+	"github_poc":       "/search/repositories",
+	"nuclei_templates": "", // git 地址：原样使用
+}
+
+// normalizeEndpointBase 剥掉已知路径后缀，返回客户端可用的基址。
+// 用户自己填的镜像地址（不带官方后缀）原样返回。
+func normalizeEndpointBase(id, raw string) string {
+	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+	if raw == "" {
+		return ""
+	}
+	if suf := endpointSuffix[id]; suf != "" {
+		raw = strings.TrimSuffix(raw, suf)
+	}
+	return strings.TrimRight(raw, "/")
+}
+
+// vulnSourceEndpoints 一次读出所有库的端点（已归一）。读失败返回空 map，
+// 调用方按「空 = 用官方地址」处理，不让库配置故障拖垮同步。
+func (s *Server) vulnSourceEndpoints(ctx context.Context) map[string]string {
+	out := map[string]string{}
+	if s.m == nil || s.m.pg == nil {
+		return out
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	rows, err := s.m.pg.QueryContext(cctx, `SELECT id, COALESCE(endpoint,'') FROM vuln_sources`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, ep string
+		if rows.Scan(&id, &ep) == nil {
+			out[id] = normalizeEndpointBase(id, ep)
+		}
+	}
+	return out
+}
+
+// vulnSourceEndpoint 取单个库的端点，缺失或为空时用 def。
+func (s *Server) vulnSourceEndpoint(id, def string) string {
+	if ep := s.vulnSourceEndpoints(context.Background())[id]; ep != "" {
+		return ep
+	}
+	return def
 }
 
 // vulnSourceCount 返回该库在库内的条数。

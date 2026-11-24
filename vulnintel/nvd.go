@@ -33,6 +33,7 @@ func NewNvdClient(apiKey string, proxyURL string) (*NvdClient, error) {
 		HTTP:   &http.Client{Timeout: 60 * time.Second, Transport: transport},
 	}, nil
 }
+
 // nvdResponse is the subset of the CVE API 2.0 envelope we consume.
 type nvdResponse struct {
 	ResultsPerPage  int          `json:"resultsPerPage"`
@@ -46,14 +47,14 @@ type nvdWrapper struct {
 }
 
 type nvdCVE struct {
-	ID             string               `json:"id"`
-	Published      string               `json:"published"`
-	LastModified   string               `json:"lastModified"`
-	Descriptions   []nvdDescription     `json:"descriptions"`
+	ID             string                     `json:"id"`
+	Published      string                     `json:"published"`
+	LastModified   string                     `json:"lastModified"`
+	Descriptions   []nvdDescription           `json:"descriptions"`
 	Metrics        map[string]json.RawMessage `json:"metrics"`
-	Weaknesses     []nvdWeakness        `json:"weaknesses"`
-	Configurations []nvdConfiguration   `json:"configurations"`
-	References     []nvdReference       `json:"references"`
+	Weaknesses     []nvdWeakness              `json:"weaknesses"`
+	Configurations []nvdConfiguration         `json:"configurations"`
+	References     []nvdReference             `json:"references"`
 }
 
 type nvdDescription struct {
@@ -65,9 +66,9 @@ type nvdMetric struct {
 	Source   string `json:"source"`
 	Type     string `json:"type"`
 	CVSSData struct {
-		BaseScore  float64 `json:"baseScore"`
-		BaseSeverity string `json:"baseSeverity"`
-		VectorString string `json:"vectorString"`
+		BaseScore    float64 `json:"baseScore"`
+		BaseSeverity string  `json:"baseSeverity"`
+		VectorString string  `json:"vectorString"`
 	} `json:"cvssData"`
 }
 
@@ -223,6 +224,7 @@ func isRecentCritical(score *float64, kev bool) bool {
 // RateLimited signals a 429 so the sync loop can back off without treating it
 // as a source failure.
 type RateLimited struct{ RetryAfter time.Duration }
+
 func (e *RateLimited) Error() string {
 	if e.RetryAfter > 0 {
 		return fmt.Sprintf("nvd rate limited, retry after %s", e.RetryAfter)
