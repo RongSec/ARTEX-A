@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [v0.3.16-hs.6] - 2026-11-25
+
+### 修复
+
+- **镜像缺 python-docx**：`report/docxgen.go` 通过子进程 python 调 python-docx 渲染 docx，缺包时整条管线静默回退成 Markdown 桩——页面显示"已生成"，产物却不是 docx（现有生产容器实测就缺）。镜像内新增 `python-docx==1.1.2` 并在构建期校验 `import docx`。
+
 ## [v0.3.16-hs.5] - 2026-11-25
 
 ### 修复

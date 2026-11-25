@@ -23,6 +23,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
+# docx 报告渲染依赖：report/docxgen.go 用子进程 python 调 python-docx。
+# 缺这个包时整条 docx 管线会静默回退成 Markdown 桩——生产容器实测就是缺的，
+# 页面看着「生成了报告」，产物却不是 docx。版本钉住，避免上游破坏兼容。
+RUN pip install --no-cache-dir "python-docx==1.1.2" \
+    && python3 -c "import docx; print('python-docx', docx.__version__)"
+
 # 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
 # @playwright/mcp：browser MCP 直接 `npx @playwright/mcp`（已全局装好，无需 -y/@latest）。
 # @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
