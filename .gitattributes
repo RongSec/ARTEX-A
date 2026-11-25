@@ -10,3 +10,5 @@ docker/.env.example text eol=lf
 # 随镜像分发的中文字体：二进制，禁止任何换行转换
 *.ttf binary
 *.ttc binary
+# 底座版本号必须保持 LF，CI 直接读文件拼镜像 tag
+/docker/base/TAG text eol=lf
