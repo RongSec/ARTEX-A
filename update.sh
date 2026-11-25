@@ -106,16 +106,30 @@ latest_tag() {
 }
 
 # ── 镜像操作 ─────────────────────────────────────────────
+# Docker Hub 直连在国内不是「快速失败」而是「连接挂住」：docker pull 会安静重试
+# 十几分钟，屏幕上什么都不动，用户以为卡死。先花 5 秒问一下 /v2/：
+# 401 算可达（未认证本来就该 401），000/空算不可达，直接跳过直连。
+hub_reachable() {
+  command -v curl >/dev/null 2>&1 || return 0
+  local code
+  code="$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' https://registry-1.docker.io/v2/ 2>/dev/null || true)"
+  [ -n "$code" ] && [ "$code" != "000" ]
+}
+
 pull_image() { # $1=tag
   local tag="$1" m
   local ref="${IMAGE_REPO}:${tag}"
   if docker image inspect "$ref" >/dev/null 2>&1; then
     ok "本地已有 $ref（跳过拉取）"; return 0
   fi
-  info "拉取 $ref …"
-  if docker pull "$ref"; then return 0; fi
+  if hub_reachable; then
+    info "拉取 $ref …"
+    if docker pull "$ref"; then return 0; fi
+    warn "直连失败，改走加速源 …"
+  else
+    warn "Docker Hub 直连不可达，走加速源 …"
+  fi
   for m in ${ARTEX_MIRRORS:-docker.1ms.run}; do
-    warn "直连失败，改走加速源 $m …"
     if docker pull "$m/$ref"; then
       docker tag "$m/$ref" "$ref"
       ok "已从 $m 拉取并重命名为 $ref"
