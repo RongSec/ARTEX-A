@@ -23,6 +23,7 @@
 #   ./run.sh              启动（等价 ./run.sh up）
 #   ./run.sh up           启动：生成 .env → 拉镜像 → 起服务 → ① 补二进制 → ② 补 apt 包
 #   ./run.sh ensure       只做 ① ② 两步（更新镜像之后、或怀疑工具丢了时跑）
+#   ./run.sh seed-skills  只把镜像自带技能播种到 data/skills（update.sh 会调）
 #   ./run.sh restart      重启容器（不重建，容器可写层的东西还在）
 #   ./run.sh down         停止（应用 + 数据库）
 #   ./run.sh status       状态
