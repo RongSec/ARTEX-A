@@ -191,18 +191,34 @@ require_docker() {
   docker info >/dev/null 2>&1 || die "docker 守护进程不可用（权限不足？sudo usermod -aG docker \$USER 后重新登录）"
 }
 
+# Docker Hub 在部分网络里不是「返回错误」而是「连接挂住」——docker pull 会
+# 安静地重试好几分钟，用户只看到屏幕不动。先花 5 秒探一下 /v2/：401 是正常
+# 响应（要求 token），000/空才是不可达，这时直接跳过直连去加速源。
+hub_reachable() {
+  command -v curl >/dev/null 2>&1 || return 0
+  local code
+  code="$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' https://registry-1.docker.io/v2/ 2>/dev/null || true)"
+  [ -n "$code" ] && [ "$code" != "000" ]
+}
+
 # 拉镜像：Docker Hub 直连在国内常年超时，失败后按 ARTEX_MIRRORS 依次换加速源，
 # 拉到后打回原 tag，compose 仍然按 ARTEX_IMAGE 找它。
 pull_image() {
   local ref="$1" m
   docker image inspect "$ref" >/dev/null 2>&1 && return 0
-  if spinner_run "拉取 $ref（首次约 5.4GB）" docker pull -q "$ref"; then
-    spin_clean; return 0
+
+  if hub_reachable; then
+    if spinner_run "拉取 $ref（首次约 5.4GB）" docker pull -q "$ref"; then
+      spin_clean; return 0
+    fi
+    spin_clean
+    warn "直连拉取失败，尝试加速源…"
+  else
+    warn "Docker Hub 直连不可达，走加速源…"
   fi
-  spin_clean
-  warn "直连拉取失败，尝试加速源…"
+
   for m in ${ARTEX_MIRRORS:-docker.1ms.run}; do
-    if spinner_run "从 $m 拉取" docker pull -q "$m/$ref"; then
+    if spinner_run "从 $m 拉取（首次约 5.4GB）" docker pull -q "$m/$ref"; then
       spin_clean
       docker tag "$m/$ref" "$ref" >/dev/null 2>&1
       ok "已从 $m 拉取并重命名为 $ref"
