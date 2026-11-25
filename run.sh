@@ -335,6 +335,8 @@ case "${1:-up}" in
   status|ps)  shift || true; cmd_status "$@" ;;
   logs)       shift || true; cmd_logs "$@" ;;
   doctor)     shift || true; cmd_doctor "$@" ;;
-  -h|--help|help) sed -n '2,40p' "$0" ;;
+  -h|--help|help)
+    # 打印文件头注释块：第 2 行到 `set -euo pipefail` 之前。
+    sed -n '2,/^set -euo/{/^set -euo/d;p}' "$0" ;;
   *) die "未知子命令：$1（可用：up / ensure / down / restart / status / logs / doctor）" ;;
 esac
