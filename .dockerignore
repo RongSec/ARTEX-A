@@ -21,3 +21,7 @@ bench/.env
 bench/scheduler.py
 bench/entrypoint_v2.sh
 bench/seed_v2.sh
+# 升级备份（含数据库快照与 .env 副本）与更新状态
+backups
+docker/.update-state
+_verify_data

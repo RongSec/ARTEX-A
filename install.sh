@@ -50,6 +50,8 @@ install_docker(){
   docker compose up -d
   ok "启动完成 → http://localhost:8787"
   info "查看日志：docker compose logs -f artex"
+  info "以后启动/重启请用 ./run.sh（会顺带补齐容器重建后丢掉的工具）"
+  info "升级/回滚请用 ./update.sh（check / to / rollback / list）"
 }
 
 # ── ② 本地编译运行 ──────────────────────────────

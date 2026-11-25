@@ -55,7 +55,7 @@ cp config.example.json config.json   # 填 database 连接
 ./start.sh                           # → http://localhost:8787
 ```
 
-> 用 `start.sh` 启动而不是直接跑 `./artex`：它是守护脚本，页面上的「一键更新」靠它完成换装。
+> 用 `start.sh` 启动而不是直接跑 `./artex`：它是守护脚本，进程崩溃后会自动退避重启。
 > 后台常驻：`nohup ./start.sh >artex.log 2>&1 &`。
 
 **装好之后（3 分钟上手）**
@@ -253,9 +253,11 @@ web/            Next.js 前端（静态导出后 go:embed 内嵌）
 
 **更新**：
 
-- 页面一键更新：系统配置 → 版本与更新。下载 → 校验 SHA256 → `-h` 冒烟 → 暂存 `artex.new` → 由 `start.sh` 换装；连续 3 次启动失败自动回滚 `artex.old`。
-- 脚本更新：`./update.sh`（Docker / 本地编译两条路径）。
-- 更新会中断正在运行的任务，请在空闲时进行。
+- 页面只做版本查询（系统配置 → 版本与更新），不再执行更新动作。
+- Docker 部署：`./update.sh check` 查版本，`./update.sh to [tag]` 升级，`./update.sh rollback` 回滚。
+  升级前自动 `pg_dump` 备份到 `backups/<时间戳>/`，健康检查失败自动退回上一个 tag。
+- 源码部署：`./update.sh local`（拉代码 + 重新编译 + 替换 `./artex`）。
+- 更新会重建容器并中断正在运行的任务，请在空闲时进行。
 
 **远程 MCP**：系统设置里可选 `http`（Streamable HTTP）或 `sse`（旧版 SSE）。旧版 SSE 服务通常 `GET /sse` 建流，再用返回的 `/message?sessionId=...` 收 JSON-RPC；URL 填 `/sse`，请求头按 `Authorization=Bearer <token>` 填。
 

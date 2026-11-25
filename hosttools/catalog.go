@@ -41,7 +41,7 @@ type Tool struct {
 }
 
 // preinstalled 是镜像默认预置的工具集合（与 docker/apt-core.txt、
-// docker/hostbin/fetch.sh 的 VERSIONS 表保持一致）。
+// docker/apt-tools.txt、docker/hostbin/fetch.sh 的 VERSIONS 表保持一致）。
 //
 // 为什么单独维护：catalog 是「能装什么」的能力清单，不是「装了什么」的事实清单。
 // 把两者混在一起，只要 Dockerfile 改了一行，页面就会说谎。这里显式声明基线，
@@ -56,6 +56,11 @@ var preinstalled = map[string]bool{
 	"dig": true, "whois": true, "smbclient": true, "sshpass": true,
 	"whatweb": true, "sqlmap": true, "gobuster": true,
 	"proxychains4": true,
+	// apt 工具层（docker/apt-tools.txt）：体积大、装失败不该拖垮构建，单独循环安装。
+	// 它们装在容器可写层，重建容器会丢——run.sh 每次启动按同一份清单补回来。
+	"file": true, "strings": true,
+	"hashcat": true, "hydra": true, "john": true, "medusa": true,
+	"gdb": true, "binwalk": true, "exiftool": true, "aws": true, "xfreerdp": true,
 	// Go 二进制层（docker/hostbin/fetch.sh VERSIONS）
 	"nuclei": true, "httpx": true, "subfinder": true, "katana": true,
 	"dnsx": true, "tlsx": true, "chisel": true, "amass": true,

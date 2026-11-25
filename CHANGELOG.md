@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+## [v0.3.16-hs.7] - 2026-11-25
+
+### 新增
+
+- **`run.sh`（启动脚本）**：每次启动固定做两步，把「容器重建就丢的东西」补回来——①单文件二进制落 `data/hostbin`（卷里、PATH 第一位），缺哪个从 GitHub 取哪个；②系统级 apt 包在容器内补装，`.deb` 缓存在 `data/aptcache`，重装不重新下载。另有 `ensure / doctor / status / logs / restart / down` 子命令，`doctor` 会直接报告 PDF 预览引擎与工具缺口。
+- **`update.sh` 重写**：`check / to [tag] / rollback [--with-db] / backup / list / import <tar> / local`。升级前自动 `pg_dump` 全库快照 + 备份 `.env` + 记录旧镜像 digest 到 `backups/<时间戳>/`；拉镜像直连失败自动换加速源；重建后按版本号校验健康检查，失败自动退回上一个 tag；成功后自动跑一次 `run.sh ensure`。离线部署可用 `import` 导入镜像 tar。
+- **`docker/apt-tools.txt`**：系统级工具的单一事实来源（命令名|包名|说明），构建期与运行期共用同一份清单。
+
+### 变更
+
+- **删除程序内一键更新**（`/api/update/apply`、`/rollback`、`/stream`、`selfupdate.Stage/Bootstrap`、`start.sh` 的 exit 75 分支）。容器里换的只是 `/app/artex` 一个文件，`docker compose up -d` 重建即退回镜像版本（假成功），且换不掉基础镜像里的 LibreOffice / 工具层 / Playwright。页面只保留「版本与更新」查询与升级命令提示。
+- **`start.sh`** 回归纯守护：只在进程崩溃时退避重启，不再处理"请求重启"退出码。
+
+### 修复
+
+- **Hub 镜像终于能 PDF 预览**：根 `Dockerfile` 补 LibreOffice Writer + `fonts-noto-cjk` + `docker/fonts`（仿宋/黑体/宋体/Times）。此前只有 `docker/Dockerfile` 本地构建版带排版层，同一个版本两种能力，`/api/preview/pdf` 一直返回 `X-Preview-Fidelity: approximate`。
+- **apt 包名不再一错就炸构建**：工具层改为逐件安装，单件失败只告警（历史上 `nikto` 一个不存在的名字就让整个镜像构建失败）。`radare2` 经实测确认 bookworm 已移除，不进清单。
+- **`fetch.sh` 去掉 python3 依赖**：GitHub JSON 改用 `tr+grep+sed` 解析，解 zip 优先 `unzip`、其次 `python3`。运行期在部署机上自愈时，宿主机未必有 python3。
+- **catalog 预置基线补齐**：`preinstalled` 加入新装的 apt 工具层，页面不会再把「镜像已装」说成「需联网安装」。
+
 ## [v0.3.16-hs.6] - 2026-11-25
 
 ### 修复

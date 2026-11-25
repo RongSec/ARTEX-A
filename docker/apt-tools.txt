@@ -1,0 +1,36 @@
+# 系统级安全工具清单（apt 包）——「工具层」的唯一事实来源。
+#
+# 格式：命令行名|apt 包名|说明
+#   - 第 1 列是 `command -v` 探测的名字（不一定等于包名，如 exiftool/aws）
+#   - 第 2 列是 Debian bookworm 官方源里的包名
+#   - 空行与 # 注释忽略
+#
+# 两个消费方：
+#   1. Dockerfile 构建时循环安装（单件失败只告警，不拖垮整条构建——
+#      历史上 nikto 一个不存在的包名就让整个镜像构建失败）；
+#   2. run.sh 每次启动做体检：容器里 `command -v` 不到的，就用 apt 补装。
+#      装进去的包在容器可写层，`docker compose up -d` 重建容器会丢，
+#      所以这是「每次启动重做一遍」的一步；deb 缓存在卷里，重装不用重新下载。
+#
+# 不进这份清单的（Debian 源里没有，只能手工/离线包）：
+#   radare2（bookworm 已移除该包）、nikto（Kali 专有）、searchsploit/exploitdb、
+#   msfconsole（Kali 包）、seclists（GitHub 仓库）、evil-winrm（ruby gem）。
+# 详见 hosttools/catalog.go 里各自的 Hint。
+#
+# 实测确认过（2026-11-25，debian:bookworm-slim + aliyun 镜像 apt-cache show）：
+# 下面每一条都能装；radare2 是唯一被删掉的——它在 bookworm 里不存在，
+# 留在清单里会让 run.sh 每次启动都白试一遍。
+
+file|file|文件类型识别
+strings|binutils|字符串提取（strings 属于 binutils）
+psql|postgresql-client|psql/pg_dump（update.sh 备份用）
+
+hashcat|hashcat|GPU/CPU 口令爆破
+hydra|hydra|在线口令爆破
+john|john|离线 hash 破解（装在 /usr/sbin）
+medusa|medusa|并行口令爆破
+gdb|gdb|调试器
+binwalk|binwalk|固件/镜像解包
+exiftool|libimage-exiftool-perl|元数据读写（包名与命令名不同）
+aws|awscli|AWS CLI
+xfreerdp|freerdp2-x11|RDP 客户端

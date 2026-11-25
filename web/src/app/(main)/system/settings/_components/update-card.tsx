@@ -2,48 +2,30 @@
 
 import * as React from "react";
 
-import {
-  CheckCircle2Icon,
-  DownloadIcon,
-  ExternalLinkIcon,
-  RefreshCwIcon,
-  RotateCcwIcon,
-  TriangleAlertIcon,
-} from "lucide-react";
+import { CheckCircle2Icon, CopyIcon, ExternalLinkIcon, RefreshCwIcon, TerminalIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Progress } from "@/components/ui/progress";
-import { api, sseUrl } from "@/lib/api";
-import type { UpdateCheck, UpdateProgress } from "@/lib/types";
+import { api } from "@/lib/api";
+import type { UpdateCheck } from "@/lib/types";
 
-/** 等待新版本上线的最长时间。一次升级要经过三次进程启动（暂存 → 换装 → 新版），
- *  每次都是秒级，三分钟足够覆盖慢磁盘和 Docker 容器重建。 */
-const RESTART_TIMEOUT_MS = 180_000;
-
-function humanSize(n?: number): string {
-  if (!n || n <= 0) return "";
-  const units = ["B", "KB", "MB", "GB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
+/**
+ * 「版本与更新」：只做版本查询，不做更新。
+ *
+ * 程序内一键更新已经删掉了（v0.3.16-hs.7）。原因不是界面不好看，而是那套机制
+ * 在容器部署下必然「假成功」：它替换的是容器可写层里的 /app/artex 一个文件，
+ * `docker compose up -d` 重建容器立刻退回镜像自带的版本；而且它换不掉基础镜像里的
+ * LibreOffice、apt 工具层、Playwright 浏览器——版本号上去了、能力没上去。
+ *
+ * 现在升级统一走部署机上的 update.sh：拉完整镜像 → 更新前 pg_dump → 重建 →
+ * 健康检查失败自动回滚。它能做进程内做不到的三件事：换镜像、备份数据库、退回去。
+ * 这张卡片负责把「该跑哪条命令」说清楚，并把命令放进剪贴板。
+ */
 export function UpdateCard() {
   const [info, setInfo] = React.useState<UpdateCheck | null>(null);
   const [checking, setChecking] = React.useState(true);
-  const [progress, setProgress] = React.useState<UpdateProgress | null>(null);
-  // 与 progress 分开：暂存完成后进程就没了，SSE 会断，此时要切到轮询 /api/health。
-  const [restarting, setRestarting] = React.useState(false);
-  const [busy, setBusy] = React.useState(false);
 
   // quiet 同时决定要不要绕过后端缓存：进页面时的自动检查用缓存（顶栏刚查过），
   // 用户手动点「检查更新」则强制回源，否则刚发布的版本要等缓存过期才看得到。
@@ -69,129 +51,31 @@ export function UpdateCard() {
     check(true);
   }, [check]);
 
-  // 轮询 /api/health 直到版本号变化。
-  //
-  // 判据必须是"版本变了"而不是"能连上了"：换装过程中旧版本会短暂地重新起来一次
-  // （那一次只负责把 artex.new 换上去然后立刻退出），只看连通性会误判成功。
-  const waitForNewVersion = React.useCallback(async (fromVersion: string) => {
-    setRestarting(true);
-    const deadline = Date.now() + RESTART_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      await sleep(2000);
-      try {
-        const r = await fetch("/api/health", { cache: "no-store" });
-        if (r.ok) {
-          const j = (await r.json()) as { version?: string };
-          if (j.version && j.version !== fromVersion) {
-            toast.success(`已更新到 ${j.version}，正在重新加载页面`);
-            await sleep(800);
-            window.location.reload();
-            return;
-          }
-        }
-      } catch {
-        // 重启窗口内连不上是预期的，继续轮询。
-      }
-    }
-    setRestarting(false);
-    toast.error("等待服务重启超时。请检查后端日志，或确认 artex 是通过 start.sh / start.bat 启动的。");
-  }, []);
-
-  // 订阅更新进度。SSE 不走 Next 的 /api 重写（那层会缓冲，事件推不出来）。
-  const openStream = React.useCallback(
-    (fromVersion: string) => {
-      const es = new EventSource(sseUrl("/api/update/stream"));
-      es.onmessage = (ev) => {
-        let p: UpdateProgress;
-        try {
-          p = JSON.parse(ev.data) as UpdateProgress;
-        } catch {
-          return;
-        }
-        setProgress(p);
-        if (p.phase === "failed") {
-          es.close();
-          setBusy(false);
-          toast.error("更新失败：" + (p.error || p.message));
-          return;
-        }
-        if (p.phase === "staged") {
-          es.close();
-          void waitForNewVersion(fromVersion);
-        }
-      };
-      es.onerror = () => {
-        // 进程退出时 SSE 必然断开。如果已经进入等待重启，这属于正常现象，
-        // 交给 /api/health 轮询继续判定即可。
-        es.close();
-      };
-      return es;
-    },
-    [waitForNewVersion],
-  );
-
-  const doUpdate = () => {
-    if (!info) return;
-    const from = info.current;
-    const ok = window.confirm(
-      `确定更新到 ${info.latest}？\n\n` +
-        "更新会重启程序，正在运行的任务会被中断。\n" +
-        (info.mode === "docker"
-          ? "\n注意：容器内更新只替换程序本身，不会更新镜像里的 playwright / nmap 等工具链；" +
-            "若新版本依赖新工具，请改用 docker compose pull。"
-          : ""),
-    );
-    if (!ok) return;
-
-    setBusy(true);
-    setProgress({ phase: "downloading", percent: 0, message: "准备中…" });
-    const es = openStream(from);
-    api.applyUpdate().catch((e) => {
-      es.close();
-      setBusy(false);
-      setProgress(null);
-      toast.error("启动更新失败：" + (e as Error).message);
-    });
+  const copy = (text: string) => {
+    void navigator.clipboard
+      ?.writeText(text)
+      .then(() => toast.success("已复制"))
+      .catch(() => toast.error("复制失败，请手动选中"));
   };
 
-  const doRollback = () => {
-    if (!info) return;
-    if (
-      !window.confirm(
-        "回滚到上一版本？\n\n程序会重启，正在运行的任务会被中断。\n注意：数据库结构不会回退，旧版本可能无法识别新版写入的数据。",
-      )
-    )
-      return;
-    const from = info.current;
-    setBusy(true);
-    api
-      .rollbackUpdate()
-      .then(() => {
-        toast.success("已切换到上一版本，正在重启…");
-        void waitForNewVersion(from);
-      })
-      .catch((e) => {
-        setBusy(false);
-        toast.error("回滚失败：" + (e as Error).message);
-      });
-  };
-
-  const phase = progress?.phase;
-  const showProgress = busy || restarting;
-  // 只有下载阶段拿得到真实百分比（按 Content-Length 算）。校验/解压/等待重启都是
-  // 时长不可知的阶段，进度条填满并加个脉冲动画表示"在忙但说不准还要多久"。
-  const downloading = !restarting && phase === "downloading";
-  const pct = downloading ? Math.max(progress?.percent ?? 0, 0) : 100;
+  // 镜像部署与源码部署的升级路径不同：前者拉镜像，后者要重新编译。
+  const cmds =
+    info?.mode === "docker"
+      ? [`${info.update_cmd}              # 拉新镜像并重建（更新前自动备份数据库）`,
+         `${info.update_cmd} rollback       # 回到上一版本`]
+      : [`${info?.update_cmd ?? "./update.sh"} local      # 重新编译并替换二进制`,
+         `${info?.update_cmd ?? "./update.sh"} rollback   # 回到上一版本`];
 
   return (
-    // 设置页是多列瀑布流布局，卡片自己负责行间距并禁止跨列断开（见 page.tsx 的注释）。
     <Card className="mb-4 break-inside-avoid md:mb-6">
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-base">
-          <DownloadIcon className="size-4" />
+          <TerminalIcon className="size-4" />
           版本与更新
         </CardTitle>
-        <CardDescription>从 GitHub 检查并安装新版本。更新会重启程序，正在运行的任务会被中断。</CardDescription>
+        <CardDescription>
+          查询 GitHub 上的最新版本。升级在部署机上执行 update.sh 完成，页面不再直接改程序。
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex flex-wrap items-center gap-2 text-sm">
@@ -227,13 +111,6 @@ export function UpdateCard() {
           )}
         </div>
 
-        {info?.boot_notice && (
-          <p className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-400">
-            <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-            {info.boot_notice}
-          </p>
-        )}
-
         {info?.error && (
           <p className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
             <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -244,70 +121,48 @@ export function UpdateCard() {
 
         {info && !info.comparable && info.reason && <p className="text-xs text-muted-foreground">{info.reason}</p>}
 
-        {info?.has_update && info.asset_available === false && (
-          <p className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
-            <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-            {info.latest} 没有提供 {info.os}/{info.arch} 的发布包（缺少 {info.asset}），无法自动更新。
-          </p>
-        )}
-
-        {info?.has_update && info.asset_available !== false && (
-          <p className="text-xs text-muted-foreground">
-            将下载 <span className="font-mono">{info.asset}</span>
-            {info.size ? `（${humanSize(info.size)}）` : ""}，校验 SHA256 并冒烟测试后才会替换，失败自动保留当前版本。
-          </p>
-        )}
-
-        {info && !info.has_update && info.comparable && !info.error && (
+        {info && info.comparable && !info.has_update && !info.error && (
           <p className="flex items-center gap-2 text-xs text-muted-foreground">
             <CheckCircle2Icon className="size-3.5 text-emerald-600" />
             当前已是最新版本。
           </p>
         )}
 
-        {info?.mode === "docker" && info.has_update && (
-          <p className="text-xs text-muted-foreground">
-            Docker 下的更新只替换程序本身，不更新镜像里的 playwright / nmap 等工具链，且
-            <span className="font-mono"> docker compose up -d </span>
-            重建容器后会退回镜像自带的版本。需要连镜像一起升级请执行
-            <span className="font-mono"> docker compose pull artex &amp;&amp; docker compose up -d artex</span>。
-          </p>
-        )}
-
-        {showProgress && (
-          <div className="space-y-1.5">
-            <Progress value={pct} className={downloading ? undefined : "animate-pulse"} />
+        {info?.has_update && (
+          <div className="space-y-2">
             <p className="text-xs text-muted-foreground">
-              {restarting ? "正在重启并应用新版本，请稍候（页面会自动刷新）…" : progress?.message}
+              在部署机的 ARTEX 目录（docker/.env 所在的那一级）执行。更新会重建容器，
+              正在运行的任务会被中断；数据库会在更新前自动备份到 <span className="font-mono">backups/</span>。
+            </p>
+            <div className="relative rounded-md border bg-muted/40 p-3 pr-10 font-mono text-xs leading-6">
+              {cmds.map((c) => (
+                <div key={c} className="whitespace-pre">
+                  {c}
+                </div>
+              ))}
+              <Button
+                variant="ghost"
+                size="icon"
+                className="absolute top-1.5 right-1.5 size-7"
+                onClick={() => copy(cmds.map((c) => c.split("#")[0].trim()).join("\n"))}
+                title="复制命令"
+              >
+                <CopyIcon className="size-3.5" />
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              为什么不在页面里点：容器里换掉的只是程序文件，重建容器就退回镜像版本，
+              而且换不掉镜像里的 LibreOffice / 工具层；脚本能拉完整镜像、能备份和恢复数据库、能回滚。
             </p>
           </div>
         )}
 
         <div className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" onClick={() => check(false)} disabled={checking || busy || restarting}>
+          <Button variant="outline" size="sm" onClick={() => check(false)} disabled={checking}>
             <RefreshCwIcon className={checking ? "size-4 animate-spin" : "size-4"} />
             检查更新
           </Button>
-          <Button
-            size="sm"
-            onClick={doUpdate}
-            disabled={busy || restarting || !info?.has_update || info?.asset_available === false}
-          >
-            <DownloadIcon className="size-4" />
-            {info?.has_update ? `更新到 ${info.latest}` : "立即更新"}
-          </Button>
-          {info?.has_backup && (
-            <Button variant="ghost" size="sm" onClick={doRollback} disabled={busy || restarting}>
-              <RotateCcwIcon className="size-4" />
-              回滚到上一版本
-            </Button>
-          )}
         </div>
-
-        <p className="text-xs text-muted-foreground">
-          一键更新依赖守护脚本重启程序。请通过 <span className="font-mono">start.sh</span>（Windows 为
-          <span className="font-mono"> start.bat</span>）启动 ARTEX；直接运行 artex 本体时，程序退出后不会被自动拉起。
-        </p>
       </CardContent>
     </Card>
   );

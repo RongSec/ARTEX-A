@@ -60,6 +60,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # fonts-dejavu-core：拉丁字符基础字体。
 # python3 + python3-docx：report/pybuilder 生成 docx 的运行时（render-draft 依赖）。
 # fontconfig + fc-cache：让 soffice 真正认到 /usr/share/fonts/truetype/win 下的字体。
+#
+# 与根目录 Dockerfile 保持同一套能力：apt-core（基础层）+ apt-tools（工具层，
+# 循环安装、单件失败只告警）+ 排版层。两个镜像除了「前端在镜像里编译还是预编译」
+# 之外，运行时能力必须完全一致，否则同一个版本会出现「本地能预览、Hub 版不能」。
+COPY docker/apt-core.txt docker/apt-tools.txt /tmp/
 RUN set -eux; \
     if [ -n "${APT_MIRROR}" ]; then \
       for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
@@ -68,6 +73,20 @@ RUN set -eux; \
     fi; \
     apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl tzdata fontconfig \
+      $(grep -v '^#' /tmp/apt-core.txt | grep -v '^$' | tr '\n' ' ') \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    while IFS='|' read -r cmd pkg note; do \
+      case "$cmd" in ''|\#*) continue ;; esac; \
+      if command -v "$cmd" >/dev/null 2>&1; then echo "工具层: $cmd 已随基础层就位"; continue; fi; \
+      if apt-get install -y --no-install-recommends "$pkg"; then \
+        echo "工具层: $cmd ← $pkg"; \
+      else \
+        echo "WARN 工具层: $pkg 安装失败，已跳过" >&2; \
+      fi; \
+    done < /tmp/apt-tools.txt
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends \
       libreoffice-writer \
       fonts-noto-cjk fonts-dejavu-core \
       python3 python3-docx \

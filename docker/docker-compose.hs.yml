@@ -33,5 +33,10 @@ services:
       - ${ARTEX_DATA_DIR:-./data}:/app/data
       # 字典（只读）：ffuf/gobuster 等直接指 /usr/share/wordlists。
       - ${ARTEX_WORDLISTS_DIR:-./data/wordlists}:/usr/share/wordlists:ro
+      # apt 的 deb 缓存与包索引。run.sh 每次启动会把「容器可写层里丢掉的」
+      # 系统级工具（hashcat/hydra/gdb…）重新装一遍，这两个目录让重装不需要
+      # 重新下载：重建容器后补装通常十几秒而不是几百兆带宽。
+      - ${ARTEX_DATA_DIR:-./data}/aptcache:/var/cache/apt/archives
+      - ${ARTEX_DATA_DIR:-./data}/aptlists:/var/lib/apt/lists
     command: ["-addr", "${ARTEX_LISTEN_ADDR:-:8801}", "-proxy", "${ARTEX_PROXY_ADDR:-127.0.0.1:8802}"]
     restart: unless-stopped

@@ -11,8 +11,9 @@
 #   tshark        约 100MB（含 wireshark-common），是这份清单里最大的一件
 #   smbclient     约 20MB（含 samba-common）
 #   whatweb       约 30MB（ruby 运行时）
-# 合计约 350-400MB。重量级工具（hashcat/john/radare2/gdb/seclists）
-# 不在这里，走页面按需安装。
+# 合计约 350-400MB。
+# 重量级工具（hashcat/john/gdb/binwalk/exiftool/awscli/xfreerdp）不在这里，
+# 在 docker/apt-tools.txt —— 那份清单逐件安装、单件失败只告警，体积也更大。
 arp-scan
 curl
 dnsutils

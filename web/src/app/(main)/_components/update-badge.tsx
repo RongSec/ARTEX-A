@@ -10,11 +10,14 @@ import { api } from "@/lib/api";
 
 /**
  * 顶栏的"有新版本"提示：整页加载时查一次，有更新就在版本号旁边亮出来，
- * 点击直达系统配置页的「版本与更新」卡片。
+ * 点击直达系统配置页的「版本与更新」卡片（那里给出该执行的 update.sh 命令）。
+ *
+ * 这里只是提示，不会自动做任何事——程序内更新已经删除，升级统一由部署机上的
+ * update.sh 完成（换镜像 + 备份数据库 + 可回滚）。
  *
  * 后端对 GitHub 的查询结果有 30 分钟缓存，所以这里每次挂载都查一次是安全的
  * ——未认证的 GitHub API 只有 60 次/小时/IP，没有那层缓存的话，多开几个标签页
- * 就会把配额耗光，之后真想更新反而查不动。
+ * 就会把配额耗光，之后真想查反而查不动。
  *
  * 查询失败一律静默：顶栏不是报错的地方，用户进设置页点「检查更新」会看到原因。
  */
@@ -42,7 +45,7 @@ export function UpdateBadge() {
   return (
     <Link
       href="/system/settings"
-      title={`发现新版本 ${latest}，点击前往更新`}
+      title={`发现新版本 ${latest}，点击查看升级方式（update.sh）`}
       className="inline-flex items-center gap-1.5 rounded-full bg-primary px-2.5 py-1 font-medium text-primary-foreground text-xs transition-opacity hover:opacity-90"
     >
       {/* 呼吸点：顶栏元素很多，纯文字容易被忽略，动效让它一眼可见。 */}

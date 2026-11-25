@@ -1612,16 +1612,16 @@ export const api = {
   attachTaskProject: (taskId: string, projectId?: number | null) =>
     patch<Task>(`/tasks/${encodeURIComponent(taskId)}/project`, { project_id: projectId ?? null }),
 
-  // ---- 一键更新 ----
-  // 检查以后端为准：下载是后端做的，浏览器能连 GitHub 而服务器连不上的情况很常见
-  // （服务器在内网、代理只配在浏览器上），那时点更新必然失败。
+  // ---- 版本检查（只读）----
+  // 检查以后端为准：服务器在内网、代理只配在浏览器上时，前端能连 GitHub 而后端
+  // 拉不动镜像，那还不如在检查这一步就如实报错。
   // 后端对 GitHub 的查询结果有 30 分钟缓存（未认证的 GitHub API 是 60 次/小时/IP，
   // 顶栏每次整页加载都会查一次，不缓存会很快耗光配额）。force=true 强制回源，
   // 留给用户显式点「检查更新」时用。
+  //
+  // 注意：程序内不再执行更新——下载/换装/回滚已删除，升级统一走 update.sh
+  // （拉完整镜像 + 数据库备份 + 可回滚）。这里只有查询。
   checkUpdate: (force = false) => get<UpdateCheck>(`/update/check${force ? "?force=1" : ""}`),
-  // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
-  applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
-  rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
 
   // ---- 发现证据截图（artex-hs T16(3/3)，/api/findings/{id}/evidence）----
   // {id}=findings 表 id（与 detail 页句柄/finding_traffic_* 兄弟路由同口径）。

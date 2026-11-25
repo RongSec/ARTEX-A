@@ -124,16 +124,8 @@ func FetchLatest(ctx context.Context, c *http.Client) (*Release, error) {
 
 // AssetName 返回当前平台对应的发布包名，与 build.sh 的 package_binary 保持一致：
 // artex-<版本>-<os>-<arch>.zip（版本号不带 v 前缀）。
+// 程序内换装已删除，这里保留命名规则是因为 update.sh 与文档都用这个名字
+// （离线包、手工下载都按它找），删掉会让两处字符串各写一份。
 func AssetName(tag, goos, goarch string) string {
 	return fmt.Sprintf("artex-%s-%s-%s.zip", strings.TrimPrefix(tag, "v"), goos, goarch)
-}
-
-// FindAsset 在 Release 里按名字找资产。
-func (r *Release) FindAsset(name string) (Asset, bool) {
-	for _, a := range r.Assets {
-		if strings.EqualFold(a.Name, name) {
-			return a, true
-		}
-	}
-	return Asset{}, false
 }

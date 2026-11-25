@@ -18,7 +18,6 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/config"
-	"github.com/Autumn-27/artex/selfupdate"
 	"github.com/Autumn-27/artex/server"
 )
 
@@ -68,18 +67,10 @@ func run() int {
 	// page can show a live log stream. Do this first, to catch startup logs too.
 	server.StartLogCapture()
 
-	// Self-update bootstrap: swap in a staged binary, or count a post-swap boot
-	// attempt and roll back if the new build keeps dying. Must run before we open
-	// the stores or bind a port — this may end with "exit and let the start script
-	// relaunch me", and there is no point paying for either first.
-	action, upState := selfupdate.Bootstrap()
-	server.SetBootUpdateState(upState)
-	if action == selfupdate.Restart {
-		return selfupdate.ExitRestart
-	}
-
 	// 首次部署自动落一份 config.json 模板（有 ARTEX_PG_DSN 或文件已存在则不写）。
 	// 用户拿到的是一个能直接改的文件，而不是「配置文件不存在」的日志。
+	// 注：程序内更新（selfupdate.Bootstrap）已移除，升级由仓库根的 update.sh 完成，
+	// 启动流程里不再有「换装后退出重启」这一步。
 	if p, created, err := config.EnsureFile(); err != nil {
 		log.Printf("[config] 生成模板失败: %v", err)
 	} else if created {
@@ -114,12 +105,6 @@ func run() int {
 	}
 	defer mgr.Close()
 
-	// Surviving this long means a freshly swapped-in build actually works, so drop
-	// the upgrade marker and stop counting attempts. Until it fires, every boot
-	// increments the count and a build that keeps dying gets rolled back.
-	settle := time.AfterFunc(selfupdate.SettleDelay, selfupdate.Settle)
-	defer settle.Stop()
-
 	skillDir := config.SkillDir()
 	if abs, err := filepath.Abs(skillDir); err == nil {
 		skillDir = abs
@@ -144,22 +129,15 @@ func run() int {
 		}
 	}()
 
-	// Two ways out: a signal (normal stop → exit 0, the start script stops looping)
-	// or a staged update / rollback (→ exit 75, the script relaunches us and the
-	// bootstrap above installs the new build).
-	code := 0
-	select {
-	case <-ctx.Done():
-	case <-server.RestartRequested():
-		code = selfupdate.ExitRestart
-		shutdown(agent.AbortShutdown)
-	}
+	// 只有一种退出方式：收到信号（正常停止 → exit 0，守护脚本随之停循环）。
+	// 程序内更新的「exit 75 让脚本重启」已经不存在了，见 server/update.go 顶部注释。
+	<-ctx.Done()
 
 	log.Println("shutting down...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
-	return code
+	return 0
 }
 
 // shutdownContext deliberately does not derive from signalCtx. If it did, the

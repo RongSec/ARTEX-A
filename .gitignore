@@ -76,5 +76,9 @@ web/.next.bak.*/
 *.key
 /config.json
 
+# 升级备份（含数据库快照与 .env 副本）与更新状态
+/backups/
+/docker/.update-state
+
 # 本地验收用的运行时数据（容器挂载的 data 目录）
 /_verify_data/

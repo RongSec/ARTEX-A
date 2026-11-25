@@ -51,7 +51,9 @@ ARTEX_PG_DSN=postgres://artex:${PG_PASS}@postgres:5432/artex?sslmode=disable
 ARTEX_INIT_PASSWORD=${ADMIN_PASS}
 ARTEX_IMAGE=rongsec/artex-a:latest
 ARTEX_HTTP_PORT=8801
-ARTEX_LISTEN_ADDR=:8787
+# hs 单机部署用 host 网络，监听端口就是对外端口（Health 检查也打这个端口）。
+ARTEX_LISTEN_ADDR=:8801
+ARTEX_PROXY_ADDR=127.0.0.1:8802
 EOF
   chmod 600 .env
   echo "== 已生成 docker/.env（0600）"
@@ -62,11 +64,13 @@ mkdir -p data && chmod 700 data 2>/dev/null || true
 cat <<'EOF'
 
 下一步：
-  docker compose -f docker/docker-compose.yml up -d
+  ./run.sh
   浏览器打开 http://<本机IP>:8801 ，用户名 ARTEX，密码见 docker/.env 的 ARTEX_INIT_PASSWORD
 
 说明：
   - 用外部 PostgreSQL 时，把 docker/.env 里 ARTEX_PG_DSN 的 host 改成实际地址；
+  - run.sh 每次启动会做两步工具自愈（单文件二进制进 data/hostbin、apt 工具补进容器）；
+  - 升级/回滚用 ./update.sh，不要用页面（页面只保留版本查询）；
   - 应用还会在首次启动时自动生成 jwt.key，无需手工创建；
   - 裸机（非 Docker）部署时，程序首次启动会在可执行文件旁生成 config.json 模板。
 EOF
