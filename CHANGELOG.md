@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+## [v0.3.16-hs.9] - 2026-11-25
+
+### 变更
+
+- **镜像拆成底座与应用两层**：新增 `rongsec/artex-base`（apt 工具、LibreOffice、
+  中文字体、Node/Playwright、nuclei 等），应用镜像只剩二进制 + `start.sh` +
+  skills 三层。改业务代码不再重烧 6GB 工具层，发版从 3 小时降到几分钟。
+- **base 用原生 ARM runner 构建**：arm64 走 `ubuntu-24.04-arm`（公开仓库免费），
+  不再用 QEMU 模拟 apt，两个架构分别构建后用 `imagetools` 合并 manifest。
+- **底座版本钉死**：`docker/base/TAG` 记录版本，应用镜像 `FROM` 时按 tag 取，
+  保证任何旧版本都能用发布当时那套工具重建。
+
+### 修复
+
+- **`update.sh` 升级假动作**：`load_env` 把 `ARTEX_IMAGE` 导进了环境，compose
+  插值优先用环境变量，只改 `.env` 文件不生效，导致「容器没重建 → 健康检查仍是
+  旧版本 → 误判失败并回滚」，回滚同样失效。现在写文件后同步 `export`。
+
 ## [v0.3.16-hs.8] - 2026-11-25
 
 ### 变更

@@ -1,15 +1,31 @@
 # artex 镜像与部署（Docker）
 
-## 两个镜像，运行时能力一致
+## 两个镜像：底座与应用分开
 
-| 镜像 | 构建文件 | 说明 |
+| 镜像 | 构建文件 | 什么时候变 |
 |---|---|---|
-| `rongsec/artex-a`（Docker Hub） | 根 `Dockerfile` | 发布/新部署用。CI 交叉编译好二进制后只装工具与依赖，构建快 |
-| `artex:local`（本地构建） | `docker/Dockerfile` | 前端在镜像里编译，其余层与上面完全相同 |
+| `rongsec/artex-base` | `docker/base/Dockerfile` | 工具清单、字体、Chromium、LibreOffice 变动时 |
+| `rongsec/artex-a`（应用） | 根 `Dockerfile` | 每次发版（只拷二进制 + 前端 + skills，约 40MB） |
+
+应用镜像 `FROM rongsec/artex-base:<TAG>`，**钉死 tag 而不是 latest**：老版本
+镜像必须永远对应它发布时那套工具，否则回滚回去会出现「版本旧了、工具却是新的」
+这种不可复现状态。
+
+为什么要拆：这些层和业务代码无关，却要在每次发版时重烧；GitHub 的 gha 缓存上限
+10GB 装不下多架构镜像层，缓存一失效就冷构建（hs.8 实测 190 分钟，其中 189 分钟
+在装工具）。拆开后 base 只在改工具时重建，日常发版几分钟。
+
+改完 `docker/apt-*.txt`、`docker/fonts/`、`docker/hostbin/fetch.sh` 任一处：
+
+1. 把 `docker/base/TAG` 改成一个新值（如 `20261201`）；
+2. 推送 `main`，`base-image` 工作流自动重建（amd64 走 `ubuntu-latest`，
+   arm64 走 `ubuntu-24.04-arm` 原生 runner，不再用 QEMU 模拟）；
+3. 之后再发版，应用镜像自动用新底座。
+
+`artex:local`（`docker/Dockerfile`）是本机源码构建用，仍自带全部层，不依赖 base。
 
 从 `v0.3.16-hs.7` 起两份镜像**都**带 LibreOffice Writer + 仿宋/黑体/宋体/Times +
-`python-docx`，也就是说 docx → PDF 保真预览在 Hub 镜像上同样可用。
-之前的版本只有本地构建版带排版层，同一个版本两种能力，属于缺陷。
+`python-docx`，docx → PDF 保真预览在 Hub 镜像上同样可用。
 
 ## 首次部署
 
