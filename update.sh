@@ -52,7 +52,11 @@ warn() { printf '\033[33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 ask()  { local p="$1" d="${2:-}" a; read -rp "$p${d:+ [$d]}: " a; echo "${a:-$d}"; }
 
-compose() { docker compose -f "$COMPOSE" --profile "$PROFILE" "$@"; }
+compose() {
+  local args=(-f "$COMPOSE" --profile "$PROFILE")
+  [ "${EMBEDDED_DB:-1}" != "0" ] && args+=(--profile db)
+  docker compose "${args[@]}" "$@"
+}
 
 # ── 环境 ─────────────────────────────────────────────────
 load_env() {
@@ -63,6 +67,7 @@ load_env() {
   set +a
   # 机密统一在 .env：GitHub token 用于版本查询与拉镜像，只有一个来源。
   GITHUB_TOKEN="${GITHUB_TOKEN:-${ARTEX_GITHUB_TOKEN:-}}"
+  EMBEDDED_DB="${ARTEX_EMBEDDED_DB:-1}"
   SERVICE="artex-$PROFILE"
   local d="${ARTEX_DATA_DIR:-./data}"
   case "$d" in /*) DATA_DIR="$d" ;; *) DATA_DIR="$(cd "$(dirname "$COMPOSE")" && pwd)/${d#./}" ;; esac

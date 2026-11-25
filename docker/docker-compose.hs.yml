@@ -77,6 +77,9 @@ services:
   artex-db:
     image: postgres:16-alpine
     container_name: ${ARTEX_DB_CONTAINER:-artex-db}
+    # 自带库是可选件：ARTEX_EMBEDDED_DB=0 时 run.sh 不带 db profile，
+    # 只起应用（用外部 PostgreSQL 的老部署就是这样接进来的）。
+    profiles: ["db"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-artex}
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?缺少 POSTGRES_PASSWORD：先运行 bash docker/init-env.sh（./run.sh 会自动做）}"
@@ -101,6 +104,8 @@ services:
     depends_on:
       artex-db:
         condition: service_healthy
+        # 外部 PostgreSQL 部署时 db profile 不启用，这里不能报错。
+        required: false
 
   # Docker Desktop：bridge + 端口映射。DSN 走 artex-db:5432（compose 内 DNS）。
   artex-desktop:
@@ -109,6 +114,8 @@ services:
     depends_on:
       artex-db:
         condition: service_healthy
+        # 外部 PostgreSQL 部署时 db profile 不启用，这里不能报错。
+        required: false
     ports:
       - "${ARTEX_HTTP_PORT:-8801}:${ARTEX_LISTEN_PORT:-8801}"
       # 流量录制代理只给本机用，不对外暴露

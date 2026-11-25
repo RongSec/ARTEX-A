@@ -107,6 +107,8 @@ load_env() {
   fi
   HOSTBIN="$DATA_DIR/hostbin"
   STATE_DIR="$COMPOSE_DIR/state"
+  # 1=跟着 compose 起一个 PostgreSQL；0=用 ARTEX_PG_DSN 指的外部库。
+  EMBEDDED_DB="${ARTEX_EMBEDDED_DB:-1}"
   ARCH="$(uname -m)"
   case "$ARCH" in
     x86_64|amd64) ARCH=amd64 ;;
@@ -115,7 +117,11 @@ load_env() {
   esac
 }
 
-compose() { docker compose -f "$COMPOSE" --profile "$PROFILE" "$@"; }
+compose() {
+  local args=(-f "$COMPOSE" --profile "$PROFILE")
+  [ "${EMBEDDED_DB:-1}" != "0" ] && args+=(--profile db)
+  docker compose "${args[@]}" "$@"
+}
 
 # 容器 ID。不用容器名：hs 版有固定 container_name，仓库根那份是 compose 自动
 # 命名的（<项目>-artex-1），靠猜必然有一边错。`compose ps -q <service>` 两边都对。

@@ -70,6 +70,8 @@ ARTEX_PROXY_PORT=8802
 ARTEX_DATA_DIR=./data
 
 # ── 数据库（compose 自带的 artex-db）────────────────────────
+# 用外部 PostgreSQL：把下面改成 0，并把 ARTEX_PG_DSN 指向那个库。
+ARTEX_EMBEDDED_DB=1
 POSTGRES_USER=artex
 POSTGRES_PASSWORD=${PG_PASS}
 POSTGRES_DB=artex
