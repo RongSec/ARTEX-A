@@ -268,6 +268,8 @@ seed_skills() {
   if docker create --name "$tmp" "$IMAGE" >/dev/null 2>&1; then
     if docker cp "$tmp:/app/skills/." "$DATA_DIR/skills/" >/dev/null 2>&1; then
       ok "已把镜像自带技能播种到 $DATA_DIR/skills（$(ls -1 "$DATA_DIR/skills" | wc -l | tr -d ' ') 个）"
+      [ -n "$(compose ps -q "$SERVICE" 2>/dev/null || true)" ] && \
+        info "容器已在运行，重启后才会加载新技能：./run.sh restart"
     fi
     docker rm -f "$tmp" >/dev/null 2>&1 || true
   fi
@@ -331,7 +333,19 @@ cmd_ensure() {
   load_env
   refresh_cid
   [ -n "$CID" ] || die "容器未运行，先 ./run.sh up"
+  # 从 hs.7 及更早升级上来时，技能目录刚从镜像层切到挂载卷，这里是空的；
+  # update.sh 升级完会调用 `run.sh ensure`，所以播种必须放在这条路径上。
+  seed_skills
   ensure_all
+}
+
+# 只播种技能，不碰容器。update.sh 在 `compose up` 之前调用它：
+# 应用启动时就会扫描技能目录，起完再补会让首屏技能列表空着。
+cmd_seed_skills() {
+  require_docker
+  load_env
+  mkdir -p "$DATA_DIR/skills" 2>/dev/null || true
+  seed_skills
 }
 
 cmd_down()    { load_env; compose down; ok "已停止"; }
@@ -410,6 +424,7 @@ cmd_doctor() {
 case "${1:-up}" in
   up|"")      shift || true; cmd_up "$@" ;;
   ensure)     shift || true; cmd_ensure "$@" ;;
+  seed-skills) shift || true; cmd_seed_skills "$@" ;;
   down)       shift || true; cmd_down "$@" ;;
   restart)    shift || true; cmd_restart "$@" ;;
   status|ps)  shift || true; cmd_status "$@" ;;

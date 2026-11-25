@@ -152,7 +152,13 @@ wait_health() { # $1=期望 tag（可空），$2=超时秒
   return 1
 }
 
-compose_up() { compose up -d --remove-orphans; }
+compose_up() {
+  # 新镜像可能带新的内置技能。技能目录在挂载卷里，先播种再起容器，
+  # 否则应用启动时扫到的是空目录（老版本把技能烘在镜像层，升级后就不见了）。
+  # 失败不阻断升级：技能缺失不影响主流程，之后还能 ./run.sh seed-skills 补。
+  bash "$ROOT/run.sh" seed-skills >/dev/null 2>&1 || true
+  compose up -d --remove-orphans
+}
 
 # ── 备份 ─────────────────────────────────────────────────
 backup() { # $1=目录
