@@ -294,7 +294,9 @@ cmd_up() {
 
   pull_image "$IMAGE" || die "拉取 $IMAGE 失败。离线部署可用 ./update.sh import <镜像tar>"
   # 数据库镜像通常已经在本地；拉不到就让 compose 自己再试一次，不阻断启动。
-  pull_image "postgres:16-alpine" >/dev/null 2>&1 || true
+  if [ "$EMBEDDED_DB" != "0" ]; then
+    pull_image "postgres:16-alpine" >/dev/null 2>&1 || true
+  fi
 
   seed_skills
 
