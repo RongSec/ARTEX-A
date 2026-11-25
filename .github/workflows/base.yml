@@ -81,6 +81,10 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-${{ matrix.arch }}
+          # CI 的 runner 在境外，阿里云源反而慢（RTT 高、小请求多）。清空
+          # APT_MIRROR 让它走官方 deb.debian.org；国内本地构建仍默认阿里云。
+          build-args: |
+            APT_MIRROR=
           cache-from: type=gha,scope=base-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=base-${{ matrix.arch }}
 
@@ -114,11 +118,14 @@ jobs:
 
       # 应用镜像用 FROM <base> 拉它，少一个架构会在构建时报
       # "no matching manifest for linux/arm64"——这里先自己拦一次。
+      # 注意用可读输出：--raw 是 manifest 索引 JSON，平台字段拆在
+      # architecture / os 两个键里，grep "linux/amd64" 永远匹配不到。
       - name: Verify both platforms present
         run: |
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
-          out="$(docker buildx imagetools inspect "$IMAGE:$tag" --raw)"
+          out="$(docker buildx imagetools inspect "$IMAGE:$tag")"
+          echo "$out"
           echo "$out" | grep -q 'linux/amd64' || { echo "缺少 amd64"; exit 1; }
           echo "$out" | grep -q 'linux/arm64' || { echo "缺少 arm64"; exit 1; }
           echo "OK: amd64 + arm64 都在"
