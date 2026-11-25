@@ -1,0 +1,124 @@
+name: base-image
+
+# artex-base：工具 / 字体 / Chromium / LibreOffice 的运行底座。
+#
+# 只在「底座内容」变动时构建，日常发版不碰它：
+#   - docker/base/**          底座 Dockerfile 与 TAG
+#   - docker/apt-core.txt     基础 apt 清单
+#   - docker/apt-tools.txt    系统级工具清单（hashcat 等）
+#   - docker/fonts/**         仿宋/黑体/宋体/Times
+#   - docker/hostbin/fetch.sh 取 nuclei 等二进制的脚本
+#
+# 为什么 arm64 用 ubuntu-24.04-arm：GitHub 对公开仓库提供原生 ARM runner。
+# 以前在 amd64 上用 QEMU 模拟跑 apt（LibreOffice 的 postinst 尤其重），
+# 单这一项就要两个多小时；原生跑和 amd64 差不多。两个架构各自构建后，
+# 用 imagetools 合并成多架构 manifest。
+#
+# 手工构建：Actions → base-image → Run workflow（可指定 tag）。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "覆盖 docker/base/TAG（留空则用文件里的值）"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "docker/base/**"
+      - "docker/apt-core.txt"
+      - "docker/apt-tools.txt"
+      - "docker/fonts/**"
+      - "docker/hostbin/fetch.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: base-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: rongsec/artex-base
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest, platform: linux/amd64 }
+          - { arch: arm64, runner: ubuntu-24.04-arm, platform: linux/arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          set -euo pipefail
+          t="${{ github.event.inputs.tag }}"
+          [ -n "$t" ] || t="$(tr -d '[:space:]' < docker/base/TAG)"
+          echo "tag=$t" >> "$GITHUB_OUTPUT"
+          echo "底座 tag: $t"
+
+      # 探测工具二进制不入库，构建前现取（约 380MB/架构）。
+      - name: Fetch host tools (${{ matrix.arch }})
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash docker/hostbin/fetch.sh --arch ${{ matrix.arch }}
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/base/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=base-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=base-${{ matrix.arch }}
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          set -euo pipefail
+          t="${{ github.event.inputs.tag }}"
+          [ -n "$t" ] || t="$(tr -d '[:space:]' < docker/base/TAG)"
+          echo "tag=$t" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Merge multi-arch manifest
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          docker buildx imagetools create -t "$IMAGE:$tag" \
+            "$IMAGE:$tag-amd64" "$IMAGE:$tag-arm64"
+          docker buildx imagetools inspect "$IMAGE:$tag"
+
+      # 应用镜像用 FROM <base> 拉它，少一个架构会在构建时报
+      # "no matching manifest for linux/arm64"——这里先自己拦一次。
+      - name: Verify both platforms present
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          out="$(docker buildx imagetools inspect "$IMAGE:$tag" --raw)"
+          echo "$out" | grep -q 'linux/amd64' || { echo "缺少 amd64"; exit 1; }
+          echo "$out" | grep -q 'linux/arm64' || { echo "缺少 arm64"; exit 1; }
+          echo "OK: amd64 + arm64 都在"
