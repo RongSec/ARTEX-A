@@ -132,6 +132,10 @@ write_ref() { # $1=tag  → 写回 .env 的 ARTEX_IMAGE
   else
     printf '\nARTEX_IMAGE=%s\n' "$ref" >> "$ENV_FILE"
   fi
+  # 关键：load_env 是 `set -a` 把 .env 导进环境的，export 过的变量优先级高于
+  # compose 自己读 .env。只改文件不改这里，compose 插值拿到的还是旧 tag，
+  # 于是判定「无需重建」→ 健康检查仍是旧版本 → 升级和回滚都变成假动作。
+  ARTEX_IMAGE="$ref"; export ARTEX_IMAGE
   REF="$ref"; IMAGE_TAG="$1"
 }
 
