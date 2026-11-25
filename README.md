@@ -20,48 +20,52 @@
 
 ## 快速开始
 
-> 依赖 **PostgreSQL**；探索前需在 UI 里配置 **LLM**（Anthropic / OpenAI / 任意兼容网关，支持多通道轮询与故障转移）。
-
-**方式一：一键安装脚本（推荐）**
+> 只需要 **Docker**（含 compose 插件）。不需要自备 PostgreSQL，也不需要预装任何渗透工具。
 
 ```bash
 git clone https://github.com/RongSec/ARTEX-A.git
 cd ARTEX-A
-./install.sh
+./run.sh
 ```
 
-脚本会检测 / 自动安装 Docker，然后让你选 **① 全部 Docker** 或 **② 本地编译运行**：
+首次运行会自动完成全部步骤，不需要先跑别的脚本：
 
-- **① 全部 Docker**：填 Postgres 密码（可回车随机）→ 自动写 `.env` → `docker compose up -d`。
-- **② 本地运行**：选数据库（连已有 / 用 Docker 起一个）→ 生成 `config.json` → 编译内嵌前端单二进制 → 启动。
+| 步骤 | 说明 |
+|---|---|
+| 生成 `docker/.env` | 随机数据库口令、管理员密码；LLM key 等机密也统一放这一份（0600，gitignore） |
+| 拉镜像 | Docker Hub 直连失败自动换加速源（默认 `docker.1ms.run`，可用 `ARTEX_MIRRORS` 改） |
+| 起服务 | 应用 + 自带 PostgreSQL（只绑 `127.0.0.1:55432`，不抢宿主 5432） |
+| 补工具 | 单文件二进制落 `data/hostbin`（卷），系统级 apt 包补进容器，deb 缓存在卷里 |
 
-装好后打开 **http://localhost:8787**（首次进入 `/setup` 设置管理员密码）。
+装好打开 **http://\<host\>:8801**，用户名 `ARTEX`，密码在 `docker/.env` 的
+`ARTEX_INIT_PASSWORD`（首次启动会直接打印一次，登录后请改）。
 
-**方式二：Docker Compose**
+镜像里已经带了完整能力：nmap/sqlmap/ffuf/nuclei 等探测工具、LibreOffice + 中文字体
+（docx → PDF 保真预览）、Playwright Chromium、python-docx（报告生成）。
+`hashcat/hydra/gdb/binwalk` 这类系统级包由 `run.sh` 在容器内补齐，重建容器后重跑一次即可。
 
 ```bash
-cp .env.example .env      # 至少改 POSTGRES_PASSWORD
-docker compose up -d      # → http://localhost:8787
+./run.sh            # 启动（幂等，全在位时几秒）
+./run.sh doctor     # 体检：版本、PDF 引擎、工具缺口
+./run.sh status     # 状态    ./run.sh logs -f    # 日志
+./run.sh down       # 停止（应用 + 数据库）
+./update.sh check   # 查新版本
+./update.sh to      # 升级（备份 → 拉镜像 → 重建 → 校验，失败自动回滚）
 ```
 
-镜像已含常用工具（ripgrep / curl / nmap / playwright 依赖等）；`./skills` 与 `./data` 绑定挂载持久化。
+**机密只有一个文件**：`docker/.env`。数据库口令、管理员密码、`ARTEX_LLM_API_KEY`、
+Brave/Tavily key、`ARTEX_NVD_API_KEY`、`ARTEX_GITHUB_TOKEN`、代理账号全部写在这里。
+应用启动时把它们导入数据库（只填空缺，不覆盖页面里改过的值），所以填完 `.env`
+重启就生效，不用再进设置页重复录入。
 
-**方式三：预编译二进制**
-
-到 Releases 下载对应平台 zip，解压得到 `artex` + `start.sh`（Windows 为 `start.bat`）+ `skills/`：
-
-```bash
-cp config.example.json config.json   # 填 database 连接
-./start.sh                           # → http://localhost:8787
-```
-
-> 用 `start.sh` 启动而不是直接跑 `./artex`：它是守护脚本，进程崩溃后会自动退避重启。
-> 后台常驻：`nohup ./start.sh >artex.log 2>&1 &`。
+> **macOS / Windows（Docker Desktop）**：`run.sh` 会自动切到 bridge + 端口映射
+> （桌面版没有真正的 host 网络）。Linux 服务器用 host 网络，反弹 shell 与内网扫描
+> 才能看到真实网卡。
 
 **装好之后（3 分钟上手）**
 
-1. 打开 `http://<host>:8787` → 初始化管理员密码（≥8 位；登录有防爆破锁定）
-2. 「LLM」页配模型通道（≥2 个通道并开轮询 = 实战推荐），填 base_url + key + model 即可
+1. 打开 `http://<host>:8801` → 用 `.env` 里的密码登录
+2. 「LLM」页确认模型通道（填了 `.env` 就已就绪；≥2 个通道并开轮询 = 实战推荐）
 3. 想试手感：新建项目 → 「批量下发」建几个任务 → 给一句话目标
 4. 任务跑出漏洞后，「报告中心」上传自己的 docx 交付模板 → 生成报告直接落 Word
 
@@ -245,19 +249,30 @@ web/            Next.js 前端（静态导出后 go:embed 内嵌）
 
 ## 部署与运维
 
-**默认端口**：HTTP `8787`，流量代理 `8788`（`-addr` / `-proxy` 可改）。
+**默认端口**：HTTP `8801`，流量代理 `8802`（`-addr` / `-proxy` 可改；Docker Desktop 下端口映射取 `.env` 的 `ARTEX_HTTP_PORT` / `ARTEX_PROXY_PORT`）。
 
-**数据**：Postgres 数据卷 `pgdata` + `./data`（`jwt.key`、任务工作区、transcripts、报告、证据）+ `./skills`。升级不动数据；`schema.sql` 每次启动幂等重跑（重启即迁移）。
+**目录布局**（都在 `docker/` 下，已 gitignore）：
 
-**备份建议**：`pg_dump` 每日一次 + `./data` 目录同步。任务工作区与报告都在 `./data` 下，只备份数据库会留下无法对应文件的黑洞（本项目线上曾因只清库不清盘留下 41 个无主工作区目录）。
+| 路径 | 内容 |
+|---|---|
+| `.env` | **唯一机密文件**：数据库口令、管理员密码、LLM/搜索/情报 key、代理 |
+| `data/` | 任务工作区、transcripts、报告、证据、`hostbin`（工具二进制）、`pyenv`、`skills`、apt 缓存 |
+| `state/` | `jwt.key`（放卷里，重建容器不会把所有人踢下线） |
+| `dbdata` 卷 | PostgreSQL 数据 |
+
+**备份建议**：`./update.sh backup` 会 `pg_dump -Fc` + 复制 `.env` 到 `backups/<时间戳>/`，再同步 `docker/data`。只备份数据库会留下无法对应文件的黑洞（本项目线上曾因只清库不清盘留下 41 个无主工作区目录）。
 
 **更新**：
 
 - 页面只做版本查询（系统配置 → 版本与更新），不再执行更新动作。
-- Docker 部署：`./update.sh check` 查版本，`./update.sh to [tag]` 升级，`./update.sh rollback` 回滚。
-  升级前自动 `pg_dump` 备份到 `backups/<时间戳>/`，健康检查失败自动退回上一个 tag。
+- `./update.sh check` 查版本，`./update.sh to [tag]` 升级，`./update.sh rollback` 回滚。
+  升级前自动备份，健康检查失败自动退回上一个 tag；`rollback --with-db` 连库一起恢复。
 - 源码部署：`./update.sh local`（拉代码 + 重新编译 + 替换 `./artex`）。
 - 更新会重建容器并中断正在运行的任务，请在空闲时进行。
+
+**为什么不在页面里更新**：容器里换的只是 `/app/artex` 一个文件，`docker compose up -d`
+重建就退回镜像版本（假成功），而且换不掉镜像里的 LibreOffice / apt 工具层 / Playwright。
+升级必须换整个镜像，这件事只能在宿主机做。
 
 **远程 MCP**：系统设置里可选 `http`（Streamable HTTP）或 `sse`（旧版 SSE）。旧版 SSE 服务通常 `GET /sse` 建流，再用返回的 `/message?sessionId=...` 收 JSON-RPC；URL 填 `/sse`，请求头按 `Authorization=Bearer <token>` 填。
 

@@ -1,42 +1,118 @@
-# 单机部署（镜像来自 Docker Hub，网络用 host）。
+# 单机部署：一个 compose 起完整系统（应用 + PostgreSQL）。
 #
-# 首次部署：
-#   bash docker/init-env.sh
-#   docker compose -f docker/docker-compose.hs.yml up -d
+#   ./run.sh     # 首次会自动生成 docker/.env，选对网络形态，然后起服务
 #
-# 口令与密钥只存在于本机 docker/.env（0600，已在 .gitignore）。
-# 本文件刻意不放任何真实口令——之前这里写死过数据库密码，属于事故。
+# 口令与密钥只存在于本机 docker/.env（0600，已在 .gitignore）。本文件不放任何
+# 真实口令——之前这里写死过数据库密码，属于事故。
+#
+# 为什么数据库也在这个文件里：以前 .env 生成的 DSN 指向 `postgres:5432`，但
+# hs 版 compose 里根本没有 postgres 服务，新用户 clone 下来照文档走必然连不上。
+# 现在默认自带一个，端口绑在回环 + 非默认 55432，不和宿主机已有的 PG 抢 5432。
+#
+# 为什么应用有两个服务定义：网络形态没法用变量切换。
+#   - Linux 服务器：host 网络。反弹 shell 监听、内网扫描、抓包都要直接看到
+#     宿主网卡，bridge 的 NAT 会让这些能力打折。
+#   - Docker Desktop（macOS/Windows）：没有真正的 host 网络（指向的是虚拟机），
+#     宿主浏览器连 127.0.0.1 是空的，只能用 bridge + 端口映射。
+# 两者其余配置逐字相同，用 YAML 锚点共用一份，避免改一处漏一处。
+# run.sh / update.sh 会按系统自动带上 --profile host 或 --profile desktop。
 name: artex-hs
 
+x-artex-common: &artex-common
+  image: ${ARTEX_IMAGE:-rongsec/artex-a:latest}
+  container_name: ${ARTEX_CONTAINER_NAME:-artex-hs}
+  environment:
+    ARTEX_PG_DSN: "${ARTEX_PG_DSN:?缺少 ARTEX_PG_DSN：先运行 bash docker/init-env.sh（./run.sh 会自动做）}"
+    # 仅首次启动建管理员（用户名 ARTEX）；之后改这里无效，去页面改密码。
+    ARTEX_INIT_PASSWORD: "${ARTEX_INIT_PASSWORD:-}"
+    ARTEX_LISTEN_ADDR: "${ARTEX_LISTEN_ADDR:-:8801}"
+    ARTEX_PROXY_ADDR: "${ARTEX_PROXY_ADDR:-127.0.0.1:8802}"
+    # go / pip 类工具落到挂载卷：重建容器不丢，升级镜像也不用重装。
+    ARTEX_HOSTBIN: "/app/data/hostbin"
+    ARTEX_HOSTPY: "/app/data/pyenv"
+    # 用户上传/改过的技能也放卷里：默认的 /app/skills 是镜像层，重建就回滚。
+    # 首次启动 run.sh 会把镜像自带的技能播种进来。
+    ARTEX_SKILL_DIR: "/app/data/skills"
+    # jwt.key 放独立目录（不放 data，那是文件管理器可浏览的工作区）。
+    # 不持久化的话每次重建容器都换签名 key，所有人被踢下线。
+    ARTEX_KEY_DIR: "/app/state"
+    GOBIN: "/app/data/hostbin"
+    GOPATH: "/app/data/gopath"
+    GOPROXY: "${GOPROXY:-https://goproxy.cn,direct}"
+    HOME: "/app/data/home"
+    TZ: "${TZ:-Asia/Shanghai}"
+    NUCLEI_DISABLE_UPDATE_CHECK: "true"
+    # ── 机密：唯一来源是 docker/.env ────────────────────────────────
+    # 应用启动时把这些值写进数据库（只填空缺，不覆盖页面里改过的）。
+    ARTEX_LLM_FORMAT: "${ARTEX_LLM_FORMAT:-}"
+    ARTEX_LLM_API_KEY: "${ARTEX_LLM_API_KEY:-}"
+    ARTEX_LLM_BASE_URL: "${ARTEX_LLM_BASE_URL:-}"
+    ARTEX_LLM_MODEL: "${ARTEX_LLM_MODEL:-}"
+    ARTEX_LLM_PROXY: "${ARTEX_LLM_PROXY:-}"
+    ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    ARTEX_BRAVE_API_KEY: "${ARTEX_BRAVE_API_KEY:-}"
+    ARTEX_TAVILY_API_KEY: "${ARTEX_TAVILY_API_KEY:-}"
+    ARTEX_NVD_API_KEY: "${ARTEX_NVD_API_KEY:-}"
+    ARTEX_GITHUB_TOKEN: "${ARTEX_GITHUB_TOKEN:-}"
+    GITHUB_TOKEN: "${ARTEX_GITHUB_TOKEN:-}"
+    ARTEX_OUTBOUND_PROXY: "${ARTEX_OUTBOUND_PROXY:-}"
+    ARTEX_GLOBAL_PROXY: "${ARTEX_GLOBAL_PROXY:-}"
+  volumes:
+    # data 整个挂上去：模板、hostbin、pyenv、技能、报告产物全在卷里。
+    - ${ARTEX_DATA_DIR:-./data}:/app/data
+    # 签名 key 独一份：跟 data 走的话会出现在文件管理器里。
+    - ${ARTEX_STATE_DIR:-./state}:/app/state
+    # 字典（只读）：ffuf/gobuster 等直接指 /usr/share/wordlists。
+    - ${ARTEX_DATA_DIR:-./data}/wordlists:/usr/share/wordlists:ro
+    # apt 的 deb 缓存与包索引。run.sh 每次启动会把「容器可写层里丢掉的」
+    # 系统级工具（hashcat/hydra/gdb…）重新装一遍，这两个目录让重装不需要
+    # 重新下载：重建容器后补装通常十几秒而不是几百兆带宽。
+    - ${ARTEX_DATA_DIR:-./data}/aptcache:/var/cache/apt/archives
+    - ${ARTEX_DATA_DIR:-./data}/aptlists:/var/lib/apt/lists
+  command: ["-addr", "${ARTEX_LISTEN_ADDR:-:8801}", "-proxy", "${ARTEX_PROXY_ADDR:-127.0.0.1:8802}"]
+  restart: unless-stopped
+
 services:
-  artex-hs:
-    image: ${ARTEX_IMAGE:-rongsec/artex-a:latest}
-    container_name: ${ARTEX_CONTAINER_NAME:-artex-hs}
-    network_mode: host
+  artex-db:
+    image: postgres:16-alpine
+    container_name: ${ARTEX_DB_CONTAINER:-artex-db}
     environment:
-      ARTEX_PG_DSN: "${ARTEX_PG_DSN:?缺少 ARTEX_PG_DSN：先运行 bash docker/init-env.sh，或按实际数据库改 docker/.env}"
-      # 仅首次启动建管理员（用户名 ARTEX）；之后改这里无效，去页面改密码。
-      ARTEX_INIT_PASSWORD: "${ARTEX_INIT_PASSWORD:-}"
-      ARTEX_LISTEN_ADDR: "${ARTEX_LISTEN_ADDR:-:8801}"
-      ARTEX_PROXY_ADDR: "${ARTEX_PROXY_ADDR:-127.0.0.1:8802}"
-      # go / pip 类工具落到挂载卷：重建容器不丢，升级镜像也不用重装。
-      ARTEX_HOSTBIN: "/app/data/hostbin"
-      ARTEX_HOSTPY: "/app/data/pyenv"
-      GOBIN: "/app/data/hostbin"
-      GOPATH: "/app/data/gopath"
-      GOPROXY: "${GOPROXY:-https://goproxy.cn,direct}"
-      HOME: "/app/data/home"
-      TZ: "${TZ:-Asia/Shanghai}"
-      NUCLEI_DISABLE_UPDATE_CHECK: "true"
+      POSTGRES_USER: ${POSTGRES_USER:-artex}
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?缺少 POSTGRES_PASSWORD：先运行 bash docker/init-env.sh（./run.sh 会自动做）}"
+      POSTGRES_DB: ${POSTGRES_DB:-artex}
     volumes:
-      # data 整个挂上去：模板、hostbin、pyenv、报告产物全在卷里。
-      - ${ARTEX_DATA_DIR:-./data}:/app/data
-      # 字典（只读）：ffuf/gobuster 等直接指 /usr/share/wordlists。
-      - ${ARTEX_WORDLISTS_DIR:-./data/wordlists}:/usr/share/wordlists:ro
-      # apt 的 deb 缓存与包索引。run.sh 每次启动会把「容器可写层里丢掉的」
-      # 系统级工具（hashcat/hydra/gdb…）重新装一遍，这两个目录让重装不需要
-      # 重新下载：重建容器后补装通常十几秒而不是几百兆带宽。
-      - ${ARTEX_DATA_DIR:-./data}/aptcache:/var/cache/apt/archives
-      - ${ARTEX_DATA_DIR:-./data}/aptlists:/var/lib/apt/lists
-    command: ["-addr", "${ARTEX_LISTEN_ADDR:-:8801}", "-proxy", "${ARTEX_PROXY_ADDR:-127.0.0.1:8802}"]
+      - dbdata:/var/lib/postgresql/data
+    ports:
+      # 只绑 127.0.0.1：数据库不对外暴露；55432 避开宿主机默认的 5432。
+      - "127.0.0.1:${ARTEX_DB_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-artex} -d ${POSTGRES_DB:-artex}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     restart: unless-stopped
+
+  # Linux：host 网络。DSN 走 127.0.0.1:55432（artex-db 映射到宿主回环）。
+  artex-host:
+    <<: *artex-common
+    profiles: ["host"]
+    network_mode: host
+    depends_on:
+      artex-db:
+        condition: service_healthy
+
+  # Docker Desktop：bridge + 端口映射。DSN 走 artex-db:5432（compose 内 DNS）。
+  artex-desktop:
+    <<: *artex-common
+    profiles: ["desktop"]
+    depends_on:
+      artex-db:
+        condition: service_healthy
+    ports:
+      - "${ARTEX_HTTP_PORT:-8801}:${ARTEX_LISTEN_PORT:-8801}"
+      # 流量录制代理只给本机用，不对外暴露
+      - "127.0.0.1:${ARTEX_PROXY_PORT:-8802}:${ARTEX_PROXY_PORT:-8802}"
+
+volumes:
+  dbdata:

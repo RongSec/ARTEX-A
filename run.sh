@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # ARTEX 启动脚本（宿主机侧）——唯一推荐的服务入口。
 #
-# 与三个脚本的分工：
-#   install.sh  首次落地（装 docker、问端口、生成 .env、起服务）
-#   run.sh      **每次启动**：拉起服务 + 把「不持久的东西」补回来   ← 本文件
+# 新机器上只需要三步：git clone → cd → ./run.sh。
+# 首次运行会自动生成 docker/.env（随机数据库口令、管理员密码、空密钥位），
+# 拉镜像（直连失败自动换加速源），起应用 + 数据库，再把工具补齐。
+#
+# 与另外两个脚本的分工：
+#   run.sh      每次启动：拉起服务 + 把「不持久的东西」补回来   ← 本文件
 #   update.sh   升级/回滚：换镜像、备份与恢复数据库、离线导入
+#   install.sh  已废弃，只剩转发到 run.sh（老文档里的入口）
 #
 # 为什么需要它：容器里有三类东西的寿命不一样。
 #   - 镜像层（nuclei/nmap/LibreOffice/Playwright）：跟着镜像走，重建容器不受影响；
@@ -17,32 +21,32 @@
 #
 # 用法：
 #   ./run.sh              启动（等价 ./run.sh up）
-#   ./run.sh up           启动：环境自检 → 起服务 → ① 补二进制 → ② 补 apt 包
+#   ./run.sh up           启动：生成 .env → 拉镜像 → 起服务 → ① 补二进制 → ② 补 apt 包
 #   ./run.sh ensure       只做 ① ② 两步（更新镜像之后、或怀疑工具丢了时跑）
 #   ./run.sh restart      重启容器（不重建，容器可写层的东西还在）
-#   ./run.sh down         停止
+#   ./run.sh down         停止（应用 + 数据库）
 #   ./run.sh status       状态
 #   ./run.sh logs [-f]    日志
 #   ./run.sh doctor       完整体检：容器、版本、PDF 预览引擎、工具缺口
 #
 # 环境变量（都可选）：
 #   ARTEX_COMPOSE    compose 文件，默认 docker/docker-compose.hs.yml
+#   ARTEX_MIRRORS    镜像加速源，空格分隔，默认 "docker.1ms.run"
 #   ARTEX_DATA_DIR   覆盖 .env 里的数据目录
 #   ARTEX_SKIP_TOOLS=1  只起服务，不做 ①②（离线且不关心工具时用）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-# 默认用 hs 单机部署（host 网络、外部 PG、8801）；没有 docker/.env 时退回仓库根
-# 那份自带 PG 的 compose（8787）。两种都支持，也可以 ARTEX_COMPOSE=... 指定。
-if [ -z "${ARTEX_COMPOSE:-}" ]; then
-  if [ -f "$ROOT/docker/docker-compose.hs.yml" ] && [ -f "$ROOT/docker/.env" ]; then
-    COMPOSE="$ROOT/docker/docker-compose.hs.yml"
-  else
-    COMPOSE="$ROOT/docker-compose.yml"
-  fi
-else
-  COMPOSE="$ARTEX_COMPOSE"
-fi
+# 唯一差异是网络：Linux 用 host（反弹 shell、内网扫描、抓包都靠它），
+# Docker Desktop（macOS/Windows）没有真 host 网络，只能 bridge + 端口映射，
+# 否则容器起来了、宿主机浏览器却是空的。两种形态在同一个 compose 里用
+# profile 区分（host / desktop），其余配置用 YAML 锚点共用。
+case "$(uname -s)" in
+  Darwin|MINGW*|MSYS*|CYGWIN*) PROFILE=desktop ;;
+  *)                           PROFILE=host ;;
+esac
+COMPOSE="${ARTEX_COMPOSE:-$ROOT/docker/docker-compose.hs.yml}"
+[ -f "$COMPOSE" ] || COMPOSE="$ROOT/docker/docker-compose.yml"
 ENV_FILE="$(dirname "$COMPOSE")/.env"
 TOOLS_FILE="$ROOT/docker/apt-tools.txt"
 
@@ -52,12 +56,27 @@ warn() { printf '\033[33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ── 读 docker/.env（与 compose 读的是同一份）──────────────
+# 首次运行没有 .env 时自动生成：随机数据库口令、管理员密码、空的密钥位。
+# 这样 `git clone && ./run.sh` 就是全部步骤，不需要先记得跑 init-env.sh。
+ensure_env() {
+  [ -f "$ENV_FILE" ] && return 0
+  if [ "$ENV_FILE" != "$ROOT/docker/.env" ]; then
+    die "未找到 $ENV_FILE（自定义 ARTEX_COMPOSE 时必须自备 .env）"
+  fi
+  info "首次启动：生成 docker/.env（随机口令，0600）"
+  bash "$ROOT/docker/init-env.sh" >/dev/null || die "生成 docker/.env 失败"
+  ENV_FRESH=1
+}
+
 load_env() {
-  [ -f "$ENV_FILE" ] || die "未找到 $ENV_FILE —— 首次部署请先运行 bash docker/init-env.sh"
+  ensure_env
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
+
+  # 机密统一在 .env：GitHub token 只有一个来源，工具下载与版本查询共用。
+  GITHUB_TOKEN="${GITHUB_TOKEN:-${ARTEX_GITHUB_TOKEN:-}}"
 
   COMPOSE_DIR="$(cd "$(dirname "$COMPOSE")" && pwd)"
   case "$COMPOSE" in
@@ -73,25 +92,21 @@ load_env() {
       esac ;;
   esac
   IMAGE="${ARTEX_IMAGE:-rongsec/artex-a:latest}"
-  # 服务名与容器名：hs 版服务叫 artex-hs（容器名同名）；仓库根那份 compose
-  # 服务叫 artex，容器由 compose 自动命名（<项目>-artex-1），所以统一用
-  # `compose ps -q <service>` 取容器 ID，不靠猜名字。
-  case "$COMPOSE" in
-    */docker-compose.yml) SERVICE=artex ;;
-    *) SERVICE=artex-hs ;;
-  esac
-  CONTAINER="${ARTEX_CONTAINER_NAME:-$SERVICE}"
-  # 健康检查打哪个端口：hs 版是 host 网络 + ARTEX_LISTEN_ADDR（默认 :8801）；
-  # 根 compose 是端口映射 8787:8787，容器内外的 8787 都通。
+  # 服务名随网络形态走（artex-host / artex-desktop），容器名始终是 artex-hs。
+  # 一律用 `compose ps -q <service>` 取 ID，不靠名字猜。
+  SERVICE="artex-$PROFILE"
+  CONTAINER="${ARTEX_CONTAINER_NAME:-artex-hs}"
+  # 健康检查打哪个端口：host 网络就是监听端口；desktop 是映射出来的宿主端口。
   if [ -n "${ARTEX_LISTEN_ADDR:-}" ]; then
     PORT="${ARTEX_LISTEN_ADDR##*:}"
   else
-    case "$COMPOSE" in
-      */docker-compose.yml) PORT=8787 ;;
-      *) PORT=8801 ;;
-    esac
+    PORT=8801
+  fi
+  if [ "$PROFILE" = "desktop" ] && [ -n "${ARTEX_HTTP_PORT:-}" ]; then
+    PORT="$ARTEX_HTTP_PORT"
   fi
   HOSTBIN="$DATA_DIR/hostbin"
+  STATE_DIR="$COMPOSE_DIR/state"
   ARCH="$(uname -m)"
   case "$ARCH" in
     x86_64|amd64) ARCH=amd64 ;;
@@ -100,7 +115,7 @@ load_env() {
   esac
 }
 
-compose() { docker compose -f "$COMPOSE" "$@"; }
+compose() { docker compose -f "$COMPOSE" --profile "$PROFILE" "$@"; }
 
 # 容器 ID。不用容器名：hs 版有固定 container_name，仓库根那份是 compose 自动
 # 命名的（<项目>-artex-1），靠猜必然有一边错。`compose ps -q <service>` 两边都对。
@@ -111,6 +126,24 @@ require_docker() {
   command -v docker >/dev/null 2>&1 || die "未检测到 docker，请先运行 ./install.sh"
   docker compose version >/dev/null 2>&1 || die "未检测到 docker compose 插件"
   docker info >/dev/null 2>&1 || die "docker 守护进程不可用（权限不足？试试 sudo usermod -aG docker \$USER 后重新登录）"
+}
+
+# 拉镜像：Docker Hub 直连在国内常年超时，失败后按 ARTEX_MIRRORS 依次换加速源，
+# 拉到后打回原 tag，compose 仍然按 ARTEX_IMAGE 找它。
+pull_image() {
+  local ref="$1" m
+  docker image inspect "$ref" >/dev/null 2>&1 && return 0
+  info "拉取镜像 $ref …"
+  docker pull "$ref" && return 0
+  warn "直连拉取失败，尝试加速源…"
+  for m in ${ARTEX_MIRRORS:-docker.1ms.run}; do
+    if docker pull "$m/$ref"; then
+      docker tag "$m/$ref" "$ref"
+      ok "已从 $m 拉取并重命名为 $ref"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # ── 健康检查 ─────────────────────────────────────────────
@@ -216,6 +249,24 @@ ensure_all() {
   ensure_pkgs
 }
 
+# ── 技能播种 ─────────────────────────────────────────────
+# 技能目录改成挂载卷（/app/data/skills）之后，镜像自带的技能不会自动出现，
+# 第一次启动必须从镜像里复制一份进去。用临时容器取，不依赖容器已启动——
+# 应用启动时就要扫描这个目录，晚一步补会把首屏技能列表留空。
+seed_skills() {
+  [ -d "$DATA_DIR/skills" ] || mkdir -p "$DATA_DIR/skills"
+  [ -n "$(ls -A "$DATA_DIR/skills" 2>/dev/null)" ] && return 0
+
+  local tmp="artex-seed-$$"
+  docker rm -f "$tmp" >/dev/null 2>&1 || true
+  if docker create --name "$tmp" "$IMAGE" >/dev/null 2>&1; then
+    if docker cp "$tmp:/app/skills/." "$DATA_DIR/skills/" >/dev/null 2>&1; then
+      ok "已把镜像自带技能播种到 $DATA_DIR/skills（$(ls -1 "$DATA_DIR/skills" | wc -l | tr -d ' ') 个）"
+    fi
+    docker rm -f "$tmp" >/dev/null 2>&1 || true
+  fi
+}
+
 # ── 子命令 ───────────────────────────────────────────────
 cmd_up() {
   require_docker
@@ -224,15 +275,25 @@ cmd_up() {
   info "镜像:    $IMAGE"
   info "数据:    $DATA_DIR"
 
-  mkdir -p "$DATA_DIR"/{hostbin,pyenv,aptcache,aptlists} 2>/dev/null || true
+  mkdir -p "$DATA_DIR"/{hostbin,pyenv,aptcache,aptlists,wordlists,skills} "$STATE_DIR" 2>/dev/null || true
 
-  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    info "本地无该镜像，先拉取…"
-    compose pull || die "拉取镜像失败。离线部署可用 ./update.sh import <镜像tar>"
+  # 端口上已经有一个不归本 compose 管的 ARTEX：停手，别起第二个。
+  # 这正是「同一台机器上两个容器、两份数据」的来源——旧部署没停，新部署又起来。
+  refresh_cid
+  if [ -z "$CID" ] && health >/dev/null 2>&1; then
+    die "端口 ${PORT} 上已有一个 ARTEX 在运行，但不是这份 compose 管理的。
+     先停掉旧实例（docker ps → docker stop <名字>），再执行 ./run.sh。
+     同一台机器只保留一个实例：两个实例会各写各的库和 data，行为不一致。"
   fi
 
+  pull_image "$IMAGE" || die "拉取 $IMAGE 失败。离线部署可用 ./update.sh import <镜像tar>"
+  # 数据库镜像通常已经在本地；拉不到就让 compose 自己再试一次，不阻断启动。
+  pull_image "postgres:16-alpine" >/dev/null 2>&1 || true
+
+  seed_skills
+
   info "启动容器…"
-  compose up -d
+  compose up -d --remove-orphans
   refresh_cid
 
   if ! wait_health 90; then
@@ -247,7 +308,14 @@ cmd_up() {
 
   printf '\n'
   ok "完成 → http://127.0.0.1:${PORT}"
+  # 首次部署把管理员密码指出来；之后只在文件里，不再往日志里写。
+  if [ "${ENV_FRESH:-0}" = "1" ]; then
+    local admin_pass
+    admin_pass="$(grep -m1 '^ARTEX_INIT_PASSWORD=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
+    [ -n "$admin_pass" ] && info "登录：用户名 ARTEX，密码 ${admin_pass}（首次登录后请改）"
+  fi
   info "日志：./run.sh logs -f    体检：./run.sh doctor"
+  info "全部机密都在 ${ENV_FILE}（0600）：LLM key、搜索 key、NVD/GitHub token 都在那一份里"
 }
 
 cmd_ensure() {
@@ -284,8 +352,12 @@ cmd_doctor() {
   printf '%-14s %s\n' "镜像"     "$IMAGE"
   printf '%-14s %s\n' "容器"     "$CONTAINER"
   printf '%-14s %s\n' "数据卷"   "$DATA_DIR"
-  local st; st="$(docker inspect -f '{{.State.Status}} / {{.State.Health.Status}}' "$CID" 2>/dev/null || true)"
-  printf '%-14s %s\n' "运行状态" "${st:-未创建}"
+  # 镜像不一定带 HEALTHCHECK（自建/精简镜像就没有），直接取 .State.Health
+  # 会因为字段不存在而整条模板报错，看起来像「容器未创建」。
+  local st h
+  st="$(docker inspect -f '{{.State.Status}}' "$CID" 2>/dev/null || true)"
+  h="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$CID" 2>/dev/null || true)"
+  printf '%-14s %s\n' "运行状态" "${st:-未创建}${h:+ / $h}"
   local hv; hv="$(health 2>/dev/null || true)"
   printf '%-14s %s\n' "健康接口" "${hv:-不可达}"
 

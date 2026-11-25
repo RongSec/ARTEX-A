@@ -14,19 +14,24 @@
 ## 首次部署
 
 ```bash
-bash docker/init-env.sh     # ① 生成随机口令到 docker/.env（0600）
-./run.sh                    # ② 起服务 + 工具自愈（见下）
+./run.sh
 ```
 
-浏览器打开 `http://<本机IP>:8801`，用户名 `ARTEX`，初始密码见 `docker/.env` 的 `ARTEX_INIT_PASSWORD`。
+一条命令做完：生成 `docker/.env`（随机口令，0600）→ 拉镜像（直连失败自动换
+`docker.1ms.run`）→ 起应用 + PostgreSQL → 补工具。浏览器打开
+`http://<本机IP>:8801`，用户名 `ARTEX`，初始密码见 `docker/.env` 的
+`ARTEX_INIT_PASSWORD`（首次启动会打印一次）。
+
+Linux 用 host 网络；macOS/Windows 的 Docker Desktop 自动切 bridge + 端口映射
+（桌面版没有真正的 host 网络，容器在跑但宿主访问不到是常见坑）。
 
 ## 三个脚本的分工
 
 | 脚本 | 什么时候用 | 做什么 |
 |---|---|---|
-| `install.sh` | 一台裸机第一次装 | 装 docker、问端口、生成 `.env` |
-| `run.sh` | **每次启动** | 起服务 + 把「容器重建就丢的东西」补回来 |
+| `run.sh` | **唯一入口**，每次启动 | 首次生成 `.env`、拉镜像、起服务；之后补「容器重建就丢的东西」 |
 | `update.sh` | 升级 / 回滚 | 换镜像、更新前备份数据库、失败自动回滚、离线导入 |
+| `install.sh` | 老文档里的入口 | 已废弃，只剩转发到 `run.sh` |
 
 ### 为什么每次启动要补东西
 
@@ -83,15 +88,21 @@ bash docker/init-env.sh     # ① 生成随机口令到 docker/.env（0600）
 
 ## 敏感配置在哪里
 
+**所有机密只有一个文件：`docker/.env`**（0600，已 gitignore）。
+
 | 内容 | 位置 | 是否入库 |
 |---|---|---|
-| 数据库口令 / 管理员初始密码 / 镜像引用 | `docker/.env`（0600，`init-env.sh` 随机生成） | 否，已 gitignore |
-| JWT 签名密钥 | 挂载卷 `data/jwt.key`（程序首启自动生成） | 否 |
-| LLM Key / GitHub Token / NVD Key | 数据库 `settings` 表（页面「同步配置」里填） | 否 |
-| 配置文件 | 程序首启在可执行文件旁生成 `config.json`（0600） | 否 |
-| 升级备份 | `backups/`（含数据库快照与 `.env` 副本） | 否，已 gitignore |
+| 数据库口令 / 管理员初始密码 / 镜像引用 | `docker/.env`（`init-env.sh` 随机生成） | 否 |
+| LLM Key（`ARTEX_LLM_API_KEY`）| `docker/.env`，启动时导入数据库 | 否 |
+| Brave / Tavily / NVD / GitHub Token | `docker/.env`，启动时导入 `settings` | 否 |
+| 出口代理（可能带账号密码） | `docker/.env`，启动时导入 `settings` | 否 |
+| JWT 签名密钥 | `docker/state/jwt.key`（首启自动生成，挂载卷） | 否 |
+| 升级备份（含 `.env` 副本与库快照） | `backups/` | 否 |
 
-`.env.example` 只是字段说明，**不要**直接拿去用。
+导入是「只填空缺」：数据库里已有非空值就不覆盖，页面里改过的配置不会被
+重启改回去。想让文件里的新值生效，先在页面把该字段清空，再重启。
+
+`docker/.env.example` 只是字段说明，**不要**直接拿去用 —— 它没有随机口令。
 
 ## 镜像里的工具
 

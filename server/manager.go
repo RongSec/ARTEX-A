@@ -401,6 +401,10 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 机密统一来自 docker/.env：首次启动把 LLM key、搜索 key、情报 token、代理
+	// 导入数据库（库里已有非空值就不动）。必须在下面的 LoadSettings 之前跑，
+	// 否则本次启动读到的还是旧值。
+	pg.SeedSecretsFromEnv()
 	if err := pg.RecoverFindingRetests(); err != nil {
 		pg.Close()
 		return nil, fmt.Errorf("recover finding retests: %w", err)

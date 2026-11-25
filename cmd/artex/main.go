@@ -110,7 +110,9 @@ func run() int {
 		skillDir = abs
 	}
 	log.Printf("[config] skill 目录: %s", skillDir)
-	srv := server.New(ctx, mgr, skillDir, *dataDir, config.BaseDir())
+	keyDir := config.KeyDir()
+	log.Printf("[config] 签名 key 目录: %s", keyDir)
+	srv := server.New(ctx, mgr, skillDir, *dataDir, keyDir)
 	// 容器化部署：ARTEX_INIT_PASSWORD 仅在密码未设置时生效（见 .env.example）。
 	srv.SeedInitialPassword()
 	// V9-DOCKER：后台预热 LibreOffice，避免首个 PDF 预览请求吃冷启动超时。

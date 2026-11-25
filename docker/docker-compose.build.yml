@@ -1,4 +1,12 @@
-name: artex
+# 仅用于「从源码构建镜像」的开发者，不是部署入口。
+#
+#   docker compose -f docker/docker-compose.build.yml up -d --build
+#
+# 部署请统一用仓库根的 ./run.sh —— 它跑的是 docker/docker-compose.hs.yml
+# （拉 Hub 镜像 + 自带数据库 + 工具自愈）。以前这个文件叫 docker-compose.yml，
+# 目录里 `docker compose up` 会顺手起一个 project=artex、容器名 artex 的栈，
+# 和 artex-hs 并存成两套系统。改名就是为了让这个误操作直接失败。
+name: artex-build
 
 services:
   postgres:

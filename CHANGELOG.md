@@ -4,6 +4,39 @@
 
 ## [Unreleased]
 
+## [v0.3.16-hs.8] - 2026-11-25
+
+### 变更
+
+- **一条命令完成部署**：`git clone && ./run.sh`。首次运行自动生成 `docker/.env`
+  （随机库口令、管理员密码、密钥位）、拉镜像（直连失败自动换加速源）、
+  起应用 + PostgreSQL、播种内置技能，不再需要先跑 `init-env.sh`。
+- **仓库只有一个部署形态**：根 `docker-compose.yml` 改为 `include`
+  `docker/docker-compose.hs.yml`；原 `docker/docker-compose.yml`（本地构建）
+  改名 `docker-compose.build.yml`。以前三份 compose 并存，目录里随手
+  `docker compose up` 就会多出一个 project、多一份数据。
+- **`install.sh` 退役**：只转发到 `run.sh`。以前它自己生成另一套 `.env`
+  与 8787 端口，和 hs 版互不相干。
+- **数据库进同一个栈**：`artex-db` 随应用一起起，只绑 `127.0.0.1:55432`。
+  旧版 `init-env.sh` 生成的 DSN 指向 `postgres:5432`，但 compose 里没有
+  这个服务，新用户照文档走必然连不上。
+- **host / desktop 双网络形态**：Linux 用 host 网络（反弹 shell、内网扫描、
+  抓包需要）；Docker Desktop（macOS/Windows）没有真 host 网络，自动切
+  bridge + 端口映射。同一 compose 用 profile + YAML 锚点共用定义。
+
+### 新增
+
+- **机密统一到 `docker/.env`**：LLM key、Brave/Tavily、NVD key、GitHub token、
+  出口代理都写在同一个文件（0600、gitignore），应用启动时导入数据库
+  （只填空缺，不覆盖页面里改过的值）。
+- **`jwt.key` 持久化**：新增 `ARTEX_KEY_DIR`（默认仍是可执行文件旁，保持
+  兼容），compose 把它指到 `docker/state`。此前每次重建容器都换签名 key，
+  升级一次全员被踢下线。
+- **技能持久化**：`ARTEX_SKILL_DIR=/app/data/skills`，首次启动从镜像播种
+  内置技能。此前用户上传的技能写在容器层，重建即回滚。
+- **重复实例拦截**：`run.sh up` 发现目标端口上已有非本 compose 管理的
+  ARTEX 时直接报错退出，不再默默起第二个。
+
 ## [v0.3.16-hs.7] - 2026-11-25
 
 ### 新增

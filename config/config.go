@@ -113,6 +113,7 @@ func Load() Config {
 //	env ARTEX_SKILL_DIR  >  config file (skill_dir)  >  BaseDir()/skills
 //
 // The directory is created if it does not exist.
+// SkillDir 返回技能根目录（ARTEX_SKILL_DIR > config.json skill_dir > 可执行文件旁的 skills/）。
 func SkillDir() string {
 	var d string
 	if v := strings.TrimSpace(os.Getenv("ARTEX_SKILL_DIR")); v != "" {
@@ -124,6 +125,20 @@ func SkillDir() string {
 	}
 	_ = os.MkdirAll(d, 0o755)
 	return d
+}
+
+// KeyDir 返回 jwt.key 的落盘目录（默认可执行文件旁）。
+//
+// 单独开这个口子是因为容器：默认位置 /app 是镜像层，`docker compose up -d`
+// 重建一次就换一把签名 key，所有人被强制退出登录。把 ARTEX_KEY_DIR 指到
+// 挂载卷就能跨重建保留。刻意不放进 data 目录：那是文件管理器可浏览的
+// 工作区，签名 key 不该出现在下载列表里。
+func KeyDir() string {
+	if v := strings.TrimSpace(os.Getenv("ARTEX_KEY_DIR")); v != "" {
+		_ = os.MkdirAll(v, 0o700)
+		return v
+	}
+	return BaseDir()
 }
 
 // PostgresDSN resolves the connection string with precedence:

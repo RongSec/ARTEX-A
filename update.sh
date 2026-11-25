@@ -32,16 +32,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-# 与 run.sh 同一套自动识别：有 docker/.env 就用 hs 单机部署，否则用仓库根那份。
-if [ -z "${ARTEX_COMPOSE:-}" ]; then
-  if [ -f "$ROOT/docker/docker-compose.hs.yml" ] && [ -f "$ROOT/docker/.env" ]; then
-    COMPOSE="$ROOT/docker/docker-compose.hs.yml"
-  else
-    COMPOSE="$ROOT/docker-compose.yml"
-  fi
-else
-  COMPOSE="$ARTEX_COMPOSE"
-fi
+# 只有一个部署形态；网络按系统选（Linux=host，Docker Desktop=bridge+映射），
+# 与 run.sh 保持同一套判断。以前「没有 .env 就退回根目录那份 compose」，
+# 结果同一台机器上两个容器并存，升级脚本管的是其中一个。
+case "$(uname -s)" in
+  Darwin|MINGW*|MSYS*|CYGWIN*) PROFILE=desktop ;;
+  *)                           PROFILE=host ;;
+esac
+COMPOSE="${ARTEX_COMPOSE:-$ROOT/docker/docker-compose.hs.yml}"
+[ -f "$COMPOSE" ] || COMPOSE="$ROOT/docker/docker-compose.yml"
 ENV_FILE="$(dirname "$COMPOSE")/.env"
 STATE_FILE="$(dirname "$COMPOSE")/.update-state"
 BACKUP_ROOT="$ROOT/backups"
@@ -53,7 +52,7 @@ warn() { printf '\033[33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 ask()  { local p="$1" d="${2:-}" a; read -rp "$p${d:+ [$d]}: " a; echo "${a:-$d}"; }
 
-compose() { docker compose -f "$COMPOSE" "$@"; }
+compose() { docker compose -f "$COMPOSE" --profile "$PROFILE" "$@"; }
 
 # ── 环境 ─────────────────────────────────────────────────
 load_env() {
@@ -62,17 +61,15 @@ load_env() {
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
-  case "$COMPOSE" in
-    */docker-compose.yml) SERVICE=artex; DATA_DIR="$ROOT/data" ;;
-    *) SERVICE=artex-hs
-       local d="${ARTEX_DATA_DIR:-./data}"
-       case "$d" in /*) DATA_DIR="$d" ;; *) DATA_DIR="$(cd "$(dirname "$COMPOSE")" && pwd)/${d#./}" ;; esac ;;
-  esac
-  CONTAINER="${ARTEX_CONTAINER_NAME:-$SERVICE}"
-  PORT="${ARTEX_LISTEN_ADDR:-}"
-  if [ -n "$PORT" ]; then PORT="${PORT##*:}"; else
-    case "$COMPOSE" in */docker-compose.yml) PORT=8787 ;; *) PORT=8801 ;; esac
-  fi
+  # 机密统一在 .env：GitHub token 用于版本查询与拉镜像，只有一个来源。
+  GITHUB_TOKEN="${GITHUB_TOKEN:-${ARTEX_GITHUB_TOKEN:-}}"
+  SERVICE="artex-$PROFILE"
+  local d="${ARTEX_DATA_DIR:-./data}"
+  case "$d" in /*) DATA_DIR="$d" ;; *) DATA_DIR="$(cd "$(dirname "$COMPOSE")" && pwd)/${d#./}" ;; esac
+  CONTAINER="${ARTEX_CONTAINER_NAME:-artex-hs}"
+  PORT="${ARTEX_LISTEN_ADDR:-:8801}"
+  PORT="${PORT##*:}"
+  if [ "$PROFILE" = "desktop" ] && [ -n "${ARTEX_HTTP_PORT:-}" ]; then PORT="$ARTEX_HTTP_PORT"; fi
   REF="${ARTEX_IMAGE:-rongsec/artex-a:latest}"
   # 拆 repo 与 tag：最后一个路径段里含 ':' 才说明带了 tag
   local last="${REF##*/}"

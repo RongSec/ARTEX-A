@@ -72,6 +72,8 @@ web/.next.bak.*/
 # 部署环境文件：口令/密钥只在本机生成，绝不提交
 /docker/.env
 /docker/data/
+# jwt.key 的挂载目录：跟着容器卷走，不进仓库
+/docker/state/
 !docker/.env.example
 *.key
 /config.json
