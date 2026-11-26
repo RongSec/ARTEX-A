@@ -265,6 +265,11 @@ func Catalog() []Tool {
 	// 只影响页面提示，不改变探测结果。
 	for i := range tools {
 		tools[i].Offline = preinstalled[tools[i].Key]
+		// NetExec 只在 amd64 底座里（arm64 构建跳过，见 docker/base/Dockerfile）。
+		// 不按架构收口的话，arm64 用户的页面会一直显示「应内置但缺失」。
+		if tools[i].Key == "nxc" && runtime.GOARCH != "amd64" {
+			tools[i].Offline = false
+		}
 	}
 	return tools
 }
