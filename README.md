@@ -294,6 +294,22 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 - 前端：`cd web && npm run dev`（`/api` 反代热更新）
 - Mock 预览：`cd web && NEXT_PUBLIC_MOCK=1 npm run dev`
 
+### 提交前敏感内容检查
+
+```bash
+git config core.hooksPath .githooks      # 每个 clone 装一次；./dev.sh 也会自动装
+python scripts/scan_repo_secrets.py      # 手动全仓扫
+```
+
+`scripts/scan_repo_secrets.py` 扫全部 **git 跟踪文件**：文本按行、docx/xlsx/pptx
+解压后扫内部 XML、其余二进制抽可打印串。硬失败项（凭据格式、机构标识、部署网段、
+手机号、`.env`/`data/`/`*.db` 等路径被跟踪）直接拦住提交；测试与 mock 里的通用私网段
+只提示不阻断。CI 的 `secret-scan` 跑同一份脚本，本地与线上规则一致。
+
+`.gitignore` 挡的是运行时产物（`data/`、`.env`、`state/`、`backups/`），
+`.dockerignore` 挡的是构建上下文；**两者都管不了「入库文件里写了什么」**，
+所以还需要这道内容闸门。
+
 工程细节（Go / Node 版本、模块代理、release 打包）见 [README.artex-hs.md](./README.artex-hs.md)。
 
 ---
