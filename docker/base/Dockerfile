@@ -114,10 +114,12 @@ RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@late
 # metadata 名是 certipy-nxc，PyPI 上的项目名仍是 certipy-ad，pip 25 直接判
 # 「certipy-ad (unavailable)」——构建必挂（实测两次）。v1.4.0 只有 impacket /
 # oscrypto / pynfsclient 三个 git 依赖，能正常装。升级前先在 CI 试装。
+# 注意 `nxc --version | head -1`：首次运行会建 ~/.nxc 并返回 1，不接管道
+# 会让整层构建判失败（实测装是成功的，只是退出码非 0）。
 RUN set -eux; \
     pip install --no-cache-dir --break-system-packages \
       "git+https://github.com/Pennyw0rth/NetExec@v1.4.0"; \
-    nxc --version
+    nxc --version | head -1
 
 # ---- 预置探测工具层（nuclei / httpx / subfinder / katana / dnsx / tlsx / chisel / ffuf …
 #      共 9 件，约 380MB）----
