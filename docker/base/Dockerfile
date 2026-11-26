@@ -110,10 +110,13 @@ RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@late
 # oscrypto 三个都写死成 git+https://github.com/...。受限网络下实测三步全挂：
 # PyPI 找不到包 → 换 GitHub 源码包 → poetry-dynamic-versioning 要 .git → 再换
 # git clone → TLS 被中断。装一次要碰运气，不如构建时装好（约 60MB）。
-# 版本钉死：升级需改这里并 bump docker/base/TAG。
+# 版本钉死 v1.4.0：v1.5.x 把 certipy 换成 Pennyw0rth 的 fork，但那个包的
+# metadata 名是 certipy-nxc，PyPI 上的项目名仍是 certipy-ad，pip 25 直接判
+# 「certipy-ad (unavailable)」——构建必挂（实测两次）。v1.4.0 只有 impacket /
+# oscrypto / pynfsclient 三个 git 依赖，能正常装。升级前先在 CI 试装。
 RUN set -eux; \
     pip install --no-cache-dir --break-system-packages \
-      "git+https://github.com/Pennyw0rth/NetExec@v1.5.1"; \
+      "git+https://github.com/Pennyw0rth/NetExec@v1.4.0"; \
     nxc --version
 
 # ---- 预置探测工具层（nuclei / httpx / subfinder / katana / dnsx / tlsx / chisel / ffuf …
