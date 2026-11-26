@@ -18,6 +18,9 @@ web/next-env.d.ts
 # 陈旧构建产物改名残留（build 前手动 rename .next/out 而来，非源码）
 web/.next_stale_*/
 web/out_stale_*/
+# 嵌入前端的旧构建快照（曾经误入库 469 个文件，一律不入库）
+server/webui/dist.bak.*/
+server/webui/dist.bak*
 # 本地临时构建/编译暂存目录
 .buildtmp/
 
