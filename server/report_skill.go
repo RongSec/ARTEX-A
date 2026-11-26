@@ -150,8 +150,8 @@ func (s *Server) reportTemplateToSkill(w http.ResponseWriter, r *http.Request) {
 	// 默认名优先用已绑定的 skill：重新蒸馏默认覆盖同一个，不再每次生成
 	// 一个新的 report-t<id>，否则模板越改、skills/ 里垃圾越多。
 	slug := skillSlugFor(t.Name, t.ID)
-	if t.SkillName != "" {
-		slug = t.SkillName
+	if bound := s.adoptSkillBinding(t); bound != "" {
+		slug = bound
 	}
 	if explicitName != "" {
 		slug = explicitName
@@ -345,6 +345,42 @@ func readSkillManifest(path string) (reportSkillManifest, bool) {
 	return m, true
 }
 
+// adoptSkillBinding 处理「绑定字段上线前就已经蒸馏过」的模板：skill_name 为空时
+// 扫一遍 skills/，manifest.template_id 指向本模板就把目录名写回 DB。
+// 只扫目录名+一个小 JSON，模板数量级很小，不需要缓存。
+// 返回最终生效的 skill 名（空=确实没蒸馏过）。
+func (s *Server) adoptSkillBinding(t *db.ReportTemplate) string {
+	if t == nil {
+		return ""
+	}
+	if strings.TrimSpace(t.SkillName) != "" {
+		return t.SkillName
+	}
+	if s.skillDir == "" {
+		return ""
+	}
+	entries, err := os.ReadDir(s.skillDir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		m, ok := readSkillManifest(filepath.Join(s.skillDir, e.Name(), skillManifestFile))
+		if !ok || m.TemplateID != t.ID {
+			continue
+		}
+		if err := s.m.pg.SetReportTemplateSkill(t.ID, e.Name()); err != nil {
+			log.Printf("[report-skill] 回填模板 %d 绑定 %s 失败: %v", t.ID, e.Name(), err)
+			return ""
+		}
+		t.SkillName = e.Name()
+		return e.Name()
+	}
+	return ""
+}
+
 // reportSkillMarkdown 生成 SKILL.md（frontmatter + 哨兵 + 人类可读说明 +
 // 模板 JSON 全文）。description 保持单行（frontmatter 解析约束）。
 func reportSkillMarkdown(slug, displayName string, v reportSkillTemplateView, templateID int64) string {
@@ -395,13 +431,17 @@ func (s *Server) reportTemplateSkillPreview(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	slugOverride := ""
 	if name != "" && !validDistillSkillName(name) {
 		writeErr(w, 400, "skill 名称非法：需以小写字母或数字开头，仅含小写字母/数字/-/_，长度 2-49")
 		return
 	}
+	if bound := s.adoptSkillBinding(t); bound != "" && name == "" {
+		slugOverride = bound
+	}
 	slug := skillSlugFor(t.Name, t.ID)
-	if t.SkillName != "" {
-		slug = t.SkillName
+	if slugOverride != "" {
+		slug = slugOverride
 	}
 	if name != "" {
 		slug = name

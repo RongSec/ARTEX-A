@@ -111,6 +111,11 @@ func (s *Server) reportTemplateList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "读取模板失败: "+err.Error())
 		return
 	}
+	// 绑定字段上线前已蒸馏过的模板：按 manifest 回填 skill_name，
+	// 否则列表上看不到绑定，再次蒸馏又会生成一个新 skill。
+	for _, t := range ts {
+		s.adoptSkillBinding(t)
+	}
 	writeJSON(w, 200, ts)
 }
 
