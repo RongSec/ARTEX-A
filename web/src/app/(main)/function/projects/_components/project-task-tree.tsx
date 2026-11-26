@@ -15,6 +15,8 @@ import { toast } from "sonner";
 import {
   ChevronDownIcon,
   ChevronRightIcon,
+  ChevronsDownIcon,
+  ChevronsUpIcon,
   FolderKanbanIcon,
   InboxIcon,
   MoreHorizontalIcon,
@@ -120,9 +122,20 @@ export function ProjectTaskTree({
   onDeleteProject,
 }: Props) {
   const [query, setQuery] = React.useState("");
-  const [collapsed, setCollapsed] = React.useState<Set<number>>(() => new Set());
+  // 折叠集合按「行 key」记：项目用 `p<id>`，未分组用 `orphans`。
+  // 早先用 Set<number> 只装项目 id，导致未分组那一组没有可点的三角、永远展开。
+  const [collapsed, setCollapsed] = React.useState<Set<string>>(() => new Set());
   const [archiving, setArchiving] = React.useState<number | null>(null);
   const [busyTask, setBusyTask] = React.useState<string | null>(null);
+
+  const toggleCollapsed = React.useCallback((key: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
 
   const q = query.trim().toLowerCase();
   const byProject = React.useMemo(() => {
@@ -152,6 +165,9 @@ export function ProjectTaskTree({
     }
     return out;
   }, [byProject, projects, q]);
+
+  // 全展开/全收起：一次改完所有可见分组（含「未分组」）。
+  const allCollapsed = rows.length > 0 && rows.every((r) => collapsed.has(r.key));
 
   async function toggleArchive(p: ProjectWithStats) {
     setArchiving(p.id);
@@ -208,6 +224,16 @@ export function ProjectTaskTree({
             className="h-8 w-56"
             aria-label="搜索项目或任务"
           />
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={rows.length === 0}
+            onClick={() => setCollapsed(allCollapsed ? new Set() : new Set(rows.map((r) => r.key)))}
+            title={allCollapsed ? "展开全部分组" : "收起全部分组"}
+          >
+            {allCollapsed ? <ChevronsDownIcon /> : <ChevronsUpIcon />}
+            {allCollapsed ? "全部展开" : "全部收起"}
+          </Button>
           <Button size="sm" variant="outline" onClick={onRefresh} disabled={loading}>
             <RefreshCwIcon className={loading ? "animate-spin" : ""} /> 刷新
           </Button>
@@ -243,31 +269,21 @@ export function ProjectTaskTree({
               </TableRow>
             )}
             {rows.map(({ project, tasks: list, key }) => {
-              const isCollapsed = project ? collapsed.has(project.id) : false;
+              const isCollapsed = collapsed.has(key);
               const active = project?.status !== "archived";
               return (
                 <React.Fragment key={key}>
                   <TableRow className={project ? "bg-muted/30" : ""}>
                     <TableCell className="pr-0">
-                      {project ? (
-                        <button
-                          type="button"
-                          aria-label={isCollapsed ? "展开项目" : "收起项目"}
-                          className="text-muted-foreground hover:text-foreground p-1"
-                          onClick={() =>
-                            setCollapsed((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(project.id)) next.delete(project.id);
-                              else next.add(project.id);
-                              return next;
-                            })
-                          }
-                        >
-                          {isCollapsed ? <ChevronRightIcon className="size-4" /> : <ChevronDownIcon className="size-4" />}
-                        </button>
-                      ) : (
-                        <InboxIcon className="text-muted-foreground ml-1 size-4" />
-                      )}
+                      <button
+                        type="button"
+                        aria-label={isCollapsed ? "展开分组" : "收起分组"}
+                        aria-expanded={!isCollapsed}
+                        className="text-muted-foreground hover:text-foreground p-1"
+                        onClick={() => toggleCollapsed(key)}
+                      >
+                        {isCollapsed ? <ChevronRightIcon className="size-4" /> : <ChevronDownIcon className="size-4" />}
+                      </button>
                     </TableCell>
                     <TableCell>
                       {project ? (
