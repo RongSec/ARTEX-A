@@ -23,6 +23,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -131,6 +132,9 @@ func (s *Server) reportTemplateToSkill(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name        string `json:"name"`
 		DisplayName string `json:"display_name"`
+		// Overwrite=true 表示用户已确认覆盖同名 skill。缺省 false：
+		// 目录已存在时返回 409，由前端弹「已有对应 skill，是否覆盖」。
+		Overwrite bool `json:"overwrite"`
 	}
 	if r.ContentLength != 0 {
 		if err := decode(r, &body); err != nil {
@@ -143,7 +147,12 @@ func (s *Server) reportTemplateToSkill(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "skill 名称非法：需以小写字母或数字开头，仅含小写字母/数字/-/_，长度 2-49")
 		return
 	}
+	// 默认名优先用已绑定的 skill：重新蒸馏默认覆盖同一个，不再每次生成
+	// 一个新的 report-t<id>，否则模板越改、skills/ 里垃圾越多。
 	slug := skillSlugFor(t.Name, t.ID)
+	if t.SkillName != "" {
+		slug = t.SkillName
+	}
 	if explicitName != "" {
 		slug = explicitName
 	}
@@ -153,9 +162,12 @@ func (s *Server) reportTemplateToSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	dir := filepath.Join(s.skillDir, slug)
 	// 哨兵判定：目录已有 SKILL.md 且不含哨兵 = 非本机制创建 → 409；
-	// 含哨兵 = 幂等覆盖（但 manifest 指向别的模板 = 名称冲突）。
+	// 含哨兵 = 本机制产物，但覆盖必须显式确认（Overwrite=true），
+	// 否则「再次蒸馏」会悄悄冲掉用户手工调过的内容。
 	mdPath := filepath.Join(dir, "SKILL.md")
+	existed := false
 	if old, err := os.ReadFile(mdPath); err == nil {
+		existed = true
 		if !canOverwriteSkillExport(string(old)) {
 			writeErr(w, 409, fmt.Sprintf("skills/%s 已存在且不是报告模板导出的 skill，拒绝覆盖", slug))
 			return
@@ -165,6 +177,10 @@ func (s *Server) reportTemplateToSkill(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if !ok && explicitName != "" {
 			writeErr(w, 409, fmt.Sprintf("skill 名称「%s」已被占用且无法确认归属，请换一个名称", slug))
+			return
+		}
+		if !body.Overwrite {
+			writeErr(w, 409, fmt.Sprintf("skill「%s」已存在（本模板此前导出），确认覆盖请传 overwrite=true", slug))
 			return
 		}
 	} else if !os.IsNotExist(err) {
@@ -214,10 +230,21 @@ func (s *Server) reportTemplateToSkill(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "蒸馏产物校验失败："+err.Error())
 		return
 	}
+	// 绑定模板 → skill。写库失败不影响已落盘的产物，但要如实告知：
+	// 下次蒸馏拿不到绑定，会按模板名重新生成一个（不是数据损坏）。
+	bindErr := ""
+	if err := s.m.pg.SetReportTemplateSkill(t.ID, slug); err != nil {
+		bindErr = err.Error()
+		log.Printf("[report-skill] 模板 %d 绑定 skill %s 失败: %v", t.ID, slug, err)
+	}
 	writeJSON(w, 200, map[string]any{
-		"skill_name": slug,
-		"dir":        filepath.ToSlash(dir),
-		"checks":     checks,
+		"skill_name":     slug,
+		"dir":            filepath.ToSlash(dir),
+		"checks":         checks,
+		"overwritten":    existed,
+		"previous_skill": t.SkillName,
+		"bound_skill":    slug,
+		"bind_error":     bindErr,
 	})
 }
 
@@ -298,15 +325,24 @@ func dirHasFiles(dir string) bool {
 
 // skillManifestTemplateID 读取已有导出 skill 的归属模板 id。
 func skillManifestTemplateID(path string) (int64, bool) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
-	}
-	var m reportSkillManifest
-	if err := json.Unmarshal(raw, &m); err != nil {
+	m, ok := readSkillManifest(path)
+	if !ok {
 		return 0, false
 	}
 	return m.TemplateID, m.TemplateID > 0
+}
+
+// readSkillManifest 读 manifest.json；文件缺失/损坏都当「无法确认归属」。
+func readSkillManifest(path string) (reportSkillManifest, bool) {
+	var m reportSkillManifest
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return m, false
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return m, false
+	}
+	return m, true
 }
 
 // reportSkillMarkdown 生成 SKILL.md（frontmatter + 哨兵 + 人类可读说明 +
@@ -364,6 +400,9 @@ func (s *Server) reportTemplateSkillPreview(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	slug := skillSlugFor(t.Name, t.ID)
+	if t.SkillName != "" {
+		slug = t.SkillName
+	}
 	if name != "" {
 		slug = name
 	}
@@ -381,11 +420,28 @@ func (s *Server) reportTemplateSkillPreview(w http.ResponseWriter, r *http.Reque
 	if r := []rune(content); len(r) > 2000 {
 		content = string(r[:2000])
 	}
+	// 目标目录现状：前端据此决定要不要弹「已有对应 skill，是否覆盖」。
+	// 只看 SKILL.md 是否存在，不用 os.Stat 目录——空目录不会挡住写入。
+	dir := filepath.Join(s.skillDir, slug)
+	targetExists, targetSentinel := false, false
+	ownerID, ownerName := int64(0), ""
+	if old, err := os.ReadFile(filepath.Join(dir, "SKILL.md")); err == nil {
+		targetExists = true
+		targetSentinel = canOverwriteSkillExport(string(old))
+		if m, ok := readSkillManifest(filepath.Join(dir, skillManifestFile)); ok {
+			ownerID, ownerName = m.TemplateID, m.SourceTemplateName
+		}
+	}
 	writeJSON(w, 200, map[string]any{
-		"skill_name":   slug,
-		"display_name": displayName,
-		"content":      content,
-		"truncated":    len([]rune(md)) > 2000,
+		"skill_name":         slug,
+		"display_name":       displayName,
+		"content":            content,
+		"truncated":          len([]rune(md)) > 2000,
+		"bound_skill":        t.SkillName,
+		"target_exists":      targetExists,
+		"target_owner_id":    ownerID,
+		"target_owner_name":  ownerName,
+		"target_overwritable": targetExists && targetSentinel && (ownerID == 0 || ownerID == t.ID),
 	})
 }
 

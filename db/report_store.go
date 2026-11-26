@@ -135,7 +135,10 @@ type ReportTemplate struct {
 	Remark      string          `json:"remark"`
 	// DocxPath = 用户上传的模板原件（相对 dataDir）。非空且文件存在时报告
 	// 渲染走模板填充（保留原版式）；空=按章节重建。
-	DocxPath  string    `json:"docx_path"`
+	DocxPath string `json:"docx_path"`
+	// SkillName = 该模板蒸馏出的 skill 目录名。空=从未蒸馏；再次蒸馏时
+	// 前端/接口以此判断「已有对应 skill，是否覆盖」，避免每次生成新 skill。
+	SkillName string    `json:"skill_name"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -178,7 +181,8 @@ var (
 const reportTemplateCols = `id, name, COALESCE(version,1), is_default, output_lang,
 	COALESCE(skeleton, '[]'::jsonb), COALESCE(style, '{}'::jsonb), COALESCE(prompts, '{}'::jsonb),
 	COALESCE(issuer, ''), COALESCE(logo_path, ''), COALESCE(personnel, '[]'::jsonb),
-	COALESCE(cvss_enabled, false), COALESCE(remark, ''), COALESCE(docx_path, ''), created_at, updated_at`
+	COALESCE(cvss_enabled, false), COALESCE(remark, ''), COALESCE(docx_path, ''),
+	COALESCE(skill_name, ''), created_at, updated_at`
 
 func scanReportTemplate(row interface{ Scan(...any) error }) (*ReportTemplate, error) {
 	t := &ReportTemplate{}
@@ -186,7 +190,7 @@ func scanReportTemplate(row interface{ Scan(...any) error }) (*ReportTemplate, e
 	if err := row.Scan(&t.ID, &t.Name, &t.Version, &t.IsDefault, &t.OutputLang,
 		&skel, &style, &prompts,
 		&t.Issuer, &t.LogoPath, &personnel,
-		&t.CVSSEnabled, &t.Remark, &t.DocxPath, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		&t.CVSSEnabled, &t.Remark, &t.DocxPath, &t.SkillName, &t.CreatedAt, &t.UpdatedAt); err != nil {
 		return nil, err
 	}
 	if t.Version <= 0 {
@@ -917,4 +921,20 @@ func (d *DB) ResolveTemplateIDBySettings(explicit int64) (*ReportTemplate, error
 		}
 	}
 	return d.GetDefaultReportTemplate()
+}
+
+// SetReportTemplateSkill 记录/清除「模板 → 蒸馏产物 skill」的绑定。
+// name 为空表示解除绑定（skill 目录被删或改用其它名称导出后由调用方决定）。
+// 单独一个方法而不是走 UpdateReportTemplate：后者会触发骨架版本快照，
+// 只是换一个绑定名不该产生历史版本。
+func (d *DB) SetReportTemplateSkill(id int64, name string) error {
+	res, err := d.Exec(`UPDATE report_templates SET skill_name=$2 WHERE id=$1`,
+		id, strings.TrimSpace(name))
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrReportTemplateNotFound
+	}
+	return nil
 }

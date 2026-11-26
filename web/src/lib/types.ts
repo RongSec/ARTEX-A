@@ -1860,6 +1860,9 @@ export interface ReportTemplate {
   remark: string;
   // 模板原件（用户上传的 docx，相对 dataDir；空=未上传）。渲染以它为底稿填充。
   docx_path: string;
+  // 该模板蒸馏出的 skill 目录名；空=从未蒸馏。再次蒸馏默认覆盖同一个，
+  // 避免每次生成新的 report-t<id>。
+  skill_name: string;
   created_at: string;
   updated_at: string;
 }

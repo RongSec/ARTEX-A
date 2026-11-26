@@ -105,6 +105,17 @@ RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@late
     && playwright-cli --help \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
+# NetExec（nxc）：AD / 横向移动的核心工具。
+# 为什么烘进底座而不是让页面装：它不在 PyPI（项目 404），依赖里 certipy / impacket /
+# oscrypto 三个都写死成 git+https://github.com/...。受限网络下实测三步全挂：
+# PyPI 找不到包 → 换 GitHub 源码包 → poetry-dynamic-versioning 要 .git → 再换
+# git clone → TLS 被中断。装一次要碰运气，不如构建时装好（约 60MB）。
+# 版本钉死：升级需改这里并 bump docker/base/TAG。
+RUN set -eux; \
+    pip install --no-cache-dir --break-system-packages \
+      "git+https://github.com/Pennyw0rth/NetExec@v1.5.1"; \
+    nxc --version
+
 # ---- 预置探测工具层（nuclei / httpx / subfinder / katana / dnsx / tlsx / chisel / ffuf …
 #      共 9 件，约 380MB）----
 # 二进制由 docker/hostbin/fetch.sh 在构建前现取，不入库；CI 会为 amd64 与 arm64

@@ -1586,6 +1586,7 @@ CREATE TABLE IF NOT EXISTS report_templates (
     cvss_enabled BOOLEAN NOT NULL DEFAULT false,             -- 报告中是否呈现 CVSS 评分
     remark       TEXT NOT NULL DEFAULT '',                   -- 备注（模板用途说明等）
     docx_path    TEXT NOT NULL DEFAULT '',                   -- 用户上传的模板原件（相对 dataDir；非空=填充式渲染、保留原版式）
+    skill_name   TEXT NOT NULL DEFAULT '',                   -- 该模板蒸馏出的 skill 目录名（report_templates→skills/ 绑定；空=从未蒸馏）
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -1600,6 +1601,9 @@ ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL D
 -- 非空且文件存在 → 渲染走 template_filler.py（以原件为底稿填充，保留页眉页脚/
 -- 封面/版式）；空或文件缺失 → 回退 report_builder.py 按章节重建。
 ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS docx_path TEXT NOT NULL DEFAULT '';
+-- V13-SKILLBIND：模板 → 蒸馏产物 skill 的绑定。重复蒸馏时据此判断
+-- 「已有对应 skill，是否覆盖」，而不是靠前端内存或目录名猜。
+ALTER TABLE report_templates ADD COLUMN IF NOT EXISTS skill_name TEXT NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS report_template_versions (
     id          BIGSERIAL PRIMARY KEY,
     template_id BIGINT NOT NULL REFERENCES report_templates(id) ON DELETE CASCADE,

@@ -312,11 +312,20 @@ function ReportTemplatesInner() {
   const [distillDisplay, setDistillDisplay] = React.useState("");
   const [distillErr, setDistillErr] = React.useState("");
   const [previewBusy, setPreviewBusy] = React.useState(false);
-  const [skillPreview, setSkillPreview] = React.useState<{ content: string; truncated: boolean } | null>(null);
+  const [skillPreview, setSkillPreview] = React.useState<{
+    content: string;
+    truncated: boolean;
+    skill_name?: string;
+    bound_skill?: string;
+    target_exists?: boolean;
+    target_owner_id?: number;
+    target_owner_name?: string;
+  } | null>(null);
 
   const openDistill = () => {
     if (selectedId == null) return;
-    setDistillName(skillExported[selectedId] ?? "");
+    // 优先带出模板已绑定的 skill：留空即覆盖它，不会每次生成新的。
+    setDistillName(selected?.skill_name || skillExported[selectedId] || "");
     setDistillDisplay(draft?.name ?? "");
     setDistillErr("");
     setSkillPreview(null);
@@ -352,20 +361,42 @@ function ReportTemplatesInner() {
       setDistillErr("名称需以小写字母或数字开头，仅含小写字母/数字/-/_，长度 2-49");
       return;
     }
-    const prior = skillExported[selectedId];
-    if (prior && prior === name && !window.confirm(`本模板已蒸馏为 Skill「${prior}」，再次蒸馏将覆盖同名 Skill，是否继续？`)) return;
     setToSkillBusy(true);
     setDistillErr("");
     try {
+      // 先问服务端目标状态：已存在才弹确认，避免「以为新建、实际覆盖」。
+      const pv = await api.reportTemplateSkillPreview(selectedId, {
+        name: name || undefined,
+        display_name: distillDisplay.trim() || undefined,
+      });
+      let overwrite = false;
+      if (pv.target_exists) {
+        const owner =
+          pv.target_owner_id && pv.target_owner_id !== selectedId
+            ? `模板 #${pv.target_owner_id}「${pv.target_owner_name ?? ""}」`
+            : pv.bound_skill
+              ? "本模板已绑定"
+              : "此前导出";
+        const ok = window.confirm(
+          `Skill「${pv.skill_name}」已存在（${owner}）。\n覆盖后，手工改过的内容会丢失。继续？`,
+        );
+        if (!ok) {
+          setToSkillBusy(false);
+          return;
+        }
+        overwrite = true;
+      }
       const r = await api.reportTemplateToSkill(selectedId, {
         name: name || undefined,
         display_name: distillDisplay.trim() || undefined,
+        overwrite,
       });
       setSkillResult(r);
       setDistillOpen(false);
       setSkillOpen(true);
       setSkillExported((m) => ({ ...m, [selectedId]: r.skill_name }));
-      toast.success(`已蒸馏为 Skill：${r.skill_name}`);
+      void loadTemplates(false);
+      toast.success(`已蒸馏为 Skill：${r.skill_name}${r.overwritten ? "（已覆盖）" : ""}`);
     } catch (e) {
       setDistillErr(`蒸馏为 Skill 失败：${(e as Error).message}`);
     } finally {
@@ -836,6 +867,11 @@ function ReportTemplatesInner() {
               <p className="text-muted-foreground text-[11px]">
                 小写字母或数字开头，仅含小写字母/数字/-/_，长度 2-49。
               </p>
+              {selected?.skill_name ? (
+                <p className="text-[11px] text-amber-600">
+                  本模板已绑定 Skill「{selected.skill_name}」，留空将覆盖同一个；改名则新建并改绑。
+                </p>
+              ) : null}
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="distill-display" className="text-xs">
@@ -870,7 +906,7 @@ function ReportTemplatesInner() {
               取消
             </Button>
             <Button onClick={() => void toSkill()} disabled={toSkillBusy}>
-              {toSkillBusy ? <Spinner /> : null} 开始蒸馏
+              {toSkillBusy ? <Spinner /> : null} {skillPreview?.target_exists ? "覆盖并蒸馏" : "开始蒸馏"}
             </Button>
           </DialogFooter>
         </DialogContent>

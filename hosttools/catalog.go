@@ -64,6 +64,9 @@ var preinstalled = map[string]bool{
 	// Go 二进制层（docker/hostbin/fetch.sh VERSIONS）
 	"nuclei": true, "httpx": true, "subfinder": true, "katana": true,
 	"dnsx": true, "tlsx": true, "chisel": true, "amass": true,
+	// NetExec 烘在底座里（docker/base/Dockerfile）：它的依赖全是 git+GitHub，
+	// 受限网络下从页面装必然失败，所以不做成「可自动安装」。
+	"nxc": true,
 	// ffuf / dalfox 是可选件：镜像里有就装，没有也不阻断构建（见 Dockerfile.hostbin）。
 }
 
@@ -231,7 +234,7 @@ func Catalog() []Tool {
 
 		// ---- 后渗透 ----
 		{Key: "impacket", Name: "impacket (secretsdump.py)", Bin: "secretsdump.py", Category: "后渗透", Install: pipx("impacket"), Note: "smbexec/wmiexec/secretsdump 一族"},
-		{Key: "nxc", Name: "netexec", Bin: "nxc", Category: "后渗透", Install: pipx("netexec")},
+		{Key: "nxc", Name: "netexec", Bin: "nxc", Category: "后渗透", Hint: "镜像已内置 v1.5.1。升级：pip3 install --break-system-packages -U git+https://github.com/Pennyw0rth/NetExec@v1.5.1（需能访问 GitHub）"},
 		{Key: "evil-winrm", Name: "evil-winrm", Bin: "evil-winrm", Category: "后渗透", Hint: "Debian 源无此包；用 gem install evil-winrm（需 ruby）"},
 		{Key: "chisel", Name: "chisel", Bin: "chisel", Category: "后渗透", Install: goInstall("github.com/jpillora/chisel")},
 		{Key: "ligolo-ng", Name: "ligolo-ng (proxy)", Bin: "ligolo-proxy", Category: "后渗透", Install: "", Hint: "下载 release：https://github.com/nicocha30/ligolo-ng/releases"},

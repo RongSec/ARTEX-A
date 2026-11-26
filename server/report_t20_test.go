@@ -231,6 +231,14 @@ func TestToSkillCreatesSlugDir(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		return rec.Code, rec.Body.String()
 	}
+	postJSON := func(path, body string) (int, string) {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
 
 	tpl, err := m.pg.CreateReportTemplate(db.ReportTemplateInput{
 		Name:       "BUG1 中文模板",
@@ -254,9 +262,17 @@ func TestToSkillCreatesSlugDir(t *testing.T) {
 		}
 	}
 
-	// 幂等重导：200。
-	if code, body = post("/api/report-templates/" + strconv.FormatInt(tpl.ID, 10) + "/to-skill"); code != 200 {
-		t.Fatalf("re-export must be idempotent, got %d %s", code, body)
+	// 重导：未确认覆盖必须 409（V13-SKILLBIND：不再静默覆盖用户改过的 skill）；
+	// 带 overwrite=true 才允许覆盖。
+	if code, body = post("/api/report-templates/" + strconv.FormatInt(tpl.ID, 10) + "/to-skill"); code != 409 {
+		t.Fatalf("re-export without overwrite must 409, got %d %s", code, body)
+	}
+	if code, body = postJSON("/api/report-templates/"+strconv.FormatInt(tpl.ID, 10)+"/to-skill", `{"overwrite":true}`); code != 200 {
+		t.Fatalf("re-export with overwrite must succeed, got %d %s", code, body)
+	}
+	// 绑定必须落库：模板 → skill 名。
+	if got, err := m.pg.GetReportTemplate(tpl.ID); err != nil || got == nil || got.SkillName != slug {
+		t.Fatalf("template must bind skill %q, got %+v err=%v", slug, got, err)
 	}
 
 	// 非哨兵同名目录 → 409 且不覆写。

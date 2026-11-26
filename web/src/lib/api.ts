@@ -1932,15 +1932,20 @@ export const api = {
   // 非法，502=LLM 失败或输出不可解析。
   reportTemplateChat: (id: number, req: TemplateChatRequest) =>
     post<TemplateChatResponse>(`/report-templates/${id}/chat`, req),
-  // T20 模板转 skill（幂等：同哨兵目录覆盖，非哨兵 409）。
+  // T20 模板转 skill。同名目录已存在时必须显式 overwrite=true（后端 409
+  // 兜底），前端拿到 skill-preview 的目标状态后先问用户。
   reportTemplateToSkill: (
     id: number,
-    input?: { name?: string; display_name?: string },
+    input?: { name?: string; display_name?: string; overwrite?: boolean },
   ) =>
     post<{
       skill_name: string;
       dir?: string;
       checks?: { skill_md: boolean; meta: boolean; size: number };
+      overwritten?: boolean;
+      previous_skill?: string;
+      bound_skill?: string;
+      bind_error?: string;
     }>(`/report-templates/${id}/to-skill`, input ?? {}),
   // V9-RULE：蒸馏前预览将要写入的 SKILL.md（前 2000 字符，不落盘）。
   reportTemplateSkillPreview: (
@@ -1956,6 +1961,13 @@ export const api = {
       display_name: string;
       content: string;
       truncated: boolean;
+      // 本模板已绑定的 skill（空=从未蒸馏）。
+      bound_skill?: string;
+      // 目标目录现状：已存在、归属模板、是否可覆盖。
+      target_exists?: boolean;
+      target_owner_id?: number;
+      target_owner_name?: string;
+      target_overwritable?: boolean;
     }>(`/report-templates/${id}/skill-preview${suffix}`);
   },
   // T20 从 skill 读模板预填体（不建模板；前端填进新建表单）。
