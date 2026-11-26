@@ -9,6 +9,19 @@ __pycache__/
 *.pyc
 *.pyo
 
+# 运行时新建的技能落在 skills/（开发模式下 SkillDir 默认 = BaseDir()/skills）。
+# 只有镜像内置的三个入库，其余一概忽略——技能是使用数据，不是源码。
+skills/*
+!skills/api-recon/
+!skills/playwright-cli/
+!skills/scopesentry/
+
+# 报告模板样本属于使用数据，不入库（2026-11-26 曾因提交真实模板泄露姓名/手机号）。
+# 本地想跑模板渲染断言，往这个路径放一份自己的模板即可。
+report/pybuilder/testdata/*.docx
+report/pybuilder/testdata/*.xlsx
+report/pybuilder/testdata/*.pdf
+
 # frontend
 web/node_modules/
 web/.next/

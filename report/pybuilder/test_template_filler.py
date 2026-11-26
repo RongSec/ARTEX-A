@@ -6,7 +6,11 @@
     cd report/pybuilder && python -m unittest test_template_filler -v
 
 Go 侧 report/docxgen_tpl_test.go 会调用本套件；无 python/python-docx 环境
-Go 测 skip。模板样本 = testdata/tpl_cn.docx（用户真实报告模板）。
+Go 测 skip。
+
+模板样本**不入库**：真实客户模板属于使用数据，历史上就因为把它提交进公开
+仓库泄露过姓名与手机号（2026-11-26 已重写历史）。本套件在 testdata/tpl_cn.docx
+存在时才跑，本地想验证模板渲染就往该路径放一份自己的模板。
 """
 import os
 import tempfile
@@ -18,6 +22,11 @@ from docx.oxml.ns import qn
 from template_filler import fill
 
 TPL = os.path.join(os.path.dirname(__file__), "testdata", "tpl_cn.docx")
+HAS_TPL = os.path.exists(TPL)
+needs_tpl = unittest.skipUnless(
+    HAS_TPL,
+    "testdata/tpl_cn.docx 不入库（属使用数据）；本地放一份真实模板再跑模板渲染断言",
+)
 HEADER_TEXT = "                                      示例科技有限公司"
 FOOTER_TEXT = "第 32 页 共 32 页"
 
@@ -103,6 +112,7 @@ def fingerprint(doc):
     }
 
 
+@needs_tpl
 class TemplateFillerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -212,6 +222,7 @@ class TemplateFillerTest(unittest.TestCase):
         self.assertEqual(vuln_block_tables(doc), [])
 
 
+@needs_tpl
 class CoverTitleSemanticsTest(unittest.TestCase):
     """封面标题 = 报告名 title；正文/表格的 `xx系统` = 系统名（两者不等价）。"""
 
@@ -252,6 +263,7 @@ class CoverTitleSemanticsTest(unittest.TestCase):
         self.assertEqual(target, self.SYSTEM_NAME)
 
 
+@needs_tpl
 class FindingImagesTest(unittest.TestCase):
     """V9-SHOT：漏洞证明单元格里的报文截图注入（顺序/图注/缺图降级）。"""
 

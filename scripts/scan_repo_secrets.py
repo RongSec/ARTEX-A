@@ -70,6 +70,7 @@ HARD_PATHS = [
     (re.compile(r"\.db(-wal|-shm)?$"), "SQLite 数据库文件"),
     (re.compile(r"dist\.bak"), "陈旧构建产物"),
     (re.compile(r"\.(pcap|pcapng)$"), "抓包文件"),
+    (re.compile(r"report/pybuilder/testdata/.*\.(docx|xlsx|pptx|pdf)$"), "报告模板样本（使用数据，不入库）"),
 ]
 
 SKIP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".ttf", ".ttc", ".woff", ".woff2",

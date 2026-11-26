@@ -10,6 +10,10 @@ cd "$(dirname "$0")"
 # 每个 clone 装一次即可；装不上不阻断开发，CI 仍会拦。
 git config core.hooksPath .githooks 2>/dev/null || true
 
+# 开发模式下 SkillDir 默认是 BaseDir()/skills，而 go run 的 BaseDir 就是源码根，
+# 于是界面上新建的技能会写进仓库目录。指到 data/ 下（已 ignore），保持源码干净。
+export ARTEX_SKILL_DIR="$PWD/data/skills"
+
 # 退出时结束本进程组内的所有子进程（后端 + 前端）。
 cleanup() { kill 0 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
