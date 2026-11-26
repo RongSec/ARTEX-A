@@ -116,10 +116,22 @@ RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@late
 # oscrypto / pynfsclient 三个 git 依赖，能正常装。升级前先在 CI 试装。
 # 注意 `nxc --version | head -1`：首次运行会建 ~/.nxc 并返回 1，不接管道
 # 会让整层构建判失败（实测装是成功的，只是退出码非 0）。
+# arm64 上 aardwolf / arc4 没有预编译 wheel，要现场编 C 扩展；amd64 有
+# manylinux wheel 不需要。编译工具在同一层装上再清掉，最终镜像不留体积。
 RUN set -eux; \
+    extra=""; \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends gcc libc6-dev; \
+      extra=1; \
+    fi; \
     pip install --no-cache-dir --break-system-packages \
       "git+https://github.com/Pennyw0rth/NetExec@v1.4.0"; \
-    nxc --version | head -1
+    nxc --version | head -1; \
+    if [ -n "$extra" ]; then \
+      apt-get purge -y gcc libc6-dev; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # ---- 预置探测工具层（nuclei / httpx / subfinder / katana / dnsx / tlsx / chisel / ffuf …
 #      共 9 件，约 380MB）----
