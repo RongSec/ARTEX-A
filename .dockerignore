@@ -25,3 +25,17 @@ bench/seed_v2.sh
 backups
 docker/.update-state
 _verify_data
+
+# ── 敏感素材：当前 Dockerfile 是白名单 COPY（dist/ start.sh skills/），
+#    这些本来进不去镜像；列在这里是防以后有人写 COPY . . 时把客户素材带出去。
+screenshots
+docs
+report/pybuilder/testdata
+*.docx
+*.xlsx
+*.pptx
+*.pdf
+*.pcap
+*.pcapng
+.env
+docker/.env

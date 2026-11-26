@@ -30,7 +30,7 @@ type TaskScope struct {
 // stripHostPort drops a trailing :port from a host:port / ip:port / [ipv6]:port
 // value, returning the bare host. Bare hosts, bare IPs (v4 or v6, whose colons make
 // them ambiguous), and anything not in host:port form are returned unchanged. Scope
-// is host/net based, so the port from a target like "10.0.188.136:3000" or
+// is host/net based, so the port from a target like "10.0.0.136:3000" or
 // "api.example.com:8080" is simply discarded rather than baked into the key.
 func stripHostPort(v string) string {
 	v = strings.TrimSpace(v)

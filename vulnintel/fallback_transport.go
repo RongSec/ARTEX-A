@@ -10,7 +10,7 @@ import (
 
 // fallbackTransport 在代理传输失败时回退到直连。
 //
-// 为什么需要：出网代理不是万能的。实测（2026-10-21）代理 10.10.70.14:7897
+// 为什么需要：出网代理不是万能的。实测（2026-10-21）代理 10.0.0.14:7897
 // 对 api.github.com 正常（200），但对 www.cisa.gov / services.nvd.nist.gov
 // 会「CONNECT 成功、然后 TLS 握手时 unexpected eof」——隧道建起来却不转发数据。
 // 于是同一轮同步里 GitHub 源成功、NVD/KEV 源全挂，表现为 EOF。

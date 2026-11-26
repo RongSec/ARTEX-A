@@ -1,0 +1,19 @@
+#!/bin/sh
+# 提交前敏感内容闸门。只扫暂存区，正常几秒内完成。
+#
+# 安装（每个 clone 一次）：  git config core.hooksPath .githooks
+# 临时绕过（不建议）：        git commit --no-verify
+#
+# 与 CI 的 .github/workflows/secret-scan.yml 共用 scripts/scan_repo_secrets.py，
+# 本地和线上同一套规则，避免"本地过了 CI 挂"。
+set -e
+
+root=$(git rev-parse --show-toplevel)
+py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
+
+if [ -z "$py" ]; then
+    echo "⚠️  未找到 python/python3，跳过敏感内容检查（CI 仍会拦）"
+    exit 0
+fi
+
+exec "$py" "$root/scripts/scan_repo_secrets.py" --staged
