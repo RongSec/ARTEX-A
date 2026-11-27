@@ -184,6 +184,9 @@ function CreateProjectDialog({
   const [taskTemplateID, setTaskTemplateID] = React.useState<number | null>(null);
   const [templates, setTemplates] = React.useState<{ id: number; name: string; is_default: boolean }[]>([]);
   const [saving, setSaving] = React.useState(false);
+  // 模态弹窗会给 body 设 pointer-events:none，模板下拉默认 portal 到 body 就点不中
+  // （表现为「选不中任务模板」）。把下拉 portal 到弹窗内容里，点击才落得到选项上。
+  const dialogContentRef = React.useRef<HTMLDivElement>(null);
 
   const targetList = React.useMemo(() => rowsToTargets(targetRows), [targetRows]);
 
@@ -287,7 +290,7 @@ function CreateProjectDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !saving && onOpenChange(o)}>
-      <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-3xl">
+      <DialogContent ref={dialogContentRef} className="max-h-[92vh] overflow-y-auto sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>新建项目</DialogTitle>
         </DialogHeader>
@@ -369,6 +372,7 @@ function CreateProjectDialog({
               targets={targetRaw}
               selectedTemplateID={taskTemplateID}
               onSelectedTemplateIDChange={setTaskTemplateID}
+              portalContainer={dialogContentRef}
               referenceOnly
               onApply={(t) => {
                 if (t.constraints?.length) {

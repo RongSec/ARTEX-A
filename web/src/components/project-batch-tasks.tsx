@@ -67,6 +67,8 @@ export function ProjectBatchTasks({
   const [categories, setCategories] = React.useState<{ id: number; name: string }[]>([]);
   const [template, setTemplate] = React.useState<TaskTemplate | null>(null);
   const [submitting, setSubmitting] = React.useState(false);
+  // 模态弹窗 body 上 pointer-events:none，模板下拉得 portal 回弹窗内容里才能点中。
+  const dialogContentRef = React.useRef<HTMLDivElement>(null);
 
   const targetList = React.useMemo(() => rowsToTargets(targetRows), [targetRows]);
   const willCreate = targetList.length;
@@ -185,7 +187,7 @@ export function ProjectBatchTasks({
         <SendIcon data-icon="inline-start" /> 批量下发
       </Button>
       <Dialog open={open} onOpenChange={(o) => !submitting && setOpen(o)}>
-        <DialogContent className="max-h-[92vh] gap-0 overflow-y-auto sm:max-w-4xl">
+        <DialogContent ref={dialogContentRef} className="max-h-[92vh] gap-0 overflow-y-auto sm:max-w-4xl">
           <DialogHeader>
             <DialogTitle>批量创建任务</DialogTitle>
           </DialogHeader>
@@ -266,6 +268,7 @@ export function ProjectBatchTasks({
                 if (id === null) setTemplate(null);
               }}
               onApply={(t) => applyTemplate(t)}
+              portalContainer={dialogContentRef}
             />
             {template && (
               <p className="text-muted-foreground -mt-2 text-xs">
