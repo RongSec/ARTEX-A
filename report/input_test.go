@@ -285,4 +285,9 @@ func TestMarkdownSection(t *testing.T) {
 	if got := markdownSection("**修复建议**\n打补丁。", "修复建议"); got != "打补丁。" {
 		t.Errorf("bold heading not recognized: %q", got)
 	}
+	// 章节内的加粗小标题（**短期**）不是章节边界，不能把正文截空。
+	bold := "## 修复建议\n\n**短期（可立即落地）**\n- 轮换密钥。\n\n**中期**\n- 改 AES-GCM。\n\n## 参考\n链接。"
+	if got := markdownSection(bold, "修复建议"); !strings.Contains(got, "轮换密钥") || !strings.Contains(got, "AES-GCM") || strings.Contains(got, "链接") {
+		t.Errorf("bold subheading should stay inside section: %q", got)
+	}
 }

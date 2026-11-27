@@ -255,8 +255,17 @@ func markdownSection(md string, names ...string) string {
 		}
 		var buf []string
 		for j := i + 1; j < len(lines); j++ {
-			if _, lv, isHeading := mdHeading(lines[j]); isHeading && (level == 0 || lv == 0 || lv <= level) {
-				break
+			if _, lv, isHeading := mdHeading(lines[j]); isHeading {
+				// 章节本身是 ATX 标题（## 修复建议）时，只被同级/更高级的 ATX
+				// 标题截断；`**短期（可立即落地）**` 这类加粗小标题只是段落，
+				// 不能当章节边界（否则修复建议会在第一个加粗小标题处被截空）。
+				// 章节本身是加粗/短标签（level=0）时，任何标题都视为下一节。
+				if level == 0 {
+					break
+				}
+				if lv > 0 && lv <= level {
+					break
+				}
 			}
 			buf = append(buf, lines[j])
 		}
