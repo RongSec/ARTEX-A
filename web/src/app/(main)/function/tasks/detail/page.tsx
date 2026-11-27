@@ -364,9 +364,10 @@ function TaskDetailInner() {
             aria-label="返回上一页"
             // 任务详情可从「项目与任务」「任务列表」「报告中心」等多处进入。
             // 硬编码回 /function/tasks 会把从项目页进来的用户甩到另一个列表，
-            // 所以优先走浏览器历史；无历史（新标签直接打开）才回任务列表。
+            // 所以优先走浏览器历史。新标签直接打开时 history.length 只有 1~2
+            // （含初始 about:blank），没有可回退的站内页面，才回任务列表。
             onClick={() => {
-              if (window.history.length > 1) router.back();
+              if (window.history.length > 2) router.back();
               else router.push("/function/tasks");
             }}
           >
