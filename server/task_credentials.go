@@ -111,20 +111,43 @@ func authItemsFor(creds []TaskCredentialInput, target string) []map[string]any {
 		if !credentialAppliesTo(c, target) {
 			continue
 		}
-		item := map[string]any{"type": c.Type}
-		if c.Username != "" {
-			item["username"] = c.Username
-		}
-		if c.Password != "" {
-			item["password"] = c.Password
-		}
-		if c.Token != "" {
-			item["token"] = c.Token
-		}
-		if c.Description != "" {
-			item["description"] = c.Description
-		}
-		out = append(out, item)
+		out = append(out, credentialAuthItem(c))
 	}
 	return out
 }
+
+// credentialAuthItem 把一行凭据转成 assets.auth 的条目。
+func credentialAuthItem(c TaskCredentialInput) map[string]any {
+	item := map[string]any{"type": c.Type}
+	if c.Username != "" {
+		item["username"] = c.Username
+	}
+	if c.Password != "" {
+		item["password"] = c.Password
+	}
+	if c.Token != "" {
+		item["token"] = c.Token
+	}
+	if c.Description != "" {
+		item["description"] = c.Description
+	}
+	return item
+}
+
+// credentialTargets 返回凭据行里显式指定的目标（去重，保持顺序）。
+// 单任务创建时资产列表在描述文本里而不是结构化字段，只按目标描述匹配会
+// 丢掉「目标写在 description、goal 只写意图」的凭据——线上实测这类凭据
+// 全部没落库（assets.auth 为空）。调用方按这些目标逐个补写。
+func credentialTargets(creds []TaskCredentialInput) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range creds {
+		if c.Target == "" || seen[c.Target] {
+			continue
+		}
+		seen[c.Target] = true
+		out = append(out, c.Target)
+	}
+	return out
+}
+

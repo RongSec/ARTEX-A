@@ -446,6 +446,33 @@ func (s *Server) deleteAssets(w http.ResponseWriter, r *http.Request) {
 // POST /api/assets
 // =====================================================================
 
+// setAssetAuth 整段替换某资产的凭据（PUT /api/assets/{id}/auth）。
+// 用于任务详情的「测试资产」卡片：改密码要顶掉旧条目，Upsert 的合并语义做不到。
+func (s *Server) setAssetAuth(w http.ResponseWriter, r *http.Request) {
+	as := s.assetStore()
+	if as == nil {
+		writeErr(w, 503, "database unavailable")
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, 400, "非法资产 id")
+		return
+	}
+	var req struct {
+		Auth []map[string]any `json:"auth"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if err := as.SetAssetAuth(id, req.Auth); err != nil {
+		writeErr(w, 500, "更新凭据失败: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
 func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 	as := s.assetStore()
 	if as == nil {
@@ -510,9 +537,11 @@ func (s *Server) insertAssets(w http.ResponseWriter, r *http.Request) {
 		var err error
 		switch a.Type {
 		case "root_domain":
-			id, err = as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: a.Domain, ICP: a.ICP, TaskID: req.TaskID})
+			// Auth 必须透传：任务详情「测试资产」卡片新增一行时就带账号密码，
+			// 漏传会让凭据只留在表单里、assets.auth 为空。
+			id, err = as.UpsertRootDomain(db.UpsertRootDomainReq{Domain: a.Domain, ICP: a.ICP, Auth: a.Auth, TaskID: req.TaskID})
 		case "ip":
-			id, err = as.UpsertIP(db.UpsertIPReq{IP: a.IP, BoundDomains: a.BoundDomains, OpenPorts: a.OpenPorts, TaskID: req.TaskID})
+			id, err = as.UpsertIP(db.UpsertIPReq{IP: a.IP, BoundDomains: a.BoundDomains, OpenPorts: a.OpenPorts, Auth: a.Auth, TaskID: req.TaskID})
 		case "subdomain":
 			id, err = as.UpsertSubdomain(db.UpsertSubdomainReq{Domain: a.Domain, RecordType: a.RecordType, RecordValue: a.RecordValue, ICP: a.ICP, TaskID: req.TaskID})
 		case "app":

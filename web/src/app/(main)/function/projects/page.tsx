@@ -237,6 +237,9 @@ function CreateProjectDialog({
         auto_report_tasks: autoReportTasks,
         reader_enabled: reader,
         task_template_id: taskTemplateID,
+        // 项目默认测试资产：随项目保存，批量下发时作为默认值带出。
+        targets: targetRaw,
+        credentials: rowsToCredentials(targetRows),
       });
       // 约束先落项目：之后每次批量下发都会复制一份到新任务，作为项目默认边界。
       if (constraintItems.length > 0) {
@@ -366,6 +369,7 @@ function CreateProjectDialog({
               targets={targetRaw}
               selectedTemplateID={taskTemplateID}
               onSelectedTemplateIDChange={setTaskTemplateID}
+              referenceOnly
               onApply={(t) => {
                 if (t.constraints?.length) {
                   setConstraintItems(t.constraints.map((c) => ({ kind: c.kind, text: c.text })));

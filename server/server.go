@@ -838,6 +838,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/assets", s.listAssets)
 	mux.HandleFunc("GET /api/assets/counts", s.assetCounts)
 	mux.HandleFunc("POST /api/assets", s.insertAssets)
+	mux.HandleFunc("PUT /api/assets/{id}/auth", s.setAssetAuth)
 	mux.HandleFunc("DELETE /api/assets", s.deleteAssets)
 
 	// company system
@@ -1758,10 +1759,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
-	// 凭据按任务目标匹配后写进目标资产；目标解析不出来时 authItemsFor 返回空，
-	// 与无凭据建任务完全一致。
-	s.launchTaskWithAuth(t, req.Description+" "+req.Goal,
-		req.SeedFirstIntent != nil && *req.SeedFirstIntent, authItemsFor(creds, req.Goal))
+	// 凭据同时按种子文本与凭据自带的 Target 落库：单任务没有独立的资产字段，
+	// 目标通常写在描述里，只用 goal 匹配会让「目标+口令」这类凭据全部丢失。
+	s.launchTaskWithCredentials(t, req.Description+" "+req.Goal,
+		req.SeedFirstIntent != nil && *req.SeedFirstIntent, creds)
 	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
 }
 

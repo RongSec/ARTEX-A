@@ -20,6 +20,8 @@ import {
   XIcon,
 } from "lucide-react";
 
+import { toast } from "sonner";
+
 import { StatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -29,6 +31,7 @@ import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { api } from "@/lib/api";
 import type {
+  Asset,
   AssetInterceptKind,
   AssetInterceptRule,
   Finding,
@@ -700,6 +703,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           )}
         </CardContent>
       </Card>
+      <TaskTestAssetsCard taskId={taskId} />
       <TaskInterceptRulesCard taskId={taskId} />
       {coverage && coverage.enabled && coverage.scope_rows > 0 && (
         <Card>
@@ -1063,6 +1067,203 @@ const TASK_RULE_KIND_OPTIONS: { value: AssetInterceptKind; label: string; placeh
 const TASK_RULE_KIND_LABEL: Record<AssetInterceptKind, string> = Object.fromEntries(
   TASK_RULE_KIND_OPTIONS.map((o) => [o.value, o.label]),
 ) as Record<AssetInterceptKind, string>;
+
+// ---- 测试资产（总览内直接编辑，不必切 tab） ----
+
+type TaskAssetRow = {
+  assetId?: number;
+  /** 载入时的资产名；用来发现「目标被改成了另一个资产」。 */
+  original?: string;
+  target: string;
+  username: string;
+  password: string;
+};
+
+// assetTarget 取资产的展示值：IP 优先，其次 URL、域名。
+function assetTarget(a: Asset): string {
+  return a.ip || a.url || a.domain || a.root_domain || "";
+}
+
+// assetPayloadFor 按目标文本推断资产类型，供 POST /api/assets 的 Upsert 使用。
+// 类型值必须与后端 insertAssets 的 switch 一致（HTTP 资产是 service 不是 http）。
+function assetPayloadFor(target: string): Record<string, unknown> {
+  if (/^https?:\/\//i.test(target)) return { type: "service", url: target };
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(target)) return { type: "ip", ip: target };
+  return { type: "root_domain", domain: target };
+}
+
+// TaskTestAssetsCard 把该任务的资产与凭据做成一张可编辑卡片，放在资产拦截规则
+// 之前：先看「测什么、拿什么测」，再看「哪些不许测」。保存语义：
+//   - 删掉的行：从任务解绑（资产行本身保留，可能被别的任务引用）；
+//   - 已有资产：整段替换 auth（改密码要顶掉旧条目，Upsert 会合并）；
+//   - 新行：按目标类型 Upsert 并挂到本任务。
+function TaskTestAssetsCard({ taskId }: { taskId: string }) {
+  const [rows, setRows] = React.useState<TaskAssetRow[]>([]);
+  const [removed, setRemoved] = React.useState<number[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+  const [err, setErr] = React.useState("");
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await api.taskAssets(taskId, "", 200, 0);
+      const list = (r.assets ?? [])
+        .map((a) => {
+          const auth = (a.auth ?? [])[0] ?? {};
+          const target = assetTarget(a);
+          return {
+            assetId: a.id,
+            original: target,
+            target,
+            username: String(auth.username ?? ""),
+            password: String(auth.password ?? ""),
+          };
+        })
+        .filter((row) => row.target);
+      setRows(list.length > 0 ? list : [{ target: "", username: "", password: "" }]);
+      setRemoved([]);
+    } catch {
+      // 瞬时错误不打断页面
+    } finally {
+      setLoading(false);
+    }
+  }, [taskId]);
+
+  React.useEffect(() => {
+    void load();
+  }, [load]);
+
+  function updateRow(index: number, patch: Partial<TaskAssetRow>) {
+    setRows((current) => current.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  }
+
+  function removeRow(index: number) {
+    setRows((current) => {
+      const row = current[index];
+      if (row?.assetId) setRemoved((ids) => [...ids, row.assetId as number]);
+      const next = current.filter((_, i) => i !== index);
+      return next.length > 0 ? next : [{ target: "", username: "", password: "" }];
+    });
+  }
+
+  async function save() {
+    setSaving(true);
+    setErr("");
+    try {
+      for (const id of removed) {
+        await api.detachTaskAsset(taskId, id);
+      }
+      for (const row of rows) {
+        const target = row.target.trim();
+        if (!target) continue;
+        const auth =
+          row.username.trim() || row.password.trim()
+            ? [{ type: "password", username: row.username.trim(), password: row.password.trim() }]
+            : [];
+        if (row.assetId) {
+          if (row.original && row.original !== target) {
+            // 目标被改成另一个资产：旧资产解绑（行本身保留），新目标重新 Upsert 挂上来。
+            await api.detachTaskAsset(taskId, row.assetId);
+            await api.createAssets(Number(taskId), [{ ...assetPayloadFor(target), auth }]);
+          } else {
+            await api.setAssetAuth(row.assetId, auth);
+          }
+        } else {
+          await api.createAssets(Number(taskId), [{ ...assetPayloadFor(target), auth }]);
+        }
+      }
+      toast.success("测试资产已保存");
+      await load();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const dirty = rows.some((r) => r.target.trim() !== "") || removed.length > 0;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <TargetIcon className="size-4 text-emerald-500" /> 测试资产
+          <span className="text-muted-foreground text-xs font-normal">（本任务的资产与凭据，执行者用 list_assets 读取）</span>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {loading ? (
+          <p className="text-muted-foreground text-sm">加载中…</p>
+        ) : (
+          <>
+            <div className="grid grid-cols-[1fr_1fr_1fr_auto] gap-2 text-xs text-muted-foreground">
+              <span>资产</span>
+              <span>用户名</span>
+              <span>密码</span>
+              <span />
+            </div>
+            {rows.map((row, index) => (
+              <div key={`${row.assetId ?? "new"}-${index}`} className="grid grid-cols-[1fr_1fr_1fr_auto] items-center gap-2">
+                <Input
+                  value={row.target}
+                  onChange={(e) => updateRow(index, { target: e.target.value })}
+                  placeholder="10.0.0.5 / https://host:8443"
+                  disabled={saving}
+                />
+                <Input
+                  value={row.username}
+                  onChange={(e) => updateRow(index, { username: e.target.value })}
+                  placeholder="用户名"
+                  disabled={saving}
+                  autoComplete="off"
+                />
+                <Input
+                  value={row.password}
+                  onChange={(e) => updateRow(index, { password: e.target.value })}
+                  placeholder="密码"
+                  type="password"
+                  disabled={saving}
+                  autoComplete="new-password"
+                />
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  onClick={() => removeRow(index)}
+                  disabled={saving}
+                  aria-label="删除这一行"
+                >
+                  <Trash2Icon />
+                </Button>
+              </div>
+            ))}
+            <div className="flex items-center justify-between gap-3">
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                onClick={() => setRows((current) => [...current, { target: "", username: "", password: "" }])}
+                disabled={saving}
+              >
+                <PlusIcon data-icon="inline-start" /> 添加一行
+              </Button>
+              <div className="flex items-center gap-2">
+                {err && <span className="text-destructive text-xs">{err}</span>}
+                <Button type="button" size="sm" variant="outline" onClick={() => void save()} disabled={saving || !dirty}>
+                  {saving ? "保存中…" : "保存资产"}
+                </Button>
+              </div>
+            </div>
+            <p className="text-muted-foreground text-xs">
+              一行一个资产，行内填账号密码；同一资产多套口令点「添加一行」。凭据写入目标资产 auth，执行者用 list_assets 读取。
+            </p>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
 
 // TaskInterceptRulesCard 在任务详情总览里管理「任务级资产拦截 / 允许规则」：
 // 列表 + 新增 + 行内编辑 + 删除 + 启用开关。规则仅本任务生效，不进全局表。

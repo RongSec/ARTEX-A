@@ -47,6 +47,36 @@ export function rowsFromTargets(text: string): TargetCredRow[] {
   return parseTargets(text).targets.map((t) => ({ ...EMPTY_TARGET_ROW, target: t }));
 }
 
+/**
+ * rowsFromTargetsAndCreds 把「资产文本 + 凭据行」合成编辑器行（项目默认值带出用）。
+ * 文本里出现的资产按原顺序在前；凭据按 target 挂到同名的空行上，同一资产多套
+ * 口令就追加多行；只存在于凭据里、文本里没有的资产追加在末尾。
+ */
+export function rowsFromTargetsAndCreds(
+  text: string,
+  creds: Record<string, unknown>[] | undefined,
+): TargetCredRow[] {
+  const rows = rowsFromTargets(text);
+  const indexesByTarget = new Map<string, number[]>();
+  rows.forEach((r, i) => indexesByTarget.set(r.target, [...(indexesByTarget.get(r.target) ?? []), i]));
+  for (const c of creds ?? []) {
+    const target = String(c.target ?? "").trim();
+    const username = String(c.username ?? "");
+    const password = String(c.password ?? "");
+    if (!target || (!username && !password)) continue;
+    const indexes = indexesByTarget.get(target) ?? [];
+    // 优先填该资产第一条还没凭据的行，避免把已有账号覆盖掉。
+    const free = indexes.find((i) => !rows[i].username && !rows[i].password);
+    if (free !== undefined) {
+      rows[free] = { ...rows[free], username, password };
+      continue;
+    }
+    rows.push({ target, username, password });
+    indexesByTarget.set(target, [...indexes, rows.length - 1]);
+  }
+  return rows;
+}
+
 /** rowsToCredentials 转成后端 credentials 入参（丢掉没填任何凭据的行）。 */
 export function rowsToCredentials(rows: TargetCredRow[]) {
   return rows

@@ -394,6 +394,12 @@ interface TaskTemplateControlsProps {
   portalContainer?: React.RefObject<HTMLElement | null>;
   /** 覆盖选择器下方的说明文字（项目创建等「只存引用、不复制内容」的场景用）。 */
   hint?: string;
+  /**
+   * referenceOnly：选择模板只建立引用，不覆盖当前表单内容。
+   * 项目创建用 true——那里的「目的」是项目描述，模板只做默认引用，
+   * 不该弹「将覆盖已填内容」的确认（弹了用户取消就表现为「选不中」）。
+   */
+  referenceOnly?: boolean;
 }
 
 export function TaskTemplateControls({
@@ -408,6 +414,7 @@ export function TaskTemplateControls({
   onApply,
   portalContainer,
   hint,
+  referenceOnly = false,
 }: TaskTemplateControlsProps) {
   const [templates, setTemplates] = React.useState<TaskTemplate[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -454,6 +461,12 @@ export function TaskTemplateControls({
       return;
     }
     setTemplateInputValue(template.name);
+    if (referenceOnly) {
+      // 只建立引用：把 id 交出去，不调用 onApply——项目页的 onApply 会把
+      // 模板资产写进项目资产框，选中模板就冲掉用户刚粘的资产。
+      onSelectedTemplateIDChange(template.id);
+      return;
+    }
     const hasContent = description.trim() !== "" || goal.trim() !== "";
     const changesContent = description !== template.description || goal !== template.goal;
     if (hasContent && changesContent) {

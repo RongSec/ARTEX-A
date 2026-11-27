@@ -426,6 +426,21 @@ RETURNING id`, req.IP, csegVal, boundDomains, openPortsJSON, authJSON, companyID
 	return id, err
 }
 
+// SetAssetAuth 整段替换某资产的 auth 数组（nil/空 = 清空）。
+// 与 Upsert 的「合并去重」不同：这里是「编辑凭据」的语义——改密码要顶掉旧条目，
+// 合并语义会让新旧两条并存，agent 读到哪条全凭顺序。
+func (s *AssetStore) SetAssetAuth(id int64, auth []map[string]any) error {
+	if id <= 0 {
+		return fmt.Errorf("asset id is required")
+	}
+	authJSON, err := marshalJSONBArray(auth)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE assets SET auth=$1::jsonb[] WHERE id=$2`, authJSON, id)
+	return err
+}
+
 // AppendIPPort appends a {port, service} entry to an existing IP asset's open_ports.
 func (s *AssetStore) AppendIPPort(ipStr string, port int, serviceName string) error {
 	if ipStr == "" || port == 0 {

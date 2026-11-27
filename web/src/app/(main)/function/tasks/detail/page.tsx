@@ -357,10 +357,20 @@ function TaskDetailInner() {
       <header className="sticky top-0 z-10 flex flex-col gap-2 border-b bg-background/95 px-4 py-2.5 backdrop-blur lg:px-6">
         <div className="flex items-center gap-2">
           <SidebarTrigger className="-ml-1" />
-          <Button asChild variant="ghost" size="icon" className="size-7">
-            <Link href="/function/tasks">
-              <ArrowLeftIcon />
-            </Link>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7"
+            aria-label="返回上一页"
+            // 任务详情可从「项目与任务」「任务列表」「报告中心」等多处进入。
+            // 硬编码回 /function/tasks 会把从项目页进来的用户甩到另一个列表，
+            // 所以优先走浏览器历史；无历史（新标签直接打开）才回任务列表。
+            onClick={() => {
+              if (window.history.length > 1) router.back();
+              else router.push("/function/tasks");
+            }}
+          >
+            <ArrowLeftIcon />
           </Button>
           <h1 className="min-w-0 flex-1 truncate text-sm font-semibold" title={task.name || task.description}>
             {task.name || task.description}

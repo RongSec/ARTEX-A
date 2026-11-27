@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -29,9 +30,13 @@ type Project struct {
 	ReaderEnabled   bool      `json:"reader_enabled"` // 跨项目阅读开关（scope='cross' 聚合/来源校验/注入；默认关）
 	// TaskTemplateID 是项目默认任务模板（task_templates.id）；nil=未预设。
 	// 批量下发时作为默认带出，用户仍可在下发弹窗里改。
-	TaskTemplateID  *int64    `json:"task_template_id"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	TaskTemplateID *int64 `json:"task_template_id"`
+	// Targets/Credentials 是项目默认测试资产（一行一个的原始文本）与凭据行。
+	// 批量下发时作为默认值带出；项目详情页可编辑。
+	Targets     string           `json:"targets"`
+	Credentials []map[string]any `json:"credentials"`
+	CreatedAt   time.Time        `json:"created_at"`
+	UpdatedAt   time.Time        `json:"updated_at"`
 }
 
 // ProjectStats 是项目列表/详情的聚合统计（任务数/排队数/finding 分档数）。
@@ -62,12 +67,16 @@ func normalizeProjectConcurrency(n int) int {
 	return n
 }
 
-const projectCols = `id, name, description, status, owner, concurrency, observer_enabled, report_template_id, auto_report, auto_report_tasks, reader_enabled, task_template_id, created_at, updated_at`
+const projectCols = `id, name, description, status, owner, concurrency, observer_enabled, report_template_id, auto_report, auto_report_tasks, reader_enabled, task_template_id, targets, credentials, created_at, updated_at`
 
 func scanProject(sc interface{ Scan(...any) error }) (*Project, error) {
 	var p Project
-	if err := sc.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Owner, &p.Concurrency, &p.ObserverEnabled, &p.ReportTemplateID, &p.AutoReport, &p.AutoReportTasks, &p.ReaderEnabled, &p.TaskTemplateID, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	var credJSON []byte
+	if err := sc.Scan(&p.ID, &p.Name, &p.Description, &p.Status, &p.Owner, &p.Concurrency, &p.ObserverEnabled, &p.ReportTemplateID, &p.AutoReport, &p.AutoReportTasks, &p.ReaderEnabled, &p.TaskTemplateID, &p.Targets, &credJSON, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
+	}
+	if len(credJSON) > 0 {
+		_ = json.Unmarshal(credJSON, &p.Credentials)
 	}
 	return &p, nil
 }
@@ -86,6 +95,8 @@ type CreateProjectInput struct {
 	AutoReportTasks  bool   // 子任务都出报告（可与 AutoReport 同真=叠加）
 	ReaderEnabled    bool
 	TaskTemplateID   *int64 // 项目默认任务模板；nil=未预设
+	Targets          string // 项目默认测试资产文本
+	Credentials      []map[string]any
 }
 
 // CreateProject 插入一个项目（status 固定 active 起步；owner 可空）。
@@ -109,11 +120,16 @@ func (d *DB) CreateProject(in CreateProjectInput) (*Project, error) {
 	if in.TaskTemplateID != nil && *in.TaskTemplateID > 0 {
 		taskTmpl = *in.TaskTemplateID
 	}
+	credJSON, err := json.Marshal(nonNilCredentials(in.Credentials))
+	if err != nil {
+		return nil, err
+	}
 	return scanProject(d.QueryRow(`
-INSERT INTO projects(name, description, owner, concurrency, observer_enabled, report_template_id, auto_report, auto_report_tasks, reader_enabled, task_template_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+INSERT INTO projects(name, description, owner, concurrency, observer_enabled, report_template_id, auto_report, auto_report_tasks, reader_enabled, task_template_id, targets, credentials)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
 RETURNING `+projectCols, name, strings.TrimSpace(in.Description), strings.TrimSpace(in.Owner),
-		normalizeProjectConcurrency(concurrency), in.ObserverEnabled, tmpl, in.AutoReport, in.AutoReportTasks, in.ReaderEnabled, taskTmpl))
+		normalizeProjectConcurrency(concurrency), in.ObserverEnabled, tmpl, in.AutoReport, in.AutoReportTasks, in.ReaderEnabled, taskTmpl,
+		strings.TrimSpace(in.Targets), string(credJSON)))
 }
 
 // GetProject 返回单个项目；不存在时返回 ErrProjectNotFound。
@@ -237,6 +253,9 @@ type UpdateProjectPatch struct {
 	// 「键缺席」与「显式清除」，由 server 判键后置 Set。
 	TaskTemplateID    *int64
 	TaskTemplateIDSet bool
+	// Targets/Credentials：nil=键缺席（不改），非 nil=整段替换。
+	Targets     *string
+	Credentials *[]map[string]any
 }
 
 // UpdateProject 应用局部更新并返回新行。status 非法值返回错误（DDL 有 CHECK，
@@ -268,7 +287,9 @@ func (d *DB) UpdateProject(id int64, patch UpdateProjectPatch) (*Project, error)
 	auto_report   = CASE WHEN $16::boolean THEN $17 ELSE auto_report END,
 	auto_report_tasks = CASE WHEN $18::boolean THEN $19 ELSE auto_report_tasks END,
 	reader_enabled = CASE WHEN $20::boolean THEN $21 ELSE reader_enabled END,
-	task_template_id = CASE WHEN $22::boolean THEN $23::bigint ELSE task_template_id END
+	task_template_id = CASE WHEN $22::boolean THEN $23::bigint ELSE task_template_id END,
+	targets       = CASE WHEN $24::boolean THEN $25 ELSE targets END,
+	credentials   = CASE WHEN $26::boolean THEN $27::jsonb ELSE credentials END
 WHERE id=$1
 RETURNING `+projectCols,
 		id,
@@ -282,11 +303,34 @@ RETURNING `+projectCols,
 		patch.AutoReport != nil, derefBool(patch.AutoReport),
 		patch.AutoReportTasks != nil, derefBool(patch.AutoReportTasks),
 		patch.ReaderEnabled != nil, derefBool(patch.ReaderEnabled),
-		patch.TaskTemplateIDSet, taskTmplAny(patch)))
+		patch.TaskTemplateIDSet, taskTmplAny(patch),
+		patch.Targets != nil, derefStr(patch.Targets),
+		patch.Credentials != nil, credentialsJSON(patch.Credentials)))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrProjectNotFound
 	}
 	return p, err
+}
+
+// credentialsJSON 把凭据行序列化成 JSON 文本；nil 视为空数组（不是 SQL NULL，
+// 列上有 NOT NULL 默认 '[]'）。
+func credentialsJSON(creds *[]map[string]any) string {
+	if creds == nil {
+		return "[]"
+	}
+	raw, err := json.Marshal(nonNilCredentials(*creds))
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
+}
+
+// nonNilCredentials 保证序列化结果是 [] 而不是 null。
+func nonNilCredentials(creds []map[string]any) []map[string]any {
+	if creds == nil {
+		return []map[string]any{}
+	}
+	return creds
 }
 
 // taskTmplAny 把 PATCH 里的模板 id 转成可绑定值：显式清除 → nil（SQL NULL）。

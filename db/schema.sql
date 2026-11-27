@@ -1457,6 +1457,11 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 -- V12-TARGET：项目默认任务模板（存量库补列，幂等）。
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS task_template_id BIGINT;
+-- V12-TARGET：项目默认测试资产与凭据。targets 是原始资产文本（一行一个），
+-- credentials 是 [{target,type,username,password,...}]；批量下发时作为默认值
+-- 带出，项目详情页可编辑。不建子表：资产是人工录入的少量文本，存文本最直观。
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS targets TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS credentials JSONB NOT NULL DEFAULT '[]';
 CREATE INDEX IF NOT EXISTS idx_projects_alive ON projects(created_at DESC) WHERE status='active';
 DROP TRIGGER IF EXISTS trg_projects_upd ON projects;
 CREATE TRIGGER trg_projects_upd BEFORE UPDATE ON projects

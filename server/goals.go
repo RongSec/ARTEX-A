@@ -29,6 +29,30 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 	s.launchTaskWithAuth(t, seedText, seedFirstIntent, nil)
 }
 
+// launchTaskWithCredentials 是建任务带凭据的入口。凭据分两类落点：
+//   - 通用凭据（Target 为空）：写进种子文本解析出的那个目标资产；
+//   - 指定目标的凭据：逐个写进它自己的目标资产——单任务的资产列表在描述
+//     文本里而不是结构化字段，只按种子文本匹配会漏（线上实测这类凭据
+//     assets.auth 为空）。
+//
+// assets.auth 在 Upsert 里是「合并去重」，同一资产被多次 seed 不会覆盖旧凭据。
+func (s *Server) launchTaskWithCredentials(t *Task, seedText string, seedFirstIntent bool, creds []TaskCredentialInput) {
+	if !s.engine.beginTaskOperation(t.ID) {
+		return
+	}
+	s.seedWithAuth(t, seedText, authItemsFor(creds, seedText))
+	for _, target := range credentialTargets(creds) {
+		s.seedWithAuth(t, target, authItemsFor(creds, target))
+	}
+	if seedFirstIntent {
+		s.seedFirstIntent(t)
+	}
+	s.engine.decInflight(t.ID)
+	if _, err := s.admitTask(t, "bootstrap"); err != nil {
+		log.Printf("[concurrency] task %s 启动失败: %v", t.ID, err)
+	}
+}
+
 // launchTaskWithAuth 是 launchTask 的带凭据版本：种子资产落库时把 auth 一起
 // 写进 assets.auth。普通建任务（无凭据）走的仍是 launchTask → auth=nil。
 func (s *Server) launchTaskWithAuth(t *Task, seedText string, seedFirstIntent bool, auth []map[string]any) {

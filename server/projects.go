@@ -169,6 +169,10 @@ func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 		ReaderEnabled    bool   `json:"reader_enabled"`
 		// TaskTemplateID 项目默认任务模板；0/null=不预设。校验存在性后落库。
 		TaskTemplateID *int64 `json:"task_template_id"`
+		// Targets/Credentials 项目默认测试资产（原始文本）与凭据行；批量下发
+		// 时作为默认值带出，项目详情页可编辑。
+		Targets     string              `json:"targets"`
+		Credentials []map[string]any    `json:"credentials"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
@@ -212,6 +216,8 @@ func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 		AutoReportTasks:  req.AutoReportTasks,
 		ReaderEnabled:    req.ReaderEnabled,
 		TaskTemplateID:   req.TaskTemplateID,
+		Targets:          req.Targets,
+		Credentials:      req.Credentials,
 	})
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -430,6 +436,23 @@ func (s *Server) projectsUpdate(w http.ResponseWriter, r *http.Request) {
 				patch.TaskTemplateID = &n
 			}
 		}
+	}
+	// 项目默认测试资产：整段替换（空串=清空）；凭据是数组，整段替换。
+	if v, has := raw["targets"]; has {
+		var sVal string
+		if err := json.Unmarshal(v, &sVal); err != nil {
+			writeErr(w, 400, "targets 须为字符串")
+			return
+		}
+		patch.Targets = &sVal
+	}
+	if v, has := raw["credentials"]; has {
+		var rows []map[string]any
+		if err := json.Unmarshal(v, &rows); err != nil {
+			writeErr(w, 400, "credentials 须为数组")
+			return
+		}
+		patch.Credentials = &rows
 	}
 	p, err := s.m.PG().UpdateProject(pid, patch)
 	if errors.Is(err, db.ErrProjectNotFound) {

@@ -1740,6 +1740,10 @@ export interface Project {
   reader_enabled: boolean; // V6-DUAL 跨项目阅读开关：跨项目聚合/来源校验/注入。与 observer_enabled 互相独立
   /** 项目默认任务模板（task_templates.id）；null=未预设。批量下发时自动带出。 */
   task_template_id: number | null;
+  /** 项目默认测试资产（一行一个的原始文本）；批量下发时作为默认值带出。 */
+  targets: string;
+  /** 项目默认凭据行（{target,type,username,password}）；批量下发时带出。 */
+  credentials: Record<string, unknown>[];
   created_at: string;
   updated_at: string;
 }

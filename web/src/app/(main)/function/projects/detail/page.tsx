@@ -20,6 +20,13 @@ import { toast } from "sonner";
 
 import { ProjectBatchTasks } from "@/components/project-batch-tasks";
 import { ConstraintEditor, type ConstraintItem } from "@/components/constraint-editor";
+import {
+  TargetCredentialEditor,
+  rowsFromTargetsAndCreds,
+  rowsToCredentials,
+  rowsToTargets,
+  type TargetCredRow,
+} from "@/components/target-credential-editor";
 import { ProjectGraphTab } from "./project-graph-tab";
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
@@ -49,7 +56,7 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
-import type { ProjectDetail, ReportTemplate, Task } from "@/lib/types";
+import type { Project, ProjectDetail, ReportTemplate, Task } from "@/lib/types";
 
 function fmtToken(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "—";
@@ -193,6 +200,8 @@ function ProjectDetailInner() {
             projectID={p.id}
             concurrency={p.concurrency}
             defaultTemplateID={p.task_template_id}
+            defaultTargets={p.targets}
+            defaultCredentials={p.credentials}
             onDone={load}
           />
           <Button variant="outline" size="icon" onClick={load} aria-label="刷新" disabled={loading}>
@@ -259,6 +268,80 @@ function ProjectDetailInner() {
 // TasksTab 任务列表：读详情聚合 API 的 task 行，口径与任务列表页一致。
 // 每行「移出」= PATCH /tasks/{id}/project 摘归属（T05 挂/摘）；操作后 toast
 // 提示投影更新时机（对齐 T12(0)：摘除后大图靠下次重建清旧行、任务重启重绑）。
+// projectRowsFromCreds 把项目的资产文本与凭据行合成编辑器行。
+function projectRowsFromCreds(p: Project): TargetCredRow[] {
+  return rowsFromTargetsAndCreds(p.targets ?? "", p.credentials ?? []);
+}
+
+// ProjectTestAssetsCard：项目默认测试资产 + 凭据。批量下发时作为默认值带出，
+// 任务里再改不回写这里（与项目约束同口径）。放在操作约束之前，先资产后边界。
+function ProjectTestAssetsCard({ project }: { project: Project }) {
+  const [rows, setRows] = React.useState<TargetCredRow[]>(() => projectRowsFromCreds(project));
+  const [raw, setRaw] = React.useState(project.targets ?? "");
+  const [invalid, setInvalid] = React.useState<string[]>([]);
+  const [saving, setSaving] = React.useState(false);
+  const [dirty, setDirty] = React.useState(false);
+
+  React.useEffect(() => {
+    setRows(projectRowsFromCreds(project));
+    setRaw(project.targets ?? "");
+    setDirty(false);
+    // 只在切换项目时重置；同一项目保存后的本地状态不该被父级刷新覆盖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.id]);
+
+  async function save() {
+    setSaving(true);
+    try {
+      // 行是保存时的权威数据：只存文本框原文的话，删掉的行会在刷新后
+      // 按 targets 重新长出来（凭据没了但资产还在）。
+      await api.updateProject(project.id, {
+        targets: rowsToTargets(rows).join("\n"),
+        credentials: rowsToCredentials(rows),
+      });
+      setDirty(false);
+      toast.success("项目测试资产已保存，批量下发时作为默认值");
+    } catch (e) {
+      toast.error("保存失败：" + (e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="rounded-xl border p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium">测试资产（项目默认）</p>
+          <p className="text-muted-foreground mt-1 text-xs">
+            一行一个资产，行内填账号密码；同一资产多套口令点「＋」。凭据写入目标资产 auth，执行者用 list_assets 读取。
+          </p>
+        </div>
+        <Button size="sm" variant="outline" onClick={() => void save()} disabled={saving || !dirty}>
+          {saving ? "保存中…" : "保存资产"}
+        </Button>
+      </div>
+      <TargetCredentialEditor
+        rows={rows}
+        onChange={(next) => {
+          setRows(next);
+          setDirty(true);
+        }}
+        raw={raw}
+        onRawChange={(next) => {
+          setRaw(next);
+          setDirty(true);
+        }}
+        invalid={invalid}
+        onInvalidChange={setInvalid}
+        disabled={saving}
+        rawRows={4}
+        hideLabel
+      />
+    </div>
+  );
+}
+
 // ProjectConstraintsCard：项目级操作约束（批量下发时复制进每个新任务的
 // task_constraints）。创建项目时录入过的会在这里显示，可继续增删改后保存。
 function ProjectConstraintsCard({ projectID }: { projectID: number }) {
@@ -469,6 +552,7 @@ function OverviewTab({ detail, templates }: { detail: ProjectDetail; templates: 
           自动写报告：{p.auto_report ? "开（全部任务收官后按下方模板生成）" : "关"}
         </p>
       </div>
+      <ProjectTestAssetsCard project={p} />
       <ProjectConstraintsCard projectID={p.id} />
       <div className="flex items-center justify-between gap-4 rounded-xl border p-4 text-sm">
         <div className="min-w-0">

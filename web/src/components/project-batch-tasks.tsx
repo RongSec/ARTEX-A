@@ -20,6 +20,7 @@ import { TaskTemplateControls } from "@/components/task-template-controls";
 import { ConstraintEditor, type ConstraintItem } from "@/components/constraint-editor";
 import {
   TargetCredentialEditor,
+  rowsFromTargetsAndCreds,
   rowsToCredentials,
   rowsToTargets,
   type TargetCredRow,
@@ -35,12 +36,23 @@ interface ProjectBatchTasksProps {
   concurrency: number;
   /** 项目默认任务模板：打开弹窗时自动带出，用户仍可改。 */
   defaultTemplateID?: number | null;
+  /** 项目默认测试资产文本：打开弹窗时预填成行（可改，不改项目）。 */
+  defaultTargets?: string;
+  /** 项目默认凭据行：按 target 挂到对应资产行上。 */
+  defaultCredentials?: Record<string, unknown>[];
   onDone: () => void;
 }
 
 // 批量下发卡（项目详情用）：资产 + 凭据行式录入、操作约束、任务参数。
 // 与「新建项目」「新建任务」共用同一套编辑器，口径一致。
-export function ProjectBatchTasks({ projectID, concurrency, defaultTemplateID, onDone }: ProjectBatchTasksProps) {
+export function ProjectBatchTasks({
+  projectID,
+  concurrency,
+  defaultTemplateID,
+  defaultTargets = "",
+  defaultCredentials,
+  onDone,
+}: ProjectBatchTasksProps) {
   const [open, setOpen] = React.useState(false);
   const [targetRaw, setTargetRaw] = React.useState("");
   const [targetRows, setTargetRows] = React.useState<TargetCredRow[]>([]);
@@ -59,8 +71,17 @@ export function ProjectBatchTasks({ projectID, concurrency, defaultTemplateID, o
   const targetList = React.useMemo(() => rowsToTargets(targetRows), [targetRows]);
   const willCreate = targetList.length;
 
+  // defaultRows 是「项目默认测试资产」解析成的行；打开弹窗与重置都用它。
+  const defaultRows = React.useMemo(
+    () => rowsFromTargetsAndCreds(defaultTargets, defaultCredentials),
+    [defaultTargets, defaultCredentials],
+  );
+
   React.useEffect(() => {
     if (!open) return;
+    // 预填项目默认资产（用户可能已经把行改过，只在空表时填）。
+    setTargetRows((current) => (current.length > 0 ? current : defaultRows));
+    setTargetRaw((current) => (current.trim() ? current : defaultTargets));
     api.taskCategories().then(setCategories).catch(() => {});
     api
       .taskTemplates()
@@ -87,8 +108,9 @@ export function ProjectBatchTasks({ projectID, concurrency, defaultTemplateID, o
   }
 
   function reset() {
-    setTargetRaw("");
-    setTargetRows([]);
+    // 重置回项目默认值，而不是空表——项目里配好的资产就是要反复下发用的。
+    setTargetRaw(defaultTargets);
+    setTargetRows(defaultRows);
     setTargetInvalid([]);
     setConstraints([]);
     setConcurrencyOverride(String(concurrency));

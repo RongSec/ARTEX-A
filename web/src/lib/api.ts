@@ -646,6 +646,12 @@ export const api = {
   registerTaskAssetScopes: (taskId: string, scope: CompanyScopeRule[]) =>
     post<TaskAssetScopeMutation>(`/tasks/${taskId}/assets`, { scope }),
   detachTaskAsset: (taskId: string, assetId: number) => del<{ detached: number }>(`/tasks/${taskId}/assets/${assetId}`),
+  // setAssetAuth 整段替换某资产的凭据（改密码要顶掉旧条目，不能走 Upsert 合并）。
+  setAssetAuth: (assetId: number, auth: Record<string, unknown>[]) =>
+    put<{ ok: boolean }>(`/assets/${assetId}/auth`, { auth }),
+  // createAssets 新建/更新资产（按 type 走 Upsert），task_id 非空时同时挂到任务。
+  createAssets: (taskId: number, assets: Record<string, unknown>[]) =>
+    post<{ ids?: number[]; created?: number }>("/assets", { task_id: taskId, assets }),
   taskIntentAssets: (taskId: string) =>
     get<{ assets: IntentAsset[] }>(`/tasks/${taskId}/intent-assets`).then((r) => arr(r.assets)),
 
@@ -1496,6 +1502,9 @@ export const api = {
     auto_report_tasks?: boolean;
     reader_enabled?: boolean;
     task_template_id?: number | null;
+    /** 项目默认测试资产文本与凭据行；批量下发时作为默认值带出。 */
+    targets?: string;
+    credentials?: Record<string, unknown>[];
   }) =>
     post<Project>("/projects", {
       name: input.name,
@@ -1508,6 +1517,8 @@ export const api = {
       auto_report_tasks: input.auto_report_tasks ?? false,
       reader_enabled: input.reader_enabled ?? false,
       task_template_id: input.task_template_id ?? null,
+      targets: input.targets ?? "",
+      credentials: input.credentials ?? [],
     }),
   updateProject: (
     id: number | string,
@@ -1526,6 +1537,9 @@ export const api = {
       reader_enabled?: boolean;
       /** 三态同 report_template_id：键缺席=不动、null=清除、数字=绑定。 */
       task_template_id?: number | null;
+      /** 整段替换：空串=清空资产；credentials 同理。 */
+      targets?: string;
+      credentials?: Record<string, unknown>[];
     },
   ) => patch<Project>(`/projects/${id}`, patchBody),
   // deleteProject 删项目。带 options 时：五个清理开关作用于旗下任务，
