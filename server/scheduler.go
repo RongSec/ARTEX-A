@@ -33,7 +33,10 @@ type Scheduler struct {
 }
 
 // projectGraphFireInterval 是同项目两次图变更触发的最小间隔。
-const projectGraphFireInterval = 60 * time.Second
+// 任务运行时事件几乎不间断；阅读者每轮要判多个候选（每个约 2~3 万输入
+// token），1 分钟一轮会把 worker 的模型配额吃掉。5 分钟足够捕捉跨任务复用，
+// 又不会让阅读者成为主要成本。
+const projectGraphFireInterval = 5 * time.Minute
 
 const (
 	schedKeyLastFinding    = "last_finding_id"    // watermark: max finding node id fired for
