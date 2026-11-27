@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -207,16 +208,20 @@ func (s *Server) judgeCandidateIsolated(ctx context.Context, taskID, candID int6
 	defer cancel()
 	callCtx = llmrec.WithWorker(callCtx, "reader")
 	msg, _, _, err := rt.Complete(callCtx, llm.CompletionRequest{
-		System:    []string{readerJudgePrompt},
-		Messages:  []llm.Message{llm.UserText(user)},
-		MaxTokens: 1200,
+		System:   []string{readerJudgePrompt},
+		Messages: []llm.Message{llm.UserText(user)},
+		// 判官要求只输出一行 JSON，但推理模型会先写很长的 thinking；1200 会被
+		// 思考吃满 → text 为空 → 解析报「unexpected end of JSON input」。
+		// 提到 3000 并保留 thinking 兜底（见下）。
+		MaxTokens: 3000,
 		Thinking:  "disabled",
 	})
 	if err != nil {
 		out.Error = "判官模型调用失败：" + err.Error()
 		return out
 	}
-	parsed, perr := parseReaderJudgeJSON(msg.Text())
+	raw := readerJudgeRawText(msg)
+	parsed, perr := parseReaderJudgeJSON(raw)
 	if perr != nil {
 		out.Error = perr.Error()
 		return out
@@ -235,10 +240,30 @@ func (s *Server) judgeCandidateIsolated(ctx context.Context, taskID, candID int6
 	return out
 }
 
+// readerJudgeRawText 取判官可解析的正文：优先 text 块；推理模型把内容全写进
+// thinking（text 为空）时回退 thinking，避免「输出不是合法 JSON」的假失败。
+func readerJudgeRawText(msg llm.Message) string {
+	if text := strings.TrimSpace(msg.Text()); text != "" {
+		return text
+	}
+	var b strings.Builder
+	for _, c := range msg.Content {
+		if c.Type == llm.BlockThinking && strings.TrimSpace(c.Thinking) != "" {
+			b.WriteString(c.Thinking)
+			b.WriteString("\n")
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // parseReaderJudgeJSON 容忍 ```json 围栏与前后缀文字，取第一个完整 JSON 对象。
 func parseReaderJudgeJSON(s string) (readerJudgeOutput, error) {
 	var out readerJudgeOutput
 	s = strings.TrimSpace(s)
+	// 推理文本里可能先出现若干 {} 片段，优先从带 "score" 的对象开始截取。
+	if loc := regexp.MustCompile(`\{\s*"score"`).FindStringIndex(s); loc != nil {
+		s = s[loc[0]:]
+	}
 	if i := strings.Index(s, "{"); i >= 0 {
 		if j := strings.LastIndex(s, "}"); j > i {
 			s = s[i : j+1]

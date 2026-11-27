@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -23,7 +24,16 @@ type Scheduler struct {
 	s    *Server
 	pg   *db.DB
 	tick time.Duration
+	// 项目图变更触发的按项目节流：任务运行时 2~3 秒就有一批图事件，若不节流
+	// 会每 5s tick 起一轮阅读者（每轮 3 个候选 × 3 万 token），把任务本身的
+	// LLM 配额挤掉。60s 内同项目最多触发一次；窗口内的事件跳过没关系——任务
+	// 还在跑，下一个窗口会有新事件。
+	graphMu   sync.Mutex
+	lastGraph map[int64]time.Time
 }
+
+// projectGraphFireInterval 是同项目两次图变更触发的最小间隔。
+const projectGraphFireInterval = 60 * time.Second
 
 const (
 	schedKeyLastFinding    = "last_finding_id"    // watermark: max finding node id fired for
@@ -226,6 +236,22 @@ func (sc *Scheduler) fireProjectGraph(triggers []*db.AgentTrigger) {
 	// 按项目分组本批事件：observer 是"每项目一个观察会话"，同项目多事件合并
 	// 进一条触发消息（清单），不同项目各自一次 run。
 	for _, g := range groupGraphEventsByProject(events) {
+		// 按项目节流：任务运行期间图事件持续产生，阅读者每轮要读多个候选摘要，
+		// 不节流会每 tick 起一轮、把 worker 的模型配额挤掉。窗口内跳过的事件
+		// 不补发——只要项目还在跑，下个窗口自然有新事件。
+		sc.graphMu.Lock()
+		if sc.lastGraph == nil {
+			sc.lastGraph = map[int64]time.Time{}
+		}
+		now := time.Now()
+		prev, seen := sc.lastGraph[g.projectID]
+		if seen && now.Sub(prev) < projectGraphFireInterval {
+			sc.graphMu.Unlock()
+			continue
+		}
+		sc.lastGraph[g.projectID] = now
+		sc.graphMu.Unlock()
+
 		msg := renderProjectGraphMessage(g.projectID, g.events)
 		for _, tr := range want {
 			// mergeable=false：observer 用 merge=all 整波合并（serial），这里一次
