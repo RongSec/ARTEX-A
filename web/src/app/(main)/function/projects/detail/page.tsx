@@ -104,6 +104,8 @@ function ProjectDetailInner() {
   const [deleteOpen, setDeleteOpen] = React.useState(false);
   // 报告模板列表（编辑对话框下拉 + 概览展示模板名共用一次拉取）。
   const [templates, setTemplates] = React.useState<ReportTemplate[]>([]);
+  // 项目级暂停/继续请求中（必须放在任何 early return 之前，否则 Hook 顺序错乱）。
+  const [projectBusy, setProjectBusy] = React.useState(false);
 
   React.useEffect(() => {
     api
@@ -164,7 +166,6 @@ function ProjectDetailInner() {
 
   // 项目级暂停/继续：暂停会连带暂停正在跑的任务并停止下发；继续只恢复
   // 由项目暂停的任务，排队中的批量任务回到 dispatcher 队列。
-  const [projectBusy, setProjectBusy] = React.useState(false);
   async function pauseToggle() {
     setProjectBusy(true);
     try {
