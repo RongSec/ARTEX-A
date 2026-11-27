@@ -495,21 +495,26 @@ func (s *Server) projectsDelete(w http.ResponseWriter, r *http.Request) {
 			tasksDeleted++
 		}
 	}
-	if err := s.m.PG().DeleteProject(pid); errors.Is(err, db.ErrProjectNotFound) {
+	reportPaths, err := s.m.PG().DeleteProjectWithReports(pid, req.DeleteReports)
+	if errors.Is(err, db.ErrProjectNotFound) {
 		writeErr(w, 404, "项目不存在")
 		return
 	} else if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	for _, p := range reportPaths {
+		_ = removeReportArtifacts(s.m.dir, p)
+	}
 	// 保留分支：FK 已把库里的 project_id 置空，内存对象要同步，否则任务列表
 	// 还会显示一个不存在的项目。
 	s.m.DetachProjectTasks(pid)
 	writeJSON(w, 200, map[string]any{
-		"deleted":       pid,
-		"tasks_deleted": tasksDeleted,
-		"tasks_kept":    len(tasks) - tasksDeleted,
-		"task_errors":   taskErrors,
+		"deleted":         pid,
+		"tasks_deleted":   tasksDeleted,
+		"tasks_kept":      len(tasks) - tasksDeleted,
+		"task_errors":     taskErrors,
+		"reports_deleted": len(reportPaths),
 	})
 }
 

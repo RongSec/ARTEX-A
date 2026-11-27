@@ -76,6 +76,10 @@ export interface DeleteTaskOptions {
   delete_intel: boolean;
   // 项目图谱投影与图事件（project_index / project_graph_events）。
   delete_project_graph: boolean;
+  // 报告记录与产物（reports 行 + data/reports 下的 docx/pdf）。
+  delete_reports: boolean;
+  // 证据截图目录（data/report_assets/evidence/<finding_id>/）。
+  delete_evidence: boolean;
 }
 
 /** 删除项目：五个清理开关与任务删除同义；delete_tasks=true 时连旗下任务一起删。 */

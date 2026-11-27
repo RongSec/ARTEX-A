@@ -27,6 +27,8 @@ export const emptyDeleteOptions = (): DeleteTaskOptions => ({
   delete_llm_records: false,
   delete_intel: false,
   delete_project_graph: false,
+  delete_reports: false,
+  delete_evidence: false,
 });
 
 export const deleteOptionKeys: (keyof DeleteTaskOptions)[] = [
@@ -34,6 +36,8 @@ export const deleteOptionKeys: (keyof DeleteTaskOptions)[] = [
   "delete_traffic",
   "delete_files",
   "delete_findings",
+  "delete_evidence",
+  "delete_reports",
   "delete_llm_records",
   "delete_intel",
   "delete_project_graph",
@@ -81,6 +85,8 @@ export function DeleteOptionFields({
       delete_traffic: checked,
       delete_files: checked,
       delete_findings: checked,
+      delete_evidence: checked,
+      delete_reports: checked,
       delete_llm_records: checked,
       delete_intel: checked || isLocked("delete_intel"),
       delete_project_graph: checked || isLocked("delete_project_graph"),
@@ -100,7 +106,7 @@ export function DeleteOptionFields({
           <FieldContent>
             <FieldLabel htmlFor={`delete-all-${idPrefix}`}>全部删除</FieldLabel>
             <FieldDescription>
-              选中下方全部关联数据：资产、流量、文件、漏洞（含证据快照）、LLM 记录、情境与复用记录、项目图谱投影。
+              选中下方全部关联数据：资产、流量、任务文件、漏洞、证据截图、报告、LLM 记录、情境与复用记录、项目图谱投影。
             </FieldDescription>
           </FieldContent>
         </Field>
@@ -138,6 +144,34 @@ export function DeleteOptionFields({
           <FieldContent>
             <FieldLabel htmlFor={`delete-files-${idPrefix}`}>任务文件</FieldLabel>
             <FieldDescription>删除该任务工作目录中的上传文件、命令输出和其他产物。</FieldDescription>
+          </FieldContent>
+        </Field>
+        <Field orientation="horizontal">
+          <Checkbox
+            id={`delete-evidence-${idPrefix}`}
+            checked={isChecked("delete_evidence")}
+            disabled={isOff("delete_evidence")}
+            onCheckedChange={(checked) => updateOption("delete_evidence", checked === true)}
+          />
+          <FieldContent>
+            <FieldLabel htmlFor={`delete-evidence-${idPrefix}`}>证据截图</FieldLabel>
+            <FieldDescription>
+              删除该任务漏洞的证据图片目录（report_assets/evidence/&lt;漏洞id&gt;）。库里的图片记录随「关联漏洞」删除，但磁盘文件不会——只勾漏洞不勾此项会留下孤儿图片。
+            </FieldDescription>
+          </FieldContent>
+        </Field>
+        <Field orientation="horizontal">
+          <Checkbox
+            id={`delete-reports-${idPrefix}`}
+            checked={isChecked("delete_reports")}
+            disabled={isOff("delete_reports")}
+            onCheckedChange={(checked) => updateOption("delete_reports", checked === true)}
+          />
+          <FieldContent>
+            <FieldLabel htmlFor={`delete-reports-${idPrefix}`}>报告与产物</FieldLabel>
+            <FieldDescription>
+              删除该任务的报告记录与生成的 docx/pdf 文件。项目删除时选此项会连同项目级汇总报告一起删除。
+            </FieldDescription>
           </FieldContent>
         </Field>
         <Field orientation="horizontal">

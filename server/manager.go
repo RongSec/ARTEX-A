@@ -204,6 +204,8 @@ type DeleteTaskOptions struct {
 	DeleteLLMRecords   bool `json:"delete_llm_records"`
 	DeleteIntel        bool `json:"delete_intel"`         // 情报表 + 阅读者勾连/下钻记录
 	DeleteProjectGraph bool `json:"delete_project_graph"` // 项目图谱投影 + 图事件
+	DeleteReports      bool `json:"delete_reports"`       // 报告记录 + data/reports 下的产物
+	DeleteEvidence     bool `json:"delete_evidence"`      // 证据截图目录 report_assets/evidence/<fid>
 }
 
 // DeleteTaskResult makes destructive cleanup auditable to API callers.
@@ -220,6 +222,8 @@ type DeleteTaskResult struct {
 	GraphIndexDeleted  int64  `json:"graph_index_deleted"`
 	GraphEventsDeleted int64  `json:"graph_events_deleted"`
 	SnapshotsDeleted   int64  `json:"snapshots_deleted"`
+	ReportsDeleted     int64  `json:"reports_deleted"`
+	EvidenceDeleted    int64  `json:"evidence_deleted"`
 	CleanupWarning     string `json:"cleanup_warning,omitempty"`
 }
 
@@ -1659,6 +1663,8 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 			DeleteLLMRecords:   opts.DeleteLLMRecords,
 			DeleteIntel:        opts.DeleteIntel,
 			DeleteProjectGraph: opts.DeleteProjectGraph,
+			DeleteReports:      opts.DeleteReports,
+			DeleteEvidence:     opts.DeleteEvidence,
 			Prepare:            prepare,
 		},
 	)
@@ -1674,6 +1680,27 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 	result.GraphIndexDeleted = dbResult.GraphIndexDeleted
 	result.GraphEventsDeleted = dbResult.GraphEventsDeleted
 	result.SnapshotsDeleted = dbResult.SnapshotsDeleted
+	result.ReportsDeleted = dbResult.ReportsDeleted
+
+	// 报告产物与证据目录在 DB 提交之后删：事务回滚时不能已经动过磁盘。
+	// 删不掉只记警告，不回滚——记录已经没了，重建文件没有意义。
+	var fileCleanupErrs []string
+	for _, path := range dbResult.ReportFilePaths {
+		if err := removeReportArtifacts(m.dir, path); err != nil {
+			fileCleanupErrs = append(fileCleanupErrs, err.Error())
+		}
+	}
+	for _, fid := range dbResult.EvidenceFindingIDs {
+		dir := filepath.Join(m.dir, "report_assets", "evidence", strconv.FormatInt(fid, 10))
+		if err := os.RemoveAll(dir); err != nil {
+			fileCleanupErrs = append(fileCleanupErrs, fmt.Sprintf("删证据目录 %s: %v", dir, err))
+			continue
+		}
+		result.EvidenceDeleted++
+	}
+	if len(fileCleanupErrs) > 0 {
+		result.CleanupWarning = strings.Join(fileCleanupErrs, "; ")
+	}
 
 	// PostgreSQL is now authoritative: finalize the staged external deletion and
 	// forget the live task even if a final purge reports an error. Such errors are

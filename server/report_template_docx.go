@@ -75,12 +75,42 @@ func (s *Server) resolveTemplateDocx(rel string) (string, error) {
 	return target, nil
 }
 
+// templateStagingTTL 是导入暂存件的保留时长。用户上传后没点「保存模板」就
+// 离开时，文件会留在 .staging/ 里；超过这个时长即可认定草稿已废弃。每次
+// 导入顺手清理一次，不需要额外的定时任务。
+const templateStagingTTL = 24 * time.Hour
+
+// sweepTemplateStaging 删除 .staging/ 下超过 TTL 的残留草稿，返回清理数量。
+// 清理失败不影响本次导入——残留只是占磁盘，不该阻断上传。
+func sweepTemplateStaging(dir string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().Add(-templateStagingTTL)
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if os.Remove(filepath.Join(dir, e.Name())) == nil {
+			removed++
+		}
+	}
+	return removed
+}
+
 // stageTemplateDocx 把导入的上传字节落到 staging 目录，返回相对路径。
 func (s *Server) stageTemplateDocx(originalName string, data []byte) (string, error) {
 	dir := filepath.Join(s.m.dir, filepath.FromSlash(templateDocxSubdir), ".staging")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("创建模板 staging 目录失败: %w", err)
 	}
+	sweepTemplateStaging(dir)
 	base := fmt.Sprintf("import-%d-%s", time.Now().UnixNano(), sanitizeTemplateDocxFilename(originalName))
 	abs := filepath.Join(dir, base)
 	if err := os.WriteFile(abs, data, 0o644); err != nil {

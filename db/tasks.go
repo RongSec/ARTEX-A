@@ -73,6 +73,11 @@ type TaskDeleteResult struct {
 	GraphIndexDeleted  int64 // project_index 投影行
 	GraphEventsDeleted int64 // project_graph_events 事件行
 	SnapshotsDeleted   int64 // 随漏洞删除、且无其他漏洞引用的流量证据快照
+	ReportsDeleted     int64 // reports 行（scope=task ∧ task_ids=本任务）
+	// ReportFilePaths 是已删报告行的产物路径,由调用方在事务提交后删除磁盘文件。
+	ReportFilePaths []string
+	// EvidenceFindingIDs 是需要清理 report_assets/evidence 目录的漏洞 id。
+	EvidenceFindingIDs []int64
 }
 
 // TaskDeleteOptions 是任务拆除的完整开关集。比旧的三参数版本多两个开关：
@@ -89,7 +94,14 @@ type TaskDeleteOptions struct {
 	DeleteLLMRecords   bool
 	DeleteIntel        bool
 	DeleteProjectGraph bool
-	Prepare            func(TaskDeletePreparation) error
+	// DeleteReports 删除该任务的报告记录（reports.scope='task' ∧ task_ids=本任务）,
+	// 并把产物路径回传给调用方做磁盘清理——文件不在事务里删，避免回滚后
+	// 记录还在而文件没了。
+	DeleteReports bool
+	// DeleteEvidence 回传该任务全部漏洞 id,调用方据此删除 report_assets/evidence/<fid>/
+	// 目录。证据图是 findings 的附属文件,库行随 findings 级联,但目录不会。
+	DeleteEvidence bool
+	Prepare        func(TaskDeletePreparation) error
 }
 
 // TaskDeletePreparation is produced inside the PostgreSQL deletion transaction
@@ -778,6 +790,28 @@ WHERE asset_ids @> to_jsonb(ARRAY[$1::bigint])`, aid); err != nil {
 	}
 	result.AssetsDetached, _ = res.RowsAffected()
 
+	// 证据图目录按 finding id 组织（report_assets/evidence/<fid>/）。findings
+	// 删掉后 id 就查不到了,必须在级联之前收集。仅回传 id,磁盘删除由调用方在
+	// 事务提交后执行——回滚时目录不能已经没了。
+	if o.DeleteEvidence {
+		rows, err := tx.Query(`SELECT id FROM findings WHERE task_id=$1 ORDER BY id`, id)
+		if err != nil {
+			return result, err
+		}
+		for rows.Next() {
+			var fid int64
+			if err := rows.Scan(&fid); err != nil {
+				rows.Close()
+				return result, err
+			}
+			result.EvidenceFindingIDs = append(result.EvidenceFindingIDs, fid)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return result, err
+		}
+		rows.Close()
+	}
 	if o.DeleteFindings {
 		// 漏洞的流量证据快照没有 task_id，只靠 finding_traffic_bindings 关联；
 		// 删 findings 会级联掉 bindings，但快照本身会永久留在盘里。必须在级联
@@ -856,6 +890,31 @@ WHERE s.id=$1 AND NOT EXISTS (SELECT 1 FROM finding_traffic_bindings b WHERE b.s
 	if _, err := tx.Exec(`UPDATE task_archives SET source_task_ids = array_remove(source_task_ids, $1)
 WHERE $1 = ANY(source_task_ids)`, id); err != nil {
 		return result, err
+	}
+	// 报告行与任务没有外键（reports.task_ids 是普通 BIGINT 列），不显式删就
+	// 永远留一份指向已删任务的报告。产物路径随 RETURNING 回传,提交后由调用方
+	// 清磁盘；只回传非空路径,未完成的 job 没有文件。
+	if o.DeleteReports {
+		rows, err := tx.Query(`DELETE FROM reports WHERE scope='task' AND task_ids=$1 RETURNING file_path`, id)
+		if err != nil {
+			return result, err
+		}
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				rows.Close()
+				return result, err
+			}
+			result.ReportsDeleted++
+			if path != "" {
+				result.ReportFilePaths = append(result.ReportFilePaths, path)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return result, err
+		}
+		rows.Close()
 	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {
 		return result, err

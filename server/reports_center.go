@@ -14,6 +14,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -336,18 +337,34 @@ func (s *Server) reportsDeleteBatch(w http.ResponseWriter, r *http.Request) {
 
 // removeReportFiles 尽力删除产物与 PDF 缓存（DB 绝对路径 + dataDir 回退路径）。
 func (s *Server) removeReportFiles(job *db.Report) {
-	if job == nil || strings.TrimSpace(job.FilePath) == "" {
+	if job == nil {
 		return
 	}
+	_ = removeReportArtifacts(s.m.dir, job.FilePath)
+}
+
+// removeReportArtifacts 删一份报告的磁盘产物：绝对路径、data/reports 下的同名
+// 文件，以及 docx→PDF 预览缓存。幂等（不存在不算错），供单删、批量删与删任务
+// 共用——三处若各写一份，早晚会出现「删了记录、留下文件」的漂移。
+func removeReportArtifacts(dataDir, filePath string) error {
+	if strings.TrimSpace(filePath) == "" {
+		return nil
+	}
 	seen := map[string]bool{}
-	for _, p := range []string{job.FilePath, filepath.Join(s.m.dir, "reports", filepath.Base(job.FilePath))} {
+	var errs []error
+	for _, p := range []string{filePath, filepath.Join(dataDir, "reports", filepath.Base(filePath))} {
 		if p == "" || seen[p] {
 			continue
 		}
 		seen[p] = true
-		_ = os.Remove(p)
-		_ = os.Remove(pdfCachePath(p))
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+		if err := os.Remove(pdfCachePath(p)); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
 }
 
 // POST /api/reports/regenerate-batch — 按原 scope/template 重建 job（复用生成

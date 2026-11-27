@@ -504,7 +504,7 @@ function DeleteProjectDialog({
             options={options}
             onOptionsChange={setOptions}
             disabled={deleting}
-            disabledKeys={deleteTasks ? [] : ["delete_assets", "delete_traffic", "delete_files", "delete_findings", "delete_llm_records"]}
+            disabledKeys={deleteTasks ? [] : ["delete_assets", "delete_traffic", "delete_files", "delete_findings", "delete_evidence", "delete_llm_records"]}
             lockedKeys={["delete_intel", "delete_project_graph"]}
           />
           {taskCount > 0 && !deleteTasks && (

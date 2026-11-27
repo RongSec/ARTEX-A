@@ -295,6 +295,11 @@ func (s *Server) reportTemplateDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法模板 id")
 		return
 	}
+	tmpl, err := s.m.pg.GetReportTemplate(id)
+	if err != nil {
+		writeErr(w, 500, "读取模板失败: "+err.Error())
+		return
+	}
 	ok, err := s.m.pg.DeleteReportTemplate(id)
 	if err != nil {
 		writeErr(w, 500, "删除失败: "+err.Error())
@@ -303,6 +308,15 @@ func (s *Server) reportTemplateDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		writeErr(w, 404, "模板不存在")
 		return
+	}
+	// 模板原件（templates/<id>-*.docx）没有外键跟着行走，不显式删就永远留在盘上。
+	// 删不掉只记日志：行已经没了，回滚没有意义。
+	if tmpl != nil && strings.TrimSpace(tmpl.DocxPath) != "" {
+		if abs, rerr := s.resolveTemplateDocx(tmpl.DocxPath); rerr == nil {
+			if rmErr := os.Remove(abs); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("[report-template] 模板 %d 已删，原件清理失败 %s: %v", id, abs, rmErr)
+			}
+		}
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

@@ -325,9 +325,17 @@ func derefBool(b *bool) bool { return b != nil && *b }
 // 其 queued 的 project_batch 任务由此变为 project_id IS NULL，dispatcher 与
 // reconcile（跳过 project_batch）都认不到它，停在队列里等待人工处置。
 func (d *DB) DeleteProject(id int64) error {
+	_, err := d.DeleteProjectWithReports(id, false)
+	return err
+}
+
+// DeleteProjectWithReports 删项目行及其派生数据；deleteReports 时同事务删掉
+// scope='project' 的报告行，并回传产物路径供调用方在提交后清磁盘。报告与项目
+// 之间没有外键，不显式删就是永久孤儿行。
+func (d *DB) DeleteProjectWithReports(id int64, deleteReports bool) ([]string, error) {
 	tx, err := d.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 	for _, q := range []string{
@@ -338,17 +346,42 @@ func (d *DB) DeleteProject(id int64) error {
 		`DELETE FROM reader_drills WHERE project_id=$1`,
 	} {
 		if _, err := tx.Exec(q, id); err != nil {
-			return err
+			return nil, err
 		}
+	}
+	var paths []string
+	if deleteReports {
+		rows, err := tx.Query(`DELETE FROM reports WHERE scope='project' AND project_id=$1 RETURNING file_path`, id)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if p != "" {
+				paths = append(paths, p)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
 	res, err := tx.Exec(`DELETE FROM projects WHERE id=$1`, id)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrProjectNotFound
+		return nil, ErrProjectNotFound
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return paths, nil
 }
 
 // ProjectTasks 返回某项目下的全部存活任务行（新在前），供详情聚合 API。
