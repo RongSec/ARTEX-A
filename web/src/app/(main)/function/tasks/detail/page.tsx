@@ -38,6 +38,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
 import type { LLMProfile, Task } from "@/lib/types";
+import { TaskIntelView } from "@/app/(main)/function/facts/_components/facts-panel";
 
 import { AssetsTab } from "./_tabs/assets-tab";
 import { BroadcastTab } from "./_tabs/broadcast-tab";
@@ -53,6 +54,7 @@ import { SessionsTab } from "./_tabs/sessions-tab";
 const TABS = [
   { value: "sessions", label: "会话" },
   { value: "overview", label: "总览" },
+  { value: "summary", label: "总结" },
   { value: "graph", label: "探索链路" },
   { value: "broadcast", label: "播报板" },
   { value: "findings", label: "发现" },
@@ -437,6 +439,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="overview" className="mt-0">
           <OverviewTab taskId={id} />
+        </TabsContent>
+        <TabsContent value="summary" className="mt-0">
+          <TaskIntelView taskId={id} />
         </TabsContent>
         <TabsContent value="graph" className="mt-0">
           <GraphTab taskId={id} />

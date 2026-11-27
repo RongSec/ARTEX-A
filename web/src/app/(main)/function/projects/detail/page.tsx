@@ -12,7 +12,9 @@ import {
   ArchiveIcon,
   ArrowLeftIcon,
   DatabaseIcon,
+  PauseIcon,
   PencilIcon,
+  PlayIcon,
   RefreshCwIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -57,6 +59,16 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import type { Project, ProjectDetail, ReportTemplate, Task } from "@/lib/types";
+
+// 项目内任务排序：正在进行的置顶，其次排队/暂停，最后终态；同档按 id 倒序
+// （新任务在上）。用户反馈原来按 id 倒序，跑到一半的任务沉在最下面要翻。
+function taskOrderRank(t: Task): number {
+  if (t.queued) return 1;
+  if (t.status === "running") return 0;
+  if (t.paused) return 2;
+  if (t.status === "done" || t.status === "failed" || t.status === "timeout") return 4;
+  return 3;
+}
 
 function fmtToken(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return "—";
@@ -141,12 +153,33 @@ function ProjectDetailInner() {
 
   async function archiveToggle() {
     try {
-      const next = p.status === "active" ? "archived" : "active";
+      const next = p.status === "archived" ? "active" : "archived";
       await api.updateProject(p.id, { status: next });
       toast.success(next === "archived" ? "项目已归档（其排队批量任务将停止放行）" : "项目已恢复");
       load();
     } catch (e) {
       toast.error("操作失败：" + (e as Error).message);
+    }
+  }
+
+  // 项目级暂停/继续：暂停会连带暂停正在跑的任务并停止下发；继续只恢复
+  // 由项目暂停的任务，排队中的批量任务回到 dispatcher 队列。
+  const [projectBusy, setProjectBusy] = React.useState(false);
+  async function pauseToggle() {
+    setProjectBusy(true);
+    try {
+      if (p.status === "paused") {
+        const r = await api.resumeProject(p.id);
+        toast.success(`项目已继续，恢复 ${r.resumed ?? 0} 个任务`);
+      } else {
+        const r = await api.pauseProject(p.id);
+        toast.success(`项目已暂停，连带暂停 ${r.paused ?? 0} 个任务`);
+      }
+      load();
+    } catch (e) {
+      toast.error("操作失败：" + (e as Error).message);
+    } finally {
+      setProjectBusy(false);
     }
   }
 
@@ -172,7 +205,7 @@ function ProjectDetailInner() {
             </Button>
             <h1 className="truncate font-semibold text-xl">{p.name}</h1>
             <Badge variant={p.status === "active" ? "default" : "secondary"}>
-              {p.status === "active" ? "进行中" : "已归档"}
+              {p.status === "active" ? "进行中" : p.status === "paused" ? "已暂停" : "已归档"}
             </Badge>
             {p.observer_enabled && (
               <Badge variant="outline" className="text-emerald-600 dark:text-emerald-400">
@@ -184,9 +217,13 @@ function ProjectDetailInner() {
                 跨项目阅读者开
               </Badge>
             )}
-            {p.auto_report && (
+            {(p.auto_report || p.auto_report_tasks) && (
               <Badge variant="outline" className="text-purple-600 dark:text-purple-400">
-                自动报告开
+                {p.auto_report && p.auto_report_tasks
+                  ? "自动报告开（子任务 + 项目汇总）"
+                  : p.auto_report_tasks
+                    ? "自动报告开（每个任务）"
+                    : "自动报告开（项目汇总）"}
               </Badge>
             )}
           </div>
@@ -202,6 +239,7 @@ function ProjectDetailInner() {
             defaultTemplateID={p.task_template_id}
             defaultTargets={p.targets}
             defaultCredentials={p.credentials}
+            disabled={p.status !== "active"}
             onDone={load}
           />
           <Button variant="outline" size="icon" onClick={load} aria-label="刷新" disabled={loading}>
@@ -210,7 +248,17 @@ function ProjectDetailInner() {
           <Button variant="outline" size="icon" onClick={() => setEditOpen(true)} aria-label="编辑项目">
             <PencilIcon />
           </Button>
-          <Button variant="outline" size="icon" onClick={archiveToggle} aria-label={p.status === "active" ? "归档" : "恢复"}>
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={pauseToggle}
+            disabled={projectBusy || p.status === "archived"}
+            aria-label={p.status === "paused" ? "继续项目" : "暂停项目"}
+            title={p.status === "paused" ? "继续项目（恢复由项目暂停的任务，继续下发）" : "暂停项目（暂停进行中的任务，停止下发新任务）"}
+          >
+            {p.status === "paused" ? <PlayIcon /> : <PauseIcon />}
+          </Button>
+          <Button variant="outline" size="icon" onClick={archiveToggle} aria-label={p.status === "archived" ? "恢复" : "归档"}>
             <ArchiveIcon />
           </Button>
           <Button variant="outline" size="icon" onClick={() => setDeleteOpen(true)} aria-label="删除项目">
@@ -432,6 +480,11 @@ function TasksTab({ tasks, onChanged }: { tasks: Task[]; onChanged: () => void }
     }
   }
 
+  const orderedTasks = React.useMemo(
+    () => [...tasks].sort((a, b) => taskOrderRank(a) - taskOrderRank(b) || Number(b.id) - Number(a.id)),
+    [tasks],
+  );
+
   if (tasks.length === 0) {
     return (
       <Empty>
@@ -459,7 +512,7 @@ function TasksTab({ tasks, onChanged }: { tasks: Task[]; onChanged: () => void }
           </TableRow>
         </TableHeader>
         <TableBody>
-          {tasks.map((t) => {
+          {orderedTasks.map((t) => {
             const f = t.findings;
             const ftotal = f ? f.critical + f.high + f.medium + f.low : 0;
             return (
@@ -549,7 +602,14 @@ function OverviewTab({ detail, templates }: { detail: ProjectDetail; templates: 
           {p.reader_enabled ? "开（跨项目串联）" : "关"}
         </p>
         <p className="text-muted-foreground mt-2">
-          自动写报告：{p.auto_report ? "开（全部任务收官后按下方模板生成）" : "关"}
+          自动写报告：
+          {p.auto_report && p.auto_report_tasks
+            ? "开（每个任务各一份 + 全部收官后项目汇总）"
+            : p.auto_report_tasks
+              ? "开（每个任务各一份，有漏洞才生成）"
+              : p.auto_report
+                ? "开（全部任务收官后按下方模板生成）"
+                : "关"}
         </p>
       </div>
       <ProjectTestAssetsCard project={p} />

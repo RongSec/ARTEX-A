@@ -32,6 +32,11 @@ export default function SystemSettingsPage() {
   const [savingOutboundProxy, setSavingOutboundProxy] = React.useState(false);
   const [globalProxyInput, setGlobalProxyInput] = React.useState("");
   const [savingGlobalProxy, setSavingGlobalProxy] = React.useState(false);
+  // 代理测试：目标可自定义，代理用输入框当前值（未保存也能测）。
+  const [globalProxyTarget, setGlobalProxyTarget] = React.useState("https://www.baidu.com");
+  const [outboundProxyTarget, setOutboundProxyTarget] = React.useState("https://www.baidu.com");
+  const [testingGlobalProxy, setTestingGlobalProxy] = React.useState(false);
+  const [testingOutboundProxy, setTestingOutboundProxy] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
   const [loaded, setLoaded] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -246,6 +251,27 @@ export default function SystemSettingsPage() {
       .finally(() => setSavingGlobalProxy(false));
   };
 
+  // testProxy 用输入框当前值（未保存也可）请求用户指定的目标，验证代理链路。
+  // 没填代理时按「直连」测试，便于区分「代理不通」和「目标本身不可达」。
+  const testProxy = (which: "global" | "outbound") => {
+    const proxy = (which === "global" ? globalProxyInput : outboundProxyInput).trim();
+    const target = which === "global" ? globalProxyTarget : outboundProxyTarget;
+    const setBusy = which === "global" ? setTestingGlobalProxy : setTestingOutboundProxy;
+    setBusy(true);
+    api
+      .proxyTest({ proxy, target: target.trim() })
+      .then((r) => {
+        if (!r.ok) {
+          toast.error(`代理不可用：${r.error || "未知错误"}`);
+          return;
+        }
+        const via = proxy ? "经代理" : "直连";
+        toast.success(`${via}可用 · HTTP ${r.status} · ${r.elapsed_ms}ms`);
+      })
+      .catch((e) => toast.error("测试失败：" + (e as Error).message))
+      .finally(() => setBusy(false));
+  };
+
   // Run a real "test" search ("test") against the CURRENT form values (backend +
   // proxy + entered key), falling back to saved values server-side. Toasts result.
   const runTest = () => {
@@ -409,6 +435,26 @@ export default function SystemSettingsPage() {
             <p className="text-muted-foreground text-xs">
               {globalProxyInput.trim() ? "已配置 · 所有目标流量经此代理出网" : "未配置 · 目标流量直连出网"}
             </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                className="h-8 min-w-48 flex-1"
+                autoComplete="off"
+                placeholder="测试目标，默认 https://www.baidu.com"
+                value={globalProxyTarget}
+                disabled={!loaded || testingGlobalProxy}
+                onChange={(e) => setGlobalProxyTarget(e.target.value)}
+                aria-label="全局代理测试目标"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => testProxy("global")}
+                disabled={!loaded || testingGlobalProxy}
+              >
+                {testingGlobalProxy ? "测试中…" : "测试代理"}
+              </Button>
+            </div>
           </CardContent>
         </Card>
 
@@ -451,6 +497,26 @@ export default function SystemSettingsPage() {
                 ? "已配置 · 搜索 / 情报 / 自更新经此代理出网"
                 : "未配置 · 检索流量回落全局代理，全局也为空则直连"}
             </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                className="h-8 min-w-48 flex-1"
+                autoComplete="off"
+                placeholder="测试目标，默认 https://www.baidu.com"
+                value={outboundProxyTarget}
+                disabled={!loaded || testingOutboundProxy}
+                onChange={(e) => setOutboundProxyTarget(e.target.value)}
+                aria-label="上网代理测试目标"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => testProxy("outbound")}
+                disabled={!loaded || testingOutboundProxy}
+              >
+                {testingOutboundProxy ? "测试中…" : "测试代理"}
+              </Button>
+            </div>
           </CardContent>
         </Card>
 

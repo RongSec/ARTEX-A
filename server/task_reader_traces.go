@@ -15,6 +15,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -127,6 +128,28 @@ func (s *Server) taskReaderTraces(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// 运行记录是附加信息：查不到不能让整个审计面失败。
 		runs = []db.ReaderLLMRun{}
+	}
+	// 跨项目阅读是「全局触发」，llm_records.task_id 为空/0，不会命中上面的
+	// 按任务查询——用户在任务审计页会看到「阅读者明明跑了，这里却啥也没有」。
+	// 任务所属项目开了跨项目阅读时，把全局运行记录并进来（去重、倒序、截 50）。
+	if projectID > 0 {
+		if p, perr := s.m.pg.GetProject(projectID); perr == nil && p != nil && p.ReaderEnabled {
+			if global, gerr := s.m.pg.ListReaderRunsGlobal(r.Context(), 50); gerr == nil {
+				seen := make(map[int64]bool, len(runs))
+				for _, x := range runs {
+					seen[x.ID] = true
+				}
+				for _, x := range global {
+					if !seen[x.ID] {
+						runs = append(runs, x)
+					}
+				}
+				sort.SliceStable(runs, func(i, j int) bool { return runs[i].ID > runs[j].ID })
+				if len(runs) > 50 {
+					runs = runs[:50]
+				}
+			}
+		}
 	}
 	// 下钻明细：审计的第二块——「采纳了谁」之外，还要看到「用了对方的哪几个点」。
 	// 查询失败同样降级为空数组，审计面不因附加信息缺失而整体 500。

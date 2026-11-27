@@ -772,6 +772,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/projects/{id}", s.projectsGet)
 	mux.HandleFunc("PATCH /api/projects/{id}", s.projectsUpdate)
 	mux.HandleFunc("DELETE /api/projects/{id}", s.projectsDelete)
+	mux.HandleFunc("POST /api/projects/{id}/pause", s.projectsPause)
+	mux.HandleFunc("POST /api/projects/{id}/resume", s.projectsResume)
 	mux.HandleFunc("POST /api/projects/{id}/batch-tasks", s.projectsBatchTasks)
 	// T13 大图 tab（project_graph.go）：投影常开，这里只读+重建。
 	mux.HandleFunc("GET /api/projects/{id}/graph", s.projectGraph)
@@ -935,6 +937,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/notify/deliveries", s.notifyListDeliveries)
 	mux.HandleFunc("POST /api/notify/deliveries/{id}/retry", s.notifyRetryDelivery)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
+	mux.HandleFunc("POST /api/settings/proxy-test", s.proxyTest)
 	mux.HandleFunc("GET /api/report", s.getReport)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
 	mux.HandleFunc("POST /api/chat", s.chat)
@@ -1719,6 +1722,12 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// 暂停的项目不再接收新任务：否则单任务会绕过 dispatcher 直接开跑，
+	// 「暂停项目」就只挡住了批量下发。
+	if p, perr := s.m.PG().GetProject(*projectID); perr == nil && p != nil && p.Status == "paused" {
+		writeErr(w, 400, "项目已暂停，不能下发新任务（先在项目页点「继续」）")
+		return
+	}
 	interceptRules, err := buildTaskInterceptRules(req.InterceptRules)
 	if err != nil {
 		writeErr(w, 400, "任务级拦截规则无效："+err.Error())
@@ -1750,6 +1759,15 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
+	// 项目级约束随项目带入：此前只有批量下发会复制 project_constraints，
+	// 手动建任务选了归属项目后约束全丢，agent 拿到的是「无约束」。
+	// 先复制项目（origin=project），再写本次手填/解析的（origin=human），
+	// 按 kind+text 去重，两者可并存。
+	if n, err := s.m.PG().CopyProjectConstraintsToTask(*projectID, t.ExpID); err != nil {
+		log.Printf("[task] 复制项目约束失败 task=#%s project=%d: %v", t.ID, *projectID, err)
+	} else if n > 0 {
+		log.Printf("[task] 已从项目 %d 带入 %d 条操作约束 task=#%s", *projectID, n, t.ID)
+	}
 	// 手工/LLM 解析的操作约束先落库：goals 拆解器后台跑起来后会再抽一遍，
 	// 两者按 kind+text 去重，不会重复。
 	if n, err := s.m.PG().InsertTaskConstraints(t.ExpID, req.Constraints); err != nil {

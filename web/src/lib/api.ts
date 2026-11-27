@@ -990,6 +990,18 @@ export const api = {
     tavily_search_api_key?: string;
   }) => post<{ ok: boolean; error?: string; count?: number; backend?: string }>(`/settings/web-search/test`, patch),
 
+  // 代理连通性测试：用当前输入（未保存也可）的代理请求指定目标。
+  proxyTest: (patch: { proxy: string; target: string }) =>
+    post<{
+      ok: boolean;
+      target: string;
+      proxy?: string;
+      status?: number;
+      elapsed_ms: number;
+      snippet?: string;
+      error?: string;
+    }>(`/settings/proxy-test`, patch),
+
   // ---- 漏洞 IM 推送 ----
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
@@ -1481,7 +1493,7 @@ export const api = {
 
   // ---- 项目（artex-hs 二开 T05-T08：项目-任务两级模型）----
   // 后端 /api/projects*；列表带统计（任务数/排队数/finding 分档），详情带任务聚合。
-  projects: (status?: "active" | "archived") =>
+  projects: (status?: "active" | "archived" | "paused") =>
     get<{ projects: ProjectWithStats[] }>(`/projects${status ? `?status=${status}` : ""}`).then((r) => ({
       projects: arr(r.projects),
     })),
@@ -1526,7 +1538,7 @@ export const api = {
       name?: string;
       description?: string;
       owner?: string;
-      status?: "active" | "archived";
+      status?: "active" | "archived" | "paused";
       concurrency?: number;
       observer_enabled?: boolean;
       // T18 三字段。report_template_id 三态：键缺席=不动、null=清绑定回默认链、
@@ -1542,6 +1554,12 @@ export const api = {
       credentials?: Record<string, unknown>[];
     },
   ) => patch<Project>(`/projects/${id}`, patchBody),
+  // 项目级暂停/继续：暂停会连带暂停项目内正在跑的任务并停止下发；继续只恢复
+  // 由项目暂停的任务，排队中的批量任务回到 dispatcher 队列。
+  pauseProject: (id: number | string) =>
+    post<{ ok: boolean; status: string; paused: number }>(`/projects/${id}/pause`, {}),
+  resumeProject: (id: number | string) =>
+    post<{ ok: boolean; status: string; resumed: number }>(`/projects/${id}/resume`, {}),
   // deleteProject 删项目。带 options 时：五个清理开关作用于旗下任务，
   // delete_tasks=true 表示连任务一起删（否则任务保留、FK SET NULL 变未分组）。
   deleteProject: (id: number | string, options?: DeleteTaskOptions & { delete_tasks?: boolean }) =>

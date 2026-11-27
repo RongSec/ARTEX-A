@@ -145,6 +145,7 @@ import type {
   TaskArchiveState,
   TaskCategory,
   TaskStatus,
+  TaskTemplate,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -3088,6 +3089,52 @@ export function CreateTaskSheet({
     }
   }
 
+  // applyTaskTemplate 把模板内容灌进创建表单。手动选模板与「选项目自动带出
+  // 项目默认模板」共用，避免两处逻辑漂移。
+  function applyTaskTemplate(template: TaskTemplate) {
+    setDescription(template.description);
+    // 模板里的资产原样送进解析：保留用户多行/逗号混贴的写法，
+    // 解析后每行一个资产，凭据行由用户再补。
+    setTargetRaw(template.targets ?? "");
+    setTargetRows(rowsFromTargets(template.targets ?? ""));
+    setTargetInvalid([]);
+    setGoal(template.goal);
+    setCategoryID(template.category_id ?? undefined);
+    setInterceptRules(template.intercept_rules ?? []);
+    setConstraintItems((template.constraints ?? []).map((c) => ({ kind: c.kind, text: c.text })));
+    setUploadCount(0);
+  }
+
+  // 选归属项目时自动选中项目默认模板；表单还空着就顺手把内容带出来，
+  // 已经填了东西则只选中（避免冲掉用户输入）。项目约束由后端在建任务时
+  // 从 project_constraints 复制，不依赖这里是否点过模板。
+  const appliedProjectTemplate = React.useRef<number | null>(null);
+  async function selectProject(raw: string) {
+    const id = raw === UNCATEGORIZED_PROJECT_VALUE ? undefined : Number(raw);
+    setProjectID(id);
+    if (id === undefined) return;
+    const p = projects.find((x) => x.id === id);
+    const tmplID = p?.task_template_id ?? null;
+    if (!tmplID) return;
+    setSelectedTemplateID(tmplID);
+    if (appliedProjectTemplate.current === tmplID) return;
+    const untouched = !description.trim() && !goal.trim() && constraintItems.length === 0;
+    if (!untouched) {
+      toast.info("已选中项目默认模板；需要套用内容时点一下模板下拉");
+      return;
+    }
+    try {
+      const list = await api.taskTemplates();
+      const template = list.find((x) => x.id === tmplID);
+      if (!template) return;
+      appliedProjectTemplate.current = tmplID;
+      applyTaskTemplate(template);
+      toast.success(`已带出项目默认模板「${template.name}」`);
+    } catch (e) {
+      toast.error("读取项目模板失败：" + (e as Error).message);
+    }
+  }
+
   async function createTask() {
     const targets = rowsToTargets(targetRows);
     const goalText = goal.trim() || (targets.length > 0 ? `对以下资产完成安全测试：\n${targets.join("\n")}` : "");
@@ -3134,6 +3181,7 @@ export function CreateTaskSheet({
       setTargetInvalid([]);
       setConstraintItems([]);
       setSelectedTemplateID(null);
+      appliedProjectTemplate.current = null;
       setSourceTaskIDs([]);
       setCompanyIDs([]);
       setLLMProfileIDs([]);
@@ -3185,21 +3233,7 @@ export function CreateTaskSheet({
               constraints={constraintItems}
               selectedTemplateID={selectedTemplateID}
               onSelectedTemplateIDChange={setSelectedTemplateID}
-              onApply={(template) => {
-                setDescription(template.description);
-                // 模板里的资产原样送进解析：保留用户多行/逗号混贴的写法，
-                // 解析后每行一个资产，凭据行由用户再补。
-                setTargetRaw(template.targets ?? "");
-                setTargetRows(rowsFromTargets(template.targets ?? ""));
-                setTargetInvalid([]);
-                setGoal(template.goal);
-                setCategoryID(template.category_id ?? undefined);
-                setInterceptRules(template.intercept_rules ?? []);
-                setConstraintItems(
-                  (template.constraints ?? []).map((c) => ({ kind: c.kind, text: c.text })),
-                );
-                setUploadCount(0);
-              }}
+              onApply={applyTaskTemplate}
               portalContainer={sheetContentRef}
             />
             <div className="grid gap-2">
@@ -3215,7 +3249,7 @@ export function CreateTaskSheet({
               <FieldLabel htmlFor="task-project">归属项目</FieldLabel>
               <Select
                 value={projectID === undefined ? UNCATEGORIZED_PROJECT_VALUE : String(projectID)}
-                onValueChange={(v) => setProjectID(v === UNCATEGORIZED_PROJECT_VALUE ? undefined : Number(v))}
+                onValueChange={(v) => void selectProject(v)}
               >
                 <SelectTrigger id="task-project" className="w-full">
                   <SelectValue placeholder="未分类" />

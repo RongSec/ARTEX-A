@@ -184,7 +184,107 @@ func VulnFromFinding(f *db.DBFinding, assetLabel func(int64) string) VulnSection
 		v.SourceTasks = []int64{tid}
 	}
 	v.URLTemplate = ExtractURLTemplate(f.Reproduction)
+	// 「影响」与「修复建议」两栏此前永远空着，模板填充只能写「（暂无）」。
+	// agent 写的 finding 详细报告本来就按「## 影响与危害 / ## 修复建议」组织，
+	// 直接从 Markdown 里抽出来填进契约，历史数据也能立即生效。
+	v.Harm = markdownSection(f.Report, "影响与危害", "影响", "危害", "风险影响")
+	v.Remediation = markdownSection(f.Report, "修复建议", "修复方案", "修复措施", "加固建议", "处置建议", "整改建议")
 	return v
+}
+
+// mdHeading 解析一行 Markdown 标题：ATX（#）、加粗整行（**xxx**）、或
+// 「xxx：」这类短标签行。level=0 表示后两种（没有层级，遇到下一个标题即结束）。
+func mdHeading(line string) (title string, level int, ok bool) {
+	s := strings.TrimSpace(line)
+	if s == "" {
+		return "", 0, false
+	}
+	if strings.HasPrefix(s, "#") {
+		n := 0
+		for n < len(s) && s[n] == '#' {
+			n++
+		}
+		if n <= 6 {
+			t := strings.TrimSpace(strings.TrimRight(s[n:], "# "))
+			if t != "" {
+				return normalizeHeading(t), n, true
+			}
+		}
+		return "", 0, false
+	}
+	if strings.HasPrefix(s, "**") && strings.HasSuffix(s, "**") && len(s) > 4 {
+		inner := strings.TrimSpace(s[2 : len(s)-2])
+		if inner != "" && !strings.Contains(inner, "\n") && len([]rune(inner)) <= 30 {
+			return normalizeHeading(inner), 0, true
+		}
+	}
+	// 「修复建议：」单独成行：只在短行且无其它标点时当标题，避免把正文里
+	// 「修复建议：升级到 1.2.3」误判成标题。
+	if strings.HasSuffix(s, "：") || strings.HasSuffix(s, ":") {
+		inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(s, "："), ":"))
+		if inner != "" && len([]rune(inner)) <= 20 && !strings.ContainsAny(inner, "。，；,;") {
+			return normalizeHeading(inner), 0, true
+		}
+	}
+	return "", 0, false
+}
+
+func normalizeHeading(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "*`# ")
+	s = strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(s, "："), ":"))
+	s = strings.ReplaceAll(s, " ", "")
+	return s
+}
+
+// markdownSection 抽取命名章节的正文（到下一个同级/更高级标题为止）。
+// 找不到返回空串，调用方自行决定回退文案。
+func markdownSection(md string, names ...string) string {
+	if strings.TrimSpace(md) == "" {
+		return ""
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[normalizeHeading(n)] = true
+	}
+	lines := strings.Split(strings.ReplaceAll(md, "\r\n", "\n"), "\n")
+	for i := 0; i < len(lines); i++ {
+		title, level, ok := mdHeading(lines[i])
+		if !ok || !want[title] {
+			continue
+		}
+		var buf []string
+		for j := i + 1; j < len(lines); j++ {
+			if _, lv, isHeading := mdHeading(lines[j]); isHeading && (level == 0 || lv == 0 || lv <= level) {
+				break
+			}
+			buf = append(buf, lines[j])
+		}
+		return cleanSectionText(strings.Join(buf, "\n"))
+	}
+	return ""
+}
+
+// cleanSectionText 把 Markdown 片段收敛成适合塞进 Word 表格单元格的纯文本：
+// 去强调符/行内代码，保留分段与列表换行，去掉首尾空行。
+func cleanSectionText(s string) string {
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "**", "")
+	s = strings.ReplaceAll(s, "__", "")
+	s = strings.ReplaceAll(s, "`", "")
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimRight(line, " \t")
+		out = append(out, line)
+	}
+	for len(out) > 0 && strings.TrimSpace(out[0]) == "" {
+		out = out[1:]
+	}
+	for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+		out = out[:len(out)-1]
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
 }
 
 // MergeVulns 按去重键 (asset, url模板, vulnclass) 合并漏洞：

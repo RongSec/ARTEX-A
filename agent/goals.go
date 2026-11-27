@@ -108,14 +108,65 @@ func DecomposeGoals(ctx context.Context, prov llm.Provider, dataDir, goalText, d
 // letting the caller own provider selection/failover. maxTokens is the profile's
 // per-reply output cap (0 = send none).
 func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir, goalText, desc string, as *db.AssetStore, ts *db.ExplorationStore, taskID int64, nonStreaming bool, maxTokens int, emit func(db.Activity), skipConstraints ...bool) []GoalSpec {
+	skipCon := len(skipConstraints) > 0 && skipConstraints[0]
+	return decomposeGoals(ctx, prov, dataDir, goalText, desc, as, ts, taskID, nonStreaming, maxTokens, emit, skipCon, nil)
+}
+
+// DecomposeGoalsWithConstraints 是「任务已有操作约束」时的入口：不挂
+// set_constraints 工具，但把 allow/deny 清单原样写进系统提示，让拆解器知道
+// 哪些方向被禁止——否则它只能看到一句「已有约束」，会在界面上声称「未登记
+// 约束」，拆出的目标也可能撞到禁止项（后续被 planner 拒绝，白跑一轮）。
+func DecomposeGoalsWithConstraints(ctx context.Context, prov llm.Provider, dataDir, goalText, desc string, as *db.AssetStore, ts *db.ExplorationStore, taskID int64, nonStreaming bool, maxTokens int, emit func(db.Activity), existing []db.Constraint) []GoalSpec {
+	return decomposeGoals(ctx, prov, dataDir, goalText, desc, as, ts, taskID, nonStreaming, maxTokens, emit, len(existing) > 0, existing)
+}
+
+// renderExistingConstraints 把 task_constraints 里的 allow/deny 清单渲染成
+// 拆解器提示的尾部块。清单来自 DB，不是用户自然语言，直接逐条列出即可；
+// deny 放前面（红线优先），最多 100 条防止极端任务把提示撑爆。
+func renderExistingConstraints(items []db.Constraint) string {
+	var allow, deny []string
+	for _, c := range items {
+		text := strings.TrimSpace(c.Text)
+		if text == "" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(c.Kind), "deny") {
+			deny = append(deny, text)
+		} else {
+			allow = append(allow, text)
+		}
+	}
+	const maxItems = 100
+	total := len(allow) + len(deny)
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n\n**本任务已有 %d 条操作约束（操作员/项目模板写入，已落约束表）。禁止再调用 set_constraints；拆分目标时必须避开所有「禁止」项，不要产出以禁止方向为前提的目标。**", total)
+	if len(deny) > 0 {
+		b.WriteString("\n\n禁止（deny，红线）：")
+		for i, t := range deny {
+			if i >= maxItems {
+				b.WriteString("\n- …（其余省略）")
+				break
+			}
+			b.WriteString("\n- " + t)
+		}
+	}
+	if len(allow) > 0 {
+		b.WriteString("\n\n允许（allow，白名单）：")
+		for i, t := range allow {
+			if i >= maxItems {
+				b.WriteString("\n- …（其余省略）")
+				break
+			}
+			b.WriteString("\n- " + t)
+		}
+	}
+	return b.String()
+}
+
+func decomposeGoals(ctx context.Context, prov llm.Provider, dataDir, goalText, desc string, as *db.AssetStore, ts *db.ExplorationStore, taskID int64, nonStreaming bool, maxTokens int, emit func(db.Activity), skipCon bool, existing []db.Constraint) []GoalSpec {
 	if prov == nil {
 		return nil
-	}
-	// V12-CREATE-UNIFY：任务创建/模板/项目已经带入了操作约束时，拆解器不再自己
-	// 抽一遍——用户解析出的约束还要人工改，重复抽取只会产生近似重复条目。此时
-	// 不挂 set_constraints 工具，并在 prompt 末尾明确告知。
-	skipCon := len(skipConstraints) > 0 && skipConstraints[0]
-	// 目标拆解是一次性调用：不挂 transcript store，所以 agentcore 不会往 ctx 上挂
+	}	// 目标拆解是一次性调用：不挂 transcript store，所以 agentcore 不会往 ctx 上挂
 	// session id（它只在有 writer 时才挂，见 agentcore.Prompt）。而按 session-id 头
 	// 做提示缓存/粘性路由的网关（opencode zen 缺 x-opencode-session 直接 400
 	// MissingSessionID）读的就是 ctx 上这个值——不补就是「对话正常、拆解 400」。
@@ -137,6 +188,8 @@ func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir,
 	tools := []actool.CoreTool{tsx.setGoals()}
 	if !skipCon {
 		tools = append(tools, tsx.setConstraints())
+	} else if len(existing) > 0 {
+		sys += renderExistingConstraints(existing)
 	} else {
 		sys += "\n\n**本任务的操作约束已由操作员在创建时录入并写入约束表，禁止再调用 set_constraints，直接进入目标拆分。**"
 	}

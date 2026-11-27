@@ -37,6 +37,8 @@ interface ProjectBatchTasksProps {
   defaultTargets?: string;
   /** 项目默认凭据行：按 target 挂到对应资产行上。 */
   defaultCredentials?: Record<string, unknown>[];
+  /** 项目暂停/归档时禁用下发（后端也会拒绝，这里只是不给入口）。 */
+  disabled?: boolean;
   onDone: () => void;
 }
 
@@ -48,6 +50,7 @@ export function ProjectBatchTasks({
   defaultTemplateID,
   defaultTargets = "",
   defaultCredentials,
+  disabled = false,
   onDone,
 }: ProjectBatchTasksProps) {
   const [open, setOpen] = React.useState(false);
@@ -176,7 +179,7 @@ export function ProjectBatchTasks({
 
   return (
     <>
-      <Button onClick={() => setOpen(true)}>
+      <Button onClick={() => setOpen(true)} disabled={disabled} title={disabled ? "项目已暂停/归档，不能下发新任务" : undefined}>
         <SendIcon data-icon="inline-start" /> 批量下发
       </Button>
       <Dialog open={open} onOpenChange={(o) => !submitting && setOpen(o)}>

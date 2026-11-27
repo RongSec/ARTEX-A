@@ -289,3 +289,52 @@ export function FactsPanel() {
     </React.Suspense>
   );
 }
+
+// TaskIntelView 是「只渲染一个任务的小结」的轻量版，供任务详情「总结」页复用。
+// 与 FactsPanel 右栏同源（同一个 /api/tasks/{id}/intel 接口 + 同一组组件），
+// 不重复维护第二套渲染。
+export function TaskIntelView({ taskId }: { taskId: string }) {
+  const [intel, setIntel] = React.useState<TaskIntelResp | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState("");
+  const [attempt, setAttempt] = React.useState(0);
+
+  React.useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setError("");
+    setIntel(null);
+    api
+      .taskIntel(taskId)
+      .then((r) => {
+        if (alive) setIntel(normalizeIntel(r));
+      })
+      .catch((e) => {
+        if (alive) setError((e as Error).message || "加载失败");
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [taskId, attempt]);
+
+  if (loading) return <DetailSkeleton />;
+  if (error) return <ErrorBar message={error} onRetry={() => setAttempt((n) => n + 1)} />;
+  if (!intel) return null;
+  return (
+    <div className="space-y-4">
+      <TaskSummarySection key={`summary-${taskId}`} taskId={taskId} summary={intel.summary} hint={intel.hint} />
+      <EndpointTable key={`endpoint-${taskId}`} taskId={taskId} rows={intel.groups.endpoint} />
+      <CredentialTable key={`credential-${taskId}`} rows={intel.groups.credential} />
+      <IntelExtraSections
+        key={`extra-${taskId}`}
+        taskId={taskId}
+        components={intel.groups.component}
+        assets={intel.groups.asset}
+        vulns={intel.groups.vuln}
+      />
+    </div>
+  );
+}

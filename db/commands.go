@@ -389,6 +389,35 @@ ORDER BY id DESC LIMIT $2`, taskID, limit)
 	return out, rows.Err()
 }
 
+// ListReaderRunsGlobal 返回项目级/定时触发的阅读者运行（llm_records.task_id
+// 为空或 '0'）。跨项目阅读是全局触发，不挂在某个任务上；任务详情的审计面
+// 需要在「本任务所属项目开了跨项目阅读」时把这类运行也展示出来。
+func (d *DB) ListReaderRunsGlobal(ctx context.Context, limit int) ([]ReaderLLMRun, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := d.QueryContext(ctx, `
+SELECT id, COALESCE(worker,''), COALESCE(ts, now()), COALESCE(response_body,'')
+FROM llm_records
+WHERE COALESCE(task_id,'') IN ('','0') AND worker IN ('reader','observer')
+ORDER BY id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ReaderLLMRun{}
+	for rows.Next() {
+		var r ReaderLLMRun
+		var body string
+		if err := rows.Scan(&r.ID, &r.Worker, &r.Ts, &body); err != nil {
+			return nil, err
+		}
+		r.Summary = llmRunSummary(body)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // llmRunSummary 从规范化响应体（{"text":...}）取首行，截断 200 字。
 // 解析失败/无正文返回空串，绝不因为展示层摘要影响接口可用性。
 func llmRunSummary(body string) string {

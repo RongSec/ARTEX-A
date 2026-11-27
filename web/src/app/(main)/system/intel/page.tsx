@@ -81,10 +81,19 @@ type SyncMode = "all" | "kev" | "recent" | "full" | "poc" | "ghsa" | "templates"
 export default function IntelPage() {
   const [status, setStatus] = React.useState<VulnIntelStatus | null>(null);
   const [syncing, setSyncing] = React.useState(false);
+  // 同步完成边沿：running true→false 时递增 token，让情报库按当前筛选刷新。
+  const [refreshToken, setRefreshToken] = React.useState(0);
+  const prevRunning = React.useRef(false);
 
   const loadStatus = React.useCallback(async () => {
     try {
-      setStatus(await api.intelStatus());
+      const s = await api.intelStatus();
+      if (prevRunning.current && !s.sync_running) {
+        setRefreshToken((n) => n + 1);
+        toast.success("情报同步已结束，列表已刷新");
+      }
+      prevRunning.current = !!s.sync_running;
+      setStatus(s);
     } catch (e) {
       toast.error("读取情报状态失败：" + (e as Error).message);
     }
@@ -103,7 +112,14 @@ export default function IntelPage() {
       toast.success(mode === "all" ? "已开始一轮完整同步" : `已触发 ${mode} 同步`);
       setTimeout(() => void loadStatus(), 1500);
     } catch (e) {
-      toast.error("触发失败：" + (e as Error).message);
+      const msg = (e as Error).message || "";
+      // 409 = 已有一轮在跑（自动快通道/上一轮未结束）。不是失败，直接提示并刷新状态。
+      if (msg.includes("已有一轮")) {
+        toast.info("已有一轮同步在进行中，进度会显示在顶部");
+        void loadStatus();
+      } else {
+        toast.error("触发失败：" + msg);
+      }
     } finally {
       setSyncing(false);
     }
@@ -148,6 +164,20 @@ export default function IntelPage() {
         </div>
       </div>
 
+      {/* 同步进度条：点击「立即同步」后这里常驻显示阶段与开始时间，结束后自动刷新列表。 */}
+      {status?.sync_running && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-sky-500/30 bg-sky-500/5 px-3 py-2 text-xs">
+          <RefreshCwIcon className="size-3.5 animate-spin text-sky-600" />
+          <span className="font-medium">正在同步：{status.sync_phase || "准备中…"}</span>
+          {status.sync_started_at > 0 && (
+            <span className="text-muted-foreground">
+              开始于 {new Date(status.sync_started_at * 1000).toLocaleTimeString("zh-CN")}
+            </span>
+          )}
+          <span className="text-muted-foreground ml-auto">可在右上角「中断」停止；完成后本页自动刷新</span>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         {[
           { label: "CVE 记录", value: counts?.cves ?? 0, hint: "NVD + GHSA 去重后" },
@@ -180,7 +210,7 @@ export default function IntelPage() {
         </TabsList>
 
         <TabsContent value="library">
-          <LibraryTab />
+          <LibraryTab refreshToken={refreshToken} />
         </TabsContent>
         <TabsContent value="hits">
           <AssetHitsTab />
@@ -195,7 +225,7 @@ export default function IntelPage() {
 
 // ── 情报库 ────────────────────────────────────────────────────────────
 
-function LibraryTab() {
+function LibraryTab({ refreshToken = 0 }: { refreshToken?: number }) {
   const [items, setItems] = React.useState<VulnCVESummary[]>([]);
   const [total, setTotal] = React.useState(0);
   const [page, setPage] = React.useState(0);
@@ -230,6 +260,13 @@ function LibraryTab() {
   React.useEffect(() => {
     void load(0, "", false, "0");
   }, [load]);
+
+  // 同步结束后由父组件递增 refreshToken，按当前筛选条件重新拉一页。
+  React.useEffect(() => {
+    if (refreshToken <= 0) return;
+    void load(page, q, kevOnly, minCvss);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshToken]);
 
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 

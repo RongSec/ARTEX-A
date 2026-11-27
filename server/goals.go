@@ -419,12 +419,13 @@ func (s *Server) createGoals(ctx context.Context, t *Task, emit func(db.Activity
 	s.engine.BeginLLMCall(t.ID)
 	goalRuntime := s.agentsForTask(t).runtime
 	// 已有约束（创建表单/模板/项目带入，或此前人工加过）→ 拆解器跳过约束抽取，
-	// 避免与用户解析出的条目重复。
-	skipConstraints := false
-	if existing, err := t.Store.ListConstraints(); err == nil && len(existing) > 0 {
-		skipConstraints = true
+	// 但把清单原样注入提示：否则它只看得到「已有约束」一句话，既会在界面上
+	// 声称「未登记约束」，也可能拆出撞红线（如内网横向）的目标白跑一轮。
+	var existing []db.Constraint
+	if list, err := t.Store.ListConstraints(); err == nil {
+		existing = list
 	}
-	decomposed := agent.DecomposeGoalsWithProvider(ctx, goalRuntime, s.m.dir, t.Goal, t.Description, as, t.Store, taskID, goalRuntime.nonStreaming(), goalRuntime.maxTokens(), emit, skipConstraints)
+	decomposed := agent.DecomposeGoalsWithConstraints(ctx, goalRuntime, s.m.dir, t.Goal, t.Description, as, t.Store, taskID, goalRuntime.nonStreaming(), goalRuntime.maxTokens(), emit, existing)
 	s.engine.EndLLMCall(t.ID)
 	for _, g := range decomposed {
 		if strings.TrimSpace(g.Text) != "" {

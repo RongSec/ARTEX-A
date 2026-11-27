@@ -265,9 +265,9 @@ func (d *DB) UpdateProject(id int64, patch UpdateProjectPatch) (*Project, error)
 	// 一并覆盖（V6-U4 的镜像写已撤销）。API 侧同样按「键出现才置指针」。
 	if patch.Status != nil {
 		switch *patch.Status {
-		case "active", "archived":
+		case "active", "archived", "paused":
 		default:
-			return nil, errors.New(`invalid status (want active|archived)`)
+			return nil, errors.New(`invalid status (want active|archived|paused)`)
 		}
 	}
 	// report_template_id 可空：$15 直接传 any——显式清除时是 nil→SQL NULL，
@@ -454,6 +454,40 @@ ORDER BY id DESC`, projectID)
 		}
 	}
 	return out, nil
+}
+
+// MarkTaskPausedByProject 给「由项目暂停连带暂停」的任务打标记。项目继续时
+// 只恢复带标记的任务，避免把用户此前手动暂停的任务一起唤醒。
+func (d *DB) MarkTaskPausedByProject(taskID int64) error {
+	_, err := d.Exec(`UPDATE tasks SET paused_by_project=true WHERE id=$1`, taskID)
+	return err
+}
+
+// ClearTaskPausedByProject 清除项目暂停标记（任务恢复/用户手动操作时调用）。
+func (d *DB) ClearTaskPausedByProject(taskID int64) error {
+	_, err := d.Exec(`UPDATE tasks SET paused_by_project=false WHERE id=$1`, taskID)
+	return err
+}
+
+// ProjectPausedTaskIDs 返回该项目「因项目暂停而暂停、且仍未终态」的任务 id。
+func (d *DB) ProjectPausedTaskIDs(projectID int64) ([]int64, error) {
+	rows, err := d.Query(`SELECT id FROM tasks
+WHERE project_id=$1 AND deleted_at IS NULL AND paused=true AND paused_by_project=true
+  AND status NOT IN ('done','failed','timeout')
+ORDER BY id`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // ProjectBatchQueuedCount 返回某项目当前排队等待项目调度的批量任务数

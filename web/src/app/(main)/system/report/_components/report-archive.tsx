@@ -644,7 +644,7 @@ function TaskNode(props: {
               onClick={(e) => e.stopPropagation()}
               aria-label={`选择报告 ${r.id}`}
             />
-            <span className="text-muted-foreground">#{r.id}</span>
+            <span className="text-muted-foreground">任务报告 #{r.id}</span>
             <StatusPill status={r.status} />
             <span className="text-muted-foreground ml-auto">{fmtTime(r.created_at)}</span>
           </div>
@@ -688,7 +688,7 @@ function ReportLeaf({
       className="hover:bg-muted flex cursor-pointer items-center gap-1.5 rounded px-2 py-1 text-left text-xs"
     >
       <Checkbox checked={selected} onCheckedChange={() => onToggle?.(report.id)} onClick={(e) => e.stopPropagation()} />
-      <span className="text-muted-foreground">#{report.id}</span>
+      <span className="text-muted-foreground">项目汇总 #{report.id}</span>
       <span>项目汇总</span>
       <StatusPill status={report.status} />
       <span className="text-muted-foreground ml-auto">{fmtTime(report.created_at)}</span>

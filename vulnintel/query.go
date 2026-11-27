@@ -79,7 +79,7 @@ SELECT c.cve_id, COALESCE(c.title,''), COALESCE(c.severity,''), c.cvss_score, c.
        COALESCE(c.published_at::text,''), COALESCE(c.source,''),
        (SELECT count(*) FROM vuln_poc_entries pe WHERE pe.cve_id=c.cve_id)
 FROM vuln_cves c WHERE `+cond+`
-ORDER BY c.kev DESC, c.cvss_score DESC NULLS LAST, c.published_at DESC
+ORDER BY c.published_at DESC NULLS LAST, c.kev DESC, c.cvss_score DESC NULLS LAST
 LIMIT $`+itoa(len(args)-1)+` OFFSET $`+itoa(len(args)), args...)
 	if err != nil {
 		return nil, 0, err

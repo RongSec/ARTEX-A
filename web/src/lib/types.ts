@@ -1729,7 +1729,7 @@ export interface Project {
   id: number;
   name: string;
   description: string;
-  status: "active" | "archived";
+  status: "active" | "archived" | "paused";
   owner: string;
   concurrency: number; // 项目内批量任务并发数：1=严格串行
   observer_enabled: boolean; // V6-DUAL 跨任务（项目内）阅读开关：项目洞察写/触发/注入

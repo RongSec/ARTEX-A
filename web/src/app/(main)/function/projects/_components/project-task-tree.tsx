@@ -18,6 +18,7 @@ import {
   ChevronsDownIcon,
   ChevronsUpIcon,
   FolderKanbanIcon,
+  FileTextIcon,
   InboxIcon,
   MoreHorizontalIcon,
   PlusIcon,
@@ -59,6 +60,19 @@ function statusText(t: Task): string {
   if (t.queued) return "排队";
   if (t.paused) return "已暂停";
   return STATUS_LABEL[t.status] ?? t.status;
+}
+
+// 项目内任务排序：进行中置顶，其次排队/暂停，最后终态；同档新任务在前。
+function taskRank(t: Task): number {
+  if (t.queued) return 1;
+  if (t.status === "running") return 0;
+  if (t.paused) return 2;
+  if (t.status === "done" || t.status === "failed" || t.status === "timeout") return 4;
+  return 3;
+}
+
+function sortTasks(list: Task[]): Task[] {
+  return [...list].sort((a, b) => taskRank(a) - taskRank(b) || Number(b.id) - Number(a.id));
 }
 
 function statusClass(t: Task): string {
@@ -151,16 +165,22 @@ export function ProjectTaskTree({
 
   const rows = React.useMemo(() => {
     const out: { project: ProjectWithStats | null; tasks: Task[]; key: string }[] = [];
+    // 任务 ID 搜索：允许「123」或「#123」，与名称/目的一起匹配。
+    const idQuery = q.replace(/^#/, "");
+    const matchTask = (t: Task) =>
+      !q ||
+      (t.name || t.description || "").toLowerCase().includes(q) ||
+      (idQuery !== "" && String(t.id).includes(idQuery));
     for (const p of projects) {
-      const list = byProject.get(p.id) ?? [];
+      const list = sortTasks(byProject.get(p.id) ?? []);
       const matchProject = !q || p.name.toLowerCase().includes(q) || p.owner?.toLowerCase().includes(q);
-      const matched = q ? list.filter((t) => (t.name || t.description || "").toLowerCase().includes(q)) : list;
+      const matched = q ? list.filter(matchTask) : list;
       if (q && !matchProject && matched.length === 0) continue;
       out.push({ project: p, tasks: q && !matchProject ? matched : list, key: `p${p.id}` });
     }
-    const orphans = byProject.get(0) ?? [];
+    const orphans = sortTasks(byProject.get(0) ?? []);
     if (orphans.length > 0) {
-      const matched = q ? orphans.filter((t) => (t.name || t.description || "").toLowerCase().includes(q)) : orphans;
+      const matched = q ? orphans.filter(matchTask) : orphans;
       if (!q || matched.length > 0) out.push({ project: null, tasks: matched, key: "orphans" });
     }
     return out;
@@ -172,8 +192,27 @@ export function ProjectTaskTree({
   async function toggleArchive(p: ProjectWithStats) {
     setArchiving(p.id);
     try {
-      await api.updateProject(p.id, { status: p.status === "active" ? "archived" : "active" });
-      toast.success(p.status === "active" ? `已归档「${p.name}」` : `已恢复「${p.name}」`);
+      const next = p.status === "archived" ? "active" : "archived";
+      await api.updateProject(p.id, { status: next });
+      toast.success(next === "archived" ? `已归档「${p.name}」` : `已恢复「${p.name}」`);
+      onRefresh();
+    } catch (e) {
+      toast.error("操作失败：" + (e as Error).message);
+    } finally {
+      setArchiving(null);
+    }
+  }
+
+  async function toggleProjectPause(p: ProjectWithStats) {
+    setArchiving(p.id);
+    try {
+      if (p.status === "paused") {
+        const r = await api.resumeProject(p.id);
+        toast.success(`已继续「${p.name}」，恢复 ${r.resumed ?? 0} 个任务`);
+      } else {
+        const r = await api.pauseProject(p.id);
+        toast.success(`已暂停「${p.name}」，连带暂停 ${r.paused ?? 0} 个任务`);
+      }
       onRefresh();
     } catch (e) {
       toast.error("操作失败：" + (e as Error).message);
@@ -220,7 +259,7 @@ export function ProjectTaskTree({
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索项目 / 任务"
+            placeholder="搜索项目 / 任务 / 任务ID"
             className="h-8 w-56"
             aria-label="搜索项目或任务"
           />
@@ -236,6 +275,11 @@ export function ProjectTaskTree({
           </Button>
           <Button size="sm" variant="outline" onClick={onRefresh} disabled={loading}>
             <RefreshCwIcon className={loading ? "animate-spin" : ""} /> 刷新
+          </Button>
+          <Button size="sm" variant="outline" asChild>
+            <Link prefetch={false} href="/function/tasks?tab=summary">
+              <FileTextIcon /> 任务小结
+            </Link>
           </Button>
           <Button size="sm" variant="outline" onClick={onCreateProject}>
             <FolderKanbanIcon /> 新建项目
@@ -270,7 +314,6 @@ export function ProjectTaskTree({
             )}
             {rows.map(({ project, tasks: list, key }) => {
               const isCollapsed = collapsed.has(key);
-              const active = project?.status !== "archived";
               return (
                 <React.Fragment key={key}>
                   <TableRow className={project ? "bg-muted/30" : ""}>
@@ -308,8 +351,17 @@ export function ProjectTaskTree({
                     </TableCell>
                     <TableCell>
                       {project ? (
-                        <Badge variant="outline" className={active ? "text-emerald-600" : "text-muted-foreground"}>
-                          {active ? "进行中" : "已归档"}
+                        <Badge
+                          variant="outline"
+                          className={
+                            project.status === "active"
+                              ? "text-emerald-600"
+                              : project.status === "paused"
+                                ? "text-amber-600"
+                                : "text-muted-foreground"
+                          }
+                        >
+                          {project.status === "active" ? "进行中" : project.status === "paused" ? "已暂停" : "已归档"}
                         </Badge>
                       ) : (
                         <span className="text-muted-foreground text-xs">—</span>
@@ -344,14 +396,27 @@ export function ProjectTaskTree({
                               </Button>
                             </DropdownMenuTrigger>
                             <DropdownMenuContent align="end">
+                              {project.status !== "archived" && (
+                                <DropdownMenuItem onSelect={() => void toggleProjectPause(project)}>
+                                  {project.status === "paused" ? (
+                                    <>
+                                      <PlayIcon /> 继续项目
+                                    </>
+                                  ) : (
+                                    <>
+                                      <PauseIcon /> 暂停项目
+                                    </>
+                                  )}
+                                </DropdownMenuItem>
+                              )}
                               <DropdownMenuItem onSelect={() => void toggleArchive(project)}>
-                                {project.status === "active" ? (
+                                {project.status === "archived" ? (
                                   <>
-                                    <ArchiveIcon /> 归档
+                                    <ArchiveRestoreIcon /> 取消归档
                                   </>
                                 ) : (
                                   <>
-                                    <ArchiveRestoreIcon /> 取消归档
+                                    <ArchiveIcon /> 归档
                                   </>
                                 )}
                               </DropdownMenuItem>

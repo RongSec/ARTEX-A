@@ -22,3 +22,18 @@ func TestCoverTitle(t *testing.T) {
 		}
 	}
 }
+
+func TestReportSystemNameSkipsIP(t *testing.T) {
+	if got := reportSystemName("task", 215, 0, []string{"https://140.207.94.175"}); got != "任务215" {
+		t.Errorf("bare IP should fall back to task id, got %q", got)
+	}
+	if got := reportSystemName("task", 215, 0, []string{"http://10.0.0.5:8080/admin"}); got != "任务215" {
+		t.Errorf("IP with port should fall back to task id, got %q", got)
+	}
+	if got := reportSystemName("task", 215, 0, []string{"https://mail.example.com"}); got != "mail.example.com" {
+		t.Errorf("domain should be kept, got %q", got)
+	}
+	if got := reportSystemName("project", 0, 9, []string{"10.1.2.3"}); got != "项目9" {
+		t.Errorf("project fallback wrong, got %q", got)
+	}
+}

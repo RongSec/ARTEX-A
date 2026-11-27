@@ -1462,6 +1462,13 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS task_template_id BIGINT;
 -- 带出，项目详情页可编辑。不建子表：资产是人工录入的少量文本，存文本最直观。
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS targets TEXT NOT NULL DEFAULT '';
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS credentials JSONB NOT NULL DEFAULT '[]';
+-- V12-PAUSE：项目级暂停。status 增加 paused；项目暂停时把正在跑的任务一并
+-- 暂停，并给这些任务打标记（paused_by_project），恢复时只恢复本操作暂停的，
+-- 不动用户此前手动暂停的任务。排队中的批量任务保持 queued，由 dispatcher
+-- 因项目非 active 而不放行。
+ALTER TABLE projects DROP CONSTRAINT IF EXISTS projects_status_check;
+ALTER TABLE projects ADD CONSTRAINT projects_status_check CHECK (status IN ('active','archived','paused'));
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS paused_by_project BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_projects_alive ON projects(created_at DESC) WHERE status='active';
 DROP TRIGGER IF EXISTS trg_projects_upd ON projects;
 CREATE TRIGGER trg_projects_upd BEFORE UPDATE ON projects

@@ -66,6 +66,10 @@ func (s *Server) projectsBatchTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if proj.Status != "active" {
+		if proj.Status == "paused" {
+			writeErr(w, 400, "项目已暂停，不能下发新任务（先在项目页点「继续」）")
+			return
+		}
 		writeErr(w, 400, "项目已归档，不能批量下发（先恢复为 active）")
 		return
 	}

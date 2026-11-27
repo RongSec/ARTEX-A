@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/agent"
@@ -139,6 +140,11 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		queued, err := s.admitPausedTask(t)
 		if err != nil {
 			return out, err
+		}
+		// 手动继续（或项目继续）后清掉项目暂停标记：下次项目暂停重新打标，
+		// 不会把「以前被项目暂停过、后来手动恢复」的任务重复算进来。
+		if id, err := strconv.ParseInt(t.ID, 10, 64); err == nil {
+			_ = s.m.PG().ClearTaskPausedByProject(id)
 		}
 		out.Queued = queued
 		out.Status = map[bool]string{true: "queued", false: "running"}[queued]

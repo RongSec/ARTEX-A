@@ -112,6 +112,19 @@ func (d *DB) ListEnabledTriggers() ([]*AgentTrigger, error) {
 	return d.queryTriggers(`SELECT ` + triggerCols + ` FROM agent_triggers WHERE enabled ORDER BY id`)
 }
 
+// EnsureAgentTriggerEnabled 打开指定内置 agent 的触发器。项目级开关
+// reader_enabled 只是「允许读取」，真正的运行还受 agent_triggers.enabled
+// 这道全局闸控制；用户勾了项目开关却发现阅读者从不运行，就是这里默认关。
+// 幂等：已经开着时影响 0 行。
+func (d *DB) EnsureAgentTriggerEnabled(agentKey string) (int, error) {
+	res, err := d.Exec(`UPDATE agent_triggers SET enabled=true WHERE agent_key=$1 AND enabled=false`, agentKey)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 func (d *DB) queryTriggers(q string, args ...any) ([]*AgentTrigger, error) {
 	rows, err := d.Query(q, args...)
 	if err != nil {

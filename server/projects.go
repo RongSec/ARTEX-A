@@ -15,11 +15,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 )
 
@@ -226,11 +228,122 @@ func (s *Server) projectsCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, p)
 }
 
-// projectsList 返回项目列表（?status=active|archived 过滤；默认全部）。
+// projectsPause 暂停项目：状态置 paused（dispatcher 不再放行排队任务），并把
+// 项目内正在跑/等待中的单个任务一并暂停，打 paused_by_project 标记。
+// 排队中的批量任务保持 queued：项目非 active，dispatcher 自然不会认领；
+// 若把它们也 pause，任务就脱离了批量队列，恢复时只能逐个手动继续。
+func (s *Server) projectsPause(w http.ResponseWriter, r *http.Request) {
+	pid, ok := projectIDParam(w, r)
+	if !ok {
+		return
+	}
+	p, err := s.m.PG().GetProject(pid)
+	if errors.Is(err, db.ErrProjectNotFound) {
+		writeErr(w, 404, "项目不存在")
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if p.Status == "paused" {
+		writeJSON(w, 200, map[string]any{"ok": true, "status": "paused", "paused": 0})
+		return
+	}
+	if p.Status != "active" {
+		writeErr(w, 400, "只有进行中的项目可以暂停（已归档项目请先恢复）")
+		return
+	}
+	st := "paused"
+	if _, err := s.m.PG().UpdateProject(pid, db.UpdateProjectPatch{Status: &st}); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	rows, err := s.m.PG().ProjectTasks(pid)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	paused := 0
+	for _, row := range rows {
+		if row.Queued || row.Paused || isTerminalStatus(row.Status) {
+			continue
+		}
+		t, ok := s.m.Task(strconv.FormatInt(row.ID, 10))
+		if !ok {
+			continue
+		}
+		if _, err := s.applyTaskControlWithCause(t, "pause", agent.AbortPausedByProject); err != nil {
+			log.Printf("[project-pause] task %d 暂停失败: %v", row.ID, err)
+			continue
+		}
+		if err := s.m.PG().MarkTaskPausedByProject(row.ID); err != nil {
+			log.Printf("[project-pause] task %d 标记失败: %v", row.ID, err)
+		}
+		paused++
+	}
+	log.Printf("[project-pause] project %d 已暂停，连带暂停 %d 个任务", pid, paused)
+	writeJSON(w, 200, map[string]any{"ok": true, "status": "paused", "paused": paused})
+}
+
+// projectsResume 继续项目：状态置 active，只恢复「因项目暂停而暂停」的任务；
+// 用户此前手动暂停的任务保持暂停。排队中的批量任务留在队列，dispatcher 下一
+// tick 按项目额度继续放行。
+func (s *Server) projectsResume(w http.ResponseWriter, r *http.Request) {
+	pid, ok := projectIDParam(w, r)
+	if !ok {
+		return
+	}
+	p, err := s.m.PG().GetProject(pid)
+	if errors.Is(err, db.ErrProjectNotFound) {
+		writeErr(w, 404, "项目不存在")
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if p.Status == "active" {
+		writeJSON(w, 200, map[string]any{"ok": true, "status": "active", "resumed": 0})
+		return
+	}
+	if p.Status != "paused" {
+		writeErr(w, 400, "只有已暂停的项目可以继续（已归档项目请先恢复）")
+		return
+	}
+	st := "active"
+	if _, err := s.m.PG().UpdateProject(pid, db.UpdateProjectPatch{Status: &st}); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	ids, err := s.m.PG().ProjectPausedTaskIDs(pid)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	resumed := 0
+	for _, id := range ids {
+		t, ok := s.m.Task(strconv.FormatInt(id, 10))
+		if !ok {
+			_ = s.m.PG().ClearTaskPausedByProject(id)
+			continue
+		}
+		if _, err := s.applyTaskControl(t, "resume"); err != nil {
+			log.Printf("[project-resume] task %d 恢复失败: %v", id, err)
+			continue
+		}
+		_ = s.m.PG().ClearTaskPausedByProject(id)
+		resumed++
+	}
+	log.Printf("[project-resume] project %d 已继续，恢复 %d 个任务", pid, resumed)
+	writeJSON(w, 200, map[string]any{"ok": true, "status": "active", "resumed": resumed})
+}
+
+// projectsList 返回项目列表（?status=active|archived|paused 过滤；默认全部）。
 func (s *Server) projectsList(w http.ResponseWriter, r *http.Request) {
 	status := strings.TrimSpace(r.URL.Query().Get("status"))
-	if status != "" && status != "active" && status != "archived" {
-		writeErr(w, 400, "status 仅支持 active|archived")
+	if status != "" && status != "active" && status != "archived" && status != "paused" {
+		writeErr(w, 400, "status 仅支持 active|archived|paused")
 		return
 	}
 	list, err := s.m.PG().ListProjects(status)
@@ -462,6 +575,16 @@ func (s *Server) projectsUpdate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	// 勾选「跨项目阅读」时顺手打开 reader 的全局触发器：项目开关只表示
+	// 「允许读」，真正跑不跑还取决于 agent_triggers.enabled（默认关）。否则
+	// 用户勾了开关却发现阅读者从不运行，审计页面永远是空的。
+	if patch.ReaderEnabled != nil && *patch.ReaderEnabled {
+		if n, err := s.m.PG().EnsureAgentTriggerEnabled("reader"); err != nil {
+			log.Printf("[project] 打开 reader 触发器失败: %v", err)
+		} else if n > 0 {
+			log.Printf("[project] 已随项目 %d 的跨项目阅读开关启用 reader 触发器", pid)
+		}
 	}
 	// 投影常开（T12 定稿）：observer_enabled 翻转不影响 project_index，无需
 	// 失效任何投影侧缓存。该开关只管 fireProjectGraph 触发（scheduler 每 tick

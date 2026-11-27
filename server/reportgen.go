@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1111,13 +1112,20 @@ func coverTitle(fallback string, targets []string) string {
 	return name + "渗透测试报告"
 }
 
-// reportSystemName 解析 {system}：优先第一个目标的 host（去 scheme/端口/路径）；
-// 否则 task→任务<id>、project→项目<id>。系统名永不为空。
+// reportSystemName 解析 {system}：优先第一个「像系统名」的目标主机（去
+// scheme/端口/路径）；否则 task→任务<id>、project→项目<id>。
+//
+// 裸 IP 不算系统名：交付规范明确「知道系统名用系统名，不知道用任务 ID，
+// 禁止拿 IP/域名占位」。此前只要目标里有 IP，标题/文件名就会变成
+// 「140.207.94.175渗透测试报告」，报告里也找不到真实系统名。
+// 域名保留（至少是可识别的资产身份，且很多系统就是以域名对外），IP 跳过。
 func reportSystemName(scope string, taskID, projectID int64, targets []string) string {
 	for _, t := range targets {
-		if h := hostOnly(t); h != "" {
-			return h
+		h := hostOnly(t)
+		if h == "" || net.ParseIP(strings.Trim(h, "[]")) != nil {
+			continue
 		}
+		return h
 	}
 	switch scope {
 	case db.ReportScopeTask:

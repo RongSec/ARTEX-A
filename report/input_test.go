@@ -262,3 +262,27 @@ func TestReportBaseName(t *testing.T) {
 		t.Errorf("long title not truncated: len=%d", len([]rune(got)))
 	}
 }
+
+// ---------- Markdown 章节抽取（影响/修复建议） ----------
+
+func TestMarkdownSection(t *testing.T) {
+	md := "# 标题\n\n## 概述\n一句话。\n\n## 影响与危害\n\n- **加密失效**：全部接口可解密。\n- 可伪造请求。\n\n### 补充\n细节。\n\n## 修复建议\n\n1. 升级到 3.2.0。\n2. 密钥改为服务端下发。\n\n## 参考\n链接。"
+	if got := markdownSection(md, "影响与危害", "影响", "危害"); !strings.Contains(got, "加密失效") || !strings.Contains(got, "可伪造请求") || !strings.Contains(got, "细节") {
+		t.Errorf("harm section wrong: %q", got)
+	}
+	if strings.Contains(markdownSection(md, "影响与危害"), "修复建议") {
+		t.Error("harm section leaked into next chapter")
+	}
+	got := markdownSection(md, "修复建议", "修复方案")
+	if !strings.Contains(got, "升级到 3.2.0") || !strings.Contains(got, "密钥改为服务端下发") {
+		t.Errorf("remediation section wrong: %q", got)
+	}
+	// 无章节 → 空串（调用方回退「暂无」）。
+	if got := markdownSection(md, "不存在的章节"); got != "" {
+		t.Errorf("missing section should be empty, got %q", got)
+	}
+	// 加粗标题形态也能识别。
+	if got := markdownSection("**修复建议**\n打补丁。", "修复建议"); got != "打补丁。" {
+		t.Errorf("bold heading not recognized: %q", got)
+	}
+}
