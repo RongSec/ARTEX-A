@@ -223,10 +223,6 @@ function CreateProjectDialog({
       toast.error("并发数须为 1-8 的整数");
       return;
     }
-    if (targetList.length > 200) {
-      toast.error(`单批最多 200 个资产（当前 ${targetList.length} 个），请分批下发`);
-      return;
-    }
     setSaving(true);
     try {
       const p = await api.createProject({

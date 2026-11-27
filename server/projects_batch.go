@@ -18,10 +18,6 @@ import (
 	"github.com/Autumn-27/artex/db"
 )
 
-// maxBatchCreate 是单次批量下发的行数上限（照 maxBatchControlIDs 范式，
-// 建任务比批量暂停重，给 200）。
-const maxBatchCreate = 200
-
 // splitBatchTargets 把 textarea 文本拆成目标行。语义已升级为 ParseTargets
 // （V12-TARGET）：除空行/重复外，还剔除非法的域名/IP/URL，并返回 invalid 供
 // 前端核对。前端「解析」按钮用同一套规则做即时预览。
@@ -81,10 +77,6 @@ func (s *Server) projectsBatchTasks(w http.ResponseWriter, r *http.Request) {
 	targets, skipped, invalid := splitBatchTargets(req.Targets)
 	if len(targets) == 0 {
 		writeErr(w, 400, "targets 为空（一行一个目标）")
-		return
-	}
-	if len(targets) > maxBatchCreate {
-		writeErr(w, 400, fmt.Sprintf("单批最多 %d 个目标（本批有效 %d 行）", maxBatchCreate, len(targets)))
 		return
 	}
 	if len(req.Common.LLMProfileIDs) > 0 {

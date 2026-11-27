@@ -77,10 +77,5 @@ func TestSplitBatchTargets(t *testing.T) {
 	}
 }
 
-// 上限保护语义在 handler（len(targets)>maxBatchCreate→400）；这里钉住常量
-// 本身，防止有人悄悄把它调大绕过保护（单批 200 是评审定值）。
-func TestMaxBatchCreateConstant(t *testing.T) {
-	if maxBatchCreate != 200 {
-		t.Fatalf("maxBatchCreate 应为 200，实际 %d", maxBatchCreate)
-	}
-}
+// 批量下发不再设单批行数上限（用户明确要求），这里保留用例位以便后续
+// 需要时补其它保护语义。

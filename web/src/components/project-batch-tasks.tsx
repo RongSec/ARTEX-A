@@ -28,9 +28,6 @@ import {
 import { api } from "@/lib/api";
 import type { TaskTemplate } from "@/lib/types";
 
-// 单批上限与后端 server/projects_batch.go maxBatchCreate 同步（改一边必须改另一边）。
-const MAX_BATCH = 200;
-
 interface ProjectBatchTasksProps {
   projectID: number;
   concurrency: number;
@@ -127,10 +124,6 @@ export function ProjectBatchTasks({
   async function submit() {
     if (willCreate === 0) {
       toast.error("请至少填写一个有效资产");
-      return;
-    }
-    if (willCreate > MAX_BATCH) {
-      toast.error(`单批最多 ${MAX_BATCH} 个资产（当前 ${willCreate} 个）`);
       return;
     }
     const conc = Number(concurrencyOverride);
@@ -307,7 +300,7 @@ export function ProjectBatchTasks({
             <Button variant="outline" onClick={() => setOpen(false)} disabled={submitting}>
               取消
             </Button>
-            <Button onClick={submit} disabled={submitting || willCreate === 0 || willCreate > MAX_BATCH}>
+            <Button onClick={submit} disabled={submitting || willCreate === 0}>
               {submitting ? "下发中…" : `下发 ${willCreate > 0 ? willCreate : ""} 个任务`}
             </Button>
           </DialogFooter>
