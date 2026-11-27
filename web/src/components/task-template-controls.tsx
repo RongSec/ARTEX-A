@@ -395,9 +395,9 @@ interface TaskTemplateControlsProps {
   /** 覆盖选择器下方的说明文字（项目创建等「只存引用、不复制内容」的场景用）。 */
   hint?: string;
   /**
-   * referenceOnly：选择模板只建立引用，不覆盖当前表单内容。
-   * 项目创建用 true——那里的「目的」是项目描述，模板只做默认引用，
-   * 不该弹「将覆盖已填内容」的确认（弹了用户取消就表现为「选不中」）。
+   * referenceOnly：选择模板只建立引用，不弹「将覆盖已填内容」的确认，直接把
+   * 模板内容带进表单。项目创建用 true——那里的目的是项目描述，模板只做默认
+   * 引用，不该因为字段有内容就拦一道确认。
    */
   referenceOnly?: boolean;
 }
@@ -462,9 +462,9 @@ export function TaskTemplateControls({
     }
     setTemplateInputValue(template.name);
     if (referenceOnly) {
-      // 只建立引用：把 id 交出去，不调用 onApply——项目页的 onApply 会把
-      // 模板资产写进项目资产框，选中模板就冲掉用户刚粘的资产。
-      onSelectedTemplateIDChange(template.id);
+      // 直接套用内容：项目创建页要的就是「选模板 → 目的/约束/资产一起带出来」。
+      // 下拉点不中的问题已由 portalContainer 修掉，这里不再需要绕开确认弹窗。
+      applyTemplate(template);
       return;
     }
     const hasContent = description.trim() !== "" || goal.trim() !== "";

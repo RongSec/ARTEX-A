@@ -375,15 +375,19 @@ function CreateProjectDialog({
               portalContainer={dialogContentRef}
               referenceOnly
               onApply={(t) => {
+                // 模板内容整体带出：目的（= 项目描述，批量下发时作描述模板）、
+                // 操作约束、资产。模板没定义资产时保留用户已粘的内容，不清空。
+                if (t.description?.trim()) setPurpose(t.description);
                 if (t.constraints?.length) {
                   setConstraintItems(t.constraints.map((c) => ({ kind: c.kind, text: c.text })));
                 }
-                // 模板资产填进项目资产框：批量下发以这里的资产为准。
-                setTargetRaw(t.targets ?? "");
-                setTargetRows(rowsFromTargets(t.targets ?? ""));
-                setTargetInvalid([]);
+                if (t.targets?.trim()) {
+                  setTargetRaw(t.targets);
+                  setTargetRows(rowsFromTargets(t.targets));
+                  setTargetInvalid([]);
+                }
               }}
-              hint="作为本项目的默认任务模板：批量下发时自动带出，可在那时再改。只存引用，不复制模板内容。"
+              hint="选中即带出目的、操作约束与资产；作为本项目的默认任务模板，批量下发时自动带出。"
             />
           </div>
 
