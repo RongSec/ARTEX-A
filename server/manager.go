@@ -1692,6 +1692,11 @@ func (m *Manager) DeleteTask(id string, opts DeleteTaskOptions) (DeleteTaskResul
 	}
 	for _, fid := range dbResult.EvidenceFindingIDs {
 		dir := filepath.Join(m.dir, "report_assets", "evidence", strconv.FormatInt(fid, 10))
+		// 只有目录真的存在才计入删除数，RemoveAll 对不存在的路径也返回 nil，
+		// 直接计数会把「本来就没有截图」的漏洞算成已删目录。
+		if _, statErr := os.Lstat(dir); statErr != nil {
+			continue
+		}
 		if err := os.RemoveAll(dir); err != nil {
 			fileCleanupErrs = append(fileCleanupErrs, fmt.Sprintf("删证据目录 %s: %v", dir, err))
 			continue
