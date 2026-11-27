@@ -439,6 +439,9 @@ function DeleteProjectDialog({
     // 项目级派生数据（情报表、图谱投影）随项目必删，列表里锁定展示。
     delete_intel: true,
     delete_project_graph: true,
+    // 项目级汇总报告默认一并清理（可取消）：项目行删掉后 reports.project_id
+    // 就成了悬空引用，报告中心按项目分组会显示一个不存在的项目。
+    delete_reports: true,
   }));
   const [deleteTasks, setDeleteTasks] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
@@ -448,7 +451,7 @@ function DeleteProjectDialog({
 
   React.useEffect(() => {
     if (open) {
-      setOptions({ ...emptyDeleteOptions(), delete_intel: true, delete_project_graph: true });
+      setOptions({ ...emptyDeleteOptions(), delete_intel: true, delete_project_graph: true, delete_reports: true });
       setDeleteTasks(false);
     }
   }, [open]);
