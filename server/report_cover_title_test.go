@@ -36,4 +36,14 @@ func TestReportSystemNameSkipsIP(t *testing.T) {
 	if got := reportSystemName("project", 0, 9, []string{"10.1.2.3"}); got != "项目9" {
 		t.Errorf("project fallback wrong, got %q", got)
 	}
+	// 人工命名的任务名可以当系统名；URL/默认目标句不行。
+	if got := reportSystemName("task", 215, 0, []string{"https://140.207.94.175"}, "示例经销商门户"); got != "示例经销商门户" {
+		t.Errorf("named task should be system name, got %q", got)
+	}
+	if got := reportSystemName("task", 215, 0, []string{"https://140.207.94.175"}, "对给定的资产范围进行全面安全审计"); got != "任务215" {
+		t.Errorf("default goal must not be system name, got %q", got)
+	}
+	if got := reportSystemName("task", 215, 0, []string{"https://140.207.94.175"}, "https://140.207.94.175"); got != "任务215" {
+		t.Errorf("URL task name must not be system name, got %q", got)
+	}
 }
