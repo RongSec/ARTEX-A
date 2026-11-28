@@ -48,49 +48,49 @@ func (s *Server) toolRecordCredential() actool.CoreTool {
 				Evidence  string `json:"evidence"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
-				return actool.Errorf("参数解析失败: %v", err), nil
+				return actool.Errorf(fmt.Sprintf("参数解析失败: %v", err)), nil
 			}
 			ri := agent.RunInfoFrom(ctx)
 			if ri.TaskID <= 0 {
-				return actool.Errorf("当前不在任务上下文中，无法登记凭据"), nil
+				return actool.Errorf(fmt.Sprintf("当前不在任务上下文中，无法登记凭据")), nil
 			}
 			t, err := s.m.pg.GetTask(ri.TaskID)
 			if err != nil || t == nil {
-				return actool.Errorf("任务 %d 不存在", ri.TaskID), nil
+				return actool.Errorf(fmt.Sprintf("任务 %d 不存在", ri.TaskID)), nil
 			}
 			if t.ProjectID == nil || *t.ProjectID <= 0 {
-				return actool.Errorf("任务未挂项目，情报表无法写入（先挂项目再登记）"), nil
+				return actool.Errorf(fmt.Sprintf("任务未挂项目，情报表无法写入（先挂项目再登记）")), nil
 			}
 			kind := strings.ToLower(strings.TrimSpace(a.Kind))
 			svc, ok := intelValidService(a.Service)
 			if !ok {
-				return actool.Errorf("service 必须是 host 或 host:port（不要带 http:// 或路径）: %q", a.Service), nil
+				return actool.Errorf(fmt.Sprintf("service 必须是 host 或 host:port（不要带 http:// 或路径）: %q", a.Service)), nil
 			}
 			user := strings.TrimSpace(a.Username)
 			if user != "" {
 				u, ok := intelValidUsername(user)
 				if !ok {
-					return actool.Errorf("username 不像账号（字段名/头名不算）: %q", user), nil
+					return actool.Errorf(fmt.Sprintf("username 不像账号（字段名/头名不算）: %q", user)), nil
 				}
 				user = u
 			}
 			secret := strings.TrimSpace(a.Secret)
 			if secret == "" {
-				return actool.Errorf("secret 不能为空"), nil
+				return actool.Errorf(fmt.Sprintf("secret 不能为空")), nil
 			}
 			if len([]rune(secret)) > 4096 {
-				return actool.Errorf("secret 过长（>4096 字符）"), nil
+				return actool.Errorf(fmt.Sprintf("secret 过长（>4096 字符）")), nil
 			}
 			masked := maskIntelSecret(secret)
 			if masked == "" {
 				if kind != "key" {
-					return actool.Errorf("secret 不像可用凭据（散文/头部碎片不登记）"), nil
+					return actool.Errorf(fmt.Sprintf("secret 不像可用凭据（散文/头部碎片不登记）")), nil
 				}
 				masked = "****"
 			}
 			key, value := db.NormalizeCredential(kind, user, svc)
 			if key == "" {
-				return actool.Errorf("kind 必须是 password/token/cookie/hash/key"), nil
+				return actool.Errorf(fmt.Sprintf("kind 必须是 password/token/cookie/hash/key")), nil
 			}
 			var where []string
 			for _, p := range strings.FieldsFunc(a.WhereUsed, func(r rune) bool { return r == ',' || r == '\n' || r == ';' }) {
@@ -111,7 +111,7 @@ func (s *Server) toolRecordCredential() actool.CoreTool {
 				Value:    value, Detail: detail, Source: "manual",
 			}})
 			if err != nil {
-				return actool.Errorf("写入凭据失败: %v", err), nil
+				return actool.Errorf(fmt.Sprintf("写入凭据失败: %v", err)), nil
 			}
 			return actool.Text(fmt.Sprintf("credential recorded: %s（%s，掩码 %s；新增 %d / 更新 %d）",
 				key, value, masked, res.Inserted, res.Updated)), nil
@@ -132,25 +132,25 @@ func (s *Server) toolSetSystemName() actool.CoreTool {
 				Name string `json:"name"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
-				return actool.Errorf("参数解析失败: %v", err), nil
+				return actool.Errorf(fmt.Sprintf("参数解析失败: %v", err)), nil
 			}
 			ri := agent.RunInfoFrom(ctx)
 			if ri.TaskID <= 0 {
-				return actool.Errorf("当前不在任务上下文中"), nil
+				return actool.Errorf(fmt.Sprintf("当前不在任务上下文中")), nil
 			}
 			name := strings.TrimSpace(a.Name)
 			if len([]rune(name)) < 2 {
-				return actool.Errorf("系统名至少 2 个字"), nil
+				return actool.Errorf(fmt.Sprintf("系统名至少 2 个字")), nil
 			}
 			if !isUsableSystemName(name) {
-				return actool.Errorf("不像系统名（域名/IP/默认任务描述/过长文本都不行）: %q", name), nil
+				return actool.Errorf(fmt.Sprintf("不像系统名（域名/IP/默认任务描述/过长文本都不行）: %q", name)), nil
 			}
 			lower := strings.ToLower(name)
 			if lower == "unknown" || name == "未知" || name == "未知系统" || name == "目标系统" {
-				return actool.Errorf("不确定就不要登记；报告会用任务 ID"), nil
+				return actool.Errorf(fmt.Sprintf("不确定就不要登记；报告会用任务 ID")), nil
 			}
 			if _, err := s.m.pg.SetTaskSystemName(ri.TaskID, name); err != nil {
-				return actool.Errorf("写入失败: %v", err), nil
+				return actool.Errorf(fmt.Sprintf("写入失败: %v", err)), nil
 			}
 			return actool.Text(fmt.Sprintf("system name recorded: %s (task#%d)", name, ri.TaskID)), nil
 		})
@@ -184,11 +184,11 @@ func (s *Server) toolSearxngSearch() actool.CoreTool {
 				Limit int    `json:"limit"`
 			}
 			if err := json.Unmarshal(in, &a); err != nil {
-				return actool.Errorf("参数解析失败: %v", err), nil
+				return actool.Errorf(fmt.Sprintf("参数解析失败: %v", err)), nil
 			}
 			q := strings.TrimSpace(a.Query)
 			if q == "" {
-				return actool.Errorf("query 不能为空"), nil
+				return actool.Errorf(fmt.Sprintf("query 不能为空")), nil
 			}
 			if a.Limit <= 0 || a.Limit > 10 {
 				a.Limit = 6
@@ -205,18 +205,18 @@ func (s *Server) toolSearxngSearch() actool.CoreTool {
 			defer cancel()
 			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 			if err != nil {
-				return actool.Errorf("构造搜索请求失败: %v", err), nil
+				return actool.Errorf(fmt.Sprintf("构造搜索请求失败: %v", err)), nil
 			}
 			// 只连本机 SearXNG，不走环境代理（SearXNG 自己配置出口代理）。
 			client := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 25 * time.Second}
 			resp, err := client.Do(req)
 			if err != nil {
-				return actool.Errorf("SearXNG 请求失败（%s）: %v", base, err), nil
+				return actool.Errorf(fmt.Sprintf("SearXNG 请求失败（%s）: %v", base, err)), nil
 			}
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 			if resp.StatusCode != http.StatusOK {
-				return actool.Errorf("SearXNG 返回 HTTP %d: %s", resp.StatusCode, clipText(string(body), 200)), nil
+				return actool.Errorf(fmt.Sprintf("SearXNG 返回 HTTP %d: %s", resp.StatusCode, clipText(string(body), 200)), nil
 			}
 			var sr searxngResponse
 			if err := json.Unmarshal(body, &sr); err != nil {
@@ -272,5 +272,5 @@ func (s *Server) seedIntelWriteTools() {
 	}
 	seed(s.toolRecordCredential(), []string{"worker", "mainagent", "pentest", "auto"})
 	seed(s.toolSetSystemName(), []string{"worker", "planner", "mainagent", "pentest", "auto"})
-	seed(s.toolSearxngSearch(), []string{"worker", "planner", "mainagent", "pentest", "auto", "retester"})
+	seed(s.toolSearxngSearch(), []string{"worker", "planner", "mainagent", "pentest", "auto", "retester"}))
 }
