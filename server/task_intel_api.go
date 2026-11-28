@@ -274,6 +274,10 @@ func intelCredentialIsNoise(user, secretMasked string) bool {
 	if strings.Contains(u, "-") {
 		return true
 	}
+	// 配置键形态（value.status / userAuthStatus）不是账号；带 @ 的邮箱保留。
+	if strings.Contains(u, ".") && !strings.Contains(u, "@") {
+		return true
+	}
 	return false
 }
 

@@ -301,6 +301,7 @@ var intelUsernameStopwords = map[string]bool{
 	"env": true, "domain": true, "imageid": true, "qrcode": true, "deviceid": true,
 	"csrf": true, "xsrf": true, "captcha": true, "verifycode": true, "rememberme": true,
 	"token": true, "secret": true, "authorization": true,
+	"type": true, "userauthstatus": true, "value": true, "data": true, "result": true,
 }
 
 // intelURLTrailing 是 URL 结束处允许出现的尾随标点（抽取时剥掉）。
