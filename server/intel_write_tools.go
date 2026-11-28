@@ -216,11 +216,11 @@ func (s *Server) toolSearxngSearch() actool.CoreTool {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 			if resp.StatusCode != http.StatusOK {
-				return actool.Errorf(fmt.Sprintf("SearXNG 返回 HTTP %d: %s", resp.StatusCode, clipText(string(body), 200)), nil
+				return actool.Errorf(fmt.Sprintf("SearXNG 返回 HTTP %d: %s", resp.StatusCode, clipText(string(body), 200))), nil
 			}
 			var sr searxngResponse
 			if err := json.Unmarshal(body, &sr); err != nil {
-				return actool.Errorf("SearXNG 返回不是 JSON: %v", err), nil
+				return actool.Errorf(fmt.Sprintf("SearXNG 返回不是 JSON: %v", err)), nil
 			}
 			if len(sr.Results) == 0 {
 				return actool.Text("没有检索结果（上游引擎可能限流，换个关键词或稍后重试）"), nil
@@ -250,13 +250,6 @@ func (s *Server) toolSearxngSearch() actool.CoreTool {
 		})
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // seedIntelWriteTools 把三个 host 工具注册进 tools 表（首次插入；之后页面可改）。
 // 未绑定到某 agent 时 ToolResolve 会丢弃该工具，所以这里按角色给最小集合。
 func (s *Server) seedIntelWriteTools() {
@@ -272,5 +265,5 @@ func (s *Server) seedIntelWriteTools() {
 	}
 	seed(s.toolRecordCredential(), []string{"worker", "mainagent", "pentest", "auto"})
 	seed(s.toolSetSystemName(), []string{"worker", "planner", "mainagent", "pentest", "auto"})
-	seed(s.toolSearxngSearch(), []string{"worker", "planner", "mainagent", "pentest", "auto", "retester"}))
+	seed(s.toolSearxngSearch(), []string{"worker", "planner", "mainagent", "pentest", "auto", "retester"})
 }
