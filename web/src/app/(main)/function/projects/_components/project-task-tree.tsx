@@ -21,6 +21,7 @@ import {
   FileTextIcon,
   InboxIcon,
   MoreHorizontalIcon,
+  CheckIcon,
   PlusIcon,
   RefreshCwIcon,
   Trash2Icon,
@@ -38,6 +39,9 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
@@ -203,6 +207,21 @@ export function ProjectTaskTree({
     }
   }
 
+  // 并发数就地调整：项目行下拉直接改，不用进详情再点编辑。
+  async function setProjectConcurrency(p: ProjectWithStats, n: number) {
+    if (p.concurrency === n) return;
+    setArchiving(p.id);
+    try {
+      await api.updateProject(p.id, { concurrency: n });
+      toast.success(`「${p.name}」并发数已改为 ${n}`);
+      onRefresh();
+    } catch (e) {
+      toast.error("修改并发失败：" + (e as Error).message);
+    } finally {
+      setArchiving(null);
+    }
+  }
+
   async function toggleProjectPause(p: ProjectWithStats) {
     setArchiving(p.id);
     try {
@@ -339,6 +358,12 @@ export function ProjectTaskTree({
                             {project.name}
                           </Link>
                           {project.status === "archived" && <Badge variant="outline">已归档</Badge>}
+                          <span
+                            className="text-muted-foreground shrink-0 text-xs tabular-nums"
+                            title="项目内同时运行的任务数（下拉菜单可改）"
+                          >
+                            并发 {project.concurrency}
+                          </span>
                           {project.owner && (
                             <span className="text-muted-foreground shrink-0 text-xs">{project.owner}</span>
                           )}
@@ -396,6 +421,27 @@ export function ProjectTaskTree({
                               </Button>
                             </DropdownMenuTrigger>
                             <DropdownMenuContent align="end">
+                              <DropdownMenuSub>
+                                <DropdownMenuSubTrigger>
+                                  <RefreshCwIcon /> 并发数（{project.concurrency}）
+                                </DropdownMenuSubTrigger>
+                                <DropdownMenuSubContent>
+                                  {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                                    <DropdownMenuItem
+                                      key={n}
+                                      onSelect={() => void setProjectConcurrency(project, n)}
+                                    >
+                                      {project.concurrency === n ? (
+                                        <CheckIcon className="text-emerald-600" />
+                                      ) : (
+                                        <span className="size-4" />
+                                      )}
+                                      同时 {n} 个任务
+                                    </DropdownMenuItem>
+                                  ))}
+                                </DropdownMenuSubContent>
+                              </DropdownMenuSub>
+                              <DropdownMenuSeparator />
                               {project.status !== "archived" && (
                                 <DropdownMenuItem onSelect={() => void toggleProjectPause(project)}>
                                   {project.status === "paused" ? (

@@ -215,7 +215,8 @@ func (s *Server) replaceProjectConstraints(w http.ResponseWriter, r *http.Reques
 		writeErr(w, 400, "invalid JSON")
 		return
 	}
-	if err := s.m.PG().ReplaceProjectConstraints(pid, body.Constraints); err != nil {
+	synced, err := s.m.PG().ReplaceProjectConstraints(pid, body.Constraints)
+	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -224,5 +225,5 @@ func (s *Server) replaceProjectConstraints(w http.ResponseWriter, r *http.Reques
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"constraints": constraintDTOs(rows)})
+	writeJSON(w, 200, map[string]any{"constraints": constraintDTOs(rows), "synced_constraints": synced})
 }

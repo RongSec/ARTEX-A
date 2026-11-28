@@ -293,6 +293,14 @@ var intelUsernameStopwords = map[string]bool{
 	"pwd": true, "level": true, "currently": true, "surname": true, "phpids": true,
 	"login": true, "submit": true, "security": true, "low": true, "high": true,
 	"medium": true, "impossible": true, "account": true,
+	// 实测误报：这些是 JS 变量名 / JSON 字段名 / HTTP 头名 / nmap 输出词，
+	// 被 `xxx: yyy` 模式当成「账号: 口令」写进了凭据表（任务 216 一次 20+ 条）。
+	"shown": true, "cmd": true, "clusterid": true, "payload123": true, "exponent": true,
+	"status": true, "isok": true, "newpage": true, "origin": true, "je": true,
+	"real-chromium": true, "enterprisedomains": true, "alg": true, "hostname": true,
+	"env": true, "domain": true, "imageid": true, "qrcode": true, "deviceid": true,
+	"csrf": true, "xsrf": true, "captcha": true, "verifycode": true, "rememberme": true,
+	"token": true, "secret": true, "authorization": true,
 }
 
 // intelURLTrailing 是 URL 结束处允许出现的尾随标点（抽取时剥掉）。
@@ -1163,6 +1171,9 @@ func (a *intelAcc) addCredentialsFromText(text, fallbackService, source string, 
 	used := intelTextPaths(text)
 
 	for _, m := range reIntelPwdAssign.FindAllStringSubmatch(text, -1) {
+		if !intelPasswordShape(m[1]) {
+			continue
+		}
 		a.addCredential("password", user, service, m[1], "password=", used, source, sourceID)
 	}
 	for _, m := range reIntelBearer.FindAllStringSubmatch(text, -1) {
@@ -1183,6 +1194,20 @@ func (a *intelAcc) addCredentialsFromText(text, fallbackService, source string, 
 		}
 		// 用户名必须是账号形态且不是字段名（Surname/name/currently/level…）。
 		if _, ok := intelValidUsername(rawUser); !ok {
+			continue
+		}
+		// 高精度门槛：只接受「与显式 user=/account= 提示一致」或「常见特权账号」
+		// 的 user:pass。纯 `xxx: yyy` 文本里字段名/头名/输出词太多（shown: 65532、
+		// X-Forwarded-Host: evil.com、cmd: com.bokesoft…），不设门槛就会把整张
+		// 页面的 JS 变量都写成凭据。
+		if user == "" || !strings.EqualFold(rawUser, user) {
+			if !reIntelCommonUsr.MatchString(rawUser) {
+				continue
+			}
+		}
+		// 口令形态：至少 6 位、不是数字/占位词/散文。`shown: 65532` 这类纯数字
+		// 端口/计数一律丢弃。
+		if !intelPasswordShape(secret) {
 			continue
 		}
 		// host:port 过滤：`app.example.com:8080` 会被本模式误读成 user:pass，
@@ -1239,7 +1264,14 @@ func (a *intelAcc) addCredential(kind, username, service, secret, pattern string
 	e.count++
 	e.patterns[pattern] = true
 	if e.secretMasked == "" {
-		e.secretMasked = maskIntelSecret(secret)
+		masked := maskIntelSecret(secret)
+		if masked == "" {
+			if kind != "key" {
+				return // 不像密文（散文/头部碎片）：不入凭据表
+			}
+			masked = "****"
+		}
+		e.secretMasked = masked
 	}
 	for _, p := range whereUsed {
 		if len(e.whereUsed) >= intelMaxWhereUsed {
@@ -1259,6 +1291,32 @@ const intelMaxWhereUsed = 8
 // 这类字符串不展示掩码——前 2 后 2 的截断反而把正文带进详情页（实测出现
 // 「re****估。」「us****]}」）。
 var reIntelSecretShape = regexp.MustCompile(`^[A-Za-z0-9._~+/=:@\-]+$`)
+
+// intelPasswordShape 判断一个「口令」是否像真的秘密：至少 6 位、不是纯数字
+// （端口/计数/验证码）、不是 null/true/**** 之类的占位。宁可漏报，也不把
+// nmap 输出或 JS 配置写成凭据。
+func intelPasswordShape(s string) bool {
+	s = strings.TrimSpace(strings.Trim(s, `"'`))
+	if len([]rune(s)) < 6 {
+		return false
+	}
+	lower := strings.ToLower(s)
+	switch lower {
+	case "null", "undefined", "true", "false", "password", "passwd", "pwd",
+		"changeme", "notshown", "filtered", "open", "closed":
+		return false
+	}
+	allDigit, allStar := true, true
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			allDigit = false
+		}
+		if r != '*' && r != '.' {
+			allStar = false
+		}
+	}
+	return !allDigit && !allStar
+}
 
 // maskIntelSecret 只留前 2 后 2 字符（≤4 字符全遮），返回值本身不含可用明文。
 // 形如 "user_token=eyJ..." 的 cookie 只掩 = 后面的值部分。

@@ -26,7 +26,7 @@ func TestProjectConstraintsCopyToTaskAndCascade(t *testing.T) {
 		{Kind: "deny", Text: "禁止爆破同一账号超过 3 次"},
 		{Kind: "deny", Text: "不得删改生产数据"},
 	}
-	if err := d.ReplaceProjectConstraints(pid, items); err != nil {
+	if _, err := d.ReplaceProjectConstraints(pid, items); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.ListProjectConstraints(pid)

@@ -315,7 +315,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                         value={maxTurns} onChange={(e) => setMaxTurns(e.target.value)} />
                     </div>
                     <div className="grid gap-1.5">
-                      <Label htmlFor="run-seconds" className="text-xs">运行时长（秒，0=不限）</Label>
+                      <Label htmlFor="run-seconds" className="text-xs">单次运行超时（秒，0=不限）</Label>
                       <Input id="run-seconds" type="number" min={0} className="h-8 w-32"
                         value={runSecs} onChange={(e) => setRunSecs(e.target.value)} />
                     </div>
@@ -325,6 +325,13 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                   <SaveIcon /> 保存配置
                 </Button>
               </div>
+              {showConfig && (
+                <p className="text-muted-foreground text-[11px]">
+                  最大循环次数按 LLM 回合计；「单次运行超时」是一次运行的最长墙钟时间
+                  （worker 即单条意图）。撞到超时会标记 exhausted 并强制收尾，已写入的
+                  事实/资产保留。线上 worker 当前 1200 秒，深目标可调大到 1800–2400。
+                </p>
+              )}
               {showWebSearch && (
                 <div className="flex items-center gap-3 border-t pt-3">
                   <Switch
