@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -923,4 +924,29 @@ WHERE $1 = ANY(source_task_ids)`, id); err != nil {
 		return result, err
 	}
 	return result, tx.Commit()
+}
+
+// SetTaskSystemName 写入 agent 在测试中确认的系统名（报告封面/文件名用）。
+// 空串=清除；返回更新前行数（0=任务不存在）。
+func (d *DB) SetTaskSystemName(taskID int64, name string) (int64, error) {
+	res, err := d.Exec(`UPDATE tasks SET system_name=$2 WHERE id=$1 AND deleted_at IS NULL`,
+		taskID, strings.TrimSpace(name))
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// TaskSystemName 读任务已登记的系统名；空=未登记（报告回退任务 ID）。
+func (d *DB) TaskSystemName(taskID int64) (string, error) {
+	var name string
+	err := d.QueryRow(`SELECT COALESCE(system_name,'') FROM tasks WHERE id=$1 AND deleted_at IS NULL`, taskID).Scan(&name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(name), nil
 }

@@ -582,14 +582,16 @@ func extractTaskIntel(in intelBuildInput) []db.TaskIntel {
 		acc.addEndpointsFromText(text, intelFindingPurpose(f), "finding", f.ID)
 		// 凭据的 service 若在正文里只剩路径（login.php），退回该 finding 的资产
 		// host——凭据必须挂在主机上，不能挂在路径上。
-		acc.addCredentialsFromText(text, intelFindingService(f, assetKeyByID), "finding", f.ID)
+		// 凭据不再从 finding 正文正则猜：agent 发现可用凭据时调 record_credential。
+		// 正则版本把字段名/头名/扫描输出都写成凭据（shown: 65532 等），噪声不可控。
+		_ = text
 		acc.addComponentsFromText(text, "finding", f.ID)
 		acc.addVuln(f, assetKeyByID, firstAssetKey)
 	}
 	for _, fact := range in.Facts {
 		text := strings.Join([]string{fact.Summary, fact.Detail, fact.Evidence}, "\n")
 		acc.addEndpointsFromText(text, intelClipRunes(fact.Summary, 60), "fact", fact.NodeID)
-		acc.addCredentialsFromText(text, "", "fact", fact.NodeID)
+		// 同上：fact 正文也不再自动抽凭据。
 		acc.addComponentsFromText(text, "fact", fact.NodeID)
 	}
 	return acc.rows(in.TaskID)

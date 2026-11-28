@@ -1469,6 +1469,9 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS credentials JSONB NOT NULL DEFAULT
 ALTER TABLE projects DROP CONSTRAINT IF EXISTS projects_status_check;
 ALTER TABLE projects ADD CONSTRAINT projects_status_check CHECK (status IN ('active','archived','paused'));
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS paused_by_project BOOLEAN NOT NULL DEFAULT false;
+-- 报告系统名：agent 在测试中确认的真实系统名（登录页标题/产品名）。空=未知，
+-- 报告回退「任务N」。不再用任务名/域名/IP 猜系统名（1000+ 任务无法人工逐个命名）。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS system_name TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_projects_alive ON projects(created_at DESC) WHERE status='active';
 DROP TRIGGER IF EXISTS trg_projects_upd ON projects;
 CREATE TRIGGER trg_projects_upd BEFORE UPDATE ON projects

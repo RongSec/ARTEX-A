@@ -269,6 +269,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
 		s.seedWorkerReaderTools()  // V11：存量库把 ask_reader 补绑到 worker
+		s.seedIntelWriteTools()    // 凭据/系统名/SearXNG 三个 agent 主动工具
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}

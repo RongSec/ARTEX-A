@@ -1115,9 +1115,9 @@ func coverTitle(fallback string, targets []string) string {
 // reportSystemName 解析 {system}。交付规范：**知道系统名就用系统名，不知道
 // 就用任务 ID，禁止拿 IP 或域名占位**。
 //
-// 「知道系统名」的唯一来源是人工命名的任务名：任务被改成「示例经销商门户」
-// 这类短名时用它；仍是 URL / 默认整句目标名时忽略。目标 host 无论 IP 还是
-// 域名都不算系统名，一律回退 任务<id>/项目<id>。
+// 「知道系统名」的唯一来源是 tasks.system_name：agent 用 set_system_name
+// 工具确认后登记。未登记时目标 host 无论 IP 还是域名都不算系统名，一律
+// 回退 任务<id>/项目<id>。
 func reportSystemName(scope string, taskID, projectID int64, targets []string, names ...string) string {
 	for _, n := range names {
 		if isUsableSystemName(n) {
@@ -1334,11 +1334,13 @@ func (s *Server) buildReportInput(ctx context.Context, job *db.Report) (*report.
 	// （去 scheme/端口/路径）；否则 task 用「任务<id>」、project 用「项目<id>」。
 	// 封面标题恒为「系统名+渗透测试报告」。任务 DisplayName 常是整句目标，
 	// 直接当标题会整段顶到封面。
-	var nameHints []string
-	for _, t := range tasks {
-		nameHints = append(nameHints, t.Name)
+	// 系统名只认 agent 通过 set_system_name 登记的值；未知回退任务ID。
+	// 不再从任务名猜（1000+ 目标不可能人工逐个命名）。
+	explicitName := ""
+	if job.Scope == db.ReportScopeTask && job.TaskID != nil {
+		explicitName, _ = s.m.pg.TaskSystemName(*job.TaskID)
 	}
-	systemName := reportSystemName(job.Scope, valueOr0(job.TaskID), valueOr0(job.ProjectID), kept, nameHints...)
+	systemName := reportSystemName(job.Scope, valueOr0(job.TaskID), valueOr0(job.ProjectID), kept, explicitName)
 	title = coverTitleFromSystem(systemName)
 
 	// 5) 模板元信息。
@@ -1596,7 +1598,11 @@ func (s *Server) reportDownloadName(job *db.Report, artifactPath string) string 
 			}
 		}
 	}
-	data.System = reportSystemName(job.Scope, data.TaskID, data.ProjectID, hosts, data.TaskName)
+	explicitName := ""
+	if job.Scope == db.ReportScopeTask && data.TaskID > 0 {
+		explicitName, _ = s.m.pg.TaskSystemName(data.TaskID)
+	}
+	data.System = reportSystemName(job.Scope, data.TaskID, data.ProjectID, hosts, explicitName)
 	data.Title = coverTitleFromSystem(data.System)
 	tmpl := ""
 	if st, err := s.m.pg.GetReportSettings(); err == nil && st != nil {

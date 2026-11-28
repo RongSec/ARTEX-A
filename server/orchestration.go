@@ -51,6 +51,8 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	// V5-A：planner 的洞察否决工具已随 project_insights 表一起移除（V12-CLEANUP）。
 	// V10-INTEL：漏洞情报两工具（只读，公开源）。绑定见 seedOrchestrationTools。
 	tools = append(tools, s.intelTools()...)
+	// agent 主动登记：凭据/系统名（取代正则猜）+ 自建 SearXNG 检索。
+	tools = append(tools, s.toolRecordCredential(), s.toolSetSystemName(), s.toolSearxngSearch())
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)
