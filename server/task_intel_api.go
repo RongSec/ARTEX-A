@@ -260,9 +260,17 @@ func emptyIfNil[T any](in []T) []T {
 //   - 用户名是字段名/头名（复用抽取侧停用词；带 "-" 的基本是 HTTP 头）。
 //
 // 只影响展示与计数，不删库；后续抽取侧已同步收紧，新数据不会再产生这类行。
-func intelCredentialIsNoise(user, secretMasked string) bool {
+func intelCredentialIsNoise(user, service, secretMasked string) bool {
 	if strings.TrimSpace(secretMasked) == "" {
 		return true
+	}
+	// 服务是配置键形态（value.status / data.length）时不是主机；这条与
+	// username 是否为空无关（hash 行没有用户名）。
+	svc := strings.ToLower(strings.TrimSpace(service))
+	for _, suffix := range []string{".status", ".value", ".length", ".type", ".code", ".message", ".data", ".result"} {
+		if strings.HasSuffix(svc, suffix) {
+			return true
+		}
 	}
 	u := strings.ToLower(strings.TrimSpace(user))
 	if u == "" {
@@ -282,7 +290,8 @@ func intelCredentialIsNoise(user, secretMasked string) bool {
 }
 
 // buildIntelGroups 纯函数：平铺行 → 五组结构化条目（空组是 []，顺序稳定）。
-func buildIntelGroups(rows []db.TaskIntel) intelGroups {	g := intelGroups{
+func buildIntelGroups(rows []db.TaskIntel) intelGroups {
+	g := intelGroups{
 		Endpoint:   []intelEndpointItem{},
 		Credential: []intelCredentialItem{},
 		Component:  []intelComponentItem{},
@@ -324,7 +333,7 @@ func buildIntelGroups(rows []db.TaskIntel) intelGroups {	g := intelGroups{
 			// 历史脏数据过滤：抽取器早期把 JS 变量名/HTTP 头名/nmap 输出词
 			// 当成账号（shown、cmd、x-forwarded-host…），且没有密文掩码。
 			// 展示层直接剔除，避免任务小结里出现「口令：password for shown@…」。
-			if intelCredentialIsNoise(user, d.SecretMasked) {
+			if intelCredentialIsNoise(user, svc, d.SecretMasked) {
 				continue
 			}
 			g.Credential = append(g.Credential, intelCredentialItem{
